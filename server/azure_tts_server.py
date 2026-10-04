@@ -64,11 +64,38 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT)
 sys.path.append(os.path.join(ROOT, 'third_party', 'Matcha-TTS'))
 
-# 用 pythonw 启动（无控制台窗口）时 stdout/stderr 是空的：把日志落到文件，避免 print 报错
-if sys.stdout is None or sys.stderr is None or not hasattr(sys.stdout, 'write'):
+# 日志始终落盘到 server_run.log：VBS 以隐藏窗口启动时看不到控制台，出问题只能靠它排查。
+# 用 Tee 同时保留原 stdout/stderr（pythonw 下它们为空，则由文件兜底）。
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = [s for s in streams if s is not None and hasattr(s, 'write')]
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:                            # noqa: BLE001
+                pass
+        return len(data)
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:                            # noqa: BLE001
+                pass
+
+    def isatty(self):
+        return False
+
+
+try:
     _lf = open(os.path.join(ROOT, 'server_run.log'), 'a', encoding='utf-8', buffering=1)
-    sys.stdout = _lf
-    sys.stderr = _lf
+    sys.stdout = _Tee(sys.stdout, _lf)
+    sys.stderr = _Tee(sys.stderr, _lf)
+    print('[tts] ===== 启动 %s  pid=%d =====' % (time.strftime('%Y-%m-%d %H:%M:%S'), os.getpid()))
+except Exception:                                        # noqa: BLE001
+    pass
 
 # CosyVoice 相关导入放在真正需要时再做（轻量模式下不加载 torch，启动更省资源）
 AutoModel = None
@@ -387,6 +414,16 @@ if __name__ == '__main__':
                         help='zero-shot 参考音频：long=完整 6.3s（默认，最像）；short=~2.7s（prefill 更少更快，音色略降）')
     args = parser.parse_args()
 
+    # 实例锁：写本进程 pid。模型加载期间端口尚未监听（健康检查必然失败），
+    # 游戏侧靠它判断「已有实例正在启动/运行」，避免重复拉起把 CPU 抢光。
+    _BOOT_LOCK = os.path.join(ROOT, '.tts_server.lock')
+    try:
+        with open(_BOOT_LOCK, 'w', encoding='utf-8') as _f:
+            _f.write(str(os.getpid()))
+    except Exception:                                    # noqa: BLE001
+        print('[tts] 写实例锁失败（不影响运行）：%s' % _BOOT_LOCK)
+        _BOOT_LOCK = ''
+
     threads = max(1, args.threads)
     # flow 采样步数（在 cosyvoice/flow/flow.py 里按此环境变量取值）
     os.environ['COSY_FLOW_STEPS'] = str(max(1, args.flow_steps))
@@ -515,3 +552,9 @@ if __name__ == '__main__':
         print('[tts] 端口 %d 无法绑定（多半已经有一个语音服务在跑）：%s' % (args.port, exc))
         print('[tts] 直接使用正在运行的那个即可；要另开请改 --port（游戏里同步改地址）')
         sys.exit(1)
+    finally:
+        if _BOOT_LOCK:                                   # 进程退出（含绑定失败）：撤掉实例锁
+            try:
+                os.remove(_BOOT_LOCK)
+            except Exception:                            # noqa: BLE001
+                pass

@@ -23,6 +23,7 @@ Azure.vrm
 # —— 运行产物 ——
 *.log
 server_run.log
+.tts_server.lock
 gtp_logs/
 shots/
 

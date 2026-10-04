@@ -681,6 +681,19 @@ func _health_url() -> String:
 		b = b.substr(0, b.length() - 3)
 	return b + "/health"
 
+## 是否已有语音服务实例在启动或运行：读服务端写的实例锁（pid），再用进程存活判断。
+## 模型加载期间端口未监听、/health 必然失败，只靠健康检查会误判成「没在跑」而重复拉起。
+func _service_started_or_starting() -> bool:
+	var lock := _tts_dir.path_join(".tts_server.lock")
+	if not FileAccess.file_exists(lock):
+		return false
+	var f := FileAccess.open(lock, FileAccess.READ)
+	if f == null:
+		return false
+	var pid := int(f.get_as_text().strip_edges())
+	f.close()
+	return pid > 0 and OS.is_process_running(pid)
+
 ## 启动游戏时自动拉起本地语音服务（pythonw，后台无窗口）
 func _autostart_tts() -> void:
 	if not cfg.tts_auto_start or not cfg.tts_enabled or cfg.tts_mode == "system":
@@ -701,7 +714,13 @@ func _autostart_tts() -> void:
 			return
 	else:
 		probe.queue_free()
-	_spawn_tts_server()
+	# 服务加载模型（1~2 分钟）期间端口还没监听，健康检查必然失败：
+	# 先看有没有实例正在启动/运行，避免重复拉起——两个实例互抢 CPU 会让「启动」看起来一直失败
+	if _service_started_or_starting():
+		print("[TTS] 已有语音服务实例在启动/运行，等待它就绪（不重复拉起）")
+		_tts_status.text = "语音服务已在启动（加载模型约 1~2 分钟），等它就绪…"
+	else:
+		_spawn_tts_server()
 	for i in 160:                                 # 等就绪（双模型加载较慢，最多约 4 分钟）
 		await get_tree().create_timer(1.5).timeout
 		var p2 := HTTPRequest.new()
