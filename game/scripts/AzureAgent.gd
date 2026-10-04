@@ -384,9 +384,11 @@ func chat(text: String) -> void:
 		{"role": "assistant", "content": "嗯，我都记着呢"},
 	]
 	var hist: Array = st.chat_history
-	var start := maxi(0, hist.size() - 6)
-	for i in range(start, hist.size()):
-		msgs.append(hist[i])
+	var upto := hist.size() - 1        # 最后一条是刚追加的这句，下面单独发，避免重复
+	# 与【最近的对话】一致：每句玩家的话都带上它的上一句/下一句（无论角色）
+	for sp in AzurePrompts.chat_windows(hist.slice(0, upto)):
+		for i in range(int(sp[0]), int(sp[1]) + 1):
+			msgs.append(hist[i])
 	msgs.append({"role": "user", "content": text})
 	var reply: String = await _reply(msgs, 400)
 	st.chat_history.append({"role": "assistant", "content": reply})

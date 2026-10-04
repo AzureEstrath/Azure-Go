@@ -141,19 +141,48 @@ static func memory_brief(memory_log: Array, last_n := 6) -> String:
 		lines.append("%s · 第%d手后：%s" % [who, int(m.get("move_no", 0)), str(m.get("text", ""))])
 	return "\n".join(lines)
 
+## 聊天上下文窗口：以玩家的每句话为中心，连同它的上一句与下一句（无论 Azure 还是玩家）
+## 一起纳入；相邻窗口重叠时合并成连续片段（去重），避免她只看到孤零零的半截对话。
+## 返回若干 [起, 止] 闭区间下标；最多取最近 last_players 条玩家发言，控制上下文长度。
+static func chat_windows(chat_history: Array, last_players := 6) -> Array:
+	var n := chat_history.size()
+	var player_idx: Array[int] = []
+	for i in range(n - 1, -1, -1):
+		if str((chat_history[i] as Dictionary).get("role", "")) == "user":
+			player_idx.append(i)
+			if player_idx.size() >= last_players:
+				break
+	player_idx.reverse()
+	var spans: Array = []
+	for i in player_idx:
+		var a := maxi(0, i - 1)
+		var b := mini(n - 1, i + 1)
+		if not spans.is_empty() and a <= int(spans[spans.size() - 1][1]) + 1:
+			spans[spans.size() - 1][1] = maxi(int(spans[spans.size() - 1][1]), b)
+		else:
+			spans.append([a, b])
+	return spans
+
 ## 最近的聊天摘录（供思考前回忆「聊天里说过的话」），过长逐条截断
-static func chat_brief(chat_history: Array, last_n := 6, per_char := 48) -> String:
+static func chat_brief(chat_history: Array, last_players := 6, per_char := 48) -> String:
 	if chat_history.is_empty():
 		return "（还没聊过天）"
-	var start := maxi(0, chat_history.size() - last_n)
+	var spans := chat_windows(chat_history, last_players)
+	if spans.is_empty():
+		return "（还没聊过天）"
 	var lines: Array[String] = []
-	for i in range(start, chat_history.size()):
-		var h: Dictionary = chat_history[i]
-		var who := "Estarth" if str(h.get("role", "")) == "user" else "Azure（我）"
-		var t := " ".join(str(h.get("content", "")).split("\n", false)).strip_edges()
-		if t.length() > per_char:
-			t = t.substr(0, per_char) + "…"
-		lines.append("%s：%s" % [who, t])
+	var prev_end := -1
+	for sp in spans:
+		if prev_end >= 0 and int(sp[0]) > prev_end + 1:
+			lines.append("……")                        # 两段窗口之间确有省略，标出来
+		for i in range(int(sp[0]), int(sp[1]) + 1):
+			var h: Dictionary = chat_history[i]
+			var who := "Estarth" if str(h.get("role", "")) == "user" else "Azure（我）"
+			var t := " ".join(str(h.get("content", "")).split("\n", false)).strip_edges()
+			if t.length() > per_char:
+				t = t.substr(0, per_char) + "…"
+			lines.append("%s：%s" % [who, t])
+		prev_end = int(sp[1])
 	return "\n".join(lines)
 
 ## 由棋谱重放得到当前盘面（含提子），用于给 Azure 一张实时的「当前棋面」图

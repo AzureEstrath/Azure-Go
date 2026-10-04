@@ -175,7 +175,7 @@ func probe_models() -> void:
 	probe.timeout = 5.0
 	add_child(probe)
 	var url := base_url.rstrip("/") + "/models"
-	if probe.request(url) != OK:
+	if probe.request(url, _headers()) != OK:      # 云端服务 /models 也需要鉴权
 		probe.queue_free()
 		return
 	var res: Array = await probe.request_completed
