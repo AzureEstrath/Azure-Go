@@ -1,0 +1,34 @@
+{
+  "_说明": "Azure 围棋陪练 配置模板。打包发布时把本文件放在与可执行文件同一目录即可覆盖包内默认值。所有相对路径会先在「可执行文件目录」再在「项目目录」查找。",
+  "katago_bin": "katago.exe",
+  "katago_config": "default_gtp.cfg",
+  "katago_model": "model.bin",
+  "max_visits": 100,
+
+  "llm_base_url": "http://localhost:8080/v1",
+  "llm_model": "qwen3.5",
+  "llm_api_key": "",
+
+  "prompt_system": "",
+  "prompt_user_name": "Estarth",
+  "prompt_phase_notes": {},
+
+  "vrm_path": "Azure.vrm",
+
+  "tts_enabled": true,
+  "tts_mode": "system",
+  "tts_auto_start": true,
+  "tts_base_url": "http://127.0.0.1:9880/v1",
+  "tts_model": "cosyvoice3",
+  "tts_api_key": "",
+  "tts_voice": "中文女",
+  "tts_speed": 1.0,
+  "tts_pitch": 1.02,
+  "tts_volume": 0.65,
+  "tts_bf16": true,
+  "tts_short_prompt": false,
+  "tts_limit_len": true,
+  "tts_sync_speak": true,
+  "tts_batch_speak": false,
+  "tts_long_chunk": false
+}

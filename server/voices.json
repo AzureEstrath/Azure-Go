@@ -1,0 +1,9 @@
+{
+  "azure": {
+    "prompt_wav": "asset/azure_clone.wav",
+    "prompt_long_wav": "asset/azure_clone_long.wav",
+    "prompt_text": "You are a helpful assistant.<|endofprompt|>旅行的意义一定能从旅途中再次找到遇到不平之事，身体也会先一步行动",
+    "prompt_short_wav": "asset/azure_clone_short.wav",
+    "prompt_short_text": "You are a helpful assistant.<|endofprompt|>旅行的意义一定能从旅途中再次找到"
+  }
+}

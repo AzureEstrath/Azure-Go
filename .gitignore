@@ -1,0 +1,32 @@
+# —— Godot 生成物 ——
+game/.godot/
+*.pck
+
+# —— 打包产物 / 分享包 ——
+build/
+dist/
+*.zip
+AzureGoGodot.exe
+
+# —— 模型权重（体积大，另行分发，见 README「模型与资产」）——
+model.bin
+**/pretrained_models/
+**/sherpa_models/
+**/*.onnx
+Azure.vrm
+
+# —— Python ——
+**/.venv/
+**/__pycache__/
+*.pyc
+
+# —— 运行产物 ——
+*.log
+server_run.log
+gtp_logs/
+shots/
+
+# —— 系统 ——
+Thumbs.db
+desktop.ini
+.DS_Store

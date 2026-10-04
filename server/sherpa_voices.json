@@ -1,0 +1,26 @@
+[
+  {
+    "id": "xiaoya",
+    "label": "小雅 · 清亮少女（轻量 22kHz）",
+    "dir": "sherpa_models/vits-piper-zh_CN-xiao_ya-medium",
+    "sid": 0
+  },
+  {
+    "id": "shaonv",
+    "label": "少女音 · 高音（fanchen）",
+    "dir": "sherpa_models/vits-zh-hf-fanchen-C",
+    "sid": 14
+  },
+  {
+    "id": "shaonv2",
+    "label": "少女音 · 中音（fanchen）",
+    "dir": "sherpa_models/vits-zh-hf-fanchen-C",
+    "sid": 8
+  },
+  {
+    "id": "nvsheng",
+    "label": "女声 · 温柔（zh-ll）",
+    "dir": "sherpa_models/sherpa-onnx-vits-zh-ll",
+    "sid": 0
+  }
+]
