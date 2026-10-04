@@ -184,7 +184,20 @@ static func board_map(board: GoBoard, num_moves: int) -> String:
 		lines.append(row)
 	var whose := "轮到 Estarth（黑）落子" if num_moves % 2 == 0 else "轮到你（Azure，白）落子"
 	var done := "棋盘为空、尚未落子" if num_moves == 0 else "已下 %d 手" % num_moves
-	return "X = Estarth(黑)   O = Azure(白)   · = 空点\n%s\n%s，%s。" % ["\n".join(lines), done, whose]
+	# 明确列出双方现有棋子坐标：谈棋时只能引用这里有的点，避免脑补不存在的子
+	var bl: Array[String] = []
+	var wh: Array[String] = []
+	for y in GoBoard.SIZE:
+		for x in GoBoard.SIZE:
+			var c2 := str(board.grid[x][y])
+			if c2 == "black":
+				bl.append(Coords.xy_to_gtp(x, y))
+			elif c2 == "white":
+				wh.append(Coords.xy_to_gtp(x, y))
+	var occ := "现有棋子（谈棋时只能引用这里出现的点）：\nEstarth 黑子：%s\nAzure 白子：%s" % [
+		(" 、 ".join(bl) if not bl.is_empty() else "（暂无）"),
+		(" 、 ".join(wh) if not wh.is_empty() else "（暂无）")]
+	return "X = Estarth(黑)   O = Azure(白)   · = 空点\n%s\n%s\n%s，%s。" % ["\n".join(lines), occ, done, whose]
 
 static func context_block(moves: Array, memory_log: Array, chat_history: Array, phase: String, skip_last_chat := false, katago := "") -> String:
 	var hist := chat_history
@@ -195,7 +208,11 @@ static func context_block(moves: Array, memory_log: Array, chat_history: Array, 
 		+ "\n\n【对局全貌 · 请始终记住】\n%s\n整盘手数：%s\n最近过程：\n%s"
 		+ "\n【落子评定存档（E=Estarth黑 / A=Azure白）】\n%s"
 		+ "\n【最近的对话】\n%s"
-		+ "\n（回忆提示：以【当前棋面】和【对局全貌】为准——不确定某点有没有子、或轮到谁落子时，看这两块，不要凭记忆猜；形势可参考【KataGo 形势】，但那是引擎的判断，用你的口吻自然带出即可，别报数字报得太生硬。上面也是你记得的事，思考动笔前先回想一遍，聊到过或评定过的内容若与此刻相关，就自然呼应一句，不要生硬复述。）") % [
+		+ "\n（铁律 · 先核对再开口：\n"
+		+ "1) 只要这句话与棋局有关，动笔前先看【当前棋面】：要提到某片区域/某个点「有子、没子、模样、实地、厚薄」时，必须能在上面的「现有棋子」里找到依据；那里没有的子一律不许提，拿不准就只说方向、不点具体子，绝不凭印象编。\n"
+		+ "2) 与棋局有关的每一句都要扣住「最近一手」和当前盘面，接着此刻的形势、以及你上一句的感受往下说；用「我 / 你」的第一人称视角，别像解说员那样说「黑方 / 白棋」，也别复述、别自说自话。\n"
+		+ "3) 轮到你说棋时，无论先说后说，都要先结合当前盘面再开口，让人听着是「接着这盘棋」在说，而不是孤立的一句话。\n"
+		+ "4) 聊的是棋以外的话题时，上面 1~3 条不适用，自然放松地聊即可。）") % [
 		board_map(board_from_moves(moves), moves.size()),
 		(katago if katago != "" else "（暂无引擎形势数据）"),
 		role_brief(moves, phase),

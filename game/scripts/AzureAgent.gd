@@ -206,7 +206,7 @@ func player_move(x: int, y: int) -> void:
 		eval_prompt = "Estarth下了 %s，不在前5。委婉指出，给点鼓励，1-2句。" % gtp
 	else:
 		eval_prompt = "Estarth下了 %s，没进我算的前5。慵懒表示不太理解，1-2句。" % gtp
-	eval_prompt += " 只评价Estarth这一手（1句）；不要提你自己接下来打算下哪里，不要复述胜率数值。"
+	eval_prompt += " 用你自己的口吻（「你这手…」「我觉得…」）评，1句就好，别像解说员那样说「黑方/白棋」；先结合【当前棋面】确认这手落在哪、周围有没有子再说；不要提你自己接下来打算下哪里，不要复述胜率数值。"
 	var player_eval: String = await _reply([
 		_sys_msg(),
 		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, eval_prompt, "after_player", false, st.last_katago)),
@@ -226,7 +226,7 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float) -> 
 
 	# 用意：落子前说明「我准备下在哪、想做什么」（此时棋谱里还没有她这一手，上下文才不会自相矛盾）
 	var think_hint := "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
-	var think_prompt := "轮到你下了。%s。用一句话说出你这一手的用意（打算下在哪、想做什么），直接说；不要复述刚才对Estarth那手的点评。" % think_hint
+	var think_prompt := "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说；不要复述刚才对Estarth那手的点评，也别用「黑方/白棋」的旁观口吻。" % think_hint
 	await get_tree().create_timer(0.35).timeout
 	var think_msg: String = await _reply([
 		_sys_msg(),
@@ -261,9 +261,9 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float) -> 
 	# 局势：一句话说清当前形势（谁占优、关键处），不复述前文（上下文里的 KataGo 形势已是最新）
 	var ai_eval_prompt := ""
 	if ai_gtp == "pass":
-		ai_eval_prompt = "你（Azure）选择了虚着。用一句话说说现在的局势（谁占优、关键处在哪）；不要复述刚才说过的话。"
+		ai_eval_prompt = "你（Azure）这手选择虚着。用你自己的口吻（我/你）一句话说说你现在对局面的感觉、心里在琢磨什么；不要用「黑方/白棋」这种旁观口吻，也不要复述刚才说过的话。"
 	else:
-		ai_eval_prompt = "你（Azure）下了 %s。用一句话说说现在的局势（谁占优、关键处在哪）；不要复述刚才说过的话。" % ai_gtp
+		ai_eval_prompt = "你（Azure）刚下了 %s。用你自己的口吻（我/你）一句话说说：我这手想要什么、现在这盘棋我感觉怎么样、接下来我打算怎么走；不要用「黑方/白棋」这种旁观口吻，也不要复述刚才说过的话。" % ai_gtp
 	var ai_eval: String = await _reply([
 		_sys_msg(),
 		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, ai_eval_prompt, "just_moved", false, st.last_katago)),
@@ -326,7 +326,7 @@ func hint() -> void:
 	for m in (analysis.get("moveInfos", []) as Array).slice(0, 3):
 		tops.append(str((m as Dictionary).get("move", "")))
 	_update_katago_brief(analysis, n)
-	var prompt := "当前局面：%s。我算到的好点：%s。Estarth还没落子，给个方向性提示，不要直接说坐标，1-2句。" % [
+	var prompt := "当前局面：%s。我算到的好点：%s。Estarth还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）。" % [
 		AzurePrompts.board_summary(st.move_seq), _py_list(tops)]
 	var msg: String = await _reply([
 		_sys_msg(),
@@ -359,7 +359,7 @@ func analyze_position() -> void:
 		tops.append(str((m as Dictionary).get("move", "")))
 	_update_katago_brief(analysis, n)
 	var lead := "你略占上风" if azure_wr > 0.5 else ("局面胶着" if azure_wr > 0.45 else "Estarth领先")
-	var prompt := "当前局面：%s，共%d手。你（Azure，执白）算出的判断：白方胜率约%s（%s），目差%s（正数是你领先）。你在考虑的几个点：%s。请以Azure口吻分析当前局势3-4句：局面走向、关键处或薄弱处，可以点醒Estarth，语气慵懒但专业。" % [
+	var prompt := "当前局面：%s，共%d手。你（Azure，执白）算出的判断：白方胜率约%s（%s），目差%s（正数是你领先）。你在考虑的几个点：%s。请用你自己的视角（我/你，别说「黑方/白棋」）分析当前局势3-4句：局面走向、关键处或薄弱处，可以点醒Estarth；语气慵懒但专业，先结合【当前棋面】核对再说，别提到盘上没有的子。" % [
 		AzurePrompts.board_summary(st.move_seq), n, _pct(azure_wr), lead, "%+.1f" % (-score_black), _py_list(tops)]
 	var msg: String = await _reply([
 		_sys_msg(),
