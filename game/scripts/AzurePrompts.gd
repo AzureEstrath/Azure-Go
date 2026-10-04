@@ -163,8 +163,8 @@ static func chat_windows(chat_history: Array, last_players := 6) -> Array:
 			spans.append([a, b])
 	return spans
 
-## 最近的聊天摘录（供思考前回忆「聊天里说过的话」），过长逐条截断
-static func chat_brief(chat_history: Array, last_players := 6, per_char := 48) -> String:
+## 最近的聊天摘录（供思考前回忆「聊天里说过的话」），过长逐条截断（64 字：既读得全玩家的话，又不撑爆上下文）
+static func chat_brief(chat_history: Array, last_players := 6, per_char := 64) -> String:
 	if chat_history.is_empty():
 		return "（还没聊过天）"
 	var spans := chat_windows(chat_history, last_players)

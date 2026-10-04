@@ -109,7 +109,7 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
 
 - **云端**：DeepSeek / OpenAI / 通义 / 硅基流动 等 OpenAI 兼容服务，填地址、模型名与 Key。
 - **本地**：vLLM / LM Studio / llama.cpp server 等，`llm_api_key` 留空。
-- 命令行临时指定：`AzureGoGodot.exe --llm=http://localhost:8080/v1 --model=你的模型名`
+- 命令行临时指定（不写回配置）：`AzureGoGodot.exe --llm=http://localhost:8080/v1 --model=你的模型名 --key=你的密钥`
 - 没接 LLM 时：**对局功能照常可用**，只是讲解/闲聊不可用。
 
 ---

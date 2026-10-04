@@ -28,6 +28,7 @@ func _ready() -> void:
 
 var _base_ready := false
 var _inflight := false           # 串行化排队：闲置搭话等新调用等待前一个完成，而不是并发撞 Busy
+var _dns_cache: Dictionary = {}  # host → 解析结果：云端服务省掉每次请求的 DNS 解析（TCP 预检仍保留，服务挂掉能快速失败）
 
 ## 首次使用前把 localhost 规范为 IPv4 回环。
 ## Godot 在本机把 localhost 只解析到 IPv6 ::1，而本地 LLM 通常只监听 IPv4，
@@ -40,6 +41,22 @@ func _ensure_base() -> void:
 		base_url = base_url.replace("://localhost", "://127.0.0.1")
 		print("[LLM] localhost → 127.0.0.1（Godot 只把 localhost 解析为 IPv6，直连会卡顿）")
 
+## 主机名 → 候选地址：本地回环固定先 IPv4 再 IPv6；其余主机解析一次后缓存
+func _resolve_addrs(host: String) -> Array[String]:
+	if host == "127.0.0.1" or host == "localhost" or host == "::1":
+		return ["127.0.0.1", "::1"]          # 先 IPv4，再 IPv6
+	if _dns_cache.has(host):
+		var cached: Array[String] = []
+		cached.assign(_dns_cache[host])
+		return cached
+	var out: Array[String] = []
+	for ip in IP.resolve_hostname(host, IP.TYPE_ANY):
+		out.append(ip)
+	if out.is_empty():
+		out.assign([host])
+	_dns_cache[host] = out
+	return out
+
 ## 连接预检：避免本地 LLM 未启动时白等满整个超时（一次要等 2 分钟）
 func _reachable() -> bool:
 	var m := _url_re.search(base_url)
@@ -47,14 +64,7 @@ func _reachable() -> bool:
 		return true
 	var host := m.get_string(2)
 	var port := int(m.get_string(3)) if m.get_string(3) != "" else (443 if m.get_string(1) == "https" else 80)
-	var addrs: Array[String] = []
-	if host == "127.0.0.1" or host == "localhost" or host == "::1":
-		addrs = ["127.0.0.1", "::1"]          # 先 IPv4，再 IPv6
-	else:
-		for ip in IP.resolve_hostname(host, IP.TYPE_ANY):
-			addrs.append(ip)
-	if addrs.is_empty():
-		addrs = [host]
+	var addrs := _resolve_addrs(host)
 	var t0 := Time.get_ticks_msec()
 	for a in addrs:
 		if await _try_connect(a, port):

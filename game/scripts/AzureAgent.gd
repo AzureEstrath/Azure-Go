@@ -381,7 +381,6 @@ func chat(text: String) -> void:
 	var msgs: Array = [
 		_sys_msg(),
 		_user_msg(AzurePrompts.context_block(st.moves, st.memory_log, st.chat_history, "chat", true, st.last_katago)),
-		{"role": "assistant", "content": "嗯，我都记着呢"},
 	]
 	var hist: Array = st.chat_history
 	var upto := hist.size() - 1        # 最后一条是刚追加的这句，下面单独发，避免重复
@@ -410,7 +409,6 @@ func idle_remark() -> void:
 	var reply: String = await _reply([
 		_sys_msg(),
 		_user_msg(AzurePrompts.context_block(st.moves, st.memory_log, st.chat_history, "chat", true, st.last_katago)),
-		{"role": "assistant", "content": "嗯，我都记着呢"},
 		{"role": "user", "content": prompt},
 	], 90)
 	if reply.strip_edges() == "" or reply.begins_with("调用出错") or reply.contains("脑子有点转不过来"):

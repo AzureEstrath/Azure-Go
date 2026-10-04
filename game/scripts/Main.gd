@@ -100,13 +100,15 @@ func _find_tts_dir() -> String:
 			return c
 	return exe_dir.path_join("cosyvoice")
 
-## 命令行覆盖：--llm=http://host:port/v1  --model=模型名
+## 命令行覆盖：--llm=http://host:port/v1  --model=模型名  --key=云端API Key（均不写回配置）
 func _apply_cli_overrides() -> void:
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--llm="):
 			cfg.llm_base_url = a.substr("--llm=".length())
 		elif a.begins_with("--model="):
 			cfg.llm_model = a.substr("--model=".length())
+		elif a.begins_with("--key="):
+			cfg.llm_api_key = a.substr("--key=".length())
 
 # ================= 世界与棋盘 =================
 

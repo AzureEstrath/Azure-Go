@@ -100,16 +100,23 @@ func clear_fallback() -> void:
 
 ## 探测本地服务是否就绪；就绪则从系统语音兜底切回原引擎
 func _probe_service() -> void:
-	var b := base_url.rstrip("/")
-	if b.ends_with("/v1"):
-		b = b.substr(0, b.length() - 3)
-	if b.contains("://localhost"):
-		b = b.replace("://localhost", "://127.0.0.1")
+	var prefer := _prefer_mode if _prefer_mode != "" else mode
+	var url := ""
+	if prefer == "cosyvoice":
+		var b := base_url.rstrip("/")
+		if b.ends_with("/v1"):
+			b = b.substr(0, b.length() - 3)
+		url = b + "/health"
+	else:
+		# OpenAI 兼容服务（含云端）：探标准 /models；只要服务在线就会有 HTTP 响应
+		url = base_url.strip_edges().rstrip("/") + "/models"
+	if url.contains("://localhost"):
+		url = url.replace("://localhost", "://127.0.0.1")
 	_http.timeout = 4.0
 	_probing = true
 	_http_busy = true
 	_http_since = Time.get_ticks_msec()
-	if _http.request(b + "/health") != OK:
+	if _http.request(url) != OK:
 		_probing = false
 		_http_busy = false
 		_recover_at = Time.get_ticks_msec() + 15000
@@ -348,10 +355,12 @@ func _on_done(result: int, code: int, _headers: PackedStringArray, body: PackedB
 	_http_busy = false
 	if _probing:                                     # 恢复探测的结果
 		_probing = false
-		if result == HTTPRequest.RESULT_SUCCESS and code == 200 and _prefer_mode != "":
+		# 服务在线即视为恢复：200 最佳；云端 TTS 的 /models 可能返回 401/404，只要 <500 就说明链路已通
+		var back := result == HTTPRequest.RESULT_SUCCESS and code > 0 and code < 500
+		if back and _prefer_mode != "":
 			mode = _prefer_mode
 			_prefer_mode = ""
-			status.emit("本地语音服务已就绪，自动切回「%s」朗读" % mode)
+			status.emit("语音服务已恢复，自动切回「%s」朗读" % mode)
 			_pump()
 		else:
 			_recover_at = Time.get_ticks_msec() + 15000
