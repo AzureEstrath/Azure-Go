@@ -1,10 +1,12 @@
 # Azure · 围棋陪练
 
 WARNING:这是一个由ai完善的项目！
+ORIGINAL ASPIRATION:Azure是一个我设定的ai少女，最开始只有概念，后来根据自己学过的几年python知识以及一台比较好的设备在本地跑了一下qwen2.5，后来又通过ai工具的使用逐渐做成了一个通过Napcat接入qq的机器人，后来得知了maibot这个工具并本地部署了qwen3.5但聊天效果太慢了，又恰好最近对围棋比较感兴趣（小时候也学过一点），遂有了此项目
+FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应用，并没有指导的感觉，很枯燥，所以我希望AazureGo不仅仅可以让大家感到开心，并且也能激发大家在现代无法沉心环境背景下对于围棋学习的乐趣
 
-一个 3D 围棋陪练程序：**KataGo** 负责算棋（你执黑先行，Azure 执白应手），
+这是一个 3D 围棋陪练程序：**KataGo** 负责算棋（玩家执黑先行，Azure 执白应手），
 **大模型** 负责讲解与闲聊，**语音合成** 让 Azure 开口说话，
-**Godot 4** 场景里是一个会眨眼、歪头、注视你的青蓝色 AI 少女 Azure（VRM 形象）。
+**Godot 4** 场景里是一个会眨眼、歪头、注视你的青蓝色 AI 少女 Azure。
 
 > 面向「**不想在本地部署大模型/语音**」的玩家：KataGo 随包本地运行，
 > **LLM 与 TTS 都走可自定义的 OpenAI 兼容 API**（可填云端服务并带 API Key），
@@ -142,3 +144,5 @@ powershell -ExecutionPolicy Bypass -File tools\build_pck.ps1
 本项目源码采用 **Apache License 2.0**（见 [LICENSE](LICENSE)）。
 `server\` 下的 CosyVoice 及其 `third_party\Matcha-TTS` 为各自上游项目，遵循其原始许可。
 KataGo 引擎与权重遵循其上游许可。
+
+本人技术有限，但想象力绝对够，后续版本更新取决于ai以及我的计算机&人工智能学习深度(:-])
