@@ -867,13 +867,15 @@ func _add_msg(kind: String, text: String) -> void:
 			get_tree().create_timer(BATCH_WINDOW).timeout.connect(func(): _flush_batch(token))
 		else:
 			# 逐句播报：每条各自合成；轮到它开始播放时再显示文字（见 _on_utterance_started）
+			# 先入队再合成：拿 speak() 的分组号，保证「一条消息 ⇄ 一次 utterance_started」严格对应
 			if cfg.tts_sync_speak:
-				_pending_ai.append({"text": text, "reveal": reveal})
+				_pending_ai.append({"text": text, "reveal": reveal, "group": -1})
+				_pending_ai[_pending_ai.size() - 1]["group"] = tts.speak(text)
 			else:
 				_add_msg_now("ai", text)
 				if reveal:
 					_reveal_move()
-			tts.speak(text)
+				tts.speak(text)
 		return
 	if is_ai:
 		_add_msg_now("ai", text)                 # 未启用语音：直接显示
@@ -1325,15 +1327,20 @@ func _on_tts_speaking(v: bool) -> void:
 	_clear_thinking_if_idle()
 
 ## 每段语音开始播放：逐句模式下把与之对应的一条 Azure 文字显示出来（文字与声音成对）
-func _on_utterance_started() -> void:
+func _on_utterance_started(group: int) -> void:
 	if cfg.tts_batch_speak:
 		return
-	if _pending_ai.is_empty():
+	if group <= 0:                   # group=0 是试听：不显示任何待播文字
 		return
-	var e: Dictionary = _pending_ai.pop_front()
-	_add_msg_now("ai", str(e.get("text", "")))
-	if bool(e.get("reveal", false)):
-		_reveal_move()               # 说到这手棋时，才把子放上棋盘
+	for i in _pending_ai.size():     # 按分组号精确匹配：一条消息只显示一次，乱序/丢块也不会错位
+		if int(_pending_ai[i].get("group", -1)) != group:
+			continue
+		var e: Dictionary = _pending_ai[i]
+		_pending_ai.remove_at(i)
+		_add_msg_now("ai", str(e.get("text", "")))
+		if bool(e.get("reveal", false)):
+			_reveal_move()           # 说到这手棋时，才把子放上棋盘
+		return
 
 # ================= 调试截图 =================
 

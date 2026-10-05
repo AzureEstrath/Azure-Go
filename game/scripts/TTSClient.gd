@@ -7,7 +7,7 @@ extends Node
 signal status(text: String)
 signal auto_fallback(kind: String)     # 本地服务连不上时临时降级（不写配置）
 signal speaking_changed(on: bool)      # 开始/结束朗读（化身说话时歪头用）
-signal utterance_started               # 每段音频开始播放（逐句模式下用它显示对应的一条文字）
+signal utterance_started(group: int)   # 一条消息的音频开始播放（group=speak() 的分组号；0=试听）
 
 const QUEUE_MAX := 3
 const FAIL_COOLDOWN := 6.0
@@ -43,11 +43,16 @@ var _http_since := 0
 
 var _http: HTTPRequest = null
 var _player: AudioStreamPlayer = null
-var _queue: Array[String] = []
 var _busy := false
 var _cooldown := 0.0
 var _base_ready := false
 var _next_stream: AudioStream = null   # 边播边合成的下一句（预取），消除句间空白/卡住
+var _queue: Array[Dictionary] = []     # 朗读队列：{text, group, start}；group 保证「一条消息一次 utterance_started」
+var _group_seq := 0                    # 消息分组号（每次 speak() 自增）
+var _req_group := 0                    # 在途合成请求属于哪一组
+var _req_start := false                # 在途请求是否为该组的第一块
+var _next_group := 0                   # 预取流所属分组
+var _next_start := false
 var fast_voices := {}                  # 服务端标记为轻量的音色 id（sherpa/melo）：不需要按句拆分
 var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think）
 var _filler_player: AudioStreamPlayer = null
@@ -107,8 +112,10 @@ func play_filler(kind: String, force := false) -> void:
 func _on_spoken() -> void:
 	if _next_stream != null:
 		var s := _next_stream
+		var g := _next_group
+		var st := _next_start
 		_next_stream = null
-		_play_stream(s)                             # 下一句已合成好：立刻接着读，不留空白
+		_play_stream(s, g, st)                      # 下一句已合成好：立刻接着读，不留空白
 		_pump()                                     # 顺便继续预取再下一句
 		return
 	_set_speaking(false)
@@ -171,12 +178,12 @@ func _probe_service() -> void:
 		_recover_at = Time.get_ticks_msec() + 15000
 
 ## 排队朗读一句（Azure 的话）。正在朗读时最多再排 3 句，避免越说越滞后
-func speak(text: String) -> void:
+func speak(text: String) -> int:
 	if not enabled:
-		return
+		return 0
 	var t := clean_for_speech(text)
 	if t == "":
-		return
+		return 0
 	# 慢引擎：把整段按「整句」合并成较大的块（短回复通常只有一块 → 一次请求连续读完）
 	var pieces: Array[String] = []
 	if _slow_engine():
@@ -188,8 +195,13 @@ func speak(text: String) -> void:
 		pieces.resize(cap)
 	while _queue.size() > cap - pieces.size():       # 队列满了丢最旧的，保证不越说越滞后
 		_queue.pop_front()
-	_queue.append_array(pieces)
+	_group_seq += 1
+	var g := _group_seq
+	for i in pieces.size():
+		# 同一条消息的所有分块共用一个 group；只有第一块标记 start=true
+		_queue.append({"text": pieces[i], "group": g, "start": i == 0})
 	_pump()
+	return g
 
 ## 是否还在忙（合成中/排队中/正在播放）。「同步说话」用它判断文字该等语音，还是直接显示
 func is_speaking() -> bool:
@@ -215,7 +227,7 @@ func preview(text: String) -> void:
 	if t == "":
 		t = "嗯~ 我是 Azure，很高兴见到你。"
 	stop()
-	_queue.push_front(t)
+	_queue.push_front({"text": t, "group": 0, "start": true})   # group=0：试听，不触发文字显示
 	_pump(true)
 
 ## 文本 → 适合朗读的句子：去装饰/表情/括号标题，合并空白，限长
@@ -316,13 +328,17 @@ func _pump(force := false) -> void:
 	if mode == "system":
 		if _sapi_pid > 0 and OS.is_process_running(_sapi_pid):
 			return                               # 上一句还在读
-		_speak_system(_queue.pop_front())
+		var item0: Dictionary = _queue.pop_front()
+		_speak_system(str(item0["text"]), int(item0["group"]), bool(item0["start"]))
 		return
 	if _next_stream != null:
 		return                                   # 已预取下一句：等它播完再合成，避免堆积
 	_ensure_base()
 	_http.timeout = HTTP_TIMEOUT_SLOW if _slow_engine() else HTTP_TIMEOUT_FAST
-	var text: String = _queue.pop_front()
+	var item: Dictionary = _queue.pop_front()
+	var text := str(item["text"])
+	_req_group = int(item["group"])
+	_req_start = bool(item["start"])
 	_busy = true
 	var headers: PackedStringArray
 	var payload := ""
@@ -361,7 +377,7 @@ func _with_auth(h: PackedStringArray) -> PackedStringArray:
 	return h
 
 ## Windows 系统语音（零配置兜底）：用 PowerShell 调 SAPI 朗读，子进程异步跑
-func _speak_system(text: String) -> void:
+func _speak_system(text: String, group: int, start: bool) -> void:
 	var s := text.replace("'", "''").replace("\"", "")
 	var rate := int(round(clampf((speed - 1.0) * 5.0, -8.0, 8.0)))
 	var vol := int(round(clampf(volume * 67.0, 5.0, 100.0)))
@@ -388,7 +404,8 @@ func _speak_system(text: String) -> void:
 		status.emit("系统语音不可用（无法启动 PowerShell）")
 	else:
 		_set_speaking(true)
-		utterance_started.emit()
+		if start:
+			utterance_started.emit.call_deferred(group)   # 延到本帧末：调用方先把待显示文字入队
 		status.emit("正在朗读…（系统语音）")
 
 ## Godot 只把 localhost 解析为 IPv6，本地服务多监听 IPv4，统一改写成 127.0.0.1
@@ -452,13 +469,15 @@ func _on_done(result: int, code: int, _headers: PackedStringArray, body: PackedB
 		return
 	if _player.playing:                              # 上一句还在播：先缓存，播完无缝接上
 		_next_stream = stream
+		_next_group = _req_group
+		_next_start = _req_start
 		_pump()                                      # 继续预取再下一句
 		return
-	_play_stream(stream)
+	_play_stream(stream, _req_group, _req_start)
 	_pump()                                          # 边播边合成下一句，消除句间停顿
 
 ## 播放一段音频（统一入口：音量/音调/状态）
-func _play_stream(stream: AudioStream) -> void:
+func _play_stream(stream: AudioStream, group: int, start: bool) -> void:
 	if _filler_player != null and _filler_player.playing:
 		_filler_player.stop()            # 正式朗读开始：语气词让位
 	_player.stream = stream
@@ -466,7 +485,8 @@ func _play_stream(stream: AudioStream) -> void:
 	_player.pitch_scale = clampf(pitch, 0.5, 2.0)
 	_player.play()
 	_set_speaking(true)
-	utterance_started.emit()
+	if start:
+		utterance_started.emit(group)
 	status.emit("正在朗读…")
 
 ## mp3（默认）或 16bit PCM wav（服务端可配）
