@@ -147,5 +147,9 @@ powershell -ExecutionPolicy Bypass -File tools\build_pck.ps1
 `server\` 下的 CosyVoice 及其 `third_party\Matcha-TTS` 为各自上游项目，遵循其原始许可。
 KataGo 引擎与权重遵循其上游许可。
 
+---
+
+## 八、更新
+
 本人技术有限，但想象力绝对够，后续版本更新取决于ai以及我的计算机&人工智能学习深度(:-])
 本地部署采用Cosy Voice3，Qwen3.5 35B版本。
