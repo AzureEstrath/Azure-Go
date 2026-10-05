@@ -13,7 +13,7 @@ const QUEUE_MAX := 3
 const FAIL_COOLDOWN := 6.0
 const MAX_CHARS := 300
 const FILLER_DIR := "res://assets/voice"   # 预制情绪语气词：填补合成等待的空白
-const FILLER_COOLDOWN_MS := 4000           # 自动插话的最小间隔（避免一直「让我看看」）
+const FILLER_COOLDOWN_MS := 6000           # 自动插话的最小间隔（避免一直「嗯……」）
 var slow_chunk_chars := 100          # 慢引擎单次请求的字数上限（右侧栏「长句合并」开关：关=100/开=160）
 const HTTP_TIMEOUT_FAST := 60.0      # 轻量引擎（melo）/ 系统语音：很快就回
 const HTTP_TIMEOUT_SLOW := 240.0     # CosyVoice 系列 CPU 很慢：给足时间，别像以前那样 60 秒就被丢弃
@@ -76,7 +76,7 @@ const FILLER_FILES := {
 	"surprise": ["filler_surprise_1.wav"],
 	"happy": ["filler_happy_1.wav", "filler_happy_2.wav"],
 	"puzzle": ["filler_puzzle_1.wav", "filler_puzzle_2.wav"],
-	"think": ["filler_think_1.wav"],
+	"think": ["filler_think_1.wav", "filler_think_2.wav"],
 }
 
 ## 载入预制语气词：res://assets/voice/ 下按清单加载

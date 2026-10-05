@@ -1004,6 +1004,8 @@ func _show_thinking() -> void:
 	_thinking_row = row
 	_thinking_label = lbl
 	_scroll_to_bottom()
+	if tts != null:
+		tts.play_filler("think")         # 思考时先「嗯……」一声，别让等待无声（冷却由 TTS 内部管）
 
 func _clear_thinking() -> void:
 	if _thinking_row != null and is_instance_valid(_thinking_row):
