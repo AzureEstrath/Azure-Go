@@ -42,6 +42,10 @@ var _speech_hold := false                  # Azure 还有语音没播完：继�
 var _pending_batch := ""                   # 攒起来的连续 Azure 文本：合并成「一整段」一次合成
 var _batch_token := 0                      # 去抖令牌：又来新消息就自增，让旧计时器失效
 var _tts_pid := -1                         # 本游戏拉起的语音服务进程（用于开关切换后重启）
+var _tts_playing := false                  # 当前是否真有音频在播（区别于「排队中/合成中」）
+var _think_dots := 0                       # 「思考中…」省略号动效点数（1~3 循环）
+var _think_last_ms := 0                    # 上次刷新省略号的时刻
+var _blush_seq := 0                        # 摸头脸红的序号（新的一次摸头会让旧的褪红计时失效）
 
 ## Azure 连着冒的多条消息在这么长时间内合并成一段再合成（CPU 合成慢，分开发会句间空很久）
 const BATCH_WINDOW := 0.35
@@ -154,6 +158,7 @@ func _build_board() -> void:
 	add_child(board)
 	board.setup_font(_font)
 	board.intersection_clicked.connect(_on_intersection_clicked)
+	board.head_patted.connect(_on_head_patted)
 	if avatar != null:
 		avatar.gaze_source = board          # 化身视线：旋转视角时看玩家，平时看鼠标落点
 
@@ -1004,6 +1009,17 @@ func _clear_thinking() -> void:
 	_thinking_row = null
 	_thinking_label = null
 
+## 句间合成空隙也要有「思考中…」：下一句正在合成、还没开始播时显示占位，并让省略号动起来
+func _update_thinking(now: int) -> void:
+	if _thinking_label == null and not _pending_ai.is_empty() and not _tts_playing:
+		_show_thinking()                                 # 文字还没轮到显示、也没在播：她在憋下一句
+	if _thinking_label == null:
+		return
+	if now - _think_last_ms >= 450:
+		_think_last_ms = now
+		_think_dots = _think_dots % 3 + 1
+		_thinking_label.text = "Azure 思考中" + "…".repeat(_think_dots)
+
 ## 占位气泡只在「还等着、也没在说话」时清掉，避免把马上要被替换的占位提前删掉
 func _clear_thinking_if_idle() -> void:
 	if _thinking_label == null:
@@ -1169,6 +1185,29 @@ func _on_tts_fallback(_kind: String) -> void:
 func _on_emotion(kind: String) -> void:
 	if avatar != null:
 		avatar.play_expression(kind)
+	if tts != null:                                # 预制语气词即时补一句，填补后续合成的等待
+		match kind:
+			"delight", "laugh":
+				tts.play_filler("happy", true)
+			"puzzled":
+				tts.play_filler("puzzle", true)
+			"worried", "sad":
+				tts.play_filler("surprise", true)
+
+## 右键按住摸摸头：开心 + 脸红几秒 + 一句开心的语气词
+func _on_head_patted() -> void:
+	if avatar != null:
+		avatar.play_expression("laugh")
+		avatar.set_blush(true)
+	if tts != null:
+		tts.play_filler("happy", true)
+	_bump_activity()
+	_set_status("你摸了摸 Azure 的头…")
+	_blush_seq += 1
+	var seq := _blush_seq
+	get_tree().create_timer(3.5).timeout.connect(func():
+		if seq == _blush_seq and avatar != null:
+			avatar.set_blush(false))
 
 func _on_tts_status(text: String) -> void:
 	if _tts_status != null:
@@ -1263,6 +1302,7 @@ func _process(_delta: float) -> void:
 	if _idle and now >= _next_talk_ms and agent != null and not agent.busy:
 		_next_talk_ms = now + randi_range(int(IDLE_TALK_MIN * 1000.0), int(IDLE_TALK_MAX * 1000.0))
 		agent.idle_remark()
+	_update_thinking(now)
 
 func _set_idle_state(v: bool) -> void:
 	if board != null:
@@ -1274,10 +1314,13 @@ func _set_idle_state(v: bool) -> void:
 func _on_tts_speaking(v: bool) -> void:
 	if avatar != null:
 		avatar.set_speaking(v)
+	_tts_playing = v
 	if v and cfg.tts_batch_speak:
 		_flush_pending_ai()          # 整段模式：文字与这段连续语音一起显示
 	if not v:
-		_speech_hold = false         # 说完了：解锁棋盘，轮到玩家
+		# 注意：这里只代表「这一句播完了」。后面常有排队/正在合成的句子，
+		# 所以要看整队是否真的空了才算说完；否则句间合成空隙里棋盘会被提前解锁。
+		_speech_hold = tts != null and tts.is_speaking()
 	_refresh_lock()
 	_clear_thinking_if_idle()
 

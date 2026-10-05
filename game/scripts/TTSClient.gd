@@ -12,6 +12,8 @@ signal utterance_started               # 每段音频开始播放（逐句模式
 const QUEUE_MAX := 3
 const FAIL_COOLDOWN := 6.0
 const MAX_CHARS := 300
+const FILLER_DIR := "res://assets/voice"   # 预制情绪语气词：填补合成等待的空白
+const FILLER_COOLDOWN_MS := 4000           # 自动插话的最小间隔（避免一直「让我看看」）
 var slow_chunk_chars := 100          # 慢引擎单次请求的字数上限（右侧栏「长句合并」开关：关=100/开=160）
 const HTTP_TIMEOUT_FAST := 60.0      # 轻量引擎（melo）/ 系统语音：很快就回
 const HTTP_TIMEOUT_SLOW := 240.0     # CosyVoice 系列 CPU 很慢：给足时间，别像以前那样 60 秒就被丢弃
@@ -47,6 +49,9 @@ var _cooldown := 0.0
 var _base_ready := false
 var _next_stream: AudioStream = null   # 边播边合成的下一句（预取），消除句间空白/卡住
 var fast_voices := {}                  # 服务端标记为轻量的音色 id（sherpa/melo）：不需要按句拆分
+var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think）
+var _filler_player: AudioStreamPlayer = null
+var _filler_last_ms := 0               # 上次插语气词的时刻（冷却用）
 
 func _ready() -> void:
 	_http = HTTPRequest.new()
@@ -56,6 +61,47 @@ func _ready() -> void:
 	_player = AudioStreamPlayer.new()
 	add_child(_player)
 	_player.finished.connect(_on_spoken)
+	_filler_player = AudioStreamPlayer.new()      # 语气词单独一个播放器：不干扰正式朗读
+	_filler_player.volume_db = -7.0
+	add_child(_filler_player)
+	_load_fillers()
+
+## 预制语气词清单（显式列出：导出后 res:// 里只剩 .import，靠枚举会拿不到文件）
+const FILLER_FILES := {
+	"surprise": ["filler_surprise_1.wav"],
+	"happy": ["filler_happy_1.wav", "filler_happy_2.wav"],
+	"puzzle": ["filler_puzzle_1.wav", "filler_puzzle_2.wav"],
+	"think": ["filler_think_1.wav"],
+}
+
+## 载入预制语气词：res://assets/voice/ 下按清单加载
+func _load_fillers() -> void:
+	for kind in FILLER_FILES.keys():
+		var list: Array = []
+		for name in FILLER_FILES[kind]:
+			var st := load(FILLER_DIR.path_join(str(name)))
+			if st is AudioStream:
+				list.append(st)
+			else:
+				push_warning("[TTS] 语气词缺失：%s" % name)
+		if not list.is_empty():
+			fillers[kind] = list
+	print("[TTS] 语气词库：%s" % str(fillers.keys()))
+
+## 播一句预制语气词填补等待空白；正在正式朗读/已在插话时让位。
+## force=true 只跳过冷却（用于跟表情绑定的即时反应）
+func play_filler(kind: String, force := false) -> void:
+	if not enabled or _filler_player == null or not fillers.has(kind):
+		return
+	if _speaking or _next_stream != null or _filler_player.playing:
+		return
+	var now := Time.get_ticks_msec()
+	if not force and now - _filler_last_ms < FILLER_COOLDOWN_MS:
+		return
+	_filler_last_ms = now
+	var arr: Array = fillers[kind]
+	_filler_player.stream = arr[randi() % arr.size()]
+	_filler_player.play()
 
 ## 一句话播完：无缝接上预取的下一句；没有预取时才算整段读完
 func _on_spoken() -> void:
@@ -93,6 +139,9 @@ func _process(delta: float) -> void:
 		_on_spoken()                             # 系统语音：本句读完，接着读下一句
 	if _prefer_mode != "" and not _http_busy and not _busy and Time.get_ticks_msec() >= _recover_at:
 		_probe_service()                         # 临时降级中：定期看看本地服务好了没
+	# 合成等待超过 1.6 秒又没在出声：插一句预制语气词，别让等待显得像卡住
+	if _http_busy and not _speaking and _next_stream == null and Time.get_ticks_msec() - _http_since > 1600:
+		play_filler("think")
 
 ## 用户手动改了设置：取消「自动切回」状态
 func clear_fallback() -> void:
@@ -410,6 +459,8 @@ func _on_done(result: int, code: int, _headers: PackedStringArray, body: PackedB
 
 ## 播放一段音频（统一入口：音量/音调/状态）
 func _play_stream(stream: AudioStream) -> void:
+	if _filler_player != null and _filler_player.playing:
+		_filler_player.stop()            # 正式朗读开始：语气词让位
 	_player.stream = stream
 	_player.volume_db = linear_to_db(clampf(volume, 0.01, 2.0))
 	_player.pitch_scale = clampf(pitch, 0.5, 2.0)

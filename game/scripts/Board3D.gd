@@ -40,6 +40,10 @@ var _yaw := 0.0
 var _pitch := deg_to_rad(38.0)   # 开局取景：平视偏俯，不做「俯视」视角
 var _dist := 42.0
 var _rotating := false
+signal head_patted                # 右键按住不动：摸摸头
+var _right_down_ms := 0           # 右键按下的时刻（判断「按住」）
+var _pat_fired := false           # 本次按住是否已触发过摸头
+var _pat_drag := 0.0              # 本次按住累计拖动距离（超过阈值算旋转，不算摸头）
 var _rotate_hold := 0.0          # 旋转结束后的注视锁定计时
 var _look_point := Vector3.ZERO  # Azure 落子后的注视点
 var _look_until := 0.0           # 落子注视的剩余时间
@@ -285,6 +289,11 @@ func _process(delta: float) -> void:
 		_rotate_hold -= delta
 	if _look_until > 0.0:
 		_look_until -= delta
+	# 右键按住不动 0.55 秒 → 摸头（拖动超过 8px 视为旋转，不触发）
+	if _rotating and not _pat_fired and _pat_drag <= 8.0 \
+			and Time.get_ticks_msec() - _right_down_ms > 550:
+		_pat_fired = true
+		head_patted.emit()
 
 ## 玩家是否正在拖拽旋转视角
 func is_rotating() -> bool:
@@ -362,7 +371,11 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
 		var mb := event as InputEventMouseButton
 		if mb.button_index == MOUSE_BUTTON_RIGHT:
-			if _rotating and not mb.pressed:
+			if mb.pressed:
+				_right_down_ms = Time.get_ticks_msec()   # 按住不动 → 摸头；拖动 → 旋转
+				_pat_fired = false
+				_pat_drag = 0.0
+			elif _rotating:
 				_rotate_hold = GAZE_LOCK_AFTER_ROTATE   # 松开后先看玩家 1 秒
 			_rotating = mb.pressed
 			get_viewport().set_input_as_handled()
@@ -387,6 +400,7 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion:
 		var mm := event as InputEventMouseMotion
 		if _rotating:
+			_pat_drag += mm.relative.length()
 			_yaw -= mm.relative.x * ROT_SPEED
 			_pitch = clampf(_pitch + mm.relative.y * PITCH_SPEED, PITCH_MIN, PITCH_MAX)
 			_update_camera()

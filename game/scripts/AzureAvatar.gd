@@ -131,6 +131,12 @@ func _load() -> String:
 			if nm.begins_with("Fcl_ALL_"):
 				_expr_shapes[nm] = i
 		if _face != null and not _expr_shapes.is_empty():
+			for si in mesh.get_surface_count():          # 脸部材质复制一份：脸红靠染色叠加
+				var sm := mesh.surface_get_material(si)
+				if sm is StandardMaterial3D:
+					var dup: StandardMaterial3D = (sm as StandardMaterial3D).duplicate()
+					mi.set_surface_override_material(si, dup)
+					_blush_mats.append([dup, dup.albedo_color])
 			break
 	_spring_defs = _parse_springs(bytes)
 	scene.scale = Vector3.ONE * scale_factor
@@ -474,6 +480,7 @@ func _process(delta: float) -> void:
 	_animate_sway(dt)
 	_animate_blink(delta)
 	_animate_expression(dt)
+	_animate_blush(dt)
 	rotation.y = 0.010 * sin(_t * 0.31)
 
 ## 呼吸 + 视线跟随（合并写入同一批骨骼，避免重复 set）
@@ -655,6 +662,27 @@ func _update_baseline() -> void:
 	var smile := int(_expr_shapes.get("Fcl_ALL_Fun", -1))    # 常态微微笑
 	if smile >= 0:
 		_expr_baseline[smile] = 0.28
+
+# —— 脸红：这个 VRM 没有 blush 形变，用脸部材质叠一层淡粉近似 ——
+var _blush_cur := 0.0
+var _blush_target := 0.0
+var _blush_mats: Array = []              # [StandardMaterial3D, 原始 albedo_color]
+
+## 摸头等亲密互动时脸红（v=false 自然褪去）
+func set_blush(v: bool) -> void:
+	_blush_target = 1.0 if v else 0.0
+
+func _animate_blush(dt: float) -> void:
+	if _blush_mats.is_empty():
+		return
+	var rate := clampf(dt * 2.6, 0.0, 1.0)
+	_blush_cur += (_blush_target - _blush_cur) * rate
+	if absf(_blush_target - _blush_cur) < 0.01:
+		_blush_cur = _blush_target
+	for e in _blush_mats:
+		var m: StandardMaterial3D = e[0]
+		var base: Color = e[1]
+		m.albedo_color = base.lerp(Color(1.0, 0.58, 0.63, base.a), _blush_cur * 0.5)
 
 ## kind: delight（好手）/ pleased（不错）/ puzzled（略意外）/ worried（俗手、明显失着）
 ##       sad（难过）/ laugh（被逗笑）
