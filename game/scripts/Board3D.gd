@@ -40,17 +40,14 @@ var _yaw := 0.0
 var _pitch := deg_to_rad(38.0)   # 开局取景：平视偏俯，不做「俯视」视角
 var _dist := 42.0
 var _rotating := false
-signal head_patted                # 摸摸头：在头部附近按住右键滑动（或按住不动）触发
-const PAT_HOLD_MS := 500          # 摸头区按住的判定时长（毫秒）
-const PAT_DRAG_MAX := 12.0        # 非摸头区：净位移上限（px），超过即视为旋转视角
-const PAT_STROKE_PX := 36.0       # 摸头区：滑动累计距离达标即触发（轻轻滑动也算）
+signal head_patted                # 摸摸头：左键点在 Azure 头部附近触发（滑动/按住更快，快速点一下也算）
+const PAT_HOLD_MS := 500          # 摸头模式按住多久即触发（毫秒）
+const PAT_STROKE_PX := 36.0       # 摸头模式：滑动累计距离达标即触发（轻轻滑动也算）
 var pat_head: Node = null         # Azure 化身（提供 head_world_pos() 供摸头区判定）
-var _right_down_ms := 0           # 右键按下的时刻（判断「按住」）
-var _pat_fired := false           # 本次按住是否已触发过摸头
-var _pat_drag := 0.0              # 鼠标相对按下点的净位移（px）
-var _pat_stroke := 0.0            # 摸头区内的滑动累计距离（px）
+var _pat_down_ms := 0             # 摸头模式：左键按下的时刻（判断「按住」）
+var _pat_fired := false           # 本次手势是否已触发过摸头
+var _pat_stroke := 0.0            # 摸头模式内的滑动累计距离（px）
 var _pat_active := false          # 摸头模式：不旋转视角，头部/视线跟着鼠标微动
-var _pat_origin := Vector2.ZERO   # 右键按下的屏幕位置（净位移起点）
 var _rotate_hold := 0.0          # 旋转结束后的注视锁定计时
 var _look_point := Vector3.ZERO  # Azure 落子后的注视点
 var _look_until := 0.0           # 落子注视的剩余时间
@@ -296,13 +293,10 @@ func _process(delta: float) -> void:
 		_rotate_hold -= delta
 	if _look_until > 0.0:
 		_look_until -= delta
-	# 摸头判定：摸头区（头部附近）→ 滑动累计达标或按住到时间即触发；其他区域 → 按住不动兜底
-	if (_rotating or _pat_active) and not _pat_fired:
-		var held := Time.get_ticks_msec() - _right_down_ms
-		if _pat_active and (held >= PAT_HOLD_MS or _pat_stroke >= PAT_STROKE_PX):
-			_pat_fired = true
-			head_patted.emit()
-		elif _rotating and held >= PAT_HOLD_MS and _pat_drag <= PAT_DRAG_MAX:
+	# 摸头判定：摸头模式内滑动累计达标或按住到时间即触发
+	if _pat_active and not _pat_fired:
+		var held := Time.get_ticks_msec() - _pat_down_ms
+		if held >= PAT_HOLD_MS or _pat_stroke >= PAT_STROKE_PX:
 			_pat_fired = true
 			head_patted.emit()
 
@@ -396,24 +390,37 @@ func pick(mouse_pos: Vector2) -> Vector2i:
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
 		var mb := event as InputEventMouseButton
+		if mb.button_index == MOUSE_BUTTON_LEFT:
+			if mb.pressed:
+				if _in_head_zone(mb.position):
+					# 摸头模式：视角不动，头部/视线跟着鼠标微动；滑动/按住在 _process 里触发，快速点一下松手补一次
+					_pat_active = true
+					_pat_fired = false
+					_pat_stroke = 0.0
+					_pat_down_ms = Time.get_ticks_msec()
+					get_viewport().set_input_as_handled()
+					return
+				if not locked:
+					var hit := pick(mb.position)
+					if hit.x >= 0 and not is_occupied(hit.x, hit.y):
+						add_optimistic(hit.x, hit.y, "black")
+						intersection_clicked.emit(hit.x, hit.y)
+						get_viewport().set_input_as_handled()
+				return
+			if _pat_active:
+				if not _pat_fired:
+					_pat_fired = true
+					head_patted.emit()          # 快速点一下（没滑动也没按够时间）松手也算一次摸头
+				_pat_active = false
+				get_viewport().set_input_as_handled()
+			return
 		if mb.button_index == MOUSE_BUTTON_RIGHT:
 			if mb.pressed:
-				_right_down_ms = Time.get_ticks_msec()   # 头部附近按住滑动 → 摸头；其他区域拖动 → 旋转
-				_pat_fired = false
-				_pat_drag = 0.0
-				_pat_stroke = 0.0
-				_pat_origin = mb.position
-				_pat_active = _in_head_zone(mb.position)
-			elif _rotating or _pat_active:
-				if _rotating:
-					_rotate_hold = GAZE_LOCK_AFTER_ROTATE   # 松开后先看玩家 1 秒
-				# 松手兜底：摸头区按够时间、或非摸头区按住没怎么动 → 补一次摸头
-				if not _pat_fired and (_pat_active or _pat_drag <= PAT_DRAG_MAX) \
-						and Time.get_ticks_msec() - _right_down_ms >= PAT_HOLD_MS:
-					_pat_fired = true
-					head_patted.emit()
-				_pat_active = false
-			_rotating = mb.pressed and not _pat_active
+				_pat_active = false             # 右键拖拽始终是旋转视角
+				_rotating = true
+			elif _rotating:
+				_rotating = false
+				_rotate_hold = GAZE_LOCK_AFTER_ROTATE   # 松开后先看玩家 1 秒
 			get_viewport().set_input_as_handled()
 			return
 		if mb.pressed and mb.button_index == MOUSE_BUTTON_WHEEL_UP:
@@ -426,12 +433,6 @@ func _unhandled_input(event: InputEvent) -> void:
 			_update_camera()
 			get_viewport().set_input_as_handled()
 			return
-		if mb.button_index == MOUSE_BUTTON_LEFT and mb.pressed and not locked:
-			var hit := pick(get_viewport().get_mouse_position())
-			if hit.x >= 0 and not is_occupied(hit.x, hit.y):
-				add_optimistic(hit.x, hit.y, "black")
-				intersection_clicked.emit(hit.x, hit.y)
-				get_viewport().set_input_as_handled()
 		return
 	if event is InputEventMouseMotion:
 		var mm := event as InputEventMouseMotion
@@ -439,7 +440,6 @@ func _unhandled_input(event: InputEvent) -> void:
 			_pat_stroke += mm.relative.length()          # 摸头模式：只累计抚摸距离，视角不动
 			return
 		if _rotating:
-			_pat_drag = (mm.position - _pat_origin).length()   # 净位移：手抖会相互抵消
 			_yaw -= mm.relative.x * ROT_SPEED
 			_pitch = clampf(_pitch + mm.relative.y * PITCH_SPEED, PITCH_MIN, PITCH_MAX)
 			_update_camera()
@@ -448,7 +448,8 @@ func _unhandled_input(event: InputEvent) -> void:
 
 func _update_hover(mouse_pos: Vector2) -> void:
 	_hover = pick(mouse_pos)
-	var valid := _hover.x >= 0 and not is_occupied(_hover.x, _hover.y) and not locked
+	var valid := _hover.x >= 0 and not is_occupied(_hover.x, _hover.y) and not locked \
+			and not _in_head_zone(mouse_pos)   # 头部附近左键是摸头，不提示落子
 	_ghost.visible = valid
 	_tip.visible = valid
 	if valid:

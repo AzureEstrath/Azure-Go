@@ -689,7 +689,7 @@ func _animate_blush(dt: float) -> void:
 	for e in _blush_mats:
 		var m: StandardMaterial3D = e[0]
 		var base: Color = e[1]
-		m.albedo_color = base.lerp(Color(1.0, 0.58, 0.63, base.a), _blush_cur * 0.5)
+		m.albedo_color = base.lerp(Color(1.0, 0.62, 0.66, base.a), _blush_cur * 0.22)   # 微微泛红（此前太红，用户要求调淡）
 
 ## kind: delight（好手）/ pleased（不错）/ puzzled（略意外）/ worried（俗手、明显失着）
 ##       sad（难过）/ laugh（被逗笑）

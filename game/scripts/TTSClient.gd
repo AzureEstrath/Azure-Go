@@ -55,7 +55,7 @@ var _req_start := false                # 在途请求是否为该组的第一块
 var _next_group := 0                   # 预取流所属分组
 var _next_start := false
 var fast_voices := {}                  # 服务端标记为轻量的音色 id（sherpa/melo）：不需要按句拆分
-var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think）
+var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think / pat）
 var allow_fillers := true              # 是否允许自动插语气词：只在对局互动中允许，闲置搭话/开场问候不插（Main 控制）
 var _filler_player: AudioStreamPlayer = null
 var _filler_last_ms := 0               # 上次插语气词的时刻（冷却用）
@@ -81,6 +81,7 @@ const FILLER_FILES := {
 	"happy": ["filler_happy_1.wav", "filler_happy_2.wav"],
 	"puzzle": ["filler_puzzle_1.wav", "filler_puzzle_2.wav"],
 	"think": ["filler_think_1.wav", "filler_think_2.wav"],
+	"pat": ["filler_pat_1.wav", "filler_pat_2.wav", "filler_pat_3.wav", "filler_pat_4.wav"],
 }
 
 ## 载入预制语气词：res://assets/voice/ 下按清单加载

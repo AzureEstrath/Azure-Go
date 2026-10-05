@@ -161,7 +161,7 @@ func _build_board() -> void:
 	board.head_patted.connect(_on_head_patted)
 	if avatar != null:
 		avatar.gaze_source = board          # 化身视线：旋转视角时看玩家，平时看鼠标落点
-		board.pat_head = avatar             # 摸头触发区：右键在头部附近滑动即可摸头
+		board.pat_head = avatar             # 摸头触发区：左键点在头部附近即可摸头
 
 # ================= 界面 =================
 
@@ -1206,13 +1206,13 @@ func _on_emotion(kind: String) -> void:
 			"worried", "sad":
 				tts.play_filler("surprise", true)
 
-## 右键按住摸摸头：开心 + 脸红几秒 + 一句开心的语气词
+## 左键点在 Azure 头部附近摸摸头：开心 + 微微脸红 + 一句轻快的语气词
 func _on_head_patted() -> void:
 	if avatar != null:
 		avatar.play_expression("laugh")
 		avatar.set_blush(true)
 	if tts != null:
-		tts.play_filler("happy", true)
+		tts.play_filler("pat", true)
 	_bump_activity()
 	_set_status("你摸了摸 Azure 的头…")
 	_blush_seq += 1
