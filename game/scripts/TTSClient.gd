@@ -55,6 +55,7 @@ var _next_group := 0                   # 预取流所属分组
 var _next_start := false
 var fast_voices := {}                  # 服务端标记为轻量的音色 id（sherpa/melo）：不需要按句拆分
 var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think）
+var allow_fillers := true              # 是否允许自动插语气词：只在对局互动中允许，闲置搭话/开场问候不插（Main 控制）
 var _filler_player: AudioStreamPlayer = null
 var _filler_last_ms := 0               # 上次插语气词的时刻（冷却用）
 
@@ -94,9 +95,11 @@ func _load_fillers() -> void:
 	print("[TTS] 语气词库：%s" % str(fillers.keys()))
 
 ## 播一句预制语气词填补等待空白；正在正式朗读/已在插话时让位。
-## force=true 只跳过冷却（用于跟表情绑定的即时反应）
+## force=true 跳过冷却与 allow_fillers 开关（用于跟表情绑定的即时反应）
 func play_filler(kind: String, force := false) -> void:
 	if not enabled or _filler_player == null or not fillers.has(kind):
+		return
+	if not force and not allow_fillers:
 		return
 	if _speaking or _next_stream != null or _filler_player.playing:
 		return

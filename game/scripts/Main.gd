@@ -295,8 +295,12 @@ func _build_right_panel(root: Control) -> void:
 	var btn_row := HBoxContainer.new()
 	btn_row.add_theme_constant_override("separation", 6)
 	vb.add_child(btn_row)
-	_buttons.append(_button(btn_row, "💡 提示", func(): agent.hint()))
-	_buttons.append(_button(btn_row, "📊 局面分析", func(): agent.analyze_position()))
+	_buttons.append(_button(btn_row, "💡 提示", func():
+		_allow_tts_fillers()
+		agent.hint()))
+	_buttons.append(_button(btn_row, "📊 局面分析", func():
+		_allow_tts_fillers()
+		agent.analyze_position()))
 	_buttons.append(_button(btn_row, "🔄 重来", _ask_reset))
 	_buttons.append(_button(btn_row, "🏁 结束", _ask_end))
 
@@ -1067,7 +1071,9 @@ func _render_bad_moves(list: Array) -> void:
 		btn.tooltip_text = str(d["reason"])
 		btn.add_theme_font_size_override("font_size", 12)
 		var idx := int(d["turn_index"])
-		btn.pressed.connect(func(): agent.undo(idx))
+		btn.pressed.connect(func():
+			_allow_tts_fillers()
+			agent.undo(idx))
 		_bad_box.add_child(btn)
 
 func _set_status(text: String, bad := false) -> void:
@@ -1151,6 +1157,7 @@ func _build_services() -> void:
 	tts.volume = cfg.tts_volume
 	tts.slow_chunk_chars = 160 if cfg.tts_long_chunk else 100
 	add_child(tts)
+	tts.allow_fillers = false                     # 开场问候/闲置搭话等非玩家触发的语音不插语气词，等真正对局互动再放行
 	tts.status.connect(_on_tts_status)
 	tts.auto_fallback.connect(_on_tts_fallback)
 	tts.speaking_changed.connect(_on_tts_speaking)
@@ -1225,6 +1232,7 @@ func _greet() -> void:
 	_add_msg("system", "你执黑先行。左键落子，右键拖拽可旋转棋盘视角。")
 
 func _on_intersection_clicked(x: int, y: int) -> void:
+	_allow_tts_fillers()
 	agent.player_move(x, y)
 
 func _on_state_changed(p: Dictionary) -> void:
@@ -1269,15 +1277,25 @@ func _send_chat() -> void:
 	var t := _chat_input.text
 	if t.strip_edges() == "":
 		return
+	_allow_tts_fillers()
 	_add_msg("user", t)
 	_chat_input.text = ""
 	agent.chat(t)
 
+## 玩家主动发起对局互动：允许 TTS 在合成等待时插「嗯…」这类语气词
+func _allow_tts_fillers() -> void:
+	if tts != null:
+		tts.allow_fillers = true
+
 func _ask_reset() -> void:
-	_ask_note("重新开始？当前棋局与俗手记录都会清空。", func(_note): agent.reset_game())
+	_ask_note("重新开始？当前棋局与俗手记录都会清空。", func(_note):
+		_allow_tts_fillers()
+		agent.reset_game())
 
 func _ask_end() -> void:
-	_ask_note("对局总结：想对Azure说什么吗？（可留空直接确定）", func(note): agent.summarize(note))
+	_ask_note("对局总结：想对Azure说什么吗？（可留空直接确定）", func(note):
+		_allow_tts_fillers()
+		agent.summarize(note))
 
 # ================= 闲置互动（看玩家 / 歪头 / 主动搭话） =================
 
@@ -1313,6 +1331,8 @@ func _set_idle_state(v: bool) -> void:
 		board.idle_attention = v
 	if avatar != null:
 		avatar.set_idle(v)
+	if v and tts != null:
+		tts.allow_fillers = false      # 进入闲置：主动搭话等不插「嗯…」（玩家一动、再次对局互动就会重新放行）
 
 ## 朗读开始/结束 → 化身说话时轻轻歪头
 func _on_tts_speaking(v: bool) -> void:
@@ -1391,5 +1411,6 @@ func _handle_cli() -> void:
 	var err := img.save_png(_shot_path)
 	print("[shot] %s -> %s" % [error_string(err), _shot_path])
 	print("[shot] viewport=%s  left_panel=%.0f  right_panel=%.0f  (PANEL_W=%d)"
-		% [get_viewport().get_visible_rect().size, _left_panel.size.x, _right_panel.size.x, PANEL_W])
+			% [get_viewport().get_visible_rect().size, _left_panel.size.x, _right_panel.size.x, PANEL_W])
 	get_tree().quit()
+

@@ -41,9 +41,12 @@ var _pitch := deg_to_rad(38.0)   # 开局取景：平视偏俯，不做「俯视
 var _dist := 42.0
 var _rotating := false
 signal head_patted                # 右键按住不动：摸摸头
+const PAT_HOLD_MS := 500          # 按住不动的判定时长（毫秒）
+const PAT_DRAG_MAX := 12.0        # 摸头的净位移上限（px）：手抖来回抵消，拖拽旋转则是单向大位移
 var _right_down_ms := 0           # 右键按下的时刻（判断「按住」）
 var _pat_fired := false           # 本次按住是否已触发过摸头
-var _pat_drag := 0.0              # 本次按住累计拖动距离（超过阈值算旋转，不算摸头）
+var _pat_drag := 0.0              # 鼠标相对按下点的净位移（px）
+var _pat_origin := Vector2.ZERO   # 右键按下的屏幕位置（净位移起点）
 var _rotate_hold := 0.0          # 旋转结束后的注视锁定计时
 var _look_point := Vector3.ZERO  # Azure 落子后的注视点
 var _look_until := 0.0           # 落子注视的剩余时间
@@ -289,9 +292,9 @@ func _process(delta: float) -> void:
 		_rotate_hold -= delta
 	if _look_until > 0.0:
 		_look_until -= delta
-	# 右键按住不动 0.55 秒 → 摸头（拖动超过 8px 视为旋转，不触发）
-	if _rotating and not _pat_fired and _pat_drag <= 8.0 \
-			and Time.get_ticks_msec() - _right_down_ms > 550:
+	# 右键按住不动 0.5 秒 → 摸头（相对按下点的移动超过阈值视为旋转视角，不触发）
+	if _rotating and not _pat_fired and _pat_drag <= PAT_DRAG_MAX \
+			and Time.get_ticks_msec() - _right_down_ms >= PAT_HOLD_MS:
 		_pat_fired = true
 		head_patted.emit()
 
@@ -375,8 +378,13 @@ func _unhandled_input(event: InputEvent) -> void:
 				_right_down_ms = Time.get_ticks_msec()   # 按住不动 → 摸头；拖动 → 旋转
 				_pat_fired = false
 				_pat_drag = 0.0
+				_pat_origin = mb.position
 			elif _rotating:
 				_rotate_hold = GAZE_LOCK_AFTER_ROTATE   # 松开后先看玩家 1 秒
+				# 松手兜底：按住时长已够、也没怎么移动 → 补一次摸头
+				if not _pat_fired and _pat_drag <= PAT_DRAG_MAX \
+						and Time.get_ticks_msec() - _right_down_ms >= PAT_HOLD_MS:
+					head_patted.emit()
 			_rotating = mb.pressed
 			get_viewport().set_input_as_handled()
 			return
@@ -400,7 +408,7 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion:
 		var mm := event as InputEventMouseMotion
 		if _rotating:
-			_pat_drag += mm.relative.length()
+			_pat_drag = (mm.position - _pat_origin).length()   # 净位移：手抖会相互抵消
 			_yaw -= mm.relative.x * ROT_SPEED
 			_pitch = clampf(_pitch + mm.relative.y * PITCH_SPEED, PITCH_MIN, PITCH_MAX)
 			_update_camera()

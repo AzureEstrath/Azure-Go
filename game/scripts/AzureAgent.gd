@@ -405,7 +405,7 @@ const IDLE_LINES := [
 func idle_remark() -> void:
 	if busy:
 		return
-	var prompt := "Estarth 已经有一段时间没有动静了，你有点好奇他在做什么。主动对他说一句很短的话（20字以内）：可以歪头看看他、问问他还在不在、要不要继续下棋或聊聊天。慵懒、亲切，1句。"
+	var prompt := "Estarth 已经有一段时间没有动静了，你有点好奇他在做什么。主动对他说一句很短的话（20字以内）：问问他还在不在、在忙什么，或要不要继续下棋、聊聊天。慵懒、亲切，1句。"
 	var reply: String = await _reply([
 		_sys_msg(),
 		_user_msg(AzurePrompts.context_block(st.moves, st.memory_log, st.chat_history, "chat", true, st.last_katago)),
