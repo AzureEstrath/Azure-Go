@@ -470,6 +470,13 @@ func _update_gaze_pivot() -> void:
 	if hidx >= 0:
 		_gaze_pivot = _skel.global_transform * _cur_global_xform(hidx).origin
 
+## 头部世界坐标（供 Board3D 的摸头触发区判定）
+func head_world_pos() -> Vector3:
+	if not ok:
+		return Vector3.INF
+	_update_gaze_pivot()
+	return _gaze_pivot
+
 func _process(delta: float) -> void:
 	if not ok:
 		return

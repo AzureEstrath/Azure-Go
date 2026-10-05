@@ -161,6 +161,7 @@ func _build_board() -> void:
 	board.head_patted.connect(_on_head_patted)
 	if avatar != null:
 		avatar.gaze_source = board          # 化身视线：旋转视角时看玩家，平时看鼠标落点
+		board.pat_head = avatar             # 摸头触发区：右键在头部附近滑动即可摸头
 
 # ================= 界面 =================
 
@@ -1286,6 +1287,7 @@ func _send_chat() -> void:
 func _allow_tts_fillers() -> void:
 	if tts != null:
 		tts.allow_fillers = true
+		tts.begin_filler_turn()          # 本回合语气词限次（think 至多两次，且不连着播同一句）
 
 func _ask_reset() -> void:
 	_ask_note("重新开始？当前棋局与俗手记录都会清空。", func(_note):

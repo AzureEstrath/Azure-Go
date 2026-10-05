@@ -14,6 +14,7 @@ const FAIL_COOLDOWN := 6.0
 const MAX_CHARS := 300
 const FILLER_DIR := "res://assets/voice"   # 预制情绪语气词：填补合成等待的空白
 const FILLER_COOLDOWN_MS := 9000           # 自动插话的最小间隔（避免一直「嗯……」）
+const THINK_FILLER_PER_TURN := 2           # 每次玩家互动后 think 语气词上限（「嗯~」「让我看看」各至多一次）
 var slow_chunk_chars := 100          # 慢引擎单次请求的字数上限（右侧栏「长句合并」开关：关=100/开=160）
 const HTTP_TIMEOUT_FAST := 60.0      # 轻量引擎（melo）/ 系统语音：很快就回
 const HTTP_TIMEOUT_SLOW := 240.0     # CosyVoice 系列 CPU 很慢：给足时间，别像以前那样 60 秒就被丢弃
@@ -58,6 +59,8 @@ var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise 
 var allow_fillers := true              # 是否允许自动插语气词：只在对局互动中允许，闲置搭话/开场问候不插（Main 控制）
 var _filler_player: AudioStreamPlayer = null
 var _filler_last_ms := 0               # 上次插语气词的时刻（冷却用）
+var _filler_last_idx := {}             # kind → 上次播的序号（避免同一句连着播）
+var think_filler_budget := 0           # 本回合剩余可自动插的 think 语气词次数（Main 在玩家互动时重置）
 
 func _ready() -> void:
 	_http = HTTPRequest.new()
@@ -101,15 +104,27 @@ func play_filler(kind: String, force := false) -> void:
 		return
 	if not force and not allow_fillers:
 		return
+	if not force and kind == "think" and think_filler_budget <= 0:
+		return                                       # 本回合的 think 语气词额度用完了（「让我看看…有一次就行」）
 	if _speaking or _next_stream != null or _filler_player.playing:
 		return
 	var now := Time.get_ticks_msec()
 	if not force and now - _filler_last_ms < FILLER_COOLDOWN_MS:
 		return
+	if not force and kind == "think":
+		think_filler_budget -= 1
 	_filler_last_ms = now
 	var arr: Array = fillers[kind]
-	_filler_player.stream = arr[randi() % arr.size()]
+	var idx := randi() % arr.size()
+	if arr.size() > 1 and int(_filler_last_idx.get(kind, -1)) == idx:
+		idx = (idx + 1) % arr.size()                 # 不连着播同一句（「嗯~」「让我看看」轮换）
+	_filler_last_idx[kind] = idx
+	_filler_player.stream = arr[idx]
 	_filler_player.play()
+
+## 玩家发起一次互动（落子 / 提问 / 功能按钮）：重置本回合的 think 语气词额度
+func begin_filler_turn() -> void:
+	think_filler_budget = THINK_FILLER_PER_TURN
 
 ## 一句话播完：无缝接上预取的下一句；没有预取时才算整段读完
 func _on_spoken() -> void:
