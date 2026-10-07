@@ -48,12 +48,16 @@ var _busy := false
 var _cooldown := 0.0
 var _base_ready := false
 var _next_stream: AudioStream = null   # 边播边合成的下一句（预取），消除句间空白/卡住
-var _queue: Array[Dictionary] = []     # 朗读队列：{text, group, start}；group 保证「一条消息一次 utterance_started」
+var _queue: Array[Dictionary] = []     # 朗读队列：{text, group, start, kind}；group 保证「一条消息一次 utterance_started」
 var _group_seq := 0                    # 消息分组号（每次 speak() 自增）
 var _req_group := 0                    # 在途合成请求属于哪一组
 var _req_start := false                # 在途请求是否为该组的第一块
+var _req_kind := ""                    # 在途请求的类型（""=对局发言；"idle"=走神搭话，可被取消）
 var _next_group := 0                   # 预取流所属分组
 var _next_start := false
+var _next_kind := ""                   # 预取流的类型
+var _play_kind := ""                   # 正在播放的声音类型
+var _drop_result := false              # 在途请求的结果已作废（取消走神搭话）：到达时直接丢弃
 var fast_voices := {}                  # 服务端标记为轻量的音色 id（sherpa/melo）：不需要按句拆分
 var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think / pat）
 var allow_fillers := true              # 是否允许自动插语气词：只在对局互动中允许，闲置搭话/开场问候不插（Main 控制）
@@ -133,10 +137,13 @@ func _on_spoken() -> void:
 		var s := _next_stream
 		var g := _next_group
 		var st := _next_start
+		var k := _next_kind
 		_next_stream = null
-		_play_stream(s, g, st)                      # 下一句已合成好：立刻接着读，不留空白
+		_next_kind = ""
+		_play_stream(s, g, st, k)                   # 下一句已合成好：立刻接着读，不留空白
 		_pump()                                     # 顺便继续预取再下一句
 		return
+	_play_kind = ""
 	_set_speaking(false)
 	status.emit("朗读完成")
 	_pump()
@@ -196,8 +203,9 @@ func _probe_service() -> void:
 		_http_busy = false
 		_recover_at = Time.get_ticks_msec() + 15000
 
-## 排队朗读一句（Azure 的话）。正在朗读时最多再排 3 句，避免越说越滞后
-func speak(text: String) -> int:
+## 排队朗读一句（Azure 的话）。正在朗读时最多再排 3 句，避免越说越滞后。
+## kind 标记消息类型（""=对局发言；"idle"=走神搭话）：走神搭话可在玩家回来后整类取消（cancel_kind）
+func speak(text: String, kind := "") -> int:
 	if not enabled:
 		return 0
 	var t := clean_for_speech(text)
@@ -218,7 +226,7 @@ func speak(text: String) -> int:
 	var g := _group_seq
 	for i in pieces.size():
 		# 同一条消息的所有分块共用一个 group；只有第一块标记 start=true
-		_queue.append({"text": pieces[i], "group": g, "start": i == 0})
+		_queue.append({"text": pieces[i], "group": g, "start": i == 0, "kind": kind})
 	_pump()
 	return g
 
@@ -229,6 +237,7 @@ func is_speaking() -> bool:
 func stop() -> void:
 	_queue.clear()
 	_next_stream = null
+	_next_kind = ""
 	if _player != null and _player.playing:
 		_player.stop()
 	if _http_busy and _http != null:
@@ -238,7 +247,45 @@ func stop() -> void:
 		OS.kill(_sapi_pid)
 	_sapi_pid = -1
 	_busy = false
+	_req_kind = ""
+	_play_kind = ""
+	_drop_result = false
 	_set_speaking(false)
+
+## 取消某一类（如 "idle"=走神搭话）尚未说完的语音：清队列、弃预取、停当前播放、丢弃在途合成结果。
+## 在途 HTTP 请求不强行 cancel_request（服务端推理串行、无法真打断，取消反而有回调竞态），
+## 只打「结果作废」标记，等它回来时丢弃并继续后面的队列。返回是否取消到了东西。
+func cancel_kind(kind: String) -> bool:
+	if kind == "":
+		return false
+	var hit := false
+	var kept: Array[Dictionary] = []
+	for it in _queue:
+		if str(it.get("kind", "")) == kind:
+			hit = true
+		else:
+			kept.append(it)
+	_queue = kept
+	if _next_stream != null and _next_kind == kind:   # 预取的那一段也属于被取消的消息
+		_next_stream = null
+		_next_kind = ""
+		_next_start = false
+		hit = true
+	if _http_busy and _req_kind == kind:              # 正在合成的就是它：结果回来时直接丢
+		_drop_result = true
+		hit = true
+	if _play_kind == kind:                            # 正在播：停掉（stop() 不触发 finished，手动收尾）
+		if mode == "system" and _sapi_pid > 0:
+			OS.kill(_sapi_pid)
+			_sapi_pid = -1
+		if _player != null and _player.playing:
+			_player.stop()
+		_play_kind = ""
+		_set_speaking(false)
+		hit = true
+	if hit:
+		_pump()                                       # 若队列里还有别的（玩家互动的新回复），立刻接着来
+	return hit
 
 ## 试听（忽略队列与开关，直接读一句）
 func preview(text: String) -> void:
@@ -246,7 +293,7 @@ func preview(text: String) -> void:
 	if t == "":
 		t = "嗯~ 我是 Azure，很高兴见到你。"
 	stop()
-	_queue.push_front({"text": t, "group": 0, "start": true})   # group=0：试听，不触发文字显示
+	_queue.push_front({"text": t, "group": 0, "start": true, "kind": ""})   # group=0：试听，不触发文字显示
 	_pump(true)
 
 ## 文本 → 适合朗读的句子：去装饰/表情/括号标题，合并空白，限长
@@ -348,7 +395,7 @@ func _pump(force := false) -> void:
 		if _sapi_pid > 0 and OS.is_process_running(_sapi_pid):
 			return                               # 上一句还在读
 		var item0: Dictionary = _queue.pop_front()
-		_speak_system(str(item0["text"]), int(item0["group"]), bool(item0["start"]))
+		_speak_system(str(item0["text"]), int(item0["group"]), bool(item0["start"]), str(item0.get("kind", "")))
 		return
 	if _next_stream != null:
 		return                                   # 已预取下一句：等它播完再合成，避免堆积
@@ -358,6 +405,7 @@ func _pump(force := false) -> void:
 	var text := str(item["text"])
 	_req_group = int(item["group"])
 	_req_start = bool(item["start"])
+	_req_kind = str(item.get("kind", ""))
 	_busy = true
 	var headers: PackedStringArray
 	var payload := ""
@@ -396,7 +444,7 @@ func _with_auth(h: PackedStringArray) -> PackedStringArray:
 	return h
 
 ## Windows 系统语音（零配置兜底）：用 PowerShell 调 SAPI 朗读，子进程异步跑
-func _speak_system(text: String, group: int, start: bool) -> void:
+func _speak_system(text: String, group: int, start: bool, kind := "") -> void:
 	var s := text.replace("'", "''").replace("\"", "")
 	var rate := int(round(clampf((speed - 1.0) * 5.0, -8.0, 8.0)))
 	var vol := int(round(clampf(volume * 67.0, 5.0, 100.0)))
@@ -422,6 +470,7 @@ func _speak_system(text: String, group: int, start: bool) -> void:
 		_set_speaking(false)
 		status.emit("系统语音不可用（无法启动 PowerShell）")
 	else:
+		_play_kind = kind
 		_set_speaking(true)
 		if start:
 			utterance_started.emit.call_deferred(group)   # 延到本帧末：调用方先把待显示文字入队
@@ -449,6 +498,10 @@ func _on_done(result: int, code: int, _headers: PackedStringArray, body: PackedB
 			_pump()
 		else:
 			_recover_at = Time.get_ticks_msec() + 15000
+		return
+	if _drop_result:                                 # 这次合成的内容（如走神搭话）已被取消：结果直接丢
+		_drop_result = false
+		_pump()
 		return
 	if result != HTTPRequest.RESULT_SUCCESS or code != 200:
 		var conn_failed := result == HTTPRequest.RESULT_CANT_CONNECT or result == HTTPRequest.RESULT_CONNECTION_ERROR \
@@ -490,19 +543,21 @@ func _on_done(result: int, code: int, _headers: PackedStringArray, body: PackedB
 		_next_stream = stream
 		_next_group = _req_group
 		_next_start = _req_start
+		_next_kind = _req_kind
 		_pump()                                      # 继续预取再下一句
 		return
-	_play_stream(stream, _req_group, _req_start)
+	_play_stream(stream, _req_group, _req_start, _req_kind)
 	_pump()                                          # 边播边合成下一句，消除句间停顿
 
 ## 播放一段音频（统一入口：音量/音调/状态）
-func _play_stream(stream: AudioStream, group: int, start: bool) -> void:
+func _play_stream(stream: AudioStream, group: int, start: bool, kind := "") -> void:
 	if _filler_player != null and _filler_player.playing:
 		_filler_player.stop()            # 正式朗读开始：语气词让位
 	_player.stream = stream
 	_player.volume_db = linear_to_db(clampf(volume, 0.01, 2.0))
 	_player.pitch_scale = clampf(pitch, 0.5, 2.0)
 	_player.play()
+	_play_kind = kind
 	_set_speaking(true)
 	if start:
 		utterance_started.emit(group)

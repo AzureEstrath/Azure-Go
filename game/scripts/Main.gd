@@ -35,11 +35,12 @@ var _chk_len: CheckBox
 var _chk_sync: CheckBox
 var _chk_batch: CheckBox                   # 整段合成 / 逐句播报
 var _chk_chunk: CheckBox                   # 长句合并（TTS 分块 100/160）
-var _pending_ai: Array[Dictionary] = []    # 待显示的 Azure 文字（FIFO；每项 {text, reveal}）
+var _pending_ai: Array[Dictionary] = []    # 待显示的 Azure 文字（FIFO；每项 {text, reveal, kind?}）
 var _thinking_row: Control = null          # 「Azure 思考中……」占位气泡
 var _thinking_label: Label = null
 var _speech_hold := false                  # Azure 还有语音没播完：继续锁住棋盘
 var _pending_batch := ""                   # 攒起来的连续 Azure 文本：合并成「一整段」一次合成
+var _pending_batch_kind := ""              # 这批文本的类型（""=对局发言；"idle"=走神搭话，可整批作废）
 var _batch_token := 0                      # 去抖令牌：又来新消息就自增，让旧计时器失效
 var _tts_pid := -1                         # 本游戏拉起的语音服务进程（用于开关切换后重启）
 var _tts_playing := false                  # 当前是否真有音频在播（区别于「排队中/合成中」）
@@ -52,8 +53,23 @@ const BATCH_WINDOW := 0.35
 
 var _last_activity_ms := 0                 # 最近一次「玩家有操作」的时刻（闲置计时）
 var _idle := false
+var _idle_muted := false                   # 玩家已回来（落子/说话）：在途与排队的走神搭话全部作废
 var _next_talk_ms := 0                     # 下一次闲置搭话的时刻
 var _last_move_count := 0                  # 用于识别 Azure 刚落的那颗子
+
+## 长时间闲置窥屏（本地 PaddleOCR + Qwen2.5-VL，独立 python 进程一跑一停）
+const IDLE_PEEK_SEC := 60.0                # 闲置超过这么久才值得窥屏（更短的闲置走普通搭话）
+const PEEK_COOLDOWN_MS := 180000           # 两次窥屏至少隔 3 分钟（本地推理很重）
+const PEEK_TIMEOUT_MS := 240000            # 窥屏进程超时：放弃，退回普通搭话
+var _peek_busy := false
+var _peek_started_ms := 0
+var _peek_last_ms := 0
+var _peek_ctx_activity := 0                # 发起窥屏时的「最近活动时刻」：对不上说明玩家已回来，结果作废
+var _peek_out := ""                        # 窥屏结果 json 路径
+var _peek_exe := ""                        # 跑窥屏的 python（需装好 paddleocr / llama-cpp-python）
+var _peek_script := ""                     # azure_peek.py 路径
+var _peek_probed := false
+var _peek_ok := false
 
 ## 本地语音服务目录：优先「可执行文件同级的 cosyvoice\」（分享版），否则回退 D:/KataGo/cosyvoice（开发机）。
 ## 用 VBS 以「隐藏窗口的 python.exe」拉起：pythonw 加载 CosyVoice 时会静默崩溃。
@@ -85,6 +101,7 @@ var _shot_path := ""
 
 func _ready() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
+	_peek_last_ms = -PEEK_COOLDOWN_MS          # 允许开局后第一次长闲置就窥屏
 	cfg = AzureConfig.load_config()
 	_tts_dir = _find_tts_dir()
 	_apply_cli_overrides()
@@ -862,11 +879,18 @@ func _button(parent: Node, text: String, cb: Callable) -> Button:
 func _add_msg(kind: String, text: String) -> void:
 	var is_ai := kind.begins_with("ai")
 	var reveal := kind == "ai_move"          # 这条是「Azure 落子宣告」：轮到她这段语音时再落子
+	if kind == "ai_idle" and _idle_muted:
+		return                               # 玩家已经回来继续下棋：这句走神搭话作废（不出声也不显示）
 	if is_ai and tts != null and tts.enabled:
+		var tts_kind := "idle" if kind == "ai_idle" else ""      # 走神搭话可被整类取消（cancel_kind("idle")）
 		if cfg.tts_batch_speak:
 			# 整段合成：把连着冒出来的多条消息攒成「一整段」再一次合成，连续朗读、无句间空白
-			_pending_ai.append({"text": text, "reveal": reveal})
+			if _pending_batch != "" and _pending_batch_kind != tts_kind:
+				_batch_token += 1
+				_release_batch(true)         # 批次按类型分组：走神搭话不跟对局发言混进同一段语音
+			_pending_ai.append({"text": text, "reveal": reveal, "kind": tts_kind})
 			_pending_batch = _join_batch(_pending_batch, text)
+			_pending_batch_kind = tts_kind
 			_batch_token += 1
 			var token := _batch_token
 			get_tree().create_timer(BATCH_WINDOW).timeout.connect(func(): _flush_batch(token))
@@ -874,13 +898,13 @@ func _add_msg(kind: String, text: String) -> void:
 			# 逐句播报：每条各自合成；轮到它开始播放时再显示文字（见 _on_utterance_started）
 			# 先入队再合成：拿 speak() 的分组号，保证「一条消息 ⇄ 一次 utterance_started」严格对应
 			if cfg.tts_sync_speak:
-				_pending_ai.append({"text": text, "reveal": reveal, "group": -1})
-				_pending_ai[_pending_ai.size() - 1]["group"] = tts.speak(text)
+				_pending_ai.append({"text": text, "reveal": reveal, "group": -1, "kind": tts_kind})
+				_pending_ai[_pending_ai.size() - 1]["group"] = tts.speak(text, tts_kind)
 			else:
 				_add_msg_now("ai", text)
 				if reveal:
 					_reveal_move()
-				tts.speak(text)
+				tts.speak(text, tts_kind)
 		return
 	if is_ai:
 		_add_msg_now("ai", text)                 # 未启用语音：直接显示
@@ -917,17 +941,19 @@ func _flush_batch(token: int) -> void:
 ## 把攒着的 Azure 文本作为一整段处理：送一次合成，并按「同步说话」开关决定文字何时显示
 func _release_batch(force_show: bool) -> void:
 	var text := _pending_batch
+	var tts_kind := _pending_batch_kind
 	_pending_batch = ""
+	_pending_batch_kind = ""
 	if text == "":
 		return
 	if tts == null or not tts.enabled:
 		_flush_pending_ai()
 		return
 	if cfg.tts_sync_speak and not force_show and not tts.is_speaking():
-		tts.speak(text)                 # 文字等语音开始播放时（_on_tts_speaking）与声音一起出现
+		tts.speak(text, tts_kind)       # 文字等语音开始播放时（_on_tts_speaking）与声音一起出现
 	else:
 		_flush_pending_ai()             # 先显示文字（已在说话 / 需要保序）
-		tts.speak(text)
+		tts.speak(text, tts_kind)
 
 func _add_msg_now(kind: String, text: String) -> void:
 	# 「Azure 思考中……」占位：第一条真实 Azure 文字原地替换它
@@ -1283,11 +1309,32 @@ func _send_chat() -> void:
 	_chat_input.text = ""
 	agent.chat(t)
 
-## 玩家主动发起对局互动：允许 TTS 在合成等待时插「嗯…」这类语气词
+## 玩家主动发起对局互动：允许 TTS 在合成等待时插「嗯…」这类语气词。
+## 同时把还在合成/排队/播放的走神搭话全部作废——人已经回来下棋了，别再追着问「在忙什么呀」
 func _allow_tts_fillers() -> void:
+	_cancel_idle_speech()
 	if tts != null:
 		tts.allow_fillers = true
 		tts.begin_filler_turn()          # 本回合语气词限次（think 至多两次，且不连着播同一句）
+
+## 作废走神搭话：文字与语音（在途合成结果、预取段、播放中、排队中）一起清掉，让新的内容立刻顶上
+func _cancel_idle_speech() -> void:
+	_idle_muted = true
+	if _pending_batch_kind == "idle":
+		_pending_batch = ""
+		_pending_batch_kind = ""
+		_batch_token += 1                # 让还在路上的去抖计时器失效
+	var kept: Array[Dictionary] = []
+	for e in _pending_ai:
+		if str((e as Dictionary).get("kind", "")) == "idle":
+			continue                     # 还没轮到显示的走神搭话文字：直接丢
+		kept.append(e)
+	_pending_ai = kept
+	if tts != null:
+		tts.cancel_kind("idle")
+	_speech_hold = tts != null and tts.is_speaking()
+	_refresh_lock()
+	_clear_thinking_if_idle()
 
 func _ask_reset() -> void:
 	_ask_note("重新开始？当前棋局与俗手记录都会清空。", func(_note):
@@ -1319,14 +1366,37 @@ func _bump_activity() -> void:
 
 func _process(_delta: float) -> void:
 	var now := Time.get_ticks_msec()
+	if _azure_hold_active():
+		# 她还在思考 / 朗读 / 有句子没播完：棋盘锁着，玩家此刻根本无法落子，
+		# 这段时间不能算「玩家闲置」——否则会出现她边堵着棋盘边问「你在忙什么呀？还要继续下棋吗」
+		_last_activity_ms = now
+		if _idle:
+			_idle = false
+			_set_idle_state(false)
 	if not _idle and now - _last_activity_ms >= int(IDLE_SEC * 1000.0):
 		_idle = true                                    # 长时间没操作：看向玩家、准备歪头
 		_set_idle_state(true)
 		_next_talk_ms = now + int(IDLE_TALK_FIRST * 1000.0)
 	if _idle and now >= _next_talk_ms and agent != null and not agent.busy:
 		_next_talk_ms = now + randi_range(int(IDLE_TALK_MIN * 1000.0), int(IDLE_TALK_MAX * 1000.0))
-		agent.idle_remark()
+		_idle_muted = false                             # 新的一轮搭话：先解除「玩家已回来」的作废标记
+		if not _peek_busy:
+			var idle_ms := now - _last_activity_ms
+			if idle_ms >= int(IDLE_PEEK_SEC * 1000.0) and now - _peek_last_ms >= PEEK_COOLDOWN_MS and _peek_available():
+				_start_peek(now)                        # 闲置很久：先窥屏看一眼玩家在干嘛（还在游戏里/切去了别处）
+			else:
+				agent.idle_remark()
+	if _peek_busy:
+		_tick_peek(now)                                 # 窥屏结果就绪后由她主动开口
 	_update_thinking(now)
+
+## 她这一侧还没收尾：思考中，或还有语音在排队/合成/播放（棋盘处于锁定状态的两种来源）
+func _azure_hold_active() -> bool:
+	if agent != null and agent.busy:
+		return true
+	if _speech_hold:
+		return true
+	return tts != null and tts.is_speaking()
 
 func _set_idle_state(v: bool) -> void:
 	if board != null:
@@ -1365,6 +1435,78 @@ func _on_utterance_started(group: int) -> void:
 		if bool(e.get("reveal", false)):
 			_reveal_move()           # 说到这手棋时，才把子放上棋盘
 		return
+
+# ================= 长时间闲置窥屏（本地 PaddleOCR + Qwen2.5-VL，独立 python 进程一跑一停） =================
+
+## 窥屏环境是否可用：需要 azure_peek.py 与一个装好 paddleocr / llama-cpp-python 的 python。
+## 探测一次后缓存；缺任何一样就永远退回普通走神搭话（优雅降级）
+func _peek_available() -> bool:
+	if _peek_probed:
+		return _peek_ok
+	_peek_probed = true
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	var dirs: Array[String] = [exe_dir.path_join("peek"), "D:/KataGo/peek"]
+	for d in dirs:
+		var script := d.path_join("azure_peek.py")
+		if not FileAccess.file_exists(script):
+			continue
+		var pys: Array[String] = [d.path_join(".venv/Scripts/python.exe"), d.path_join("python.exe"), "E:/AI_Omni/Python/python.exe"]
+		for py in pys:
+			if FileAccess.file_exists(py):
+				_peek_script = script
+				_peek_exe = py
+				_peek_ok = true
+				print("[Peek] 窥屏可用：%s + %s" % [py, script])
+				return true
+	print("[Peek] 未找到窥屏环境（azure_peek.py / python），长时间闲置只走普通搭话")
+	return false
+
+## 后台拉起一次窥屏：独立 python 进程截图 → OCR → VLM，把结果写成 json（不阻塞游戏）
+func _start_peek(now: int) -> void:
+	_peek_busy = true
+	_peek_started_ms = now
+	_peek_last_ms = now
+	_peek_ctx_activity = _last_activity_ms
+	_peek_out = OS.get_user_data_dir().path_join("peek_result.json")
+	if FileAccess.file_exists(_peek_out):
+		DirAccess.remove_absolute(_peek_out)
+	var pid := OS.create_process(_peek_exe, PackedStringArray([
+		_peek_script, "--out", _peek_out, "--game-pid", str(OS.get_process_id())]))
+	if pid <= 0:
+		_peek_busy = false
+		agent.idle_remark()                      # 拉不起来：照旧问一句
+		return
+	print("[Peek] 已发起窥屏（pid=%d），等结果…" % pid)
+
+## 每帧看窥屏结果好了没；等不到就超时放弃
+func _tick_peek(now: int) -> void:
+	if FileAccess.file_exists(_peek_out):
+		var data: Dictionary = {}
+		var f := FileAccess.open(_peek_out, FileAccess.READ)
+		if f != null:
+			var parsed = JSON.parse_string(f.get_as_text())
+			if typeof(parsed) == TYPE_DICTIONARY:
+				data = parsed
+			f.close()
+		DirAccess.remove_absolute(_peek_out)
+		_peek_busy = false
+		if data.is_empty():
+			return
+		# 结果回来时玩家已经动过（或已不闲置）：这条窥屏内容过期了，不说
+		if _last_activity_ms != _peek_ctx_activity or not _idle or agent.busy:
+			return
+		if not bool(data.get("ok", true)):
+			agent.idle_remark()                  # 窥屏失败：退回普通搭话
+			return
+		if bool(data.get("is_game", true)):
+			agent.idle_remark()                  # 前台还是游戏：普通走神提醒
+		else:
+			agent.peer_remark(data)              # 切去别的窗口了：结合窥屏内容与性格说
+		return
+	if now - _peek_started_ms > PEEK_TIMEOUT_MS:
+		_peek_busy = false
+		if _idle and not agent.busy and _last_activity_ms == _peek_ctx_activity:
+			agent.idle_remark()                  # 窥屏没结果：退回普通搭话
 
 # ================= 调试截图 =================
 

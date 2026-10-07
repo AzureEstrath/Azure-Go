@@ -235,7 +235,7 @@ static func context_block(moves: Array, memory_log: Array, chat_history: Array, 
 	var block := ("【当前棋面 · 请时刻记住】\n%s"
 		+ "\n\n【KataGo 形势 · 引擎判断，仅供参考】\n%s"
 		+ "\n\n【对局全貌 · 请始终记住】\n%s\n整盘手数：%s\n最近过程：\n%s"
-		+ "\n【落子评定存档（E=Estarth黑 / A=Azure白）】\n%s"
+		+ "\n【落子评定存档（E=Estarth黑 / A=Azure白）· 只作回忆参考，别照抄、别改写里面的句子】\n%s"
 		+ "\n【最近的对话】\n%s"
 		+ "\n（铁律 · 先核对再开口：\n"
 		+ "1) 只要这句话与棋局有关，动笔前先看【当前棋面】：要提到某片区域/某个点「有子、没子、模样、实地、厚薄」时，必须能在上面的「现有棋子」里找到依据；那里没有的子一律不许提，拿不准就只说方向、不点具体子，绝不凭印象编。\n"

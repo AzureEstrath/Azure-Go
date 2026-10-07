@@ -207,6 +207,15 @@ func player_move(x: int, y: int) -> void:
 	else:
 		eval_prompt = "Estarth下了 %s，没进我算的前5。慵懒表示不太理解，1-2句。" % gtp
 	eval_prompt += " 用你自己的口吻（「你这手…」「我觉得…」）评，1句就好，别像解说员那样说「黑方/白棋」；先结合【当前棋面】确认这手落在哪、周围有没有子再说；不要提你自己接下来打算下哪里，不要复述胜率数值。"
+	# 防复读：上一手点评的原话拿出来明确避开（不然容易连着几手都说「挺稳的，没什么大问题」）
+	var prev_eval := ""
+	for i in range(st.memory_log.size() - 1, -1, -1):
+		if str((st.memory_log[i] as Dictionary).get("tag", "")) == "E":
+			prev_eval = str((st.memory_log[i] as Dictionary).get("text", ""))
+			break
+	if prev_eval != "":
+		var angles := ["这手的方向/意图", "厚薄与轻重", "形状好不好", "和附近棋子的呼应", "对以后势力的影响", "和刚才几手的联系"]
+		eval_prompt += " 你上一手点评的原话是「%s」：这次不要复用里面出现过的形容词和句式，也别用同样的夸奖方式；从%s这个角度换个说法，还是一句话。" % [prev_eval, angles[randi() % angles.size()]]
 	var player_eval: String = await _reply([
 		_sys_msg(),
 		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, eval_prompt, "after_player", false, st.last_katago)),
@@ -214,11 +223,11 @@ func player_move(x: int, y: int) -> void:
 	st.log_memory("E", player_eval, st.moves.size())      # 给「Estarth 这手」的分析打标签存档
 	message.emit("ai", player_eval)
 
-	# ⑥ Azure 思考并落子
-	await _ai_turn(after_infos, after_black_wr, after_black_score)
+	# ⑥ Azure 思考并落子（把刚才那手点评一并传给她，避免落子后重复/自相矛盾）
+	await _ai_turn(after_infos, after_black_wr, after_black_score, player_eval)
 	_set_busy(false)
 
-func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float) -> void:
+func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float, player_eval := "") -> void:
 	var pick := _pick_ai_move(after_infos)
 	var ai_gtp: String = pick[0]
 	var ai_x: int = pick[1]
@@ -226,7 +235,7 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float) -> 
 
 	# 用意：落子前说明「我准备下在哪、想做什么」（此时棋谱里还没有她这一手，上下文才不会自相矛盾）
 	var think_hint := "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
-	var think_prompt := "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说；不要复述刚才对Estarth那手的点评，也别用「黑方/白棋」的旁观口吻。" % think_hint
+	var think_prompt := "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过Estarth那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。" % think_hint
 	await get_tree().create_timer(0.35).timeout
 	var think_msg: String = await _reply([
 		_sys_msg(),
@@ -259,11 +268,12 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float) -> 
 	info_changed.emit(wr, sc)
 
 	# 局势：一句话说清当前形势（谁占优、关键处），不复述前文（上下文里的 KataGo 形势已是最新）
+	# 本级消息最容易变成「把点评和用意再讲一遍」的复读机：把本回合已说的两句原样喂回去，明确禁止重复
 	var ai_eval_prompt := ""
 	if ai_gtp == "pass":
-		ai_eval_prompt = "你（Azure）这手选择虚着。用你自己的口吻（我/你）一句话说说你现在对局面的感觉、心里在琢磨什么；不要用「黑方/白棋」这种旁观口吻，也不要复述刚才说过的话。"
+		ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。" % [player_eval, think_msg]
 	else:
-		ai_eval_prompt = "你（Azure）刚下了 %s。用你自己的口吻（我/你）一句话说说：我这手想要什么、现在这盘棋我感觉怎么样、接下来我打算怎么走；不要用「黑方/白棋」这种旁观口吻，也不要复述刚才说过的话。" % ai_gtp
+		ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。" % [ai_gtp, player_eval, think_msg]
 	var ai_eval: String = await _reply([
 		_sys_msg(),
 		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, ai_eval_prompt, "just_moved", false, st.last_katago)),
@@ -414,7 +424,37 @@ func idle_remark() -> void:
 	if reply.strip_edges() == "" or reply.begins_with("调用出错") or reply.contains("脑子有点转不过来"):
 		reply = str(IDLE_LINES[randi() % IDLE_LINES.size()])     # LLM 不可用时兜底台词
 	st.chat_history.append({"role": "assistant", "content": reply})
-	message.emit("ai", reply)
+	message.emit("ai_idle", reply)                                # ai_idle：玩家一回来可整句作废（不出声也不显示）
+
+## 窥屏搭话：长时间无操作时偷看一眼屏幕，切去了别的窗口就结合看到的内容和性格说一句
+## info：{fg_title, ocr, vlm}（来自本地 azure_peek.py 的 OCR+VLM 快照）
+func peer_remark(info: Dictionary) -> void:
+	if busy:
+		return
+	var title := str(info.get("fg_title", "")).strip_edges()
+	var vlm := str(info.get("vlm", "")).strip_edges()
+	var ocr := str(info.get("ocr", "")).strip_edges()
+	if ocr.length() > 220:
+		ocr = ocr.substr(0, 220) + "…"
+	var seen := ""
+	if vlm != "":
+		seen += "屏幕画面：%s\n" % vlm
+	if ocr != "":
+		seen += "屏幕文字（OCR）：%s\n" % ocr
+	if seen == "":
+		seen = "（没能看清具体内容）\n"
+	var prompt := ("Estarth 很久没碰棋盘了。你悄悄瞥了一眼他的屏幕——他现在开着的窗口是「%s」，%s"
+		+ "用你自己的口吻主动对他说一句很短的话（30字以内）：自然地带出你看到了什么（他在看什么、忙什么），"
+		+ "好奇、有点小情绪，但别像监视器一样复述细节、也别责备他；如果他只是在看别的页面，就顺着内容搭话。1句，慵懒亲切。") % [title if title != "" else "未知窗口", seen]
+	var reply: String = await _reply([
+		_sys_msg(),
+		_user_msg(AzurePrompts.context_block(st.moves, st.memory_log, st.chat_history, "chat", true, st.last_katago)),
+		{"role": "user", "content": prompt},
+	], 120)
+	if reply.strip_edges() == "" or reply.begins_with("调用出错") or reply.contains("脑子有点转不过来"):
+		reply = "唔…跑去忙别的啦？我还在这儿等你哦。"          # LLM 不可用时兜底
+	st.chat_history.append({"role": "assistant", "content": reply})
+	message.emit("ai_idle", reply)
 
 ## 对局总结
 func summarize(note: String) -> void:
