@@ -70,6 +70,10 @@ var _peek_exe := ""                        # 跑窥屏的 python（需装好 pad
 var _peek_script := ""                     # azure_peek.py 路径
 var _peek_probed := false
 var _peek_ok := false
+var _peek_pid := -1                        # 正在跑的窥屏进程（退出时清掉，别留孤儿）
+var _vlm_starter := ""                     # start_vlm_server.py 路径（拉起 GPU 常驻 VLM 服务）
+var _llm_starter := ""                     # start_llm_server.py 路径（启动时一并拉起本地 LLM 服务）
+var _llm_py := ""                          # 用来跑启动器的 python（启动器只用标准库，任意 python 皆可）
 
 ## 本地语音服务目录：优先「可执行文件同级的 cosyvoice\」（分享版），否则回退 D:/KataGo/cosyvoice（开发机）。
 ## 用 VBS 以「隐藏窗口的 python.exe」拉起：pythonw 加载 CosyVoice 时会静默崩溃。
@@ -1190,6 +1194,8 @@ func _build_services() -> void:
 	tts.speaking_changed.connect(_on_tts_speaking)
 	tts.utterance_started.connect(_on_utterance_started)
 	_autostart_tts()                              # 需要时后台拉起本地语音服务（无窗口）
+	_ensure_vlm_url()                             # 后台预热窥屏 VLM 服务（GPU 常驻；本机没有则静默跳过）
+	_ensure_llm_url()                             # 启动时一并拉起本地 LLM 服务（已有实例则跳过）
 
 	AzurePrompts.configure(cfg)                   # 注入 config.json 的自定义人设/称呼/阶段提示
 	agent = AzureAgent.new()
@@ -1255,7 +1261,11 @@ func _on_tts_status(text: String) -> void:
 		_flush_pending_ai()              # 语音出错：文字不能丢，立即显示
 
 func _greet() -> void:
-	_add_msg("ai", "嗯~ %s，来下棋吧...我会陪你的 (｡･ω･｡)" % cfg.prompt_user_name)
+	var greet := "嗯~ %s，来下棋吧...我会陪你的 (｡･ω･｡)" % cfg.prompt_user_name
+	if tts != null and tts.play_welcome(cfg.prompt_user_name):
+		_add_msg_now("ai", greet)             # 预制欢迎语音已经开口：文字直接显示，零等待
+	else:
+		_add_msg("ai", greet)
 	_add_msg("system", "你执黑先行。左键落子，右键拖拽可旋转棋盘视角。")
 
 func _on_intersection_clicked(x: int, y: int) -> void:
@@ -1461,6 +1471,87 @@ func _peek_available() -> bool:
 	print("[Peek] 未找到窥屏环境（azure_peek.py / python），长时间闲置只走普通搭话")
 	return false
 
+## 确保窥屏 VLM 服务可用，返回传给窥屏脚本的 --vlm-url（空字符串=不可用，窥屏脚本会自动回退 CPU 推理）。
+## - cfg.vlm_base_url 填了：视为外部/自管服务，直接用，不碰本地进程（分享版可指向远程 API）
+## - 留空且 vlm_auto_start：由本机 python 拉起 start_vlm_server.py（内部有 lock+健康检查防重复），
+##   服务是 GPU 常驻的（加载一次，之后每次窥屏推理 1~2 秒）
+func _ensure_vlm_url() -> String:
+	var manual := cfg.vlm_base_url.strip_edges()
+	if manual != "":
+		return manual
+	if not cfg.vlm_auto_start:
+		return ""
+	if not _peek_available():                     # 窥屏环境本身不可用：不值得起服务
+		return ""
+	if _vlm_starter == "":
+		var exe_dir := OS.get_executable_path().get_base_dir()
+		var dirs: Array[String] = [exe_dir.path_join("peek"), "D:/KataGo/peek"]
+		for d in dirs:
+			var st := d.path_join("start_vlm_server.py")
+			if FileAccess.file_exists(st):
+				_vlm_starter = st
+				break
+	if _vlm_starter == "":
+		return ""                                 # 本机没有 VLM 启动器（分享版）：窥屏走 CPU/降级
+	var args := PackedStringArray([_vlm_starter, "--port", str(cfg.vlm_port)])
+	if cfg.vlm_exe != "":
+		args.append_array(["--exe", cfg.vlm_exe])
+	if cfg.vlm_model != "":
+		args.append_array(["--model", cfg.vlm_model])
+	if cfg.vlm_mmproj != "":
+		args.append_array(["--mmproj", cfg.vlm_mmproj])
+	var pid := OS.create_process(_peek_exe, args)
+	if pid <= 0:
+		print("[Peek] VLM 服务启动器拉起失败，窥屏将回退 CPU 推理")
+		return ""
+	return "http://127.0.0.1:%d/v1" % cfg.vlm_port
+
+## 确保本地 LLM 服务可用（启动游戏时一并拉起，免去手动开服务），返回配置里的 base_url。
+## - cfg.llm_base_url 指向非本机（云端/局域网）或 llm_auto_start=false：原样返回，不碰对方
+## - 本机地址：用 python 拉起 start_llm_server.py（内部有「锁 + 健康检查」，已在跑则直接跳过），
+##   模型加载在后台进行，游戏不用等它——聊天/点评会在就绪后自动恢复
+func _ensure_llm_url() -> String:
+	var url := cfg.llm_base_url.strip_edges()
+	var re := RegEx.new()
+	if re.compile("^(https?)://([^:/]+)") != OK:
+		return url
+	var m := re.search(url)
+	if m == null:
+		return url
+	var host := m.get_string(2).to_lower()
+	if not ["127.0.0.1", "localhost", "::1"].has(host) or not cfg.llm_auto_start:
+		return url
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	if _llm_starter == "":
+		for p in [exe_dir.path_join("start_llm_server.py"), "D:/KataGo/start_llm_server.py"]:
+			if FileAccess.file_exists(p):
+				_llm_starter = p
+				break
+	if _llm_starter == "":
+		print("[LLM] 未找到 start_llm_server.py，跳过自动拉起（服务需自行启动）")
+		return url
+	if _llm_py == "":
+		for py in [exe_dir.path_join("peek/.venv/Scripts/python.exe"),
+				"D:/KataGo/peek/.venv/Scripts/python.exe",
+				"E:/AI_Omni/Python/python.exe"]:
+			if FileAccess.file_exists(py):
+				_llm_py = py
+				break
+	if _llm_py == "":
+		print("[LLM] 未找到可用的 python，跳过自动拉起（服务需自行启动）")
+		return url
+	var args := PackedStringArray([_llm_starter, "--port", str(cfg.llm_port)])
+	if cfg.llm_exe != "":
+		args.append_array(["--exe", cfg.llm_exe])
+	if cfg.llm_model_path != "":
+		args.append_array(["--model", cfg.llm_model_path])
+	var pid := OS.create_process(_llm_py, args)
+	if pid <= 0:
+		print("[LLM] 本地 LLM 服务启动器拉起失败（服务需自行启动）")
+		return url
+	print("[LLM] 已后台拉起本地 LLM 服务（启动器 pid=%d，端口 %d），加载模型需要一段时间" % [pid, cfg.llm_port])
+	return url
+
 ## 后台拉起一次窥屏：独立 python 进程截图 → OCR → VLM，把结果写成 json（不阻塞游戏）
 func _start_peek(now: int) -> void:
 	_peek_busy = true
@@ -1470,17 +1561,23 @@ func _start_peek(now: int) -> void:
 	_peek_out = OS.get_user_data_dir().path_join("peek_result.json")
 	if FileAccess.file_exists(_peek_out):
 		DirAccess.remove_absolute(_peek_out)
-	var pid := OS.create_process(_peek_exe, PackedStringArray([
-		_peek_script, "--out", _peek_out, "--game-pid", str(OS.get_process_id())]))
+	var pargs := PackedStringArray([
+		_peek_script, "--out", _peek_out, "--game-pid", str(OS.get_process_id())])
+	var vlm_url := _ensure_vlm_url()             # 顺手确保 GPU 常驻 VLM 服务在跑（幂等）
+	if vlm_url != "":
+		pargs.append_array(["--vlm-url", vlm_url])
+	var pid := OS.create_process(_peek_exe, pargs)
 	if pid <= 0:
 		_peek_busy = false
 		agent.idle_remark()                      # 拉不起来：照旧问一句
 		return
+	_peek_pid = pid
 	print("[Peek] 已发起窥屏（pid=%d），等结果…" % pid)
 
 ## 每帧看窥屏结果好了没；等不到就超时放弃
 func _tick_peek(now: int) -> void:
 	if FileAccess.file_exists(_peek_out):
+		_peek_pid = -1
 		var data: Dictionary = {}
 		var f := FileAccess.open(_peek_out, FileAccess.READ)
 		if f != null:
@@ -1504,6 +1601,7 @@ func _tick_peek(now: int) -> void:
 			agent.peer_remark(data)              # 切去别的窗口了：结合窥屏内容与性格说
 		return
 	if now - _peek_started_ms > PEEK_TIMEOUT_MS:
+		_peek_pid = -1
 		_peek_busy = false
 		if _idle and not agent.busy and _last_activity_ms == _peek_ctx_activity:
 			agent.idle_remark()                  # 窥屏没结果：退回普通搭话
@@ -1557,4 +1655,45 @@ func _handle_cli() -> void:
 	print("[shot] viewport=%s  left_panel=%.0f  right_panel=%.0f  (PANEL_W=%d)"
 			% [get_viewport().get_visible_rect().size, _left_panel.size.x, _right_panel.size.x, PANEL_W])
 	get_tree().quit()
+
+# ================= 退出清理 =================
+
+## 退出游戏：把本次运行拉起的本地服务一并结束，避免残留进程继续占用显存/CPU。
+## 只动「写了锁记录」的进程；用户手动起、没写锁的服务（如 bat 起的 TTS）不受影响。
+func _exit_tree() -> void:
+	if _peek_pid > 0:
+		OS.kill(_peek_pid)                       # 窥屏进程（截图 + OCR + VLM 推理）还在跑
+		_peek_pid = -1
+	# LLM / VLM：锁文件就在启动器同级目录（开发机=D:/KataGo，分享版=可执行文件目录）
+	if _llm_starter != "":
+		_kill_lock(_llm_starter.get_base_dir().path_join(".llm_server.lock"))
+	if _vlm_starter != "":
+		_kill_lock(_vlm_starter.get_base_dir().path_join(".vlm_server.lock"))
+	_kill_lock(_tts_dir.path_join(".tts_server.lock"))   # 语音服务（实例锁由服务自己写）
+	if _tts_pid > 0:
+		OS.kill(_tts_pid)                        # 语音服务的窗口启动器也一并收掉
+		_tts_pid = -1
+
+## 按锁文件结束它记录的进程，并清掉锁。
+## 注意：不能先查 OS.is_process_running 再杀——Godot 在 Windows 上只认自己 create_process
+## 出来的进程，服务进程是「启动器 python 的子进程」，会被误判成已退出（TTSClient 也踩过同样的坑）。
+## 直接杀：进程若已经退出，kill 只会返回错误，没有副作用。
+func _kill_lock(path: String) -> void:
+	var pid := _read_lock_pid(path)
+	if pid <= 0:
+		return
+	var err := OS.kill(pid)
+	print("[exit] 已请求结束本地服务进程 pid=%d（%s，锁：%s）" % [pid, error_string(err), path])
+	DirAccess.remove_absolute(path)
+
+## 读锁文件里记录的 pid；文件不存在或内容非法时返回 -1
+static func _read_lock_pid(path: String) -> int:
+	if not FileAccess.file_exists(path):
+		return -1
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return -1
+	var pid := int(f.get_as_text().strip_edges())
+	f.close()
+	return pid if pid > 0 else -1
 

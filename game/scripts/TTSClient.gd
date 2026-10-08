@@ -16,6 +16,8 @@ const FILLER_DIR := "res://assets/voice"   # 预制情绪语气词：填补合�
 const FILLER_COOLDOWN_MS := 9000           # 自动插话的最小间隔（避免一直「嗯……」）
 const THINK_FILLER_PER_TURN := 2           # 每次玩家互动后 think 语气词上限（「嗯~」「让我看看」各至多一次）
 var slow_chunk_chars := 100          # 慢引擎单次请求的字数上限（右侧栏「长句合并」开关：关=100/开=160）
+const FIRST_CHUNK_CHARS := 12        # 首块目标字数上限：第一声尽快出来（后续块边播边合成，总时长几乎不变）
+const MIN_FIRST_CHARS := 4           # 首块最小字数：比这还短就不切了，宁可等久一点也别开口太碎
 const HTTP_TIMEOUT_FAST := 60.0      # 轻量引擎（melo）/ 系统语音：很快就回
 const HTTP_TIMEOUT_SLOW := 240.0     # CosyVoice 系列 CPU 很慢：给足时间，别像以前那样 60 秒就被丢弃
 ## 讲话时要丢掉的装饰：emoji、箭头/符号、半角假名颜文字等
@@ -130,6 +132,27 @@ func play_filler(kind: String, force := false) -> void:
 ## 玩家发起一次互动（落子 / 提问 / 功能按钮）：重置本回合的 think 语气词额度
 func begin_filler_turn() -> void:
 	think_filler_budget = THINK_FILLER_PER_TURN
+
+## 播放预制欢迎语音（assets/voice/welcome_<名字>.wav）：开场问候零等待，不必等引擎合成。
+## 有对应文件才播并返回 true（调用方据此把文字直接显示）；否则返回 false，走普通语音流程。
+func play_welcome(name: String) -> bool:
+	if not enabled or _player == null:
+		return false
+	var key := name.strip_edges().to_lower()
+	if key == "":
+		return false
+	var res := FILLER_DIR.path_join("welcome_%s.wav" % key)
+	if not ResourceLoader.exists(res):
+		push_warning("[TTS] 预制欢迎语音缺失：%s（退回普通合成）" % res)
+		return false
+	var st := load(res)
+	if not (st is AudioStream):
+		push_warning("[TTS] 预制欢迎语音无法加载：%s" % res)
+		return false
+	stop()                                        # 清掉可能还排着的旧语音，欢迎语先出声
+	_play_stream(st, 0, false, "")
+	print("[TTS] 播放预制欢迎语音：%s" % res)
+	return true
 
 ## 一句话播完：无缝接上预取的下一句；没有预取时才算整段读完
 func _on_spoken() -> void:
@@ -333,13 +356,7 @@ static func _split_sentences(text: String) -> Array[String]:
 	# 纯标点的碎片（如「...」被拆出来的「.」）并回前一句，别当成独立句子发出去
 	var merged: Array[String] = []
 	for p in out:
-		var has_word := false
-		for i in p.length():
-			var c := p[i]
-			if not (c in ["。", "！", "？", "；", "…", "!", "?", ";", ".", "\n", "，", ",", "、", "~", " "]):
-				has_word = true
-				break
-		if has_word:
+		if _has_word(p):
 			merged.append(p)
 		elif not merged.is_empty():
 			merged[merged.size() - 1] += p
@@ -347,13 +364,40 @@ static func _split_sentences(text: String) -> Array[String]:
 		merged.append(text)
 	return merged
 
-## 慢引擎分块：按整句合并，每块不超过 slow_chunk_chars 字。
-## 关键：不把一句话从标点中间切开——短消息会合成「一整块」，一次请求就连续读完整句。
+## 这段文本里是否含有「实字」（非标点/空白）；纯标点碎片不值得单独送去合成
+static func _has_word(s: String) -> bool:
+	for i in s.length():
+		var c := s[i]
+		if not (c in ["。", "！", "？", "；", "…", "!", "?", ";", ".", "\n", "，", ",", "、", "~", " "]):
+			return true
+	return false
+
+## 慢引擎分块：首块尽量短（第一声尽快出来），其余按整句合并成大块。
+## 关键：边播边合成会把后续块在播放期间预取好，所以首块切小几乎不增加总时长，只把「开口等待」压下来。
 func _chunk_for_slow(text: String) -> Array[String]:
 	var sents := _split_sentences(text)
 	var out: Array[String] = []
+	if sents.is_empty():
+		out.append(text)
+		return out
+	# ① 拼首块：从第一句开始；极短的首句（「嗯。」「好。」）先并上后续，避免开口太碎
+	var first: String = sents[0]
+	var idx := 1
+	while first.strip_edges().length() < MIN_FIRST_CHARS and idx < sents.size():
+		first += sents[idx]
+		idx += 1
+	# 仍然超过上限：在自然停顿标点处切一刀（切点太靠前则放弃，宁可多一点等待也不碎）
+	if first.length() > FIRST_CHUNK_CHARS:
+		var cut := _cut_at_pause(first, FIRST_CHUNK_CHARS + 8)
+		if cut >= MIN_FIRST_CHARS:
+			out.append(first.substr(0, cut))
+			first = first.substr(cut)
+	if first.strip_edges() != "":
+		out.append(first)
+	# ② 其余句子按原逻辑合并成大块（不与首块合并）
 	var cur := ""
-	for s in sents:
+	for i in range(idx, sents.size()):
+		var s: String = sents[i]
 		if cur == "":
 			cur = s
 		elif cur.length() + s.length() <= slow_chunk_chars:
@@ -366,6 +410,15 @@ func _chunk_for_slow(text: String) -> Array[String]:
 	if out.is_empty():
 		out.append(text)
 	return out
+
+## 在前 limit 个字符内找最靠后的自然停顿标点（逗号/句号等）作为切点；没有合适切点返回 -1
+static func _cut_at_pause(s: String, limit: int) -> int:
+	var n := mini(s.length() - 1, limit)
+	var best := -1
+	for i in n:
+		if s[i] in ["，", ",", "、", "：", ":", "。", ".", "！", "？", "；", ";", "…"]:
+			best = i + 1
+	return best if best >= 2 else -1
 
 ## 是否为慢速神经网络引擎（CosyVoice 克隆/预设；melo 与系统语音不算）
 func _slow_engine() -> bool:

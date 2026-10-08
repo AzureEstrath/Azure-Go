@@ -29,6 +29,7 @@ func _ready() -> void:
 var _base_ready := false
 var _inflight := false           # 串行化排队：闲置搭话等新调用等待前一个完成，而不是并发撞 Busy
 var _dns_cache: Dictionary = {}  # host → 解析结果：云端服务省掉每次请求的 DNS 解析（TCP 预检仍保留，服务挂掉能快速失败）
+var _no_think_unsupported := false  # 服务端不认 chat_template_kwargs（云端 API 会 400）：探测一次后不再发送
 
 ## 首次使用前把 localhost 规范为 IPv4 回环。
 ## Godot 在本机把 localhost 只解析到 IPv6 ::1，而本地 LLM 通常只监听 IPv4，
@@ -115,20 +116,31 @@ func chat(messages: Array, max_tokens := 300) -> String:
 		"max_tokens": max_tokens,
 		"temperature": 0.7,
 		"top_p": 0.9,
+		"cache_prompt": true,          # 复用上轮 KV 前缀（人设+对局状态不变）：本地点评首字更快
 	}
+	# 思考型模型（Qwen3 系）默认把 max_tokens 全耗在推理段落上：本地实测同一句点评
+	# 思考开 10.5s / 关 1.0s。陪练对话都是短互动，第一次请求就关思考；
+	# 云端 API 不认这个参数（400）时自动去掉并记住，之后不再发送。
+	var no_think := not _no_think_unsupported
+	if no_think:
+		body["chat_template_kwargs"] = {"enable_thinking": false}
 	var r := await _post(body)
+	if r.has("_error") and no_think:
+		_no_think_unsupported = true
+		print("[LLM] 服务端不支持 enable_thinking 参数（多为云端 API），本次去掉重试")
+		body.erase("chat_template_kwargs")
+		r = await _post(body)
 	if r.has("_error"):
 		return "调用出错：" + str(r["_error"])
 	var content := _content_of(r)
-	if content == "":
-		# 思考型模型可能把 token 耗在推理上：关掉思考模式重试一次
-		body["chat_template_kwargs"] = {"enable_thinking": false}
+	if content == "" and no_think:
+		# 关思考仍为空（罕见）：退回默认模式再试一次
+		body.erase("chat_template_kwargs")
 		r = await _post(body)
-		if r.has("_error"):
-			return "调用出错：" + str(r["_error"])
-		content = _content_of(r)
-		if content == "":
-			content = clean_content(str(r.get("_reasoning", "")))
+		if not r.has("_error"):
+			content = _content_of(r)
+	if content == "":
+		content = clean_content(str(r.get("_reasoning", "")))
 	return content if content != "" else "唔...我脑子有点转不过来了"
 
 func _content_of(r: Dictionary) -> String:

@@ -2,13 +2,18 @@ class_name AzureConfig
 extends RefCounted
 ## 配置加载/保存：优先读「可执行文件同目录 / config.json」，其次项目内 res://config.json
 
-var katago_bin := "katago.exe"
-var katago_model := "model.bin"
-var katago_config := "default_gtp.cfg"
-var max_visits := 100
+var katago_bin := "bin/katago/katago.exe"
+var katago_model := "models/model-b18c384nbt.bin.gz"   # 现代 b18c384nbt（v1.18 引擎，16 线程下 500 visits ≈ 2s/手）
+var katago_config := "bin/katago/default_gtp.cfg"
+var max_visits := 500
 var llm_base_url := "http://localhost:8080/v1"
 var llm_model := "qwen3.5"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
+# —— 本地 LLM 服务（llama-server 常驻，游戏启动时一并拉起；也可指向远程服务）——
+var llm_auto_start := true        # base_url 指向本机时，启动游戏自动拉起本地 LLM 服务
+var llm_exe := ""                 # llama-server.exe 路径；留空由启动器自动探测
+var llm_model_path := ""          # 主模型 gguf 路径；留空由启动器自动探测
+var llm_port := 8080              # 本地服务端口（应和 base_url 里的端口一致）
 var vrm_path := "D:/KataGo/Azure.vrm"
 # —— 提示词自定义（留空则用内置 Azure 人设）——
 var prompt_system := ""           # 覆盖系统提示词（人设全文）；留空用内置
@@ -32,6 +37,13 @@ var tts_limit_len := true         # 限制 Azure 回复长度（点评 1 句/聊
 var tts_sync_speak := true        # 同步说话：Azure 文字等语音就绪后再一起显示（关掉则文字立即显示）
 var tts_batch_speak := false      # 整段合成：连发的多条消息合并成一段连续朗读；关=逐句（第一句播完等第二句合成）
 var tts_long_chunk := false       # 长句合并：单次 TTS 合成上限 100→160 字（首句更慢；关=100 更快出第一句）
+# —— 窥屏 VLM（本地 llama-server，ROCm GPU 常驻；也可指向远程 OpenAI 兼容服务）——
+var vlm_base_url := ""            # 留空=自动使用本地 llama-server（游戏侧负责拉起）；填了则视为外部服务，不碰本地
+var vlm_auto_start := true        # 是否允许游戏侧拉起本地 VLM 服务（本机没有 llama-server 时自动跳过）
+var vlm_exe := ""                 # llama-server.exe 路径；留空自动探测（D:/KataGo/llamacpp-rocm）
+var vlm_model := ""               # VLM gguf；留空自动探测（D:/KataGo/models/Qwen2.5-VL-3B-Instruct-IQ4_NL.gguf）
+var vlm_mmproj := ""              # 视觉编码器 gguf；留空自动探测
+var vlm_port := 8090
 
 var _path := ""
 var _raw: Dictionary = {}       # 原样保存读到的配置，写回时只覆盖改动项（保留相对路径等写法）
@@ -59,6 +71,10 @@ static func load_config() -> AzureConfig:
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
 			c.llm_api_key = str(d.get("llm_api_key", c.llm_api_key))
+			c.llm_auto_start = bool(d.get("llm_auto_start", c.llm_auto_start))
+			c.llm_exe = str(d.get("llm_exe", c.llm_exe))
+			c.llm_model_path = str(d.get("llm_model_path", c.llm_model_path))
+			c.llm_port = int(d.get("llm_port", c.llm_port))
 			c.vrm_path = str(d.get("vrm_path", c.vrm_path))
 			c.prompt_system = str(d.get("prompt_system", c.prompt_system))
 			c.prompt_user_name = str(d.get("prompt_user_name", c.prompt_user_name))
@@ -81,9 +97,25 @@ static func load_config() -> AzureConfig:
 			c.tts_sync_speak = bool(d.get("tts_sync_speak", c.tts_sync_speak))
 			c.tts_batch_speak = bool(d.get("tts_batch_speak", c.tts_batch_speak))
 			c.tts_long_chunk = bool(d.get("tts_long_chunk", c.tts_long_chunk))
+			c.vlm_base_url = str(d.get("vlm_base_url", c.vlm_base_url))
+			c.vlm_auto_start = bool(d.get("vlm_auto_start", c.vlm_auto_start))
+			c.vlm_exe = str(d.get("vlm_exe", c.vlm_exe))
+			c.vlm_model = str(d.get("vlm_model", c.vlm_model))
+			c.vlm_mmproj = str(d.get("vlm_mmproj", c.vlm_mmproj))
+			c.vlm_port = int(d.get("vlm_port", c.vlm_port))
 	c.katago_bin = _resolve(c.katago_bin, exe_dir)
 	c.katago_model = _resolve(c.katago_model, exe_dir)
 	c.katago_config = _resolve(c.katago_config, exe_dir)
+	if c.vlm_exe != "":
+		c.vlm_exe = _resolve(c.vlm_exe, exe_dir)
+	if c.vlm_model != "":
+		c.vlm_model = _resolve(c.vlm_model, exe_dir)
+	if c.vlm_mmproj != "":
+		c.vlm_mmproj = _resolve(c.vlm_mmproj, exe_dir)
+	if c.llm_exe != "":
+		c.llm_exe = _resolve(c.llm_exe, exe_dir)
+	if c.llm_model_path != "":
+		c.llm_model_path = _resolve(c.llm_model_path, exe_dir)
 	return c
 
 ## 写回配置文件（语音设置改动后调用，下次启动仍生效）
@@ -101,6 +133,10 @@ func save() -> bool:
 	d["max_visits"] = max_visits
 	d["llm_base_url"] = llm_base_url
 	d["llm_model"] = llm_model
+	d["llm_auto_start"] = llm_auto_start
+	d["llm_port"] = llm_port
+	d["llm_exe"] = d.get("llm_exe", llm_exe)
+	d["llm_model_path"] = d.get("llm_model_path", llm_model_path)
 	d["vrm_path"] = d.get("vrm_path", vrm_path)
 	d.merge({
 		"tts_enabled": tts_enabled,

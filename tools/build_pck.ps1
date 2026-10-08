@@ -1,4 +1,4 @@
-# 重新打包游戏 PCK（分享版只需替换 AzureGoGodot.pck，exe 是 Godot 引擎本体）
+﻿# 重新打包游戏 PCK（分享版只需替换 AzureGoGodot.pck，exe 是 Godot 引擎本体）
 # 用法（在仓库根目录）：
 #   powershell -ExecutionPolicy Bypass -File tools\build_pck.ps1
 param(
