@@ -62,8 +62,7 @@ var _next_talk_ms := 0                     # 下一次闲置搭话的时刻
 var _last_move_count := 0                  # 用于识别 Azure 刚落的那颗子
 
 ## 长时间闲置窥屏（本地 PaddleOCR + Qwen2.5-VL，独立 python 进程一跑一停）
-const IDLE_PEEK_SEC := 60.0                # 闲置超过这么久才值得窥屏（更短的闲置走普通搭话）
-const PEEK_COOLDOWN_MS := 180000           # 两次窥屏至少隔 3 分钟（本地推理很重）
+const PEEK_COOLDOWN_MS := 60000            # 两次窥屏至少隔 1 分钟（搭话本身也要间隔 45 秒起，不会刷屏）
 const PEEK_TIMEOUT_MS := 240000            # 窥屏进程超时：放弃，退回普通搭话
 var _peek_busy := false
 var _peek_started_ms := 0
@@ -1573,10 +1572,12 @@ func _process(_delta: float) -> void:
 		_idle_muted = false                             # 新的一轮搭话：先解除「玩家已回来」的作废标记
 		if not _peek_busy:
 			var idle_ms := now - _last_player_activity_ms   # 用「真实玩家操作」时钟：她边搭话边把闲置刷掉也不会卡住窥屏
-			# 游戏窗口在前台 = 玩家就在游戏里（窥屏只会看到游戏本身）：直接普通搭话，不白起 python 进程
+			# 玩家切去了别的窗口（微信/浏览器…）：搭话一律先窥屏再开口，不说默认的「还在吗」；
+			# 游戏窗口在前台 = 玩家就在游戏里（窥屏只会看到游戏本身）：直接普通搭话，不白起 python 进程。
+			# 窥屏失败/看到的是游戏本身时，_tick_peek 会自动退回普通搭话（优雅降级）。
 			var peekable := not DisplayServer.window_is_focused()
-			if peekable and idle_ms >= int(IDLE_PEEK_SEC * 1000.0) and now - _peek_last_ms >= PEEK_COOLDOWN_MS and _peek_available():
-				_start_peek(now)                        # 闲置很久且玩家切去了别处：窥屏看一眼他在干嘛
+			if peekable and idle_ms >= int(IDLE_SEC * 1000.0) and now - _peek_last_ms >= PEEK_COOLDOWN_MS and _peek_available():
+				_start_peek(now)                        # 窥屏看一眼他在干嘛，结合屏幕内容开口
 			else:
 				agent.idle_remark()
 	if _peek_busy:
@@ -1770,16 +1771,21 @@ func _tick_peek(now: int) -> void:
 		DirAccess.remove_absolute(_peek_out)
 		_peek_busy = false
 		if data.is_empty():
+			print("[Peek] 结果文件为空/损坏，放弃本次窥屏")
 			return
 		# 结果回来时玩家已经动过（或已不闲置）：这条窥屏内容过期了，不说
 		if _last_player_activity_ms != _peek_ctx_activity or not _idle or agent.busy:
+			print("[Peek] 结果到达时玩家已回来/不再闲置/Azure 正忙，本次窥屏作废")
 			return
 		if not bool(data.get("ok", true)):
+			print("[Peek] 窥屏失败（ok=false），退回普通搭话")
 			agent.idle_remark()                  # 窥屏失败：退回普通搭话
 			return
 		if bool(data.get("is_game", true)):
+			print("[Peek] 前台仍是游戏本身，退回普通搭话")
 			agent.idle_remark()                  # 前台还是游戏：普通走神提醒
 		else:
+			print("[Peek] 结合窥屏内容搭话：前台=%s" % str(data.get("fg_title", "")))
 			agent.peer_remark(data)              # 切去别的窗口了：结合窥屏内容与性格说
 		return
 	if now - _peek_started_ms > PEEK_TIMEOUT_MS:
@@ -1788,6 +1794,7 @@ func _tick_peek(now: int) -> void:
 		_peek_pid = -1
 		_peek_busy = false
 		if _idle and not agent.busy and _last_player_activity_ms == _peek_ctx_activity:
+			print("[Peek] 超时仍未出结果，退回普通搭话")
 			agent.idle_remark()                  # 窥屏没结果：退回普通搭话
 
 # ================= 调试截图 =================

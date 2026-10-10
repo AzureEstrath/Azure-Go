@@ -1,7 +1,7 @@
 class_name LLMClient
 extends Node
 ## 本地 LLM（OpenAI 兼容 /v1/chat/completions）调用
-## 与网页版一致：剥离思考段落，content 为空时带 enable_thinking=false 重试一次
+## 与网页版一致：剥离思考段落；强思考只影响「她怎么想」，推理段永不显示给玩家
 
 var base_url := "http://localhost:8080/v1"
 var model := "qwen3.5"
@@ -137,14 +137,20 @@ func chat(messages: Array, max_tokens := 300) -> String:
 	if r.has("_error"):
 		return "调用出错：" + str(r["_error"])
 	var content := _content_of(r)
-	if content == "" and no_think:
+	if content == "" and no_think and not think_strong:
 		# 关思考仍为空（罕见）：退回默认模式再试一次
 		body.erase("chat_template_kwargs")
 		r = await _post(body)
 		if not r.has("_error"):
 			content = _content_of(r)
-	if content == "":
-		content = clean_content(str(r.get("_reasoning", "")))
+	if content == "" and no_think and think_strong:
+		# 强思考把预算全耗在推理段上、正文还没开口（content 为空）：
+		# 改用快速模式立刻再要一次正式回答——绝不把原始推理段显示给玩家
+		body["chat_template_kwargs"] = {"enable_thinking": false}
+		body["max_tokens"] = max_tokens
+		r = await _post(body)
+		if not r.has("_error"):
+			content = _content_of(r)
 	return content if content != "" else "唔...我脑子有点转不过来了"
 
 func _content_of(r: Dictionary) -> String:
