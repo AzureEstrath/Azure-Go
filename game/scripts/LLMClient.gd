@@ -7,6 +7,7 @@ var base_url := "http://localhost:8080/v1"
 var model := "qwen3.5"
 var api_key := ""                # 云端 OpenAI 兼容服务：非空则发送 Authorization: Bearer <key>
 var timeout_sec := 120.0
+var think_strong := false        # 强思考：思考型模型先推理再给答案（更慢、质量更好）；默认关=快速模式
 
 var _http: HTTPRequest = null
 var _think_re: RegEx = null
@@ -119,11 +120,14 @@ func chat(messages: Array, max_tokens := 300) -> String:
 		"cache_prompt": true,          # 复用上轮 KV 前缀（人设+对局状态不变）：本地点评首字更快
 	}
 	# 思考型模型（Qwen3 系）默认把 max_tokens 全耗在推理段落上：本地实测同一句点评
-	# 思考开 10.5s / 关 1.0s。陪练对话都是短互动，第一次请求就关思考；
+	# 思考开 10.5s / 关 1.0s。陪练对话都是短互动，默认关思考（快速模式）；
+	# 启动设置可选「强思考」：发 enable_thinking=true 并加预算，让答案不被推理段挤掉。
 	# 云端 API 不认这个参数（400）时自动去掉并记住，之后不再发送。
 	var no_think := not _no_think_unsupported
 	if no_think:
-		body["chat_template_kwargs"] = {"enable_thinking": false}
+		body["chat_template_kwargs"] = {"enable_thinking": think_strong}
+	if think_strong:
+		body["max_tokens"] = max_tokens + 800
 	var r := await _post(body)
 	if r.has("_error") and no_think:
 		_no_think_unsupported = true

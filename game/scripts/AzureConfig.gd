@@ -9,6 +9,7 @@ var max_visits := 500
 var llm_base_url := "http://localhost:8080/v1"
 var llm_model := "qwen3.5"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
+var llm_think_strong := false     # 强思考：让思考型模型先推理再给答案（更慢、质量更好）；默认关=快速模式
 # —— 本地 LLM 服务（llama-server 常驻，游戏启动时一并拉起；也可指向远程服务）——
 var llm_auto_start := true        # base_url 指向本机时，启动游戏自动拉起本地 LLM 服务
 var llm_exe := ""                 # llama-server.exe 路径；留空由启动器自动探测
@@ -47,6 +48,7 @@ var vlm_port := 8090
 
 var _path := ""
 var _raw: Dictionary = {}       # 原样保存读到的配置，写回时只覆盖改动项（保留相对路径等写法）
+var cli_locked: Dictionary = {} # 被命令行覆盖过的字段（Main 里登记）：save() 不回写，保持「CLI 只影响本次运行」
 
 static func load_config() -> AzureConfig:
 	var c := AzureConfig.new()
@@ -71,6 +73,7 @@ static func load_config() -> AzureConfig:
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
 			c.llm_api_key = str(d.get("llm_api_key", c.llm_api_key))
+			c.llm_think_strong = bool(d.get("llm_think_strong", c.llm_think_strong))
 			c.llm_auto_start = bool(d.get("llm_auto_start", c.llm_auto_start))
 			c.llm_exe = str(d.get("llm_exe", c.llm_exe))
 			c.llm_model_path = str(d.get("llm_model_path", c.llm_model_path))
@@ -133,11 +136,15 @@ func save() -> bool:
 	d["max_visits"] = max_visits
 	d["llm_base_url"] = llm_base_url
 	d["llm_model"] = llm_model
+	d["llm_api_key"] = llm_api_key
+	d["llm_think_strong"] = llm_think_strong
 	d["llm_auto_start"] = llm_auto_start
 	d["llm_port"] = llm_port
 	d["llm_exe"] = d.get("llm_exe", llm_exe)
 	d["llm_model_path"] = d.get("llm_model_path", llm_model_path)
 	d["vrm_path"] = d.get("vrm_path", vrm_path)
+	d["vlm_base_url"] = vlm_base_url
+	d["vlm_port"] = vlm_port
 	d.merge({
 		"tts_enabled": tts_enabled,
 		"tts_mode": tts_mode,
@@ -155,6 +162,11 @@ func save() -> bool:
 		"tts_batch_speak": tts_batch_speak,
 		"tts_long_chunk": tts_long_chunk,
 	}, true)
+	for k in cli_locked:                      # 命令行覆盖过的字段保持原值：--llm/--model/--key 只影响本次运行
+		if _raw.has(k):
+			d[k] = _raw[k]
+		else:
+			d.erase(k)                        # 原文件本来就没这个键：也不要写进去
 	var f := FileAccess.open(path, FileAccess.WRITE)
 	if f == null:
 		return false

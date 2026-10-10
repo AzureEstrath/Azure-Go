@@ -8,6 +8,9 @@ const TEAL_DARK := Color(0.173, 0.620, 0.620)
 const BUBBLE_AI := Color(0.878, 0.957, 0.957)
 const BUBBLE_SYS := Color(1.0, 0.953, 0.804)
 
+## 启动设置面板确认（_ready 里 await 它，之后才按新配置起各服务）
+signal setup_confirmed
+
 var cfg: AzureConfig
 var katago: KataGoEngine
 var llm: LLMClient
@@ -52,6 +55,7 @@ var _blush_seq := 0                        # 摸头脸红的序号（新的一�
 const BATCH_WINDOW := 0.35
 
 var _last_activity_ms := 0                 # 最近一次「玩家有操作」的时刻（闲置计时）
+var _last_player_activity_ms := 0          # 同上的「真实玩家操作」时钟：只有玩家自己动鼠标/键盘才刷新（窥屏门槛用，不被 Azure 自己说话重置）
 var _idle := false
 var _idle_muted := false                   # 玩家已回来（落子/说话）：在途与排队的走神搭话全部作废
 var _next_talk_ms := 0                     # 下一次闲置搭话的时刻
@@ -64,7 +68,7 @@ const PEEK_TIMEOUT_MS := 240000            # 窥屏进程超时：放弃，退�
 var _peek_busy := false
 var _peek_started_ms := 0
 var _peek_last_ms := 0
-var _peek_ctx_activity := 0                # 发起窥屏时的「最近活动时刻」：对不上说明玩家已回来，结果作废
+var _peek_ctx_activity := 0                # 发起窥屏时的「玩家活动时刻」：对不上说明玩家已回来，结果作废
 var _peek_out := ""                        # 窥屏结果 json 路径
 var _peek_exe := ""                        # 跑窥屏的 python（需装好 paddleocr / llama-cpp-python）
 var _peek_script := ""                     # azure_peek.py 路径
@@ -105,6 +109,7 @@ var _shot_path := ""
 
 func _ready() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
+	_last_player_activity_ms = _last_activity_ms
 	_peek_last_ms = -PEEK_COOLDOWN_MS          # 允许开局后第一次长闲置就窥屏
 	cfg = AzureConfig.load_config()
 	_tts_dir = _find_tts_dir()
@@ -113,6 +118,7 @@ func _ready() -> void:
 	_build_world()
 	_build_board()
 	_build_ui()
+	await _maybe_show_setup()                  # 启动设置面板：思考模式 + 各 API 配置（默认=当前配置）；确认后按新配置起服务
 	_build_services()
 	_greet()
 	_handle_cli()
@@ -130,10 +136,13 @@ func _apply_cli_overrides() -> void:
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--llm="):
 			cfg.llm_base_url = a.substr("--llm=".length())
+			cfg.cli_locked["llm_base_url"] = true
 		elif a.begins_with("--model="):
 			cfg.llm_model = a.substr("--model=".length())
+			cfg.cli_locked["llm_model"] = true
 		elif a.begins_with("--key="):
 			cfg.llm_api_key = a.substr("--key=".length())
+			cfg.cli_locked["llm_api_key"] = true
 
 # ================= 世界与棋盘 =================
 
@@ -1159,6 +1168,176 @@ func _ask_note(title_text: String, on_ok: Callable) -> void:
 	le.text_submitted.connect(func(t): finish.call(t))
 	le.grab_focus()
 
+# ================= 启动设置面板 =================
+
+## 启动设置：思考模式 + LLM / 语音 TTS / 窥屏 VLM 的 API 配置（默认全部取当前 config.json 的值）。
+## 确认后写回 config.json，_ready 再继续按新配置起服务。
+## 调试自动化（--shot= / --demo）默认跳过面板；带 --setup 时只把面板画出来（不等确认），供截图核对样式。
+func _maybe_show_setup() -> void:
+	if DisplayServer.get_name() == "headless":
+		return                                   # 无窗口（自动化测试 / --check-only）：没人能点，等了就死锁
+	var shot := false
+	var force := false
+	for a in OS.get_cmdline_user_args():
+		if a.begins_with("--shot=") or a == "--demo":
+			shot = true
+		elif a == "--setup":
+			force = true
+	if shot and not force:
+		return
+	_build_setup_panel()
+	if shot:
+		return                                   # 截图模式：画出来即可，不能卡在等确认上
+	await setup_confirmed
+
+func _build_setup_panel() -> void:
+	var back := ColorRect.new()
+	back.color = Color(0, 0, 0, 0.45)
+	back.set_anchors_preset(Control.PRESET_FULL_RECT)
+	back.mouse_filter = Control.MOUSE_FILTER_STOP
+	_ui_root.add_child(back)
+
+	var box := PanelContainer.new()
+	box.anchor_left = 0.5
+	box.anchor_right = 0.5
+	box.anchor_top = 0.5
+	box.anchor_bottom = 0.5
+	box.offset_left = -280
+	box.offset_right = 280
+	box.offset_top = -290
+	box.offset_bottom = 290
+	box.add_theme_stylebox_override("panel", _style(Color.WHITE, 12, 16))
+	back.add_child(box)
+
+	var scroll := ScrollContainer.new()
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	box.add_child(scroll)
+	var vb := VBoxContainer.new()
+	vb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vb.add_theme_constant_override("separation", 8)
+	scroll.add_child(vb)
+
+	var title := Label.new()
+	title.text = "⚙️ 出发前的准备"
+	title.add_theme_font_size_override("font_size", 20)
+	title.add_theme_color_override("font_color", TEAL_DARK)
+	vb.add_child(title)
+	var sub := Label.new()
+	sub.text = "以下默认就是上次的配置，直接点「开始对局」即可；改过的值会写回 config.json。"
+	sub.add_theme_font_size_override("font_size", 11)
+	sub.add_theme_color_override("font_color", Color(0.45, 0.45, 0.45))
+	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	vb.add_child(sub)
+
+	vb.add_child(_field_label("思考模式（只影响本地 Qwen3 这类思考型模型）"))
+	var think_opt := OptionButton.new()
+	think_opt.fit_to_longest_item = false
+	think_opt.add_item("快速：不思考，首字 1~2 秒（推荐）")
+	think_opt.add_item("强思考：先推理再回答，更慢、质量更好")
+	think_opt.selected = 1 if cfg.llm_think_strong else 0
+	think_opt.tooltip_text = "强思考会让模型先写推理段落再给答案（本地实测同一条点评 10 秒上下）；快速模式直接出答案"
+	vb.add_child(think_opt)
+
+	var llm_body := _setup_section(vb, "LLM 对话 API（点评 / 聊天）")
+	var le_llm_url := _setup_field(llm_body, "服务地址", cfg.llm_base_url,
+		"本地：http://127.0.0.1:8080/v1；云端：OpenAI 兼容地址（本机地址时游戏会自动拉起本地服务）")
+	var le_llm_model := _setup_field(llm_body, "模型名", cfg.llm_model,
+		"本地 llama-server 通常任意名皆可；云端填服务商要求的模型 id")
+	var le_llm_key := _setup_field(llm_body, "API Key（只有云端需要）", cfg.llm_api_key,
+		"留空=不发送 Authorization；只会存在本机的 config.json 里")
+
+	var tts_body := _setup_section(vb, "语音 TTS API")
+	var le_tts_url := _setup_field(tts_body, "服务地址", cfg.tts_base_url,
+		"本地 CosyVoice 默认 http://127.0.0.1:9880/v1")
+	var le_tts_voice := _setup_field(tts_body, "音色", cfg.tts_voice,
+		"如 azure-fast（克隆音色·快速版）/ 中文女；进游戏后左侧栏也可下拉改")
+
+	var vlm_body := _setup_section(vb, "窥屏 VLM API（长时间闲置时看她一眼）")
+	var le_vlm_url := _setup_field(vlm_body, "服务地址（留空=本机自动拉起）", cfg.vlm_base_url,
+		"填了就走这个外部/自管服务，游戏不再碰本地进程；留空则由游戏在本机端口拉起")
+	var le_vlm_port := _setup_field(vlm_body, "本机服务端口", str(cfg.vlm_port),
+		"留空服务地址时，游戏在 127.0.0.1 的这个端口自动拉起 VLM 服务")
+
+	var hb := HBoxContainer.new()
+	hb.alignment = BoxContainer.ALIGNMENT_END
+	vb.add_child(hb)
+	var start := Button.new()
+	start.text = "▶ 开始对局"
+	start.add_theme_font_size_override("font_size", 16)
+	hb.add_child(start)
+	start.pressed.connect(func():
+		_apply_setup(think_opt, le_llm_url, le_llm_model, le_llm_key, le_tts_url, le_tts_voice, le_vlm_url, le_vlm_port)
+		back.queue_free()
+		setup_confirmed.emit())
+	start.grab_focus()
+	# 高度随内容自适应（折叠时紧凑，展开分节后变高），并保持垂直居中
+	await get_tree().process_frame
+	var h := clampf(vb.get_combined_minimum_size().y + 24.0, 240.0, 640.0)
+	box.offset_top = -h * 0.5
+	box.offset_bottom = h * 0.5
+
+## 面板里可折叠的分节（默认收起，减少第一眼信息量）
+func _setup_section(vb: VBoxContainer, title_text: String, expanded := false) -> VBoxContainer:
+	var btn := Button.new()
+	btn.text = ("▾ " if expanded else "▸ ") + title_text
+	btn.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	vb.add_child(btn)
+	var body := VBoxContainer.new()
+	body.add_theme_constant_override("separation", 4)
+	body.visible = expanded
+	vb.add_child(body)
+	btn.pressed.connect(func():
+		body.visible = not body.visible
+		btn.text = ("▾ " if body.visible else "▸ ") + title_text)
+	return body
+
+## 面板里的「标签 + 输入框」
+func _setup_field(parent: Control, label_text: String, value: String, tip := "") -> LineEdit:
+	parent.add_child(_field_label(label_text))
+	var le := LineEdit.new()
+	le.text = value
+	if tip != "":
+		le.tooltip_text = tip
+	parent.add_child(le)
+	return le
+
+## 应用启动设置：写回 config.json（下次启动仍是这些值），随后 _build_services 按新配置起服务
+func _apply_setup(think_opt: OptionButton, llm_url: LineEdit, llm_model: LineEdit, llm_key: LineEdit,
+		tts_url: LineEdit, tts_voice: LineEdit, vlm_url: LineEdit, vlm_port: LineEdit) -> void:
+	cfg.llm_think_strong = think_opt.selected == 1
+	if llm_url.text.strip_edges() != "":         # 地址/模型/音色不允许被清成空：空则保留原值
+		cfg.llm_base_url = llm_url.text.strip_edges()
+	if llm_model.text.strip_edges() != "":
+		cfg.llm_model = llm_model.text.strip_edges()
+	cfg.llm_api_key = llm_key.text.strip_edges() # Key 可以清空（切回本地服务）
+	if tts_url.text.strip_edges() != "":
+		cfg.tts_base_url = tts_url.text.strip_edges()
+	if tts_voice.text.strip_edges() != "":
+		cfg.tts_voice = tts_voice.text.strip_edges()
+	cfg.vlm_base_url = vlm_url.text.strip_edges()   # 留空=本机自动拉起，是合法值
+	var vp := vlm_port.text.strip_edges().to_int()
+	if vp > 0 and vp < 65536:
+		cfg.vlm_port = vp
+	var lip := _url_port(cfg.llm_base_url)       # 地址里写了端口就同步 llm_port：本机自动拉起要用同一个端口
+	if lip > 0 and not cfg.cli_locked.has("llm_base_url"):   # 命令行覆盖的地址不写回（llm_port 也一样）
+		cfg.llm_port = lip
+	cfg.save()
+	if _tts_url_edit != null:                    # 左侧语音栏建在面板之前：同步显示新值
+		_tts_url_edit.text = cfg.tts_base_url
+		_tts_model_edit.text = cfg.tts_model
+		_tts_voice_edit.text = cfg.tts_voice
+	print("[Setup] 启动设置已保存：强思考=%s · LLM=%s (%s) · TTS=%s/%s · VLM=%s:%d"
+			% [cfg.llm_think_strong, cfg.llm_base_url, cfg.llm_model,
+			   cfg.tts_base_url, cfg.tts_voice, cfg.vlm_base_url, cfg.vlm_port])
+
+## 从 http(s)://host:port/... 里取端口；没写端口返回 -1
+func _url_port(url: String) -> int:
+	var re := RegEx.new()
+	if re.compile("^https?://[^:/]+:(\\d+)") != OK:
+		return -1
+	var m := re.search(url)
+	return int(m.get_string(1)) if m != null else -1
+
 # ================= 服务与接线 =================
 
 func _build_services() -> void:
@@ -1174,6 +1353,7 @@ func _build_services() -> void:
 	llm.base_url = cfg.llm_base_url
 	llm.model = cfg.llm_model
 	llm.api_key = cfg.llm_api_key
+	llm.think_strong = cfg.llm_think_strong
 	add_child(llm)
 
 	tts = TTSClient.new()
@@ -1370,6 +1550,7 @@ func _input(event: InputEvent) -> void:
 
 func _bump_activity() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
+	_last_player_activity_ms = _last_activity_ms      # 只有真实玩家操作才推进这个时钟（窥屏门槛的另一把尺）
 	if _idle:
 		_idle = false
 		_set_idle_state(false)
@@ -1391,9 +1572,11 @@ func _process(_delta: float) -> void:
 		_next_talk_ms = now + randi_range(int(IDLE_TALK_MIN * 1000.0), int(IDLE_TALK_MAX * 1000.0))
 		_idle_muted = false                             # 新的一轮搭话：先解除「玩家已回来」的作废标记
 		if not _peek_busy:
-			var idle_ms := now - _last_activity_ms
-			if idle_ms >= int(IDLE_PEEK_SEC * 1000.0) and now - _peek_last_ms >= PEEK_COOLDOWN_MS and _peek_available():
-				_start_peek(now)                        # 闲置很久：先窥屏看一眼玩家在干嘛（还在游戏里/切去了别处）
+			var idle_ms := now - _last_player_activity_ms   # 用「真实玩家操作」时钟：她边搭话边把闲置刷掉也不会卡住窥屏
+			# 游戏窗口在前台 = 玩家就在游戏里（窥屏只会看到游戏本身）：直接普通搭话，不白起 python 进程
+			var peekable := not DisplayServer.window_is_focused()
+			if peekable and idle_ms >= int(IDLE_PEEK_SEC * 1000.0) and now - _peek_last_ms >= PEEK_COOLDOWN_MS and _peek_available():
+				_start_peek(now)                        # 闲置很久且玩家切去了别处：窥屏看一眼他在干嘛
 			else:
 				agent.idle_remark()
 	if _peek_busy:
@@ -1556,11 +1739,9 @@ func _ensure_llm_url() -> String:
 func _start_peek(now: int) -> void:
 	_peek_busy = true
 	_peek_started_ms = now
-	_peek_last_ms = now
-	_peek_ctx_activity = _last_activity_ms
-	_peek_out = OS.get_user_data_dir().path_join("peek_result.json")
-	if FileAccess.file_exists(_peek_out):
-		DirAccess.remove_absolute(_peek_out)
+	_peek_ctx_activity = _last_player_activity_ms
+	# 结果文件按次命名：超时被杀掉的旧进程即使晚写结果，也不会串到下一轮窥屏里
+	_peek_out = OS.get_user_data_dir().path_join("peek_result_%d.json" % now)
 	var pargs := PackedStringArray([
 		_peek_script, "--out", _peek_out, "--game-pid", str(OS.get_process_id())])
 	var vlm_url := _ensure_vlm_url()             # 顺手确保 GPU 常驻 VLM 服务在跑（幂等）
@@ -1572,6 +1753,7 @@ func _start_peek(now: int) -> void:
 		agent.idle_remark()                      # 拉不起来：照旧问一句
 		return
 	_peek_pid = pid
+	_peek_last_ms = now                          # 真的拉起来了才吃冷却：拉起失败不该白等 3 分钟
 	print("[Peek] 已发起窥屏（pid=%d），等结果…" % pid)
 
 ## 每帧看窥屏结果好了没；等不到就超时放弃
@@ -1590,7 +1772,7 @@ func _tick_peek(now: int) -> void:
 		if data.is_empty():
 			return
 		# 结果回来时玩家已经动过（或已不闲置）：这条窥屏内容过期了，不说
-		if _last_activity_ms != _peek_ctx_activity or not _idle or agent.busy:
+		if _last_player_activity_ms != _peek_ctx_activity or not _idle or agent.busy:
 			return
 		if not bool(data.get("ok", true)):
 			agent.idle_remark()                  # 窥屏失败：退回普通搭话
@@ -1601,9 +1783,11 @@ func _tick_peek(now: int) -> void:
 			agent.peer_remark(data)              # 切去别的窗口了：结合窥屏内容与性格说
 		return
 	if now - _peek_started_ms > PEEK_TIMEOUT_MS:
+		if _peek_pid > 0:
+			OS.kill(_peek_pid)                       # 超时进程多半还在跑（截图/CPU 推理很重）：必须杀掉，别留孤儿占资源
 		_peek_pid = -1
 		_peek_busy = false
-		if _idle and not agent.busy and _last_activity_ms == _peek_ctx_activity:
+		if _idle and not agent.busy and _last_player_activity_ms == _peek_ctx_activity:
 			agent.idle_remark()                  # 窥屏没结果：退回普通搭话
 
 # ================= 调试截图 =================

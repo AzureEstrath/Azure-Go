@@ -14,7 +14,8 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 > **LLM 与 TTS 都走可自定义的 OpenAI 兼容 API**（可填云端服务并带 API Key），
 > **人设与提示词也能在 `config.json` 里直接改**。
 >
-> 当前版本 **v1.2.0**：开场第一句为预制语音（启动即开口）；本地服务（LLM / CosyVoice / 窥屏 VLM）
+> 当前版本 **v1.3.0**：开局前先弹出「出发前的准备」面板——选择快速 / 强思考，直接修改 LLM / 语音 / 窥屏的
+> API 配置（默认沿用上次，改过才写回）；开场第一句为预制语音（启动即开口）；本地服务（LLM / CosyVoice / 窥屏 VLM）
 > 随游戏自动起停，退出不留后台进程。
 
 ---
@@ -64,7 +65,9 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）、本地 LLM / VLM �
 ### 方式 A：下载分享版（推荐给只想玩的玩家）
 
 到 **Releases** 下载 `AzureGoGodot-share.zip`，解压后双击 `AzureGoGodot.exe`
-即可下棋（KataGo 与权重已随包）。开场第一句是 Azure 预制欢迎语音，启动即开口；
+即可下棋（KataGo 与权重已随包）。开局前会先弹出「出发前的准备」：选择思考模式、
+需要的话直接改 LLM / 语音 / 窥屏的 API 配置（默认沿用上次，直接点「开始对局」即可）。
+开场第一句是 Azure 预制欢迎语音，启动即开口；
 语音默认走 **Windows 系统语音**，零配置；聊天/讲解需要按第四节接上一个大模型 API。
 若本机配了本地服务（LLM / CosyVoice / 窥屏 VLM），游戏启动时会一并拉起、退出时清理。
 
@@ -90,6 +93,7 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）、本地 LLM / VLM �
 | `max_visits` | KataGo 每手搜索次数，越大越强越慢 |
 | `llm_base_url` / `llm_model` | **LLM 的 OpenAI 兼容地址与模型名**（本地或云端） |
 | `llm_api_key` | **云端 LLM 的 API Key**；非空则发送 `Authorization: Bearer <key>`，本地服务留空 |
+| `llm_think_strong` | **强思考**：思考型模型（Qwen3 等）先推理再回答，更慢、质量更好；默认 `false`（直答，首字快）；开局前的设置面板里也能改 |
 | `llm_auto_start` / `llm_port` | **本地 LLM 自动起停**：`llm_base_url` 指向本机时随游戏一并拉起（已在跑则跳过，退出游戏自动清理）；端口应与 `llm_base_url` 一致 |
 | `llm_exe` / `llm_model_path` | 本地 `llama-server.exe` / 主模型 gguf 路径（留空由启动器自动探测） |
 | `vlm_base_url` / `vlm_auto_start` / `vlm_port` | 窥屏搭话的 VLM 服务：留空=用本地服务（游戏负责拉起），填了视为外部服务、不碰本地 |
@@ -120,6 +124,7 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）、本地 LLM / VLM �
 "llm_api_key": "sk-你的密钥"
 ```
 
+- **也可在游戏里改**：开局前的「出发前的准备」面板能直接填地址 / 模型名 / API Key（确认后写回 `config.json`），不用手动编辑。
 - **云端**：DeepSeek / OpenAI / 通义 / 硅基流动 等 OpenAI 兼容服务，填地址、模型名与 Key。
 - **本地**：vLLM / LM Studio / llama.cpp server 等，`llm_api_key` 留空。
 - **本地想省事**：把 `start_llm_server.py`（分享包根目录附带）与 `llm_exe` / `llm_model_path`
@@ -166,11 +171,18 @@ KataGo 引擎与权重遵循其上游许可。
 
 ## 八、更新
 
-### v1.2.0（当前）
+### v1.3.0（当前）
+- **开局设置面板**：启动时先弹出「出发前的准备」——选择**快速 / 强思考**，并可直接修改 **LLM / 语音 TTS / 窥屏 VLM** 的 API 配置（默认沿用上次的值，只有改过的才写回 `config.json`；命令行 `--llm/--model/--key` 的临时覆盖不会写回）。
+- **强思考模式**：思考型模型（Qwen3 等）可选「先推理再回答」（更慢、质量更好）；本地服务自动放行推理段，云端 API 不支持时自动回退，不影响使用。
+- 语音修正：取消「首块短切」分句合成——短消息整句一次合成、连续读完，不再开口碎句。
+- 窥屏修正：游戏窗口在前台（玩家就在游戏里）时不再白起 python 进程；超时不再残留孤儿进程、失败不再占用冷却；结果文件按次命名；VLM 服务未就绪时等待重试（不再白白回退 CPU）。
+- 修复 `start_qwen35b.bat` 误杀窥屏 VLM 的 llama-server（现在只结束占用 8080 的旧实例）。
+
+### v1.2.0
 - **开场秒开口**：第一句欢迎语改为**预制语音**（`assets\voice\welcome_<玩家名>.wav`），启动即播、零等待；缺文件自动回退普通合成。
 - **本地服务随游戏自动起停**：启动时一并拉起本地 LLM / CosyVoice / 窥屏 VLM 服务，退出时清理由游戏拉起的进程（缺环境自动跳过，不影响使用）。
 - 新增 `llm_auto_start` / `llm_exe` / `llm_model_path` / `llm_port` 与 `vlm_*` 配置项。
-- 提速：LLM 前缀缓存复用；思考型模型默认关思考（云端不认自动回退）；CosyVoice 首块短切、边播边合成。
+- 提速：LLM 前缀缓存复用；思考型模型默认关思考（云端不认自动回退）；CosyVoice 边播边合成、长句合并（可开关）。
 
 ### v1.1.0
 - 长闲置**窥屏搭话**：空闲时截屏 + OCR + 本地 VLM 看图，Azure 主动找你说话（缺环境自动降级为普通搭话）。
