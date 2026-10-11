@@ -23,6 +23,6 @@ static func gtp_to_xy(pos: String) -> Vector2i:
 static func xy_to_gtp(x: int, y: int) -> String:
 	return letter(x) + str(SIZE - y)
 
-## 给阵法命名，用于日志与提示
+## 坐标是否在棋盘范围内
 static func valid(x: int, y: int) -> bool:
 	return x >= 0 and x < SIZE and y >= 0 and y < SIZE

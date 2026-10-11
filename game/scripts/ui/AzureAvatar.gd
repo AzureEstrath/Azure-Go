@@ -11,7 +11,7 @@ extends Node3D
 const HIP_H_MODEL := 0.9279      # 静止站立时髋骨高度（模型米制，由静态探测得到）
 const SIT_HIP_H := 0.19          # 坐下后髋部离地高度（模型米制；留出裙摆铺地的余量）
 
-var vrm_path := "D:/KataGo/Azure.vrm"
+var vrm_path := "D:/KataGo/assets/Azure.vrm"
 var scale_factor := 13.5         # 棋盘 1 格 = 1 世界单位，化身按此比例缩到「同伴」尺寸
 var floor_y := -0.6              # 地面高度（与棋盘底面一致）
 var seat_z := -15.2              # 坐在棋盘对面（远端之后；裙摆/手都不越过棋盘边线）

@@ -31,15 +31,9 @@ var _tts_url_edit: LineEdit
 var _tts_model_edit: LineEdit
 var _tts_voice_edit: LineEdit
 var _tts_voice_opt: OptionButton
-var _tts_autostart_chk: CheckBox
-var _chk_bf16: CheckBox                    # 右侧栏加速开关
-var _chk_short: CheckBox
-var _chk_len: CheckBox
-var _chk_sync: CheckBox
-var _chk_batch: CheckBox                   # 整段合成 / 逐句播报
-var _chk_chunk: CheckBox                   # 长句合并（TTS 分块 100/160）
 var _pending_ai: Array[Dictionary] = []    # 待显示的 Azure 文字（FIFO；每项 {text, reveal, kind?}）
-var _last_ai_text := ""                    # 上一条 Azure 发言：与它一字不差的重复句直接抑制（防复读兜底）
+const AI_DEDUP_WINDOW := 8                 # 防复读窗口：最近 N 条 AI 发言参与去重（不再只比对相邻一条）
+var _recent_ai_texts: Array[String] = []   # 最近说过的 AI 原话（含落子宣告）：一字不差的重复句直接抑制（防复读兜底）
 var _thinking_row: Control = null          # 「Azure 思考中……」占位气泡
 var _thinking_label: Label = null
 var _speech_hold := false                  # Azure 还有语音没播完：继续锁住棋盘
@@ -312,22 +306,22 @@ func _build_right_panel(root: Control) -> void:
 	_style_check(_chk_joseki, "定式导学")
 	info.add_child(_chk_joseki)
 
-	# 加速开关（bf16 / 短参考需重启语音服务；短回复、同步说话立即生效）
+	# 加速开关（bf16 / 短参考需重启语音服务；短回复、同步说话、整段合成、长句合并立即生效）
 	var acc := GridContainer.new()
 	acc.columns = 2
 	acc.add_theme_constant_override("h_separation", 12)
 	vb.add_child(acc)
-	_chk_bf16 = _acc_check(acc, "bf16 加速", cfg.tts_bf16, "bf16",
+	_acc_check(acc, "bf16 加速", cfg.tts_bf16, "bf16",
 		"把 CosyVoice 的 LLM 权重降到 bfloat16：约快 20~28%，个别词可能读错（需重启语音服务）")
-	_chk_short = _acc_check(acc, "短参考", cfg.tts_short_prompt, "short",
+	_acc_check(acc, "短参考", cfg.tts_short_prompt, "short",
 		"用 ~2.7s 短参考替代 6.3s：实测总耗时基本不变，语速会变慢、音色略变（需重启语音服务）")
-	_chk_len = _acc_check(acc, "短回复", cfg.tts_limit_len, "len",
+	_acc_check(acc, "短回复", cfg.tts_limit_len, "len",
 		"限制 Azure 每次只说 1~2 句：语音等待时间随字数下降（立即生效）")
-	_chk_sync = _acc_check(acc, "同步说话", cfg.tts_sync_speak, "sync",
+	_acc_check(acc, "同步说话", cfg.tts_sync_speak, "sync",
 		"开启：Azure 的文字等语音就绪后一起显示（消除文字先出、声音晚到的割裂感）；关闭：文字立即显示")
-	_chk_batch = _acc_check(acc, "整段合成", cfg.tts_batch_speak, "batch",
+	_acc_check(acc, "整段合成", cfg.tts_batch_speak, "batch",
 		"开启：Azure 连发的多条消息合并成一段、连续朗读；关闭：逐句合成，第一句播完等第二句合成（想边听边等选它）")
-	_chk_chunk = _acc_check(acc, "长句合并", cfg.tts_long_chunk, "chunk",
+	_acc_check(acc, "长句合并", cfg.tts_long_chunk, "chunk",
 		"单次 TTS 合成字数上限：关=100（更快出第一句，默认）；开=160（长句一次合成、但首句更慢）")
 
 	# 聊天区
@@ -478,7 +472,6 @@ func _build_left_panel(root: Control) -> void:
 	var chk_auto := CheckBox.new()
 	chk_auto.button_pressed = cfg.tts_auto_start
 	chk_auto.toggled.connect(func(v): cfg.tts_auto_start = v; cfg.save())
-	_tts_autostart_chk = chk_auto
 	_style_check(chk_auto, "启动游戏时自动拉起语音服务")
 	vb.add_child(chk_auto)
 
@@ -792,7 +785,7 @@ func _wait_tts_health(iterations: int) -> bool:
 	tts.notify_service_ready()                   # 超时也解除：之后真连不上再按原逻辑降级
 	return false
 
-## 启动游戏时自动拉起本地语音服务（pythonw，后台无窗口）
+## 启动游戏时自动拉起本地语音服务（经 VBS 以隐藏窗口的 python.exe 后台拉起）
 func _autostart_tts() -> void:
 	if not cfg.tts_enabled or cfg.tts_mode == "system":
 		return
@@ -940,10 +933,13 @@ func _add_msg(kind: String, text: String) -> void:
 		text = str(parsed[1])
 		if text.strip_edges() == "":
 			return
-		if kind != "ai_move" and text == _last_ai_text:
-			print("[chat] 与上一条一字不差的发言已抑制：%s" % text)
-			return                           # 防复读兜底：完全相同的一句不再重复显示/朗读
-		_last_ai_text = text
+		var norm := text.strip_edges()
+		if kind != "ai_move" and _recent_ai_texts.has(norm):
+			print("[chat] 防复读（最近 %d 条内一字不差）已抑制：%s" % [_recent_ai_texts.size(), norm])
+			return                           # 防复读兜底：最近窗口内完全相同的一句不再重复显示/朗读（含隔了几条的原样复读）
+		_recent_ai_texts.append(norm)
+		while _recent_ai_texts.size() > AI_DEDUP_WINDOW:
+			_recent_ai_texts.pop_front()
 	# 所有消息统一入队、单协程顺序投递：ai_comment 前由导演层加犹豫节拍，延迟期间顺序不乱
 	_msg_seq += 1
 	_msg_queue.append({"kind": kind, "text": text, "tone": tone, "seq": _msg_seq})
@@ -1947,7 +1943,7 @@ func _ensure_llm_url() -> String:
 		return url                                 # 外部 API 或关掉自动拉起：不碰对方
 	var exe_dir := OS.get_executable_path().get_base_dir()
 	if _llm_starter == "":
-		for p in [exe_dir.path_join("start_llm_server.py"), "D:/KataGo/start_llm_server.py"]:
+		for p in [exe_dir.path_join("start_llm_server.py"), "D:/KataGo/tools/start_llm_server.py"]:
 			if FileAccess.file_exists(p):
 				_llm_starter = p
 				break

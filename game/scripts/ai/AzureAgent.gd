@@ -6,7 +6,7 @@ signal message(kind: String, text: String)          # kind: ai / ai_comment / ai
 signal state_changed(payload: Dictionary)
 signal info_changed(winrate: float, score: float)
 signal busy_changed(busy: bool)
-signal emotion(kind: String)                        # 表情反应：delight / pleased / puzzled / worried
+signal emotion(kind: String)                        # 表情反应：delight / pleased / puzzled / worried / sad / laugh
 signal joseki_event(payload: Dictionary)            # 定式识别成功：棋盘高亮轨迹（kind/corner/points）
 
 var st := GameState.new()
@@ -351,9 +351,9 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float, pla
 		# 她自己走出定式：这一条换成一句点题短话（不展开成讲解，也不额外增加 LLM 调用）
 		ai_eval_prompt = AzurePrompts.joseki_short_prompt(str(jk2["name"]), str(jk2["key"]), ai_gtp)
 	elif ai_gtp == "pass":
-		ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。注意：上面引号里是你自己刚说过的话——一个字都不要照抄，开头词也要换新的。" % [player_eval, think_msg]
+		ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % [player_eval, think_msg]
 	else:
-		ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。注意：上面引号里是你自己刚说过的话——一个字都不要照抄，开头词也要换新的。" % [ai_gtp, player_eval, think_msg]
+		ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % [ai_gtp, player_eval, think_msg]
 	var ai_eval: String = await _reply([
 		_sys_msg(),
 		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, ai_eval_prompt, "just_moved", false, st.last_katago)),

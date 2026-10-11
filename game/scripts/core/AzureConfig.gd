@@ -16,7 +16,7 @@ var llm_auto_start := true        # base_url 指向本机时，启动游戏自�
 var llm_exe := ""                 # llama-server.exe 路径；留空由启动器自动探测
 var llm_model_path := ""          # 主模型 gguf 路径；留空由启动器自动探测
 var llm_port := 8080              # 本地服务端口（应和 base_url 里的端口一致）
-var vrm_path := "D:/KataGo/Azure.vrm"
+var vrm_path := "D:/KataGo/assets/Azure.vrm"
 # —— 提示词自定义（留空则用内置 Azure 人设）——
 var prompt_system := ""           # 覆盖系统提示词（人设全文）；留空用内置
 var prompt_user_name := "Estarth" # 玩家称呼；会替换提示词中的「Estarth」

@@ -212,7 +212,7 @@ func _exit_tree() -> void:
 func _process(delta: float) -> void:
 	if _http_busy and Time.get_ticks_msec() - _http_since > int((_http.timeout + 20.0) * 1000.0):
 		if _http != null:
-			_http.cancel_request()               # 卡死保护：3 分钟没回包就取消
+			_http.cancel_request()               # 卡死保护：超过请求超时阈值 20 秒仍未回包就取消
 		_http_busy = false
 		_busy = false
 		_cooldown = FAIL_COOLDOWN

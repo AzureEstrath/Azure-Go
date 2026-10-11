@@ -7,9 +7,6 @@ signal engine_died(reason: String)
 
 var max_visits := 100
 
-var _exe := ""
-var _model := ""
-var _cfg := ""
 var _stdio: FileAccess = null
 var _errf: FileAccess = null
 var _pid := -1
@@ -18,16 +15,12 @@ var _pending := {}                  # id -> {done, result, t0}
 var _stderr_tail: Array[String] = []
 var _dead := false
 var _last_error := ""
-var _startup_t0 := 0
 var _ever_replied := false
 
 const REQ_TIMEOUT_MS := 30000
 const STARTUP_TIMEOUT_MS := 180000
 
 func start(exe: String, model: String, cfg: String) -> bool:
-	_exe = exe
-	_model = model
-	_cfg = cfg
 	if not FileAccess.file_exists(exe):
 		_fail("找不到 KataGo 可执行文件：%s" % exe)
 		return false
@@ -51,7 +44,6 @@ func start(exe: String, model: String, cfg: String) -> bool:
 	_stdio = res["stdio"]
 	_errf = res.get("stderr")
 	_pid = int(res.get("pid", -1))
-	_startup_t0 = Time.get_ticks_msec()
 	print("[KataGo] 已启动 pid=%d  (%s)" % [_pid, exe])
 	return true
 
