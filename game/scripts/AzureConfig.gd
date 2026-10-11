@@ -6,10 +6,11 @@ var katago_bin := "bin/katago/katago.exe"
 var katago_model := "models/model-b18c384nbt.bin.gz"   # 现代 b18c384nbt（v1.18 引擎，16 线程下 500 visits ≈ 2s/手）
 var katago_config := "bin/katago/default_gtp.cfg"
 var max_visits := 500
+var joseki_teach := true          # 定式导学：识别对局中走出的定式并讲解（右侧栏可关；关掉=行为零变化）
 var llm_base_url := "http://localhost:8080/v1"
 var llm_model := "qwen3.5"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
-var llm_think_strong := false     # 强思考：让思考型模型先推理再给答案（更慢、质量更好）；默认关=快速模式
+var llm_think_mode := 0           # 思考档位：0=快速（不思考） 1=中等（限定推理预算） 2=强思考（自由推理）
 # —— 本地 LLM 服务（llama-server 常驻，游戏启动时一并拉起；也可指向远程服务）——
 var llm_auto_start := true        # base_url 指向本机时，启动游戏自动拉起本地 LLM 服务
 var llm_exe := ""                 # llama-server.exe 路径；留空由启动器自动探测
@@ -70,10 +71,14 @@ static func load_config() -> AzureConfig:
 			c.katago_model = str(d.get("katago_model", c.katago_model))
 			c.katago_config = str(d.get("katago_config", c.katago_config))
 			c.max_visits = int(d.get("max_visits", c.max_visits))
+			c.joseki_teach = bool(d.get("joseki_teach", c.joseki_teach))
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
 			c.llm_api_key = str(d.get("llm_api_key", c.llm_api_key))
-			c.llm_think_strong = bool(d.get("llm_think_strong", c.llm_think_strong))
+			if d.has("llm_think_mode"):
+				c.llm_think_mode = clampi(int(d.get("llm_think_mode", c.llm_think_mode)), 0, 2)
+			else:
+				c.llm_think_mode = 2 if bool(d.get("llm_think_strong", false)) else 0   # 旧键（bool）迁移
 			c.llm_auto_start = bool(d.get("llm_auto_start", c.llm_auto_start))
 			c.llm_exe = str(d.get("llm_exe", c.llm_exe))
 			c.llm_model_path = str(d.get("llm_model_path", c.llm_model_path))
@@ -134,10 +139,12 @@ func save() -> bool:
 	d["katago_model"] = d.get("katago_model", katago_model)
 	d["katago_config"] = d.get("katago_config", katago_config)
 	d["max_visits"] = max_visits
+	d["joseki_teach"] = joseki_teach
 	d["llm_base_url"] = llm_base_url
 	d["llm_model"] = llm_model
 	d["llm_api_key"] = llm_api_key
-	d["llm_think_strong"] = llm_think_strong
+	d["llm_think_mode"] = llm_think_mode
+	d.erase("llm_think_strong")                   # 旧 bool 键已被 llm_think_mode 取代，写回时清掉
 	d["llm_auto_start"] = llm_auto_start
 	d["llm_port"] = llm_port
 	d["llm_exe"] = d.get("llm_exe", llm_exe)

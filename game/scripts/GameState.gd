@@ -8,6 +8,7 @@ var board: GoBoard = GoBoard.new()
 var snapshots: Array = []        # 每个玩家手之前的完整状态，供俗手回档
 var bad_moves: Array = []        # 最近三次俗手
 var memory_log: Array = []       # 带标签的对局记忆：{tag, move_no, text}；E=Estarth(黑)的棋，A=Azure(白)的棋
+var joseki_log: Array = []       # 定式识别去重记录：{key, move_no}；随快照回滚（悔棋后可以重新讲解）
 var chat_history: Array = []
 var allow_pass := false          # 是否允许 Azure 虚着
 var pre_analysis = null          # {n, a} 落子前局面分析缓存
@@ -25,6 +26,7 @@ func make_snapshot() -> Dictionary:
 		"moves": moves.duplicate(true),
 		"move_seq": move_seq.duplicate(),
 		"memory_log": memory_log.duplicate(true),
+		"joseki_log": joseki_log.duplicate(true),
 	}
 
 ## 最近一手实际落子的交叉点（跳过 pass）
@@ -70,6 +72,7 @@ func reset() -> void:
 	snapshots = []
 	bad_moves = []
 	memory_log = []
+	joseki_log = []
 	chat_history = []
 	pre_analysis = null
 	after_analysis = null

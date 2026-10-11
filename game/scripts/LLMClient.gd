@@ -1,13 +1,25 @@
 class_name LLMClient
 extends Node
 ## 本地 LLM（OpenAI 兼容 /v1/chat/completions）调用
-## 与网页版一致：剥离思考段落；强思考只影响「她怎么想」，推理段永不显示给玩家
+## 与网页版一致：剥离思考段落；思考档位只影响「她怎么想」，推理段永不显示给玩家
+
+const REASON_BUDGET_MED := 160   # 中思考：推理段 token 预算（本地实测整条回复 ≈5 秒）
+const REASON_STOP_MSG := "思考到此为止，请立即用中文直接给出最终回答，不要再继续分析。"   # 预算用尽时注入：逼模型转入正式回答
 
 var base_url := "http://localhost:8080/v1"
 var model := "qwen3.5"
 var api_key := ""                # 云端 OpenAI 兼容服务：非空则发送 Authorization: Bearer <key>
 var timeout_sec := 120.0
-var think_strong := false        # 强思考：思考型模型先推理再给答案（更慢、质量更好）；默认关=快速模式
+var think_mode := 0              # 思考档位：0=快速（不思考） 1=中等（限定推理预算） 2=强思考（自由推理）
+
+# 对局中看护本地服务：偶发 GPU 故障会把 llama-server 中途打死（实测跑了 6 分多钟后
+# ROCm 报 unspecified launch failure 直接退出）。持续不可达就回调重新拉起；
+# Main 侧把 relaunch_cb 接到 _ensure_llm_url（启动器自带重试与并发去重，可放心重复调用）
+var relaunch_cb: Callable = Callable()
+
+const WATCH_INTERVAL := 15.0     # 看护轮询间隔（秒）
+const WATCH_TRIGGER := 3         # 连续 3 次（≈45 秒）不可达才触发重新拉起
+const WATCH_COOLDOWN_MS := 120000  # 触发后 2 分钟内不重复触发（留给启动器自愈的时间）
 
 var _http: HTTPRequest = null
 var _think_re: RegEx = null
@@ -26,11 +38,18 @@ func _ready() -> void:
 	_think_re.compile("(?s)" + _tag_open + ".*?" + _tag_close)
 	_url_re = RegEx.new()
 	_url_re.compile("^(https?)://([^:/]+)(?::(\\d+))?")
+	var watch := Timer.new()
+	watch.wait_time = WATCH_INTERVAL
+	watch.autostart = true
+	watch.timeout.connect(_watch_tick)
+	add_child(watch)
 
 var _base_ready := false
 var _inflight := false           # 串行化排队：闲置搭话等新调用等待前一个完成，而不是并发撞 Busy
 var _dns_cache: Dictionary = {}  # host → 解析结果：云端服务省掉每次请求的 DNS 解析（TCP 预检仍保留，服务挂掉能快速失败）
-var _no_think_unsupported := false  # 服务端不认 chat_template_kwargs（云端 API 会 400）：探测一次后不再发送
+var _think_params_unsupported := false  # 服务端拒绝思考参数（云端 API 会 4xx）：探测一次后不再发送
+var _watch_fails := 0            # 看护：连续不可达次数
+var _watch_last_ms := -WATCH_COOLDOWN_MS
 
 ## 首次使用前把 localhost 规范为 IPv4 回环。
 ## Godot 在本机把 localhost 只解析到 IPv6 ::1，而本地 LLM 通常只监听 IPv4，
@@ -117,36 +136,52 @@ func chat(messages: Array, max_tokens := 300) -> String:
 		"max_tokens": max_tokens,
 		"temperature": 0.7,
 		"top_p": 0.9,
+		# 降复读（OpenAI 兼容参数，llama-server 原生支持）：
+		# 让她少用重复的口头禅和句式（实测她连「嗯~…就好」「轻轻应了一手」都复读），发言更像人
+		"frequency_penalty": 0.4,
+		"presence_penalty": 0.2,
 		"cache_prompt": true,          # 复用上轮 KV 前缀（人设+对局状态不变）：本地点评首字更快
 	}
-	# 思考型模型（Qwen3 系）默认把 max_tokens 全耗在推理段落上：本地实测同一句点评
-	# 思考开 10.5s / 关 1.0s。陪练对话都是短互动，默认关思考（快速模式）；
-	# 启动设置可选「强思考」：发 enable_thinking=true 并加预算，让答案不被推理段挤掉。
-	# 云端 API 不认这个参数（400）时自动去掉并记住，之后不再发送。
-	var no_think := not _no_think_unsupported
-	if no_think:
-		body["chat_template_kwargs"] = {"enable_thinking": think_strong}
-	if think_strong:
+	# 思考档位（本地 Qwen3 系实测：同一句点评 0≈1 秒 / 1≈5 秒 / 2≈10 秒起步）：
+	# - 1 中等：给推理段限 token 预算，并在预算用尽处注入收尾提示，让模型转入正式回答；
+	# - 2 强思考：推理不设限，max_tokens 加预算，答案不被推理段挤掉；
+	# 云端 API 拒绝这些参数（4xx）时自动去掉并记住，之后不再发送。
+	var with_think := not _think_params_unsupported
+	if with_think:
+		body["chat_template_kwargs"] = {"enable_thinking": think_mode > 0}
+		if think_mode == 1:
+			body["reasoning_budget_tokens"] = REASON_BUDGET_MED
+			body["reasoning_budget_message"] = REASON_STOP_MSG
+	if think_mode == 2:
 		body["max_tokens"] = max_tokens + 800
+	elif think_mode == 1:
+		body["max_tokens"] = max_tokens + REASON_BUDGET_MED
 	var r := await _post(body)
-	if r.has("_error") and no_think:
-		_no_think_unsupported = true
-		print("[LLM] 服务端不支持 enable_thinking 参数（多为云端 API），本次去掉重试")
+	var err_txt := str(r.get("_error", ""))
+	if err_txt != "" and with_think and (err_txt.begins_with("HTTP 400") or err_txt.begins_with("HTTP 422")):
+		# 只有服务端「明确拒绝参数」（400/422）才去掉重试；连接失败等不许乱扣帽子，否则一次断连就永久丢档
+		_think_params_unsupported = true
+		print("[LLM] 服务端不支持思考参数（多为云端 API），本次去掉重试")
 		body.erase("chat_template_kwargs")
+		body.erase("reasoning_budget_tokens")
+		body.erase("reasoning_budget_message")
 		r = await _post(body)
+		with_think = false
 	if r.has("_error"):
 		return "调用出错：" + str(r["_error"])
 	var content := _content_of(r)
-	if content == "" and no_think and not think_strong:
+	if content == "" and with_think and think_mode == 0:
 		# 关思考仍为空（罕见）：退回默认模式再试一次
 		body.erase("chat_template_kwargs")
 		r = await _post(body)
 		if not r.has("_error"):
 			content = _content_of(r)
-	if content == "" and no_think and think_strong:
-		# 强思考把预算全耗在推理段上、正文还没开口（content 为空）：
+	if content == "" and with_think and think_mode > 0:
+		# 推理段把预算全耗光、正文还没开口（强思考偶发）：
 		# 改用快速模式立刻再要一次正式回答——绝不把原始推理段显示给玩家
 		body["chat_template_kwargs"] = {"enable_thinking": false}
+		body.erase("reasoning_budget_tokens")
+		body.erase("reasoning_budget_message")
 		body["max_tokens"] = max_tokens
 		r = await _post(body)
 		if not r.has("_error"):
@@ -181,6 +216,8 @@ func _post_locked(body: Dictionary) -> Dictionary:
 		return {"_error": "HTTP 客户端未就绪"}
 	await _ensure_base()
 	if not await _reachable():
+		if _local_target():
+			return {"_error": "本地 LLM 服务暂未就绪（%s 正在加载或自动重试，最长几分钟），稍等再试" % base_url}
 		return {"_error": "无法连接 LLM（%s），请确认服务已启动" % base_url}
 	var headers := _headers()
 	var err := _http.request(_endpoint(), headers, HTTPClient.METHOD_POST, JSON.stringify(body))
@@ -189,19 +226,56 @@ func _post_locked(body: Dictionary) -> Dictionary:
 	var res: Array = await _http.request_completed
 	var code := int(res[1])
 	var text := (res[3] as PackedByteArray).get_string_from_utf8()
+	if code == 0:
+		# TCP 连上了但请求中断：服务多半刚崩溃/重启（不是「不支持参数」，别误判成 4xx）
+		return {"_error": "LLM 连接被中断（%s），可能服务刚重启，稍等再试" % base_url}
 	if code != 200:
 		push_warning("[LLM] HTTP %d: %s" % [code, text.substr(0, 300)])
+		if code == 503:
+			# llama-server 加载模型期间对一切请求回 503：这是「还在加载」不是出错，
+			# 别对玩家显示「检查模型名」这种吓人的话（首屏 503 全走这里）
+			if _local_target():
+				return {"_error": "本地 LLM 正在加载模型（十几秒到半分钟），稍等一小会儿再和我说话吧"}
+			return {"_error": "服务端暂时不可用（HTTP 503），稍后再试"}
 		return {"_error": "HTTP %d（检查模型名是否为 %s）" % [code, model]}
 	var parsed = JSON.parse_string(text)
 	if typeof(parsed) != TYPE_DICTIONARY:
 		return {"_error": "响应不是合法 JSON"}
 	return parsed
 
+## 服务地址是否指向本机（本地服务加载/重启期允许「稍等再试」的提示语）
+func _local_target() -> bool:
+	return base_url.contains("127.0.0.1") or base_url.contains("localhost") or base_url.contains("::1")
+
+## 看护本地服务：不可达时回调重新拉起（只对本机目标生效；未接回调则不做任何事）
+func _watch_tick() -> void:
+	if relaunch_cb.is_null():
+		return
+	await _ensure_base()
+	if not _local_target():
+		return
+	if await _reachable():
+		_watch_fails = 0
+		return
+	_watch_fails += 1
+	if _watch_fails < WATCH_TRIGGER:
+		return
+	var now := Time.get_ticks_msec()
+	if now - _watch_last_ms < WATCH_COOLDOWN_MS:
+		return
+	_watch_last_ms = now
+	_watch_fails = 0
+	print("[LLM] 本地服务已无响应，请求重新拉起…")
+	relaunch_cb.call()
+
 ## 启动时探测可用模型，便于用户核对模型名（用独立节点，避免占用聊天通道）
 func probe_models() -> void:
 	await _ensure_base()
 	if not await _reachable():
-		print("[LLM] 无法连接 %s（聊天功能将不可用），请确认本地 LLM 已启动" % base_url)
+		if _local_target():
+			print("[LLM] 本地服务 %s 暂未就绪（正在加载或自动重试，稍后会自行恢复，不影响下棋）" % base_url)
+		else:
+			print("[LLM] 无法连接 %s（聊天功能将不可用），请确认服务已启动" % base_url)
 		return
 	var probe := HTTPRequest.new()
 	probe.timeout = 5.0

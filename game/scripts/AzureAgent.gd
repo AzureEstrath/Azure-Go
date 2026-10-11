@@ -2,11 +2,12 @@ class_name AzureAgent
 extends Node
 ## 对局编排：玩家落子 → Azure 点评 → Azure 思考并落子（等价于网页版 /api/* 的全部逻辑）
 
-signal message(kind: String, text: String)          # kind: ai / user / system
+signal message(kind: String, text: String)          # kind: ai / ai_comment / ai_move / ai_idle / user / system
 signal state_changed(payload: Dictionary)
 signal info_changed(winrate: float, score: float)
 signal busy_changed(busy: bool)
 signal emotion(kind: String)                        # 表情反应：delight / pleased / puzzled / worried
+signal joseki_event(payload: Dictionary)            # 定式识别成功：棋盘高亮轨迹（kind/corner/points）
 
 var st := GameState.new()
 var katago: KataGoEngine = null
@@ -14,10 +15,14 @@ var llm: LLMClient = null
 
 var busy := false
 var limit_len := false          # 开启后追加「回复尽量短」要求：语音合成时间随字数下降（右侧栏可切）
+var joseki_teach := true        # 定式导学开关（右侧栏可切；关掉=识别与讲解全部跳过，行为零变化）
 var _reveal_pending := false    # 已落到内部棋谱但尚未显示：等她「落子宣告」的语音开始时再 reveal_move()
 
 ## 限制回复长度时追加的约束（在不动原人设的前提下，单独附在末尾）
 const LEN_NOTE := "\n\n【本次额外要求 · 优先遵守】\n- 点评 / 提示：只回 1 句，尽量 20 字以内\n- 普通聊天：最多 2 句，尽量 40 字以内\n- 不复述局面、不客套，直接说结论就好"
+
+## 「短回复」模式下，定式讲解用的替代约束：讲解要讲清要点，允许 2~3 句，不被一句式限制压扁
+const LEN_TEACH_NOTE := "\n\n【本次额外要求 · 优先遵守】\n- 这是定式讲解：把名称与要点讲清楚，2~3 句即可，别长篇大论\n- 不复述局面、不客套，直接开讲就好"
 
 func setup(engine: KataGoEngine, client: LLMClient) -> void:
 	katago = engine
@@ -59,6 +64,10 @@ func _update_katago_brief(analysis: Dictionary, num_moves: int) -> void:
 
 func _sys_msg() -> Dictionary:
 	return {"role": "system", "content": AzurePrompts._t(AzurePrompts.system_prompt()) + (LEN_NOTE if limit_len else "")}
+
+## 定式讲解用的系统消息（同一人设，只换长度约束）
+func _sys_teach_msg() -> Dictionary:
+	return {"role": "system", "content": AzurePrompts._t(AzurePrompts.system_prompt()) + (LEN_TEACH_NOTE if limit_len else "")}
 
 func _user_msg(content: String) -> Dictionary:
 	return {"role": "user", "content": content}
@@ -105,6 +114,10 @@ static func clean_reply(text: String) -> String:
 func _reply(messages: Array, max_tokens := 300) -> String:
 	return clean_reply(await llm.chat(messages, max_tokens))
 
+## LLM 调用失败的统一判据（与闲置/窥屏的兜底判据一致）
+static func _llm_failed(t: String) -> bool:
+	return t.strip_edges() == "" or t.begins_with("调用出错") or t.contains("脑子有点转不过来")
+
 ## 聊天内容的粗分类 → 表情（本地关键词判断，不额外打扰 LLM）
 static func chat_emotion(text: String) -> String:
 	var t := text.to_lower()
@@ -121,6 +134,50 @@ static func chat_emotion(text: String) -> String:
 		if t.contains(kw):
 			return "puzzled"
 	return "pleased"
+
+# ================= 定式导学 =================
+
+## 定式识别（纯本地、零引擎调用，每手一次）：识别则登记去重记录后返回结果；开关关/重复/未识别一律返回 {}
+func _joseki_check() -> Dictionary:
+	if not joseki_teach:
+		return {}
+	var r := JosekiRecognizer.scan(st.moves)
+	if r.is_empty():
+		return {}
+	var kind := str(r["kind"])
+	# 去重防刷屏：成型「每角每类一次」；偏离「每角一次、全局最多 2 次」（悔棋回滚后可重新识别）
+	var dedup := ("F:%s:%s" % [r["corner"], r["cat"]]) if kind == "formed" else ("D:%s" % r["corner"])
+	if _joseki_logged(dedup):
+		return {}
+	if kind == "deviated":
+		var dcount := 0
+		for e in st.joseki_log:
+			if str((e as Dictionary).get("key", "")).begins_with("D:"):
+				dcount += 1
+		if dcount >= 2:
+			return {}
+	st.joseki_log.append({"key": dedup, "move_no": st.moves.size()})
+	return r
+
+func _joseki_logged(key: String) -> bool:
+	for e in st.joseki_log:
+		if str((e as Dictionary).get("key", "")) == key:
+			return true
+	return false
+
+## 棋盘高亮轨迹（信号由 Main 接到 Board3D）：成型=按手顺点亮；偏离=只点「常规一手」那个位置
+func _joseki_emit(r: Dictionary) -> void:
+	if r.is_empty():
+		return
+	var pts: Array = r.get("points", [])
+	if str(r["kind"]) == "deviated":
+		var ex: Vector2i = r.get("expect", Vector2i(-1, -1))
+		if ex.x < 0:
+			return
+		pts = [ex]
+	if pts.is_empty():
+		return
+	joseki_event.emit({"kind": str(r["kind"]), "corner": str(r["corner"]), "points": pts})
 
 # ================= 玩家落子 =================
 
@@ -186,8 +243,13 @@ func player_move(x: int, y: int) -> void:
 		st.record_bad_move(turn_index, gtp, reason)
 	state_changed.emit(st.payload())
 
-	# ④′ 表情反应：好手欣喜、一般平和、俗手先惊讶再失落（表情由界面接到化身上播放）
-	if player_rank == 0:
+	# ④″ 定式识别（纯本地计算、零引擎调用）：成型→高亮轨迹；偏离→轻提示（只对玩家开口）
+	var jk := _joseki_check()
+	if not jk.is_empty():
+		_joseki_emit(jk)
+
+	# ④′ 表情反应：定式成型/好手欣喜、一般平和、俗手先惊讶再失落（表情由界面接到化身上播放）
+	if str(jk.get("kind", "")) == "formed" or player_rank == 0:
 		emotion.emit("delight")
 	elif player_rank < 0 or drop > 0.10:
 		emotion.emit("worried")
@@ -196,32 +258,44 @@ func player_move(x: int, y: int) -> void:
 	else:
 		emotion.emit("puzzled")
 
-	# ⑤ Azure 点评这一手
+	# ⑤ Azure 点评这一手（定式成型时，这一条点评直接换成讲解——不额外增加 LLM 调用）
 	var eval_prompt := ""
-	if player_rank == 0:
-		eval_prompt = "Estarth下了 %s，这是我算的最优手！胜率%s。轻描淡写夸一下，1-2句。" % [gtp, _pct(winrate_before)]
-	elif player_rank > 0 and player_rank < 3:
-		eval_prompt = "Estarth下了 %s，Top%d，胜率%s。肯定一下，1-2句。" % [gtp, player_rank + 1, _pct(winrate_before)]
-	elif player_rank >= 0:
-		eval_prompt = "Estarth下了 %s，不在前5。委婉指出，给点鼓励，1-2句。" % gtp
+	var eval_sys := _sys_msg()
+	if str(jk.get("kind", "")) == "formed":
+		eval_prompt = AzurePrompts.joseki_teach_prompt(str(jk["name"]), str(jk["key"]), str(jk["corner"]))
+		eval_sys = _sys_teach_msg()
 	else:
-		eval_prompt = "Estarth下了 %s，没进我算的前5。慵懒表示不太理解，1-2句。" % gtp
-	eval_prompt += " 用你自己的口吻（「你这手…」「我觉得…」）评，1句就好，别像解说员那样说「黑方/白棋」；先结合【当前棋面】确认这手落在哪、周围有没有子再说；不要提你自己接下来打算下哪里，不要复述胜率数值。"
-	# 防复读：上一手点评的原话拿出来明确避开（不然容易连着几手都说「挺稳的，没什么大问题」）
-	var prev_eval := ""
-	for i in range(st.memory_log.size() - 1, -1, -1):
-		if str((st.memory_log[i] as Dictionary).get("tag", "")) == "E":
-			prev_eval = str((st.memory_log[i] as Dictionary).get("text", ""))
-			break
-	if prev_eval != "":
-		var angles := ["这手的方向/意图", "厚薄与轻重", "形状好不好", "和附近棋子的呼应", "对以后势力的影响", "和刚才几手的联系"]
-		eval_prompt += " 你上一手点评的原话是「%s」：这次不要复用里面出现过的形容词和句式，也别用同样的夸奖方式；从%s这个角度换个说法，还是一句话。" % [prev_eval, angles[randi() % angles.size()]]
+		if player_rank == 0:
+			eval_prompt = "Estarth下了 %s，这是我算的最优手！胜率%s。轻描淡写夸一下，1-2句。" % [gtp, _pct(winrate_before)]
+		elif player_rank > 0 and player_rank < 3:
+			eval_prompt = "Estarth下了 %s，Top%d，胜率%s。肯定一下，1-2句。" % [gtp, player_rank + 1, _pct(winrate_before)]
+		elif player_rank >= 0:
+			eval_prompt = "Estarth下了 %s，不在前5。委婉指出，给点鼓励，1-2句。" % gtp
+		else:
+			eval_prompt = "Estarth下了 %s，没进我算的前5。慵懒表示不太理解，1-2句。" % gtp
+		eval_prompt += " 用你自己的口吻评，1句就好，别像解说员那样说「黑方/白棋」；先结合【当前棋面】确认这手落在哪、周围有没有子再说；不要提你自己接下来打算下哪里，不要复述胜率数值；开头和收尾都换一种新的说法，别复读你最近用过的口头禅。"
+		# 防复读：上一手点评的原话拿出来明确避开（不然容易连着几手都说「挺稳的，没什么大问题」）
+		var prev_eval := ""
+		for i in range(st.memory_log.size() - 1, -1, -1):
+			if str((st.memory_log[i] as Dictionary).get("tag", "")) == "E":
+				prev_eval = str((st.memory_log[i] as Dictionary).get("text", ""))
+				break
+		if prev_eval != "":
+			var angles := ["这手的方向/意图", "厚薄与轻重", "形状好不好", "和附近棋子的呼应", "对以后势力的影响", "和刚才几手的联系"]
+			eval_prompt += " 你上一手点评的原话是「%s」：这次不要复用里面出现过的形容词和句式，也别用同样的夸奖方式；从%s这个角度换个说法，还是一句话。" % [prev_eval, angles[randi() % angles.size()]]
+		# 定式偏离：在常规点评后轻轻提一句常规形状（点到即止、不提胜率）
+		if str(jk.get("kind", "")) == "deviated":
+			var want: Vector2i = jk.get("expect", Vector2i(-1, -1))
+			if want.x >= 0:
+				eval_prompt += " " + AzurePrompts.joseki_hint_clause(str(jk["name"]), Coords.xy_to_gtp(want.x, want.y))
 	var player_eval: String = await _reply([
-		_sys_msg(),
+		eval_sys,
 		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, eval_prompt, "after_player", false, st.last_katago)),
 	], 300)
+	if str(jk.get("kind", "")) == "formed" and _llm_failed(player_eval):
+		player_eval = AzurePrompts.joseki_fallback(str(jk["name"]), str(jk["key"]))     # LLM 不可用时的本地兜底
 	st.log_memory("E", player_eval, st.moves.size())      # 给「Estarth 这手」的分析打标签存档
-	message.emit("ai", player_eval)
+	message.emit("ai_comment", player_eval)               # ai_comment：重要点评，Main 导演层据此加犹豫节拍
 
 	# ⑥ Azure 思考并落子（把刚才那手点评一并传给她，避免落子后重复/自相矛盾）
 	await _ai_turn(after_infos, after_black_wr, after_black_score, player_eval)
@@ -235,7 +309,7 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float, pla
 
 	# 用意：落子前说明「我准备下在哪、想做什么」（此时棋谱里还没有她这一手，上下文才不会自相矛盾）
 	var think_hint := "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
-	var think_prompt := "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过Estarth那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。" % think_hint
+	var think_prompt := "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过Estarth那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。换一个全新的说法，别总用「嗯~」「唔」开头，句式也别和刚才那条点评一样。" % think_hint
 	await get_tree().create_timer(0.35).timeout
 	var think_msg: String = await _reply([
 		_sys_msg(),
@@ -254,6 +328,9 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float, pla
 	if ai_gtp == "pass":
 		message.emit("ai", "（Azure本手选择了虚着）")
 
+	# 定式识别（她这一手之后，纯本地计算）：成型→本回合「局势」换成一句点题短话
+	var jk2 := _joseki_check()
+
 	# ⑦ 先算「Azure 落子后局面」（轮到黑方）→ 供信息栏与下面「局势」的上下文使用
 	var post := await katago.analyze(st.moves)
 	var wr := fallback_wr
@@ -270,16 +347,22 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float, pla
 	# 局势：一句话说清当前形势（谁占优、关键处），不复述前文（上下文里的 KataGo 形势已是最新）
 	# 本级消息最容易变成「把点评和用意再讲一遍」的复读机：把本回合已说的两句原样喂回去，明确禁止重复
 	var ai_eval_prompt := ""
-	if ai_gtp == "pass":
-		ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。" % [player_eval, think_msg]
+	if str(jk2.get("kind", "")) == "formed":
+		# 她自己走出定式：这一条换成一句点题短话（不展开成讲解，也不额外增加 LLM 调用）
+		ai_eval_prompt = AzurePrompts.joseki_short_prompt(str(jk2["name"]), str(jk2["key"]), ai_gtp)
+	elif ai_gtp == "pass":
+		ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。注意：上面引号里是你自己刚说过的话——一个字都不要照抄，开头词也要换新的。" % [player_eval, think_msg]
 	else:
-		ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。" % [ai_gtp, player_eval, think_msg]
+		ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。注意：上面引号里是你自己刚说过的话——一个字都不要照抄，开头词也要换新的。" % [ai_gtp, player_eval, think_msg]
 	var ai_eval: String = await _reply([
 		_sys_msg(),
 		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, ai_eval_prompt, "just_moved", false, st.last_katago)),
 	], 120)
+	if str(jk2.get("kind", "")) == "formed" and _llm_failed(ai_eval):
+		ai_eval = AzurePrompts.joseki_fallback(str(jk2["name"]), str(jk2["key"]))
 	st.log_memory("A", ai_eval, st.moves.size())          # 给「Azure 自己这手」的局势记录打标签存档
-	message.emit("ai", ai_eval)
+	message.emit("ai_comment", ai_eval)                   # ai_comment：重要点评，Main 导演层据此加犹豫节拍
+	_joseki_emit(jk2)                                     # 高亮轨迹：她的子已随「落子宣告」语音显示，此时亮起
 	# 不在这里 emit state_changed：落子的可见更新由 reveal_move() 在她这段语音开始时触发
 
 ## 按引擎候选顺序取第一个在当前棋盘合法的点；不允许虚着时绝不虚着
@@ -336,13 +419,13 @@ func hint() -> void:
 	for m in (analysis.get("moveInfos", []) as Array).slice(0, 3):
 		tops.append(str((m as Dictionary).get("move", "")))
 	_update_katago_brief(analysis, n)
-	var prompt := "当前局面：%s。我算到的好点：%s。Estarth还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）。" % [
+	var prompt := "当前局面：%s。我算到的好点：%s。Estarth还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）；换个说法开场，别重复你上一次提示的句式和口头禅。" % [
 		AzurePrompts.board_summary(st.move_seq), _py_list(tops)]
 	var msg: String = await _reply([
 		_sys_msg(),
 		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, prompt, "observe", false, st.last_katago)),
 	], 300)
-	message.emit("ai", msg)
+	message.emit("ai_comment", msg)                       # ai_comment：重要点评，Main 导演层据此加犹豫节拍
 	_set_busy(false)
 
 ## 局面分析：以 Azure（执白）的视角解读局势
@@ -498,6 +581,7 @@ func undo(turn_index: int) -> void:
 	st.moves = s["moves"]
 	st.move_seq = s["move_seq"]
 	st.memory_log = s["memory_log"]
+	st.joseki_log = s["joseki_log"]        # 定式去重记录随快照回滚：悔棋重走那手可以重新讲解
 	st.snapshots = st.snapshots.slice(0, turn_index)
 	var kept: Array = []
 	for b in st.bad_moves:

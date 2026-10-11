@@ -286,6 +286,55 @@ func _make_stone(x: int, y: int, color: String, last: bool) -> void:
 func is_occupied(x: int, y: int) -> bool:
 	return _occupied.has(Vector2i(x, y))
 
+# ================= 定式高亮轨迹 =================
+
+var _joseki_root: Node3D = null
+var _joseki_marks: Array = []        # 淡出中的标记节点（Sprite3D / Label3D）
+var _joseki_t := 0.0
+
+## 定式高亮：formed=按手顺点亮编号光点；deviated=单点浅提示 几秒后自动淡出；新一轮会清掉上一轮
+func highlight_points(points: Array, kind := "formed") -> void:
+	_clear_joseki()
+	_joseki_root = Node3D.new()
+	add_child(_joseki_root)
+	var idx := 0
+	for p in points:
+		if typeof(p) != TYPE_VECTOR2I:
+			continue
+		var px: Vector2i = p
+		idx += 1
+		var dot := Sprite3D.new()
+		dot.texture = _dot_tex
+		dot.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		dot.pixel_size = 0.0064
+		dot.modulate = Color(0.32, 0.94, 0.92, 0.0) if kind == "formed" else Color(0.95, 0.78, 0.32, 0.0)
+		dot.position = _world(px.x, px.y, STONE_H + 0.42)
+		_joseki_root.add_child(dot)
+		_joseki_marks.append(dot)
+		if kind == "formed" and points.size() > 1:
+			var lb := Label3D.new()
+			lb.text = str(idx)
+			if _font != null:
+				lb.font = _font
+			lb.font_size = 64
+			lb.outline_size = 16
+			lb.pixel_size = 0.0026
+			lb.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+			lb.no_depth_test = true
+			lb.modulate = Color(0.88, 1.0, 1.0, 0.0)
+			lb.outline_modulate = Color(0.03, 0.22, 0.26, 0.9)
+			lb.position = _world(px.x, px.y, STONE_H + 1.25)
+			_joseki_root.add_child(lb)
+			_joseki_marks.append(lb)
+	_joseki_t = 0.0
+
+func _clear_joseki() -> void:
+	if _joseki_root != null and is_instance_valid(_joseki_root):
+		_joseki_root.queue_free()
+	_joseki_root = null
+	_joseki_marks = []
+	_joseki_t = 0.0
+
 # ================= 化身视线目标 =================
 
 func _process(delta: float) -> void:
@@ -293,6 +342,19 @@ func _process(delta: float) -> void:
 		_rotate_hold -= delta
 	if _look_until > 0.0:
 		_look_until -= delta
+	# 定式高亮：快速淡入 → 停留 → 整体淡出
+	if not _joseki_marks.is_empty():
+		_joseki_t += delta
+		var ja := 1.0
+		if _joseki_t < 0.25:
+			ja = _joseki_t / 0.25
+		elif _joseki_t > 3.4:
+			ja = clampf(1.0 - (_joseki_t - 3.4) / 1.1, 0.0, 1.0)
+		for m in _joseki_marks:
+			if is_instance_valid(m):
+				(m as Node3D).modulate.a = ja
+		if ja <= 0.0:
+			_clear_joseki()
 	# 摸头判定：摸头模式内滑动累计达标或按住到时间即触发
 	if _pat_active and not _pat_fired:
 		var held := Time.get_ticks_msec() - _pat_down_ms

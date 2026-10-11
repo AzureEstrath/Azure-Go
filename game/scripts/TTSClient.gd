@@ -8,13 +8,17 @@ signal status(text: String)
 signal auto_fallback(kind: String)     # 本地服务连不上时临时降级（不写配置）
 signal speaking_changed(on: bool)      # 开始/结束朗读（化身说话时歪头用）
 signal utterance_started(group: int)   # 一条消息的音频开始播放（group=speak() 的分组号；0=试听）
+signal speech_skipped(group: int)      # 跳过朗读（服务加载中）：文字照常显示，只是没有声音
 
 const QUEUE_MAX := 3
+const LOADING_HOLD_MAX := 6             # 语音服务加载期间最多暂存多少条待读消息（超出丢最旧的并放行其文字）
 const FAIL_COOLDOWN := 6.0
 const MAX_CHARS := 300
+const FILLER_FORCE_GAP_MS := 4000      # 任意两个语气词之间的最小间隔（force 也不能贴脸连播，防多路叠着响）
+const FILLER_THINK_GAP_MS := 1500      # 上一声是「思考声」时：情绪声可以更快接上（情绪优先）
 const FILLER_DIR := "res://assets/voice"   # 预制情绪语气词：填补合成等待的空白
 const FILLER_COOLDOWN_MS := 9000           # 自动插话的最小间隔（避免一直「嗯……」）
-const THINK_FILLER_PER_TURN := 2           # 每次玩家互动后 think 语气词上限（「嗯~」「让我看看」各至多一次）
+const THINK_FILLER_PER_TURN := 1           # 每次玩家互动后 think 语气词上限（一回合最多「嗯……」一次，别反复）
 var slow_chunk_chars := 100          # 慢引擎单次请求的字数上限（右侧栏「长句合并」开关：关=100/开=160）
 const HTTP_TIMEOUT_FAST := 60.0      # 轻量引擎（melo）/ 系统语音：很快就回
 const HTTP_TIMEOUT_SLOW := 240.0     # CosyVoice 系列 CPU 很慢：给足时间，别像以前那样 60 秒就被丢弃
@@ -49,20 +53,24 @@ var _cooldown := 0.0
 var _base_ready := false
 var _next_stream: AudioStream = null   # 边播边合成的下一句（预取），消除句间空白/卡住
 var _queue: Array[Dictionary] = []     # 朗读队列：{text, group, start, kind}；group 保证「一条消息一次 utterance_started」
+var _loading_hold: Array[Dictionary] = []   # 服务加载期暂存的整条消息：就绪后按序补读（不再跳过朗读）
 var _group_seq := 0                    # 消息分组号（每次 speak() 自增）
 var _req_group := 0                    # 在途合成请求属于哪一组
 var _req_start := false                # 在途请求是否为该组的第一块
 var _req_kind := ""                    # 在途请求的类型（""=对局发言；"idle"=走神搭话，可被取消）
+var _req_text := ""                    # 在途请求的文本（连接失败时回队重试用，不再丢句）
 var _next_group := 0                   # 预取流所属分组
 var _next_start := false
 var _next_kind := ""                   # 预取流的类型
 var _play_kind := ""                   # 正在播放的声音类型
 var _drop_result := false              # 在途请求的结果已作废（取消走神搭话）：到达时直接丢弃
 var fast_voices := {}                  # 服务端标记为轻量的音色 id（sherpa/melo）：不需要按句拆分
+var service_loading := false           # Main 置位：本地语音服务正在加载模型（加载期不出声、也不降级系统语音）
 var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think / pat）
 var allow_fillers := true              # 是否允许自动插语气词：只在对局互动中允许，闲置搭话/开场问候不插（Main 控制）
 var _filler_player: AudioStreamPlayer = null
 var _filler_last_ms := 0               # 上次插语气词的时刻（冷却用）
+var _filler_last_kind := ""            # 上次语气词的类型（情绪声可优先接在「思考声」后、并可打断它）
 var _filler_last_idx := {}             # kind → 上次播的序号（避免同一句连着播）
 var think_filler_budget := 0           # 本回合剩余可自动插的 think 语气词次数（Main 在玩家互动时重置）
 
@@ -86,6 +94,10 @@ const FILLER_FILES := {
 	"puzzle": ["filler_puzzle_1.wav", "filler_puzzle_2.wav"],
 	"think": ["filler_think_1.wav", "filler_think_2.wav"],
 	"pat": ["filler_pat_1.wav", "filler_pat_2.wav", "filler_pat_3.wav", "filler_pat_4.wav"],
+	"sigh": ["filler_sigh_1.wav", "filler_sigh_2.wav"],          # 叹气/可惜：唉……、哎呀
+	"cheer": ["filler_cheer_1.wav", "filler_cheer_2.wav"],       # 惊叹/赞叹：哇！、好哎~
+	"proud": ["filler_proud_1.wav", "filler_proud_2.wav"],       # 小得意/撒娇：哼哼~、诶嘿
+	"hmph": ["filler_hmph_1.wav", "filler_hmph_2.wav"],          # 生气/得意的哼：窥屏发言前专用
 }
 
 ## 载入预制语气词：res://assets/voice/ 下按清单加载
@@ -111,14 +123,24 @@ func play_filler(kind: String, force := false) -> void:
 		return
 	if not force and kind == "think" and think_filler_budget <= 0:
 		return                                       # 本回合的 think 语气词额度用完了（「让我看看…有一次就行」）
-	if _speaking or _next_stream != null or _filler_player.playing:
-		return
+	if _speaking or _next_stream != null:
+		return                                       # 她正在正式朗读：语气词一律让位
 	var now := Time.get_ticks_msec()
-	if not force and now - _filler_last_ms < FILLER_COOLDOWN_MS:
-		return
+	var can_cut_think := force and _filler_player.playing and _filler_last_kind == "think"
+	if _filler_player.playing and not can_cut_think:
+		return                                       # 已在插话中：别叠着响
+	if can_cut_think:
+		_filler_player.stop()                        # 情绪声优先：打断还在播的「嗯……」
+	else:
+		var gap := FILLER_FORCE_GAP_MS if force else FILLER_COOLDOWN_MS
+		if force and _filler_last_kind == "think":
+			gap = FILLER_THINK_GAP_MS                # 上一声是思考声：情绪声可以更快接上
+		if now - _filler_last_ms < gap:
+			return
 	if not force and kind == "think":
 		think_filler_budget -= 1
 	_filler_last_ms = now
+	_filler_last_kind = kind
 	var arr: Array = fillers[kind]
 	var idx := randi() % arr.size()
 	if arr.size() > 1 and int(_filler_last_idx.get(kind, -1)) == idx:
@@ -130,6 +152,18 @@ func play_filler(kind: String, force := false) -> void:
 ## 玩家发起一次互动（落子 / 提问 / 功能按钮）：重置本回合的 think 语气词额度
 func begin_filler_turn() -> void:
 	think_filler_budget = THINK_FILLER_PER_TURN
+
+## Main 在语音服务健康检查结束（就绪或超时）后调用：解除「加载中」闸门并立刻开始朗读
+func notify_service_ready() -> void:
+	service_loading = false
+	_cooldown = 0.0
+	# 加载期间排队的整条消息：现在按序补读（文字端仍按「同步说话」规则跟着语音开口才出现）
+	if not _loading_hold.is_empty():
+		var held := _loading_hold
+		_loading_hold = []
+		for it in held:
+			_enqueue(str(it["text"]), int(it["group"]), str(it.get("kind", "")))
+	_pump()
 
 ## 播放预制欢迎语音（assets/voice/welcome_<名字>.wav）：开场问候零等待，不必等引擎合成。
 ## 有对应文件才播并返回 true（调用方据此把文字直接显示）；否则返回 false，走普通语音流程。
@@ -232,31 +266,37 @@ func speak(text: String, kind := "") -> int:
 	var t := clean_for_speech(text)
 	if t == "":
 		return 0
-	# 慢引擎：把整段按「整句」合并成较大的块（短回复通常只有一块 → 一次请求连续读完）
-	var pieces: Array[String] = []
-	if _slow_engine():
-		pieces = _chunk_for_slow(t)
-	else:
-		pieces.append(t)
-	var cap := QUEUE_MAX if mode == "system" else (4 if _slow_engine() else 3)
-	if pieces.size() > cap:                          # 太长的消息只念前几句
-		pieces.resize(cap)
-	while _queue.size() > cap - pieces.size():       # 队列满了丢最旧的，保证不越说越滞后
-		_queue.pop_front()
+	if service_loading and mode != "system":
+		# 本地服务正在加载模型：本条先排队等它就绪再读（绝不降级系统语音——用户会突然听到 Windows 音色）。
+		# 这里不发 speech_skipped：调用方的文字会一直等到这条真正开口才显示（同步说话模式）
+		_group_seq += 1
+		var lg := _group_seq
+		_loading_hold.append({"text": t, "group": lg, "kind": kind})
+		while _loading_hold.size() > LOADING_HOLD_MAX:
+			var old: Dictionary = _loading_hold.pop_front()   # 排太久了：丢最旧的一条，放行它的文字
+			speech_skipped.emit.call_deferred(int(old["group"]))
+		status.emit("语音服务加载中：本条已排队，就绪后自动朗读")
+		return lg
 	_group_seq += 1
 	var g := _group_seq
-	for i in pieces.size():
-		# 同一条消息的所有分块共用一个 group；只有第一块标记 start=true
-		_queue.append({"text": pieces[i], "group": g, "start": i == 0, "kind": kind})
+	_enqueue(t, g, kind)
 	_pump()
 	return g
 
-## 是否还在忙（合成中/排队中/正在播放）。「同步说话」用它判断文字该等语音，还是直接显示
+## 是否还在忙（合成中/排队中/正在播放）。「同步说话」用它判断文字该等语音，还是直接显示。
+## 注意：加载期暂存的 _loading_hold 不算「在说」——棋盘锁与落子揭示不该被它拖住
 func is_speaking() -> bool:
 	return _speaking or _busy or _http_busy or _next_stream != null or not _queue.is_empty()
 
 func stop() -> void:
+	# 被停掉的消息只是没有声音，文字不能跟着消失：补发 speech_skipped 让调用方照常显示
+	for it in _queue:
+		if bool(it.get("start", false)):
+			speech_skipped.emit.call_deferred(int(it["group"]))
+	for it2 in _loading_hold:
+		speech_skipped.emit.call_deferred(int(it2["group"]))
 	_queue.clear()
+	_loading_hold.clear()
 	_next_stream = null
 	_next_kind = ""
 	if _player != null and _player.playing:
@@ -287,6 +327,13 @@ func cancel_kind(kind: String) -> bool:
 		else:
 			kept.append(it)
 	_queue = kept
+	var kept_hold: Array[Dictionary] = []
+	for it in _loading_hold:
+		if str(it.get("kind", "")) == kind:
+			hit = true                                # 还没轮到补读的走神搭话：直接丢掉（文字也不显示）
+		else:
+			kept_hold.append(it)
+	_loading_hold = kept_hold
 	if _next_stream != null and _next_kind == kind:   # 预取的那一段也属于被取消的消息
 		_next_stream = null
 		_next_kind = ""
@@ -390,8 +437,9 @@ func _chunk_for_slow(text: String) -> Array[String]:
 		out.append(text)
 	return out
 
-## 是否为慢速神经网络引擎（CosyVoice 克隆/预设；melo 与系统语音不算）
-func _slow_engine() -> bool:
+## 是否为慢速神经网络引擎（CosyVoice 克隆/预设；melo 与系统语音不算）。
+## 导演层也用它判断犹豫节拍时长：慢引擎缩短犹豫，避免雪上加霜。
+func is_slow_engine() -> bool:
 	if mode == "system":
 		return false
 	var v := voice.strip_edges().to_lower()
@@ -409,11 +457,39 @@ func _set_speaking(v: bool) -> void:
 	_speaking = v
 	speaking_changed.emit(v)
 
+## 分块并入朗读队列（speak 与加载期补读共用）。慢引擎按「整句」合并成较大的块；
+## 队列满了丢最旧的——丢的若是某条消息的首块，说明这条再也不会开口，补发 speech_skipped
+## 让它的文字照常显示，并把该消息剩余的分块一并清掉（避免无文字配半截语音）。
+func _enqueue(text: String, group: int, kind: String) -> void:
+	var pieces: Array[String] = []
+	if is_slow_engine():
+		pieces = _chunk_for_slow(text)
+	else:
+		pieces.append(text)
+	var cap := QUEUE_MAX if mode == "system" else (4 if is_slow_engine() else 3)
+	if pieces.size() > cap:                          # 太长的消息只念前几句
+		pieces.resize(cap)
+	while _queue.size() > cap - pieces.size():
+		var old: Dictionary = _queue.pop_front()
+		if bool(old.get("start", false)):
+			var g := int(old["group"])
+			var kept: Array[Dictionary] = []
+			for it in _queue:
+				if int(it.get("group", -1)) != g:
+					kept.append(it)
+			_queue = kept
+			speech_skipped.emit.call_deferred(g)
+	for i in pieces.size():
+		# 同一条消息的所有分块共用一个 group；只有第一块标记 start=true
+		_queue.append({"text": pieces[i], "group": group, "start": i == 0, "kind": kind})
+
 func _pump(force := false) -> void:
 	if _busy or _http_busy or _queue.is_empty():
 		return
 	if not force and (not enabled or _cooldown > 0.0):
 		return
+	if service_loading and mode != "system":
+		return                                   # 本地服务正在加载：本轮不请求（notify_service_ready 后恢复）
 	if mode == "system":
 		if _sapi_pid > 0 and OS.is_process_running(_sapi_pid):
 			return                               # 上一句还在读
@@ -423,12 +499,13 @@ func _pump(force := false) -> void:
 	if _next_stream != null:
 		return                                   # 已预取下一句：等它播完再合成，避免堆积
 	_ensure_base()
-	_http.timeout = HTTP_TIMEOUT_SLOW if _slow_engine() else HTTP_TIMEOUT_FAST
+	_http.timeout = HTTP_TIMEOUT_SLOW if is_slow_engine() else HTTP_TIMEOUT_FAST
 	var item: Dictionary = _queue.pop_front()
 	var text := str(item["text"])
 	_req_group = int(item["group"])
 	_req_start = bool(item["start"])
 	_req_kind = str(item.get("kind", ""))
+	_req_text = text                             # 记录在途文本：连接失败可回队重试，不再丢句
 	_busy = true
 	var headers: PackedStringArray
 	var payload := ""
@@ -451,7 +528,7 @@ func _pump(force := false) -> void:
 		_cooldown = FAIL_COOLDOWN
 		print("[TTS] 请求无法发出：%s  URL=%s" % [error_string(err), _last_url])
 		status.emit("TTS 请求发送失败（%s）：%s" % [error_string(err), _last_url])
-	elif _slow_engine():
+	elif is_slow_engine():
 		# 慢引擎（CosyVoice）：让用户知道在合成、大概要等多久，消除「文字出了但没声音」的割裂感
 		status.emit("Azure 正在开口…（本句合成中，约 %d 秒）" % int(ceil(text.length() * 1.2)))
 
@@ -530,13 +607,20 @@ func _on_done(result: int, code: int, _headers: PackedStringArray, body: PackedB
 		var conn_failed := result == HTTPRequest.RESULT_CANT_CONNECT or result == HTTPRequest.RESULT_CONNECTION_ERROR \
 			or result == HTTPRequest.RESULT_CANT_RESOLVE
 		if conn_failed and mode != "system":
-			# 本地服务没启动：临时改走系统语音，保证「有声音」，但不写回配置
-			_cooldown = 0.0
-			_prefer_mode = mode                       # 记住原引擎，服务就绪后自动切回
-			_recover_at = Time.get_ticks_msec() + 8000
-			mode = "system"
-			auto_fallback.emit("system")
-			_pump()
+			# 出队的这句先放回队首（原来会静默丢弃）
+			_queue.push_front({"text": _req_text, "group": _req_group, "start": _req_start, "kind": _req_kind})
+			if service_loading:
+				# 服务还在加载模型：绝不降级系统语音（否则会突然冒出 Windows 音色），等它就绪
+				status.emit("语音服务正在加载模型，本条等它就绪后再读")
+				_cooldown = 2.0
+			else:
+				# 本地服务没启动：临时改走系统语音，保证「有声音」，但不写回配置
+				_cooldown = 0.0
+				_prefer_mode = mode                       # 记住原引擎，服务就绪后自动切回
+				_recover_at = Time.get_ticks_msec() + 8000
+				mode = "system"
+				auto_fallback.emit("system")
+				_pump()
 			return
 		_cooldown = FAIL_COOLDOWN
 		_set_speaking(false)
