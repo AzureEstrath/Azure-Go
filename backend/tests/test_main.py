@@ -39,6 +39,15 @@ class RestTest(unittest.TestCase):
             self.assertFalse(body["busy"])
             self.assertEqual(body["state"]["move_count"], 2)   # 玩家一手 + 她一手
 
+    def test_move_bad_body_no_500(self):
+        """畸形/越界坐标不应打成 500，而是优雅返回 ok=false（C1）。"""
+        with _client() as client:
+            for body in ({"x": "abc", "y": 3}, {}, {"x": 99, "y": 3}, {"x": 3, "y": -5}):
+                r = client.post("/api/move", json=body)
+                self.assertEqual(r.status_code, 200)
+                self.assertFalse(r.json()["ok"])
+            self.assertEqual(client.get("/api/state").json()["move_count"], 0)
+
     def test_config_undo_reset(self):
         with _client() as client:
             self.assertTrue(client.post("/api/config", json={"allow_pass": True}).json()["ok"])
@@ -55,6 +64,7 @@ class WebSocketTest(unittest.TestCase):
                 self.assertEqual(hello["type"], "hello")
                 self.assertIn("state", hello)
                 self.assertIn("mood", hello)
+                self.assertIn("busy", hello)
 
     def test_events_pushed_to_subscriber(self):
         with _client() as client:

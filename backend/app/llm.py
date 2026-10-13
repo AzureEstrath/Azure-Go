@@ -223,6 +223,7 @@ class LLMClient:
         try:
             resp = await client.post(self._endpoint(), headers=self._headers(), json=body)
         except Exception as e:
+            print("[LLM] 连接中断：%s" % e)
             return {"_error": "LLM 连接被中断（%s），可能服务刚重启，稍等再试" % self.base_url}
         code = resp.status_code
         if code != 200:

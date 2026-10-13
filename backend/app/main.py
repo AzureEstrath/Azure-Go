@@ -32,10 +32,18 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from . import config as config_mod
-from . import events, prompts, services
+from . import coords, events, prompts, services
 from .agent import AzureAgent
 from .engine import KataGoEngine
 from .llm import LLMClient
+
+
+def _int(v, d=-1):
+    """把请求体字段安全转为 int；非法（缺省/非数字）时返回默认值，避免畸形请求打成 500。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return d
 
 
 def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
@@ -97,7 +105,11 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
         s = a()
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
-        await s.player_move(int(body.get("x", -1)), int(body.get("y", -1)))
+        x = _int(body.get("x"), -1)
+        y = _int(body.get("y"), -1)
+        if not (0 <= x < coords.SIZE and 0 <= y < coords.SIZE):
+            return {"ok": False, "busy": s.busy, "state": s.st.payload()}
+        await s.player_move(x, y)
         return ok()
 
     @app.post("/api/hint")
@@ -137,7 +149,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
         s = a()
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
-        s.undo(int(body.get("turn", -1)))
+        s.undo(_int(body.get("turn"), -1))
         return ok()
 
     @app.post("/api/reset")
@@ -193,14 +205,14 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
         s = a()
         q = s.bus.subscribe()
         try:
-            await sock.send_json(events.hello(s.st.payload(), s.mood_payload()))
+            await sock.send_json(events.hello(s.st.payload(), s.mood_payload(), s.busy))
             while True:
                 event = await q.get()
                 await sock.send_json(event)
         except WebSocketDisconnect:
             pass
-        except Exception:
-            pass
+        except Exception as e:
+            print("[WS] 连接异常：%s" % e)
         finally:
             s.bus.unsubscribe(q)
 

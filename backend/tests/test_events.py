@@ -36,10 +36,11 @@ class EventShapeTest(unittest.TestCase):
         self.assertEqual(j["points"], [(3, 3)])
 
     def test_hello(self):
-        h = events.hello({"move_count": 0}, {"region": 12})
+        h = events.hello({"move_count": 0}, {"region": 12}, True)
         self.assertEqual(h["type"], "hello")
         self.assertEqual(h["state"]["move_count"], 0)
         self.assertEqual(h["mood"]["region"], 12)
+        self.assertTrue(h["busy"])
 
 
 class RecordingBusTest(unittest.TestCase):

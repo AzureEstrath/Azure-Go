@@ -14,8 +14,8 @@ AzureAgent.gd 通过 6 个 signal 把结果推给界面；分离后改为「后�
 message.kind 取值与 AzureAgent 的 message.emit 完全一致：
     ai / ai_comment / ai_move / ai_idle / user / system
 
-``ai_move`` 额外带 ``move`` 字段（{x, y, gtp, pass}）：语音开始播放时客户端据此本地揭示棋子，
-不做 round-trip（与现有「落子宣告语音开始时才 reveal」一致）。
+``ai_move`` 额外带 ``move`` 字段（{x, y, gtp, pass}）；客户端在落子宣告语音开始时
+``POST /api/reveal`` 让后端把这一手推到棋盘（round-trip，与本地模式「语音开始才 reveal」语义一致）。
 """
 
 # —— message.kind ——
@@ -60,9 +60,9 @@ def joseki(payload):
     return e
 
 
-def hello(payload, mood_payload):
-    """WS 连接建立时的初始同步：棋盘状态 + 当前情绪，保证客户端首屏一致。"""
-    return {"type": "hello", "state": payload, "mood": mood_payload}
+def hello(payload, mood_payload, busy):
+    """WS 连接建立时的初始同步：棋盘状态 + 当前情绪 + 忙闲，保证客户端首屏一致。"""
+    return {"type": "hello", "state": payload, "mood": mood_payload, "busy": bool(busy)}
 
 
 class EventBus:

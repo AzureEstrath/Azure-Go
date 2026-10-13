@@ -23,6 +23,7 @@ signal net_status(text: String, bad: bool)
 
 const RECONNECT_MIN := 1.0
 const RECONNECT_MAX := 8.0
+const POST_TIMEOUT := 30.0   # REST 请求超时：后端卡住时也能回调释放节点，避免泄漏
 
 var base_url := "http://127.0.0.1:8000"
 
@@ -115,6 +116,8 @@ func _handle_packet(raw: String) -> void:
 		"hello":
 			state_changed.emit(_dict(d.get("state", {})))
 			mood_changed.emit(_dict(d.get("mood", {})))
+			busy = bool(d.get("busy", false))
+			busy_changed.emit(busy)
 		"message":
 			message.emit(str(d.get("kind", "ai")), str(d.get("text", "")))
 		"state":
@@ -200,6 +203,7 @@ func _flush_settings() -> void:
 
 func _post(path: String, body: Dictionary = {}) -> void:
 	var req := HTTPRequest.new()
+	req.timeout = POST_TIMEOUT        # 超时也会触发 request_completed → 回调里 queue_free
 	add_child(req)
 	req.request_completed.connect(func(_result, _code, _headers, _data): req.queue_free())
 	var err := req.request(_strip_slash(base_url) + path,
