@@ -14,10 +14,11 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 > **LLM 与 TTS 都走可自定义的 OpenAI 兼容 API**（可填云端服务并带 API Key），
 > **人设与提示词也能在 `config.json` 里直接改**。
 >
-> 当前版本 **v1.5.0**：**聊天防复读加强**——非相邻的完全重复句也会被抑制（最近 8 条窗口去重），
-> 不再出现隔一句话的原样复读；**方位描述纠错**——点评里的「上下左右」必须按坐标核对
-> （同列只说上下、同行才说左右，核对不上就换说法）；**代码整理**——scripts 按 core / ai / services / ui
-> 分类，注释与死代码清理。上一版 **v1.4.0**：定式导学、语气与导演层、思考三档、本地服务看护。
+> 当前版本 **v2.0.0**：**前后端分离（可选）**——新增 Python 后端（`backend\`，FastAPI，REST + WebSocket），
+> 对局编排与 KataGo / LLM 可移到后端进程，客户端只做渲染、语音与窥屏；默认仍是 **local 模式**
+> （全在客户端内），行为与旧版一致。**三维情感模型**——Azure 的情绪由「愉悦 × 好奇 × 唤醒」三维状态
+> 驱动，27 个情绪区域带滞回防抖，表情 / 音高 / 语气词随之变化。上一版 **v1.5.0**：聊天防复读加强、
+> 方位描述纠错、代码整理。
 
 ---
 
@@ -37,9 +38,11 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 │   │   ├─ services\        KataGoEngine.gd  KataGo 子进程封装（GTP）
 │   │   │                   LLMClient.gd     LLM（OpenAI 兼容）客户端，支持 API Key
 │   │   │                   TTSClient.gd     语音客户端，支持 system / openai / cosyvoice
-│   │   └─ core\            GoBoard.gd / GameState.gd / Coords.gd   棋盘与对局核心
-│   │                       JosekiData.gd / JosekiRecognizer.gd     定式库与识别（纯本地）
-│   │                       AzureConfig.gd  config.json 读写
+│   │   ├─ core\            GoBoard.gd / GameState.gd / Coords.gd   棋盘与对局核心
+│   │   │                   JosekiData.gd / JosekiRecognizer.gd     定式库与识别（纯本地）
+│   │   │                   AzureConfig.gd  config.json 读写
+│   │   │                   EmotionModel.gd  三维情感模型（愉悦×好奇×唤醒 → 27 区域）
+│   │   └─ net\             NetClient.gd  远程后端客户端（REST + WebSocket，前后端分离用）
 │   ├─ assets\voice\        预制语音：开场欢迎语 + 20 条语气词（即播零等待，与情绪/表情绑定）
 │   ├─ tests\               端到端与语音测试脚本
 │   ├─ config.json          全部参数模板（见第三节）
@@ -50,6 +53,11 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 │   ├─ start_tts_server*.bat 手动启动脚本
 │   ├─ voices.json          克隆音色的参考音频与文本
 │   └─ sherpa_voices.json   轻量音色清单（小雅 / 少女 / 女声）
+├─ backend\                 远程后端（前后端分离，可选；FastAPI + REST + WebSocket）
+│   ├─ app\                 对局编排 / KataGo·LLM 客户端 / 情感模型
+│   ├─ tests\               后端单元测试（含情感模型黄金样本）
+│   ├─ requirements.txt     后端依赖
+│   └─ run_server.bat       一键启动后端（监听 127.0.0.1:8000）
 └─ tools\build_pck.ps1      重建游戏 PCK（分享版只需替换 .pck）
 ```
 
@@ -152,7 +160,32 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）、本地 LLM / VLM �
 
 ---
 
-## 六、重建分享版
+## 六、远程后端（前后端分离，可选）
+
+游戏默认 `backend_mode = "local"`：KataGo 算棋、LLM 讲解、语音合成全在客户端进程内完成，
+**与旧版行为一致**。若想把「对局编排 + KataGo / LLM」挪到独立进程（例如多客户端共享一个后端、
+或在别的主机上跑后端），可切换到 **remote 模式**——本仓库附带可选的 **Python 后端**（`backend\`，FastAPI）。
+
+- **启动后端**：双击 `backend\run_server.bat`（或 `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`），
+  监听 `http://127.0.0.1:8000`。依赖 `fastapi` / `uvicorn` / `httpx`（见 `backend\requirements.txt`）。
+- **切换配置**：`config.json` 里
+  ```json
+  "backend_mode": "remote",
+  "backend_url": "http://127.0.0.1:8000"
+  ```
+  也可命令行临时指定：`AzureGoGodot.exe --backend=remote --backend-url=http://127.0.0.1:8000`。
+- **接口契约**：
+  - REST：`/api/move|hint|analyze|chat|summarize|undo|reset|config|reveal|interaction|idle|peer|mood/tick`，
+    以及 `GET /api/state`、`GET /health`。
+  - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki`。
+- **后端配置**：后端进程用环境变量 `AZURE_CONFIG` 指定 `config.json`；未设置时依次在
+  可执行目录 → 项目目录 → `..\game\config.json` 查找。
+- **注意**：remote 模式依赖后端进程与本机 Python 环境，**不随分享包分发**；
+  分享包默认仍是 local 模式，无需后端即可游玩。
+
+---
+
+## 七、重建分享版
 
 分享版的 `AzureGoGodot.exe` 只是 Godot 引擎本体，**游戏逻辑全在 `AzureGoGodot.pck`**。
 改完 `game\` 源码后：
@@ -165,7 +198,7 @@ powershell -ExecutionPolicy Bypass -File tools\build_pck.ps1
 
 ---
 
-## 七、许可
+## 八、许可
 
 本项目源码采用 **Apache License 2.0**（见 [LICENSE](LICENSE)）。
 `server\` 下的 CosyVoice 及其 `third_party\Matcha-TTS` 为各自上游项目，遵循其原始许可。
@@ -173,9 +206,13 @@ KataGo 引擎与权重遵循其上游许可。
 
 ---
 
-## 八、更新
+## 九、更新
 
-### v1.5.0（当前）
+### v2.0.0（当前）
+- **三维情感模型**：Azure 的情绪由「愉悦度 × 好奇度 × 唤醒度」三维状态驱动（各 0~1，分低/中/高三带 → 27 个情绪区域）；区域带滞回防抖、随时间向基线平缓回落。情绪经「落子 / 聊天 / 互动 / 闲置」等事件即时结算，表情（形变持续层 + 一次性强调）、语气词与语音音高随之变化，另有一次异步的 LLM「情绪变化」小调用做细腻微调（失败静默、绝不阻塞交互）。
+- **前后端分离（可选）**：新增 Python 后端 `backend\`（FastAPI，REST + WebSocket），可把对局编排与 KataGo / LLM 移到独立进程，客户端只做渲染、语音与窥屏；`config.json` 用 `backend_mode`（`local` / `remote`）与 `backend_url` 切换。**默认仍是 local**，全在客户端内，行为与旧版一致；分享包不随后端，玩家无需改动。
+
+### v1.5.0
 - **聊天防复读加强**：抑制「非相邻的原样复读」——此前只拦紧挨着的重复句，落子宣告（如「我在D16补一手」）夹在中间时，同一句点评仍会再冒一次；现在按最近 8 条窗口去重，隔一句话的一字不差复读也会被拦下（落子宣告本身不受影响）。
 - **方位描述纠错**：点评里的「左/右/上/下」必须先按坐标核对——字母是列（从左到右）、数字是行（从上到下）；两子同列只能说「上下」、同行才算「左右」，核对不上就别说方位词（如「你这两颗黑子一左一右」说成实际同列一上一下的错误不再出现）。
 - **代码整理**：`game\scripts\` 按职责重新分类为 `core` / `ai` / `services` / `ui` 四个子目录（引用与场景同步更新）；清理过期注释与只写不读的死变量，行为不变。

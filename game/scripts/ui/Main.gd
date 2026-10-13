@@ -14,7 +14,9 @@ signal setup_confirmed
 var cfg: AzureConfig
 var katago: KataGoEngine
 var llm: LLMClient
-var agent: AzureAgent
+## 对局编排入口：本地模式为 AzureAgent（同进程编排），remote 模式为 NetClient（后端服务进程）。
+## 两者的信号与方法面完全一致，故此处不写死类型（按 cfg.backend_mode 动态选择）。
+var agent
 var board: Board3D
 var ambience: Ambience
 var avatar: AzureAvatar
@@ -150,9 +152,16 @@ func _find_tts_dir() -> String:
 	return exe_dir.path_join("cosyvoice")
 
 ## 命令行覆盖：--llm=http://host:port/v1  --model=模型名  --key=云端API Key（均不写回配置）
+## 另有架构开关：--backend=local|remote 与 --backend-url=http://host:port
 func _apply_cli_overrides() -> void:
 	for a in OS.get_cmdline_user_args():
-		if a.begins_with("--llm="):
+		if a.begins_with("--backend-url="):
+			cfg.backend_url = a.substr("--backend-url=".length())
+			cfg.cli_locked["backend_url"] = true
+		elif a.begins_with("--backend="):
+			cfg.backend_mode = a.substr("--backend=".length())
+			cfg.cli_locked["backend_mode"] = true
+		elif a.begins_with("--llm="):
 			cfg.llm_base_url = a.substr("--llm=".length())
 			cfg.cli_locked["llm_base_url"] = true
 		elif a.begins_with("--model="):
@@ -1256,7 +1265,7 @@ func _clear_thinking_if_idle() -> void:
 
 ## 棋盘锁：Azure 思考中，或她还有话没播完（整段关闭时尤其要等她说完）
 func _refresh_lock() -> void:
-	var locked := (agent != null and agent.busy) or _speech_hold
+	var locked: bool = (agent != null and agent.busy) or _speech_hold
 	if board != null:
 		board.locked = locked
 	for b in _buttons:
@@ -1531,6 +1540,10 @@ func _is_local_url(url: String) -> bool:
 # ================= 服务与接线 =================
 
 func _build_services() -> void:
+	if cfg.backend_mode == "remote":
+		_build_services_remote()                  # 前后端分离：编排在后端服务进程
+		return
+	# —— 本地模式（默认）：编排在本进程，行为与旧版完全一致 ——
 	katago = KataGoEngine.new()
 	katago.max_visits = cfg.max_visits
 	add_child(katago)
@@ -1547,6 +1560,38 @@ func _build_services() -> void:
 	llm.relaunch_cb = _ensure_llm_url             # 对局中服务掉线（偶发 GPU 故障打死 llama-server）时自动重新拉起
 	add_child(llm)
 
+	_build_client_tts()                           # 语音/窥屏属客户端（渲染与交互在本进程）
+	_ensure_llm_url()                             # 本地模式：启动时一并拉起本地 LLM 服务（已有实例则跳过）
+
+	AzurePrompts.configure(cfg)                   # 注入 config.json 的自定义人设/称呼/阶段提示
+	agent = AzureAgent.new()
+	add_child(agent)
+	agent.setup(katago, llm)
+	agent.limit_len = cfg.tts_limit_len       # 右侧栏「短回复」开关
+	agent.joseki_teach = cfg.joseki_teach     # 右侧栏「定式导学」开关
+	_wire_agent()
+	llm.probe_models()
+	_warm_up_engine()                             # 后台预热 KataGo：把首次 OpenCL 调优放在开局前完成
+
+## 前后端分离（remote）：编排与 KataGo/LLM 都在后端服务进程；游戏只做渲染、语音与窥屏，
+## 通过 NetClient 以 REST（命令）+ WebSocket（事件）与后端通信。信号接线与本地模式共用。
+const NetClientScript := preload("res://scripts/net/NetClient.gd")
+
+func _build_services_remote() -> void:
+	_build_client_tts()                           # 语音/窥屏仍归客户端（本进程拉起）
+	AzurePrompts.configure(cfg)
+	agent = NetClientScript.new()
+	agent.base_url = cfg.backend_url
+	agent.net_status.connect(_on_net_status)
+	add_child(agent)                              # _ready 里发起 WS 连接（连上先收 hello 同步棋盘与情绪）
+	agent.setup()                                 # 占位：引擎/LLM 由后端持有
+	agent.limit_len = cfg.tts_limit_len           # 转发给后端（连上后自动补发）
+	agent.joseki_teach = cfg.joseki_teach
+	_wire_agent()
+	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
+
+## 客户端侧语音与窥屏（本地/远程模式共用；本机拉起语音服务、预热窥屏 VLM）
+func _build_client_tts() -> void:
 	tts = TTSClient.new()
 	tts.enabled = cfg.tts_enabled
 	tts.mode = cfg.tts_mode
@@ -1567,22 +1612,25 @@ func _build_services() -> void:
 	tts.speech_skipped.connect(_on_speech_skipped)   # 这条语音不会再响（被停/队列溢出）：文字兜底立即显示
 	_autostart_tts()                              # 需要时后台拉起本地语音服务（无窗口）
 	_ensure_vlm_url()                             # 后台预热窥屏 VLM 服务（GPU 常驻；本机没有则静默跳过）
-	_ensure_llm_url()                             # 启动时一并拉起本地 LLM 服务（已有实例则跳过）
 
-	AzurePrompts.configure(cfg)                   # 注入 config.json 的自定义人设/称呼/阶段提示
-	agent = AzureAgent.new()
-	add_child(agent)
-	agent.setup(katago, llm)
-	agent.limit_len = cfg.tts_limit_len       # 右侧栏「短回复」开关
-	agent.joseki_teach = cfg.joseki_teach     # 右侧栏「定式导学」开关
+## agent 的信号接线 + 情绪心跳（本地/远程模式共用：两者信号面完全一致）
+func _wire_agent() -> void:
 	agent.message.connect(_add_msg)
 	agent.state_changed.connect(_on_state_changed)
 	agent.info_changed.connect(_on_info_changed)
 	agent.busy_changed.connect(_on_busy_changed)
-	agent.emotion.connect(_on_emotion)
+	agent.mood_changed.connect(_on_mood_changed)
 	agent.joseki_event.connect(_on_joseki_event)
-	llm.probe_models()
-	_warm_up_engine()                             # 后台预热 KataGo：把首次 OpenCL 调优放在开局前完成
+	var mood_timer := Timer.new()                 # 三维情绪向基线回落的心跳：2 秒一次，区域没变时零开销
+	mood_timer.wait_time = 2.0
+	mood_timer.autostart = true
+	mood_timer.timeout.connect(func(): agent.tick_mood())
+	add_child(mood_timer)
+	agent.sync_mood(true)                         # 初始「平静」立即生效（表情/音高一次对齐）
+
+## 后端连接状态（仅 remote 模式）：连上/断开提示进状态栏
+func _on_net_status(text: String, bad: bool) -> void:
+	_set_status(text, bad)
 
 ## 预热 KataGo：首次运行需 OpenCL 调优（约 1~3 分钟），提前触发，避免玩家第一手时干等
 func _warm_up_engine() -> void:
@@ -1600,15 +1648,6 @@ func _on_tts_fallback(_kind: String) -> void:
 	_tts_status.text = "本地语音服务未启动，已临时改用系统语音"
 	_set_status("语音：本地服务未启动，已临时改用系统语音（配置里仍是你的选择）")
 
-## 情绪 → 预制语气词映射（没有对应语气词的情绪只做表情、不出声）
-const EMOTION_FILLER := {
-	"delight": "cheer",      # 惊叹/赞叹：哇！、好哎~
-	"laugh": "happy",
-	"puzzled": "puzzle",
-	"worried": "sigh",       # 叹气/可惜：唉……、哎呀
-	"sad": "sigh",
-}
-
 ## 语气词统一出口：同一情绪在 MOOD_KEEP_MS 内延续时只刷新计时、不再出声（治「一惊一乍、语气太多」）；
 ## 情绪变化或隔了很久才再次出现，才真正响一声。"" 是 no-op（平淡发言不代表情绪结束）。
 func _mood_sound(kind: String) -> void:
@@ -1622,10 +1661,18 @@ func _mood_sound(kind: String) -> void:
 	_mood_ms = now
 	tts.play_filler(kind, true)
 
-func _on_emotion(kind: String) -> void:
+## 三维情绪区域变化：持续表情 / 一次性强调表情 / 语气词 / TTS 音高微调
+func _on_mood_changed(p: Dictionary) -> void:
+	if tts != null:
+		tts.set_mood_pitch(float(p.get("pitch", 0.0)))
 	if avatar != null:
-		avatar.play_expression(kind)
-	_mood_sound(str(EMOTION_FILLER.get(kind, "")))  # 预制语气词即时补一句，填补后续合成的等待
+		avatar.set_mood(p.get("morphs", {}))
+		var burst := str(p.get("burst", ""))
+		if burst != "":
+			avatar.play_expression(burst)          # 一次性强调（叠加在持续层上，几秒后回落到区域表情）
+	var f := str(p.get("filler", ""))
+	if f != "":
+		_mood_sound(f)                             # 区域对应的预制语气词（同情绪延续时不出声）
 
 ## 定式识别成功：角部手顺高亮轨迹（几秒后自动淡出；纯显示，不影响棋局状态）
 func _on_joseki_event(payload: Dictionary) -> void:
@@ -1636,8 +1683,10 @@ func _on_joseki_event(payload: Dictionary) -> void:
 		return
 	board.highlight_points(pts, str(payload.get("kind", "formed")))
 
-## 左键点在 Azure 头部附近摸摸头：开心 + 微微脸红 + 一句轻快的语气词
+## 左键点在 Azure 头部附近摸摸头：开心 + 微微脸红 + 一句轻快的语气词（情绪模型同步静默加成）
 func _on_head_patted() -> void:
+	if agent != null:
+		agent.player_interaction("patted")     # 三维情绪：愉悦度/唤醒度上升（静默：不出区域语气词，避免和「pat」叠音）
 	if avatar != null:
 		avatar.play_expression("laugh")
 		avatar.set_blush(true)

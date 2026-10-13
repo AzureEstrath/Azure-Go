@@ -5,6 +5,9 @@
   "katago_model": "model.bin",
   "max_visits": 100,
 
+  "backend_mode": "local",
+  "backend_url": "http://127.0.0.1:8000",
+
   "llm_base_url": "http://localhost:8080/v1",
   "llm_model": "qwen3.5",
   "llm_api_key": "",

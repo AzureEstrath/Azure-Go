@@ -34,6 +34,7 @@ var api_key := ""            # 云端 OpenAI 兼容 TTS：非空则发送 Author
 var voice := "azure"
 var speed := 1.0
 var pitch := 1.0              # 播放层音调：直接改播放速率（会略带动语速）
+var mood_pitch := 0.0         # 情绪区域的瞬时音高偏移（叠加在 pitch 上、不写回配置；±0.1 以内）
 var volume := 1.0
 var enabled := false
 
@@ -152,6 +153,10 @@ func play_filler(kind: String, force := false) -> void:
 ## 玩家发起一次互动（落子 / 提问 / 功能按钮）：重置本回合的 think 语气词额度
 func begin_filler_turn() -> void:
 	think_filler_budget = THINK_FILLER_PER_TURN
+
+## 三维情绪区域 → 音高微调（由 Main 在 mood_changed 时下发；只影响本句听感，不改用户配置）
+func set_mood_pitch(p: float) -> void:
+	mood_pitch = clampf(p, -0.15, 0.15)
 
 ## Main 在语音服务健康检查结束（就绪或超时）后调用：解除「加载中」闸门并立刻开始朗读
 func notify_service_ready() -> void:
@@ -553,7 +558,7 @@ func _speak_system(text: String, group: int, start: bool, kind := "") -> void:
 		+ "$s.Rate=%d; $s.Volume=%d; " % [rate, vol]
 	if voice.strip_edges() != "":
 		script += "try { $s.SelectVoice('%s') } catch {}; " % voice.replace("'", "''")
-	var pitch_pct := int(round(clampf((pitch - 1.0) * 100.0, -30.0, 40.0)))
+	var pitch_pct := int(round(clampf((pitch + mood_pitch - 1.0) * 100.0, -30.0, 40.0)))
 	if pitch_pct == 0:
 		script += "$s.Speak('%s')" % s
 	else:
@@ -662,7 +667,7 @@ func _play_stream(stream: AudioStream, group: int, start: bool, kind := "") -> v
 		_filler_player.stop()            # 正式朗读开始：语气词让位
 	_player.stream = stream
 	_player.volume_db = linear_to_db(clampf(volume, 0.01, 2.0))
-	_player.pitch_scale = clampf(pitch, 0.5, 2.0)
+	_player.pitch_scale = clampf(pitch + mood_pitch, 0.5, 2.0)
 	_player.play()
 	_play_kind = kind
 	_set_speaking(true)

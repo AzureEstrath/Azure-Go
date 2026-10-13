@@ -12,7 +12,6 @@ var joseki_log: Array = []       # 定式识别去重记录：{key, move_no}；�
 var chat_history: Array = []
 var allow_pass := false          # 是否允许 Azure 虚着
 var pre_analysis = null          # {n, a} 落子前局面分析缓存
-var after_analysis = null        # {n, a} 玩家落子后局面分析缓存
 var last_katago := ""            # 最近一次 KataGo 形势的文字摘要（胜率/目差/实地估算），供 Azure 上下文使用
 var finished := false
 
@@ -75,6 +74,5 @@ func reset() -> void:
 	joseki_log = []
 	chat_history = []
 	pre_analysis = null
-	after_analysis = null
 	last_katago = ""
 	finished = false

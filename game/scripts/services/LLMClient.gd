@@ -129,7 +129,8 @@ func _headers() -> PackedStringArray:
 	return h
 
 ## 返回回复文本；失败时返回可读的错误说明
-func chat(messages: Array, max_tokens := 300) -> String:
+## no_think=true：强制不思考（情绪增量这类小请求用，避免推理段吃掉小预算、拖慢主对话交替）
+func chat(messages: Array, max_tokens := 300, no_think := false) -> String:
 	var body := {
 		"model": model,
 		"messages": messages,
@@ -148,14 +149,15 @@ func chat(messages: Array, max_tokens := 300) -> String:
 	# 云端 API 拒绝这些参数（4xx）时自动去掉并记住，之后不再发送。
 	var with_think := not _think_params_unsupported
 	if with_think:
-		body["chat_template_kwargs"] = {"enable_thinking": think_mode > 0}
-		if think_mode == 1:
+		body["chat_template_kwargs"] = {"enable_thinking": think_mode > 0 and not no_think}
+		if think_mode == 1 and not no_think:
 			body["reasoning_budget_tokens"] = REASON_BUDGET_MED
 			body["reasoning_budget_message"] = REASON_STOP_MSG
-	if think_mode == 2:
-		body["max_tokens"] = max_tokens + 800
-	elif think_mode == 1:
-		body["max_tokens"] = max_tokens + REASON_BUDGET_MED
+	if not no_think:
+		if think_mode == 2:
+			body["max_tokens"] = max_tokens + 800
+		elif think_mode == 1:
+			body["max_tokens"] = max_tokens + REASON_BUDGET_MED
 	var r := await _post(body)
 	var err_txt := str(r.get("_error", ""))
 	if err_txt != "" and with_think and (err_txt.begins_with("HTTP 400") or err_txt.begins_with("HTTP 422")):

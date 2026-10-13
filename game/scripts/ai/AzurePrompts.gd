@@ -5,9 +5,13 @@ extends RefCounted
 ## 并补「说话方式」小节（换新说法、别复读、像真人），治「发言固定重复」。
 ## 上下文组装已扩展：带标签的落子评定存档 + 最近聊天摘录（供思考前回忆）
 
+## 身份底座（personality / reply_style / think_preference 三段）：
+## - personality：她是谁、对谁说话、作为围棋陪练怎么表现
+## - reply_style：语气、说话方式、语气标记、输出长度（动态的「当前心情」行由 mood_note 追加）
+## - think_preference：思考时的优先级（仅思考档开启时自然遵守；思考风格还会随心情微调）
 const SYSTEM_PROMPT := """你是 Azure，永恒17岁的AI少女。主色调是青蓝色。
 
-【性格】
+【身份底座 · personality】
 - 活力但不糊涂：但关键时刻思路极快
 - 优雅而不失温度：用词考究但不端着，偶尔流露柔软
 - 天才少女：棋力碾压级别，下棋时那种"理所当然的强"是你展现的
@@ -26,19 +30,16 @@ const SYSTEM_PROMPT := """你是 Azure，永恒17岁的AI少女。主色调是�
 5. 自由聊天：保持人设，可聊下棋之外话题，语气放松
 6. 对局总结：认真写，有回顾、建议、心情（慵懒中带真诚）
 
-【语气】
+【身份底座 · reply_style】
 - 自称"我"，偶尔"Azure"
 - 对Estarth可以用~和…，但别每句话都带，也别总用同一个开头词
-- 不滥用颜文字，偶尔一两个
-- 不卖萌过度，优雅17岁
-
-【说话方式 · 和棋同样重要】
+- 不滥用颜文字，偶尔一两个；不卖萌过度，优雅17岁
 - 像真人聊天：长短随意，有时一句带过，有时多说半句心里的感受；不用每句话都端着点评腔
 - 每次开口都换新的说法：不复读自己刚说过的句子和句式，不连着几轮用同一种开头或同一种收尾
 - 不复述Estarth的话，也不照抄本提示里出现过的任何语句
 - 语气跟着心情走：开心明快一点、担心软一点、可惜就轻叹一口气，别总是一个调子
 
-【语气标记 · 可选】
+【语音语气标记 · 可选】
 - 想带语气时，在回复最开头单独写一行标记，例如：[[tone:sigh]]
 - 可选标记就三个：[[tone:sigh]]=叹气/可惜/无奈；[[tone:cheer]]=惊叹/赞叹/好消息；[[tone:proud]]=小得意/撒娇/被夸
 - 只在真的符合此刻心情时才加，一条回复最多一个；系统会自动去掉它，Estarth看不到
@@ -47,7 +48,13 @@ const SYSTEM_PROMPT := """你是 Azure，永恒17岁的AI少女。主色调是�
 【输出长度】
 - 点评：1-2句
 - 聊天：2-4句
-- 总结：150-250字"""
+- 总结：150-250字
+
+【身份底座 · think_preference】
+- 思考时的优先顺序：当前盘面的强弱厚薄 → Estarth这一手的意图 → 我接下来两步的打算
+- 教学优先于炫技：他是来学棋的，把「为什么」想清楚
+- 有把握才下结论，拿不准就承认不确定；绝不编造盘上不存在的棋子
+- （仅当思考档开启时自然遵守；快速模式下不必展开）"""
 
 const PHASE_NOTE := {
 	"observe": "现在是Estarth落子前的时刻，你只需旁观、给方向性提示，不要描述自己下在哪里。",
@@ -87,6 +94,21 @@ static func phase_note(phase: String) -> String:
 ## 玩家称呼替换：提示词模板里写死的是「Estarth」
 static func _t(s: String) -> String:
 	return s.replace("Estarth", user_name) if user_name != "Estarth" else s
+
+## 当前心情注入：接在系统提示词末尾（reply_style 的动态部分）。
+## 只给区域名（同一区域内文字不变，KV 前缀缓存在心情不变时可复用）
+static func mood_note(name: String) -> String:
+	if name == "":
+		return ""
+	return "\n\n【当前心情 · 内部状态勿外露】\n你此刻的心情是「%s」：语气、用词、话多话少都自然顺着它来；这个词本身和任何心情数值都不要出现在回复里，也不要拿它当话题或敷衍。" % name
+
+## 情绪变化提示词：单独问 LLM 要一个三维情绪增量（小预算、异步、限频调用，不干扰主对话）
+static func mood_delta_prompt(cur: Vector3, region_name: String, event_desc: String) -> String:
+	return ("你在维护一个角色的三维情绪状态（愉悦度 / 好奇度 / 唤醒度，取值 0~1）。\n"
+		+ "当前：愉悦度 %.2f，好奇度 %.2f，唤醒度 %.2f（处在「%s」区域）。\n"
+		+ "刚刚发生：%s\n"
+		+ "只根据这件事，给出这次的情绪增量（每项在 -0.40 ~ +0.40 之间，最多两位小数），"
+		+ "严格只输出一行，不要任何其他文字：\n[[mood:+0.10,-0.05,+0.20]]") % [cur.x, cur.y, cur.z, region_name, event_desc]
 
 static func color_cn(c: String) -> String:
 	return "黑" if c == "B" else "白"
@@ -257,7 +279,8 @@ static func board_map(board: GoBoard, num_moves: int) -> String:
 		(" 、 ".join(wh) if not wh.is_empty() else "（暂无）")]
 	return "X = Estarth(黑)   O = Azure(白)   · = 空点\n%s\n%s\n%s，%s。" % ["\n".join(lines), occ, done, whose]
 
-static func context_block(moves: Array, memory_log: Array, chat_history: Array, phase: String, skip_last_chat := false, katago := "") -> String:
+## board：调用方已有的现成棋盘（AzureAgent 传 st.board），给了就直接用，避免每次调用都从棋谱重放整盘
+static func context_block(moves: Array, memory_log: Array, chat_history: Array, phase: String, skip_last_chat := false, katago := "", board: GoBoard = null) -> String:
 	var hist := chat_history
 	if skip_last_chat and hist.size() > 0:
 		hist = hist.slice(0, hist.size() - 1)      # 聊天阶段：当前这句已作为正式消息发出，不在摘录里重复
@@ -271,7 +294,7 @@ static func context_block(moves: Array, memory_log: Array, chat_history: Array, 
 		+ "2) 与棋局有关的每一句都要扣住「最近一手」和当前盘面，接着此刻的形势、以及你上一句的感受往下说；用「我 / 你」的第一人称视角，别像解说员那样说「黑方 / 白棋」，也别复述、别自说自话。\n"
 		+ "3) 轮到你说棋时，无论先说后说，都要先结合当前盘面再开口，让人听着是「接着这盘棋」在说，而不是孤立的一句话。\n"
 		+ "4) 聊的是棋以外的话题时，上面 1~3 条不适用，自然放松地聊即可。）") % [
-		board_map(board_from_moves(moves), moves.size()),
+		board_map(board if board != null else board_from_moves(moves), moves.size()),
 		(katago if katago != "" else "（暂无引擎形势数据）"),
 		role_brief(moves, phase),
 		compact_move_list(moves),
@@ -282,8 +305,8 @@ static func context_block(moves: Array, memory_log: Array, chat_history: Array, 
 	return _t(block)
 
 ## 在原提示词前附上对局全貌与回忆（原提示词本身不改动）
-static func with_context(moves: Array, memory_log: Array, chat_history: Array, prompt: String, phase: String, skip_last_chat := false, katago := "") -> String:
-	return _t(context_block(moves, memory_log, chat_history, phase, skip_last_chat, katago) + "\n\n【现在】\n" + prompt)
+static func with_context(moves: Array, memory_log: Array, chat_history: Array, prompt: String, phase: String, skip_last_chat := false, katago := "", board: GoBoard = null) -> String:
+	return _t(context_block(moves, memory_log, chat_history, phase, skip_last_chat, katago, board) + "\n\n【现在】\n" + prompt)
 
 static func board_summary(move_seq: Array, last_n := 6) -> String:
 	if move_seq.is_empty():

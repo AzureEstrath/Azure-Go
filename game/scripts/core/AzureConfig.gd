@@ -7,6 +7,11 @@ var katago_model := "models/model-b18c384nbt.bin.gz"   # 现代 b18c384nbt（v1.
 var katago_config := "bin/katago/default_gtp.cfg"
 var max_visits := 500
 var joseki_teach := true          # 定式导学：识别对局中走出的定式并讲解（右侧栏可关；关掉=行为零变化）
+# —— 前后端架构 ——
+# "local"（默认）：对局编排在游戏进程内（KataGo/LLM 同进程，行为与旧版完全一致）
+# "remote"：对局编排在后端服务进程（KataGo/LLM 归后端），游戏只做渲染与语音，经 REST + WebSocket 通信
+var backend_mode := "local"
+var backend_url := "http://127.0.0.1:8000"   # 后端服务地址（remote 模式；WS 地址由其推导）
 var llm_base_url := "http://localhost:8080/v1"
 var llm_model := "qwen3.5"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
@@ -72,6 +77,8 @@ static func load_config() -> AzureConfig:
 			c.katago_config = str(d.get("katago_config", c.katago_config))
 			c.max_visits = int(d.get("max_visits", c.max_visits))
 			c.joseki_teach = bool(d.get("joseki_teach", c.joseki_teach))
+			c.backend_mode = str(d.get("backend_mode", c.backend_mode))
+			c.backend_url = str(d.get("backend_url", c.backend_url))
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
 			c.llm_api_key = str(d.get("llm_api_key", c.llm_api_key))
@@ -140,6 +147,8 @@ func save() -> bool:
 	d["katago_config"] = d.get("katago_config", katago_config)
 	d["max_visits"] = max_visits
 	d["joseki_teach"] = joseki_teach
+	d["backend_mode"] = backend_mode
+	d["backend_url"] = backend_url
 	d["llm_base_url"] = llm_base_url
 	d["llm_model"] = llm_model
 	d["llm_api_key"] = llm_api_key

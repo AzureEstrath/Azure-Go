@@ -6,12 +6,20 @@ signal message(kind: String, text: String)          # kind: ai / ai_comment / ai
 signal state_changed(payload: Dictionary)
 signal info_changed(winrate: float, score: float)
 signal busy_changed(busy: bool)
-signal emotion(kind: String)                        # 表情反应：delight / pleased / puzzled / worried / sad / laugh
+signal mood_changed(payload: Dictionary)            # 三维情绪区域变化：表情/语气词/音高由此驱动
 signal joseki_event(payload: Dictionary)            # 定式识别成功：棋盘高亮轨迹（kind/corner/points）
 
 var st := GameState.new()
 var katago: KataGoEngine = null
 var llm: LLMClient = null
+var mood := EmotionModel.new()                      # 三维情感模型（愉悦度 × 好奇度 × 唤醒度 → 27 区域）
+
+## LLM「情绪变化」小调用：限频 + 忙时跳过，保护主对话的响应速度与 KV 前缀缓存
+const MOOD_LLM_GAP_MS := 15000
+const MOOD_LLM_MAX_TOKENS := 32
+var _mood_region := -1                              # 最近一次推送给界面的区域（没变则不打扰）
+var _mood_ms := 0                                   # 上次 LLM 情绪增量调用时刻（限频用）
+var _mood_desc := ""                                # 最近一件情绪事件的短描述（喂给情绪变化提示词）
 
 var busy := false
 var limit_len := false          # 开启后追加「回复尽量短」要求：语音合成时间随字数下降（右侧栏可切）
@@ -62,12 +70,19 @@ func _update_katago_brief(analysis: Dictionary, num_moves: int) -> void:
 		s += " 实地估算：Estarth（黑）约 %.0f 目，Azure（白）约 %.0f 目（按逐点归属估算，仅供参考）。" % [b, w]
 	st.last_katago = s
 
+## 系统消息正文：身份底座 + 当前心情（注入 reply_style 尾部）+ 思考风格（仅思考档开启）+ 附加长度约束
+func _sys_content(len_note: String) -> String:
+	var s := AzurePrompts._t(AzurePrompts.system_prompt()) + AzurePrompts.mood_note(mood.region_name())
+	if llm != null and llm.think_mode > 0:
+		s += "\n\n【思考风格 · 随心情微调】" + mood.think_hint()
+	return s + len_note
+
 func _sys_msg() -> Dictionary:
-	return {"role": "system", "content": AzurePrompts._t(AzurePrompts.system_prompt()) + (LEN_NOTE if limit_len else "")}
+	return {"role": "system", "content": _sys_content(LEN_NOTE if limit_len else "")}
 
 ## 定式讲解用的系统消息（同一人设，只换长度约束）
 func _sys_teach_msg() -> Dictionary:
-	return {"role": "system", "content": AzurePrompts._t(AzurePrompts.system_prompt()) + (LEN_TEACH_NOTE if limit_len else "")}
+	return {"role": "system", "content": _sys_content(LEN_TEACH_NOTE if limit_len else "")}
 
 func _user_msg(content: String) -> Dictionary:
 	return {"role": "user", "content": content}
@@ -117,6 +132,78 @@ func _reply(messages: Array, max_tokens := 300) -> String:
 ## LLM 调用失败的统一判据（与闲置/窥屏的兜底判据一致）
 static func _llm_failed(t: String) -> bool:
 	return t.strip_edges() == "" or t.begins_with("调用出错") or t.contains("脑子有点转不过来")
+
+# ================= 三维情绪 =================
+
+## 事件结算入口：本地增量立即生效，区域变化才推给界面（表情/语气词/音高）
+func _mood_event(ev: String, desc_extra := "") -> void:
+	mood.apply_event(ev)
+	_mood_desc = EmotionModel.event_desc(ev) + desc_extra
+	sync_mood(false)
+
+## 把当前情绪区域推给界面；force=true 强制推一次（初始化/重开）。
+## 区域没变时不产生任何信号；quiet=true 只更新持续表情，不出一次性表情与语气词（避免和摸头等即时反馈叠音）
+func sync_mood(force := false, quiet := false) -> void:
+	var r := mood.region()
+	if not force and r == _mood_region:
+		return
+	_mood_region = r
+	var info := mood.info(r)
+	mood_changed.emit({
+		"region": r,
+		"v": mood.v, "c": mood.c, "a": mood.a,
+		"name": str(info.get("name", "")),
+		"morphs": info.get("morphs", {}),
+		"filler": "" if quiet else str(info.get("filler", "")),
+		"burst": "" if quiet else str(info.get("burst", "")),
+		"pitch": float(info.get("pitch", 0.0)),
+	})
+
+## 界面每 2 秒的心跳：只结算「向基线回落」；区域没变时开销为一次衰减 + 三个比较
+func tick_mood() -> void:
+	sync_mood(false)
+
+## 玩家亲密互动（摸头等）：本地增量 + 静默同步（表情立刻变，语气词让位给互动音效）
+func player_interaction(what: String) -> void:
+	mood.apply_event(what)
+	_mood_desc = EmotionModel.event_desc(what)
+	sync_mood(false, true)
+
+## 单独的「情绪变化」小调用：异步、限频、失败静默；绝不等它、绝不阻塞交互
+func _mood_llm_refine() -> void:
+	if llm == null or _mood_desc == "" or busy:
+		return
+	var now := Time.get_ticks_msec()
+	if now - _mood_ms < MOOD_LLM_GAP_MS:
+		return
+	_mood_ms = now
+	var desc := _mood_desc
+	_mood_desc = ""
+	var text: String = await llm.chat([{
+		"role": "user",
+		"content": AzurePrompts.mood_delta_prompt(Vector3(mood.v, mood.c, mood.a), mood.region_name(), desc),
+	}], MOOD_LLM_MAX_TOKENS, true)
+	if _llm_failed(text):
+		return
+	var parsed := EmotionModel.parse_delta(text)
+	if not bool(parsed[0]):
+		return
+	var d: Vector3 = parsed[1]
+	mood.apply_delta(d.x, d.y, d.z)
+	sync_mood(false)
+
+## 聊天粗分类 → 本地情绪事件键（分类仍是纯本地关键词判断）
+static func _chat_event(kind: String) -> String:
+	match kind:
+		"laugh":
+			return "chat_laugh"
+		"delight":
+			return "chat_praise"
+		"sad":
+			return "chat_sad"
+		"puzzled":
+			return "chat_question"
+	return "chat_normal"
 
 ## 聊天内容的粗分类 → 表情（本地关键词判断，不额外打扰 LLM）
 static func chat_emotion(text: String) -> String:
@@ -227,7 +314,6 @@ func player_move(x: int, y: int) -> void:
 		var conv := AzurePrompts.to_black_perspective(after, n + 1)
 		after_black_wr = conv[0]
 		after_black_score = conv[1]
-		st.after_analysis = {"n": n + 1, "a": after}
 		_update_katago_brief(after, n + 1)            # 当前棋面的引擎形势，供 Azure 上下文
 
 	# ③ 提交玩家落子（先存快照，供俗手回档）
@@ -248,15 +334,15 @@ func player_move(x: int, y: int) -> void:
 	if not jk.is_empty():
 		_joseki_emit(jk)
 
-	# ④′ 表情反应：定式成型/好手欣喜、一般平和、俗手先惊讶再失落（表情由界面接到化身上播放）
+	# ④′ 情绪反应：按这一手的好坏结算三维情绪（区域变化驱动表情/语气词/音高，即时反馈不等 LLM）
+	var ev := "player_ok"
 	if str(jk.get("kind", "")) == "formed" or player_rank == 0:
-		emotion.emit("delight")
+		ev = "player_good"
 	elif player_rank < 0 or drop > 0.10:
-		emotion.emit("worried")
-	elif player_rank < 3:
-		emotion.emit("pleased")
-	else:
-		emotion.emit("puzzled")
+		ev = "player_bad"
+	elif player_rank >= 3:
+		ev = "player_off"
+	_mood_event(ev)
 
 	# ⑤ Azure 点评这一手（定式成型时，这一条点评直接换成讲解——不额外增加 LLM 调用）
 	var eval_prompt := ""
@@ -290,7 +376,7 @@ func player_move(x: int, y: int) -> void:
 				eval_prompt += " " + AzurePrompts.joseki_hint_clause(str(jk["name"]), Coords.xy_to_gtp(want.x, want.y))
 	var player_eval: String = await _reply([
 		eval_sys,
-		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, eval_prompt, "after_player", false, st.last_katago)),
+		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, eval_prompt, "after_player", false, st.last_katago, st.board)),
 	], 300)
 	if str(jk.get("kind", "")) == "formed" and _llm_failed(player_eval):
 		player_eval = AzurePrompts.joseki_fallback(str(jk["name"]), str(jk["key"]))     # LLM 不可用时的本地兜底
@@ -300,6 +386,7 @@ func player_move(x: int, y: int) -> void:
 	# ⑥ Azure 思考并落子（把刚才那手点评一并传给她，避免落子后重复/自相矛盾）
 	await _ai_turn(after_infos, after_black_wr, after_black_score, player_eval)
 	_set_busy(false)
+	_mood_llm_refine()                                    # 双方都下完了：异步细化一次情绪（不等它、失败静默）
 
 func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float, player_eval := "") -> void:
 	var pick := _pick_ai_move(after_infos)
@@ -313,7 +400,7 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float, pla
 	await get_tree().create_timer(0.35).timeout
 	var think_msg: String = await _reply([
 		_sys_msg(),
-		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, think_prompt, "own_turn", false, st.last_katago)),
+		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, think_prompt, "own_turn", false, st.last_katago, st.board)),
 	], 80)
 	message.emit("ai_move", think_msg)                    # 这条语音开始播放时，界面才把她的子放上棋盘
 
@@ -342,6 +429,8 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float, pla
 		wr = float(ri.get("winrate", 0.5))
 		sc = float(ri.get("scoreLead", 0.0))
 		_update_katago_brief(post, st.moves.size())       # 更新为她落子后的最新形势
+		# 这份「她落子后」的分析，正好就是下一手玩家落子前的局面：缓存起来直接复用，省掉一次引擎分析
+		st.pre_analysis = {"n": st.moves.size(), "a": post}
 	info_changed.emit(wr, sc)
 
 	# 局势：一句话说清当前形势（谁占优、关键处），不复述前文（上下文里的 KataGo 形势已是最新）
@@ -356,7 +445,7 @@ func _ai_turn(after_infos: Array, fallback_wr: float, fallback_score: float, pla
 		ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % [ai_gtp, player_eval, think_msg]
 	var ai_eval: String = await _reply([
 		_sys_msg(),
-		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, ai_eval_prompt, "just_moved", false, st.last_katago)),
+		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, ai_eval_prompt, "just_moved", false, st.last_katago, st.board)),
 	], 120)
 	if str(jk2.get("kind", "")) == "formed" and _llm_failed(ai_eval):
 		ai_eval = AzurePrompts.joseki_fallback(str(jk2["name"]), str(jk2["key"]))
@@ -423,7 +512,7 @@ func hint() -> void:
 		AzurePrompts.board_summary(st.move_seq), _py_list(tops)]
 	var msg: String = await _reply([
 		_sys_msg(),
-		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, prompt, "observe", false, st.last_katago)),
+		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, prompt, "observe", false, st.last_katago, st.board)),
 	], 300)
 	message.emit("ai_comment", msg)                       # ai_comment：重要点评，Main 导演层据此加犹豫节拍
 	_set_busy(false)
@@ -456,7 +545,7 @@ func analyze_position() -> void:
 		AzurePrompts.board_summary(st.move_seq), n, _pct(azure_wr), lead, "%+.1f" % (-score_black), _py_list(tops)]
 	var msg: String = await _reply([
 		_sys_msg(),
-		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, prompt, "analyze", false, st.last_katago)),
+		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, prompt, "analyze", false, st.last_katago, st.board)),
 	], 350)
 	message.emit("ai", "📊 " + msg)
 	info_changed.emit(black_wr, score_black)
@@ -469,11 +558,12 @@ func chat(text: String) -> void:
 	if text.strip_edges() == "":
 		return
 	st.chat_history.append({"role": "user", "content": text})
-	emotion.emit(chat_emotion(text))       # 按聊天内容给个即时表情反应
+	# 按聊天内容即时结算情绪（本地关键词分类）：她接下来的开口就带着这个心情（reply_style 注入）
+	_mood_event(_chat_event(chat_emotion(text)), "，他说：「%s」" % text.substr(0, 40).strip_edges())
 	_set_busy(true)
 	var msgs: Array = [
 		_sys_msg(),
-		_user_msg(AzurePrompts.context_block(st.moves, st.memory_log, st.chat_history, "chat", true, st.last_katago)),
+		_user_msg(AzurePrompts.context_block(st.moves, st.memory_log, st.chat_history, "chat", true, st.last_katago, st.board)),
 	]
 	var hist: Array = st.chat_history
 	var upto := hist.size() - 1        # 最后一条是刚追加的这句，下面单独发，避免重复
@@ -486,6 +576,7 @@ func chat(text: String) -> void:
 	st.chat_history.append({"role": "assistant", "content": reply})
 	message.emit("ai", reply)
 	_set_busy(false)
+	_mood_llm_refine()                    # 双方都说完这句：异步细化一次情绪（不等它、失败静默）
 
 ## 闲置搭话：Estarth 一段时间没动静时，Azure 主动说一句短话（主场景在空闲计时到点时调用）
 const IDLE_LINES := [
@@ -498,10 +589,11 @@ const IDLE_LINES := [
 func idle_remark() -> void:
 	if busy:
 		return
+	_mood_event("idle_bored")             # 玩家长时间没动静：好奇升、唤醒略降
 	var prompt := "Estarth 已经有一段时间没有动静了，你有点好奇他在做什么。主动对他说一句很短的话（20字以内）：问问他还在不在、在忙什么，或要不要继续下棋、聊聊天。慵懒、亲切，1句。"
 	var reply: String = await _reply([
 		_sys_msg(),
-		_user_msg(AzurePrompts.context_block(st.moves, st.memory_log, st.chat_history, "chat", true, st.last_katago)),
+		_user_msg(AzurePrompts.context_block(st.moves, st.memory_log, st.chat_history, "chat", true, st.last_katago, st.board)),
 		{"role": "user", "content": prompt},
 	], 90)
 	if reply.strip_edges() == "" or reply.begins_with("调用出错") or reply.contains("脑子有点转不过来"):
@@ -514,6 +606,7 @@ func idle_remark() -> void:
 func peer_remark(info: Dictionary) -> void:
 	if busy:
 		return
+	_mood_event("peek")                   # 偷看到他在忙别的：好奇升、微妙的失落
 	var title := str(info.get("fg_title", "")).strip_edges()
 	var vlm := str(info.get("vlm", "")).strip_edges()
 	var ocr := str(info.get("ocr", "")).strip_edges()
@@ -531,7 +624,7 @@ func peer_remark(info: Dictionary) -> void:
 		+ "好奇、有点小情绪，但别像监视器一样复述细节、也别责备他；如果他只是在看别的页面，就顺着内容搭话。1句，慵懒亲切。") % [title if title != "" else "未知窗口", seen]
 	var reply: String = await _reply([
 		_sys_msg(),
-		_user_msg(AzurePrompts.context_block(st.moves, st.memory_log, st.chat_history, "chat", true, st.last_katago)),
+		_user_msg(AzurePrompts.context_block(st.moves, st.memory_log, st.chat_history, "chat", true, st.last_katago, st.board)),
 		{"role": "user", "content": prompt},
 	], 120)
 	if reply.strip_edges() == "" or reply.begins_with("调用出错") or reply.contains("脑子有点转不过来"):
@@ -558,12 +651,14 @@ func summarize(note: String) -> void:
 		final_wr = conv[0]
 		final_score = conv[1]
 	_update_katago_brief(analysis, n)
+	# 终局情绪：她赢下（黑方胜率 < 0.5）平和地开心，输了则有点低落——总结的语气随之走
+	_mood_event("summary_win" if final_wr < 0.5 else "summary_lose")
 	var seq := " → ".join(PackedStringArray(st.move_seq))
 	var prompt := "对局结束，共%d手。\n序列：%s\n最终黑胜率：%s，目差：%s\nEstarth备注：%s\n\n写总结：1.对局回顾 2.给Estarth的改进建议 2-3条 3.你的心情\n用Azure口吻，150-250字，慵懒真诚。" % [
 		n, seq, _pct(final_wr), "%+.1f" % final_score, note]
 	var text: String = await _reply([
 		_sys_msg(),
-		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, prompt, "summary", false, st.last_katago)),
+		_user_msg(AzurePrompts.with_context(st.moves, st.memory_log, st.chat_history, prompt, "summary", false, st.last_katago, st.board)),
 	], 600)
 	st.finished = true
 	message.emit("ai", "📋 对局总结\n" + text)
@@ -576,6 +671,7 @@ func undo(turn_index: int) -> void:
 	if turn_index < 0 or turn_index >= st.snapshots.size():
 		message.emit("ai", "这个回档点已经不存在了哦")
 		return
+	_mood_event("undo")
 	var s: Dictionary = st.snapshots[turn_index]
 	st.board = s["board"]
 	st.moves = s["moves"]
@@ -589,7 +685,6 @@ func undo(turn_index: int) -> void:
 			kept.append(b)
 	st.bad_moves = kept
 	st.pre_analysis = null
-	st.after_analysis = null
 	state_changed.emit(st.payload())
 	message.emit("ai", "嗯~ 那我们退回第%d手，重新想想…" % st.moves.size())
 
@@ -597,6 +692,8 @@ func reset_game() -> void:
 	var keep_pass := st.allow_pass
 	st.reset()
 	st.allow_pass = keep_pass
+	mood.reset()                          # 新一局：情绪回到基线（平静），界面表情一并复位
+	sync_mood(true)
 	state_changed.emit(st.payload())
 	message.emit("ai", "嗯~ 重新来吧...")
 

@@ -74,6 +74,7 @@ var _expr_targets: Dictionary = {}
 var _expr_cur: Dictionary = {}
 var _expr_baseline: Dictionary = {}    # 常态表情：形状 -> 值
 var _expr_thinking := false
+var _mood_targets: Dictionary = {}     # 三维情绪区域的持续表情层（形状 -> 值；非空时取代常态微笑）
 
 # 歪头小动作：闲置 / 说话时偶尔轻轻歪一下（绕世界 Z 轴横滚），随机起止
 var _idle := false
@@ -691,6 +692,15 @@ func _animate_blush(dt: float) -> void:
 		var base: Color = e[1]
 		m.albedo_color = base.lerp(Color(1.0, 0.62, 0.66, base.a), _blush_cur * 0.1)   # 微微泛红（0.1：用户再调淡）
 
+## 三维情绪区域的持续表情层（由 Main 在 mood_changed 时下发）：morph 名 → 权重（≤3 个）
+## 非空时取代常态微笑成为表情底；一次性表情（play_expression）叠加其上、优先显示
+func set_mood(morphs: Dictionary) -> void:
+	_mood_targets.clear()
+	for nm in morphs.keys():
+		var idx := int(_expr_shapes.get(str(nm), -1))
+		if idx >= 0:
+			_mood_targets[idx] = float(morphs[nm])
+
 ## kind: delight（好手）/ pleased（不错）/ puzzled（略意外）/ worried（俗手、明显失着）
 ##       sad（难过）/ laugh（被逗笑）
 func play_expression(kind: String) -> void:
@@ -732,8 +742,12 @@ func _apply_expr_stage() -> void:
 		_expr_cur[idx] = 0.0
 
 func _animate_expression(dt: float) -> void:
-	# 目标 = 常态基线 ∪ 当前表情步骤（步骤优先）
-	var targets := _expr_baseline.duplicate()
+	# 目标 = 情绪区域持续层（思考中让位给中性）或常态基线 ∪ 当前表情步骤（步骤优先）
+	var targets: Dictionary = {}
+	if not _expr_thinking and not _mood_targets.is_empty():
+		targets = _mood_targets.duplicate()
+	else:
+		targets = _expr_baseline.duplicate()
 	for k in _expr_targets.keys():
 		targets[k] = _expr_targets[k]
 	if not _expr_queue.is_empty():
