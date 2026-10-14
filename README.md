@@ -73,8 +73,9 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
 4. 玩家**执黑先行**：左键落子，右键拖拽旋转视角，滚轮缩放。
 
 `config.json` 放在**可执行文件同目录**即可覆盖包内默认值（源码运行时读 `game\config.json`）。
-语音默认走云端 `openai`（模板指向 OpenAI，填 `tts_api_key` 即可用）；服务连不上时会自动临时降级为
-**Windows 系统语音**。聊天/讲解需要按第四节接上一个大模型 API。
+语音默认走云端 `openai`（模板指向 OpenAI）：要填好 `tts_api_key`，并按第三节把 `tts_voice` 从 `中文女` 换成
+OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降级为 **Windows 系统语音**。
+聊天/讲解需要按第四节接上一个大模型 API。
 
 ---
 
@@ -103,9 +104,14 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
 | `tts_limit_len` / `tts_sync_speak` / `tts_batch_speak` / `tts_long_chunk` | 短回复 / 同步说话 / 整段合成 / 长句合并（立即生效） |
 
 > - `tts_base_url` / `tts_model` / `tts_voice` 要**配套**：模板的三件套是 `https://api.openai.com/v1` + `tts-1` + `中文女`，
->   其中 `中文女` **不是** OpenAI 的音色 id——想在 OpenAI 上「只填 Key」的话，音色要一并改成 `alloy` / `nova` / `onyx`
->   之类的 OpenAI 音色（音色 id 也可手填）；换其他服务商时地址、模型名、音色 id 都按服务商的取值改。
->   三件套不匹配时合成会失败并**静默降级为系统语音**（不报错、不改配置），表现为「有声音，但是 Windows 系统语音」。
+>   其中 `中文女` **不是** OpenAI 的音色 id——用 OpenAI 的话要把音色一并改成 `alloy` / `nova` / `onyx` 之类的
+>   OpenAI 音色（音色 id 也可手填）；换其他服务商时地址、模型名、音色 id 都按服务商的取值改。
+> - **两种失败表现不一样**：
+>   ① 服务**连不上**（断网 / 地址写错 / 服务没启动）→ **自动临时降级**为 Windows 系统语音继续朗读，
+>   服务恢复后自动切回云端（不报错、不改配置）；
+>   ② 服务**能连上但拒绝了这次请求**（音色 / 模型名不被接受，例如用 `中文女` 调 OpenAI 会返回 HTTP 400）
+>   → **不出声**：左侧语音栏与底部状态行显示「TTS 无响应（HTTP 400）…」，Azure 的文字照常显示，
+>   冷却 6 秒后继续尝试队列里的下一句。**音色 / 模型配错不会自动降级**，只会没声音 + 一行报错。
 > - `katago_bin` / `katago_model` / `katago_config` **不在上表**：它们由**后端**读取（当前后端仍自行拉起
 >   KataGo 进程，计划 01 会改成独立的 KataGo 服务 + `katago_url`），客户端忽略这些键。
 
@@ -161,7 +167,7 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
   - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki`。
 - **后端配置**：后端进程用环境变量 `AZURE_CONFIG` 指定 `config.json`；未设置时依次找 `<当前工作目录>\config.json`
   → `backend\config.json`（`backend\app\config.py` 的 `load`）。`backend\run_server.bat` 会先把
-  `..\game\config.json`（或 `..\AzureGoGodot\config.json`）写进 `AZURE_CONFIG`，所以双击启动时用的是游戏那份配置。
+  `..\AzureGoGodot\config.json` 写进 `AZURE_CONFIG`，该文件不存在时改用 `..\game\config.json`——两个都在时用前者。
 - **注意**：后端依赖本机 Python 环境，需按上面的命令自行启动；后端不在时游戏只提示、不崩溃。
 
 ---
