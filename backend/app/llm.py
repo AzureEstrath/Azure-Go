@@ -25,7 +25,8 @@ FAIL_TEXT = "唔...我脑子有点转不过来了"
 
 
 class LLMClient:
-    def __init__(self, base_url="http://localhost:8080/v1", model="qwen3.5", api_key="", timeout_sec=120.0,
+    # 默认值是云端示例（与 game/config.json 模板、backend/app/config.py 一致）；实际运行时由 main.py 传入 cfg 的值
+    def __init__(self, base_url="https://api.deepseek.com/v1", model="deepseek-chat", api_key="", timeout_sec=120.0,
                  think_mode=0):
         self.base_url = base_url
         self.model = model
