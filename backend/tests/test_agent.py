@@ -279,6 +279,52 @@ class FailSafeTest(unittest.TestCase):
         async def chat(self, messages, max_tokens=300, no_think=False):
             raise RuntimeError("云端 500")
 
+    class ErrLLM:
+        """真实失败形态：断网 / 401 / 429 / 超时在 LLMClient 里是「调用出错：…」文案（不抛异常）。"""
+
+        think_mode = 0
+        base_url = "https://api.example.com/v1"
+
+        async def chat(self, messages, max_tokens=300, no_think=False):
+            return "调用出错：HTTP 401（检查模型名是否为 qwen3.5）"
+
+    # —— 断言工具 ——
+
+    def _run(self, llm, flow):
+        """用失败的云端 LLM 跑一条流程，返回 (agent, bus)。"""
+        async def run():
+            agent, _eng, _llm, bus = _mk()
+            agent.llm = llm
+            await flow(agent)
+            return agent, bus
+
+        return asyncio.run(run())
+
+    def _run_after_move(self, llm, flow):
+        """先正常下一手铺出局面，再换成失败的云端 LLM 跑目标流程（bus 已清空）。"""
+        async def run():
+            agent, _eng, _llm, bus = _mk()
+            await agent.player_move(3, 3)
+            agent.llm = llm
+            bus.clear()
+            await flow(agent)
+            return agent, bus
+
+        return asyncio.run(run())
+
+    def _assert_no_error_text_and_unlocked(self, tag, agent, bus):
+        """玩家可见文本里不许出现「调用出错」，且 busy 必须归位（否则棋盘永久锁死）。"""
+        for e in bus.messages():
+            self.assertNotIn("调用出错", str(e.get("text", "")), "%s：错误文案漏给了玩家" % tag)
+        self.assertFalse(agent.busy, "%s：busy 没归位" % tag)
+        self.assertFalse(bus.of_type("busy")[-1]["busy"], "%s：最后一个 busy 事件应为 False" % tag)
+
+    def _assert_says_something(self, tag, bus, kind):
+        """该流程必须有一句非空的兜底台词顶上来。"""
+        texts = [str(e.get("text", "")).strip() for e in bus.messages(kind)]
+        self.assertTrue(texts, "%s：应有一句兜底台词" % tag)
+        self.assertTrue(all(t != "" for t in texts), "%s：兜底台词不能为空" % tag)
+
     def test_busy_released_when_llm_raises(self):
         agent, eng, _llm, bus = _mk()
         agent.llm = self.BoomLLM()
@@ -289,6 +335,50 @@ class FailSafeTest(unittest.TestCase):
         asyncio.run(run())
         self.assertFalse(agent.busy)
         self.assertFalse(bus.of_type("busy")[-1]["busy"])
+
+    def test_move_degrades_cleanly(self):
+        """点评 / 落子宣告退化为兜底台词；她的应手照常（Review Focus #2/#3）。"""
+        for llm in (self.ErrLLM(), self.BoomLLM()):
+            tag = type(llm).__name__
+            agent, bus = self._run(llm, lambda a: a.player_move(3, 3))
+            self._assert_no_error_text_and_unlocked(tag, agent, bus)
+            self._assert_says_something(tag, bus, events.AI_COMMENT)     # 点评有兜底
+            self.assertTrue(bus.messages(events.AI_MOVE), tag + "：落子宣告必须照常")
+            self.assertEqual(len(agent.st.moves), 2, tag + "：她该下的一手不能丢")
+            payload = agent.st.payload()
+            self.assertEqual(len(payload["stones"]), payload["move_count"], tag + "：棋盘状态必须自洽")
+
+    def test_hint_degrades_cleanly(self):
+        for llm in (self.ErrLLM(), self.BoomLLM()):
+            tag = type(llm).__name__
+            agent, bus = self._run(llm, lambda a: a.hint())
+            self._assert_no_error_text_and_unlocked(tag, agent, bus)
+            self._assert_says_something(tag, bus, events.AI_COMMENT)
+
+    def test_analyze_degrades_cleanly(self):
+        for llm in (self.ErrLLM(), self.BoomLLM()):
+            tag = type(llm).__name__
+            agent, bus = self._run_after_move(llm, lambda a: a.analyze_position())
+            self._assert_no_error_text_and_unlocked(tag, agent, bus)
+            self._assert_says_something(tag, bus, events.AI)
+
+    def test_chat_degrades_cleanly(self):
+        for llm in (self.ErrLLM(), self.BoomLLM()):
+            tag = type(llm).__name__
+            agent, bus = self._run(llm, lambda a: a.chat("你好呀~"))
+            self._assert_no_error_text_and_unlocked(tag, agent, bus)
+            self._assert_says_something(tag, bus, events.AI)
+            # 兜底台词要进聊天历史，下一轮上下文才自洽
+            self.assertEqual(agent.st.chat_history[-1]["role"], "assistant", tag)
+
+    def test_summarize_degrades_cleanly(self):
+        for llm in (self.ErrLLM(), self.BoomLLM()):
+            tag = type(llm).__name__
+            agent, bus = self._run_after_move(llm, lambda a: a.summarize("辛苦啦"))
+            self._assert_no_error_text_and_unlocked(tag, agent, bus)
+            texts = [str(e.get("text", "")) for e in bus.messages(events.AI)]
+            self.assertTrue(any(t.startswith("📋 对局总结") for t in texts), tag)
+            self._assert_says_something(tag, bus, events.AI)
 
 
 if __name__ == "__main__":

@@ -14,8 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi.testclient import TestClient
 
 from app import events
+from app.llm import LLMClient
 from app.main import create_app
-from test_agent import StubEngine, StubLLM
+from test_agent import FailSafeTest, StubEngine, StubLLM
 
 
 def _client():
@@ -87,6 +88,44 @@ class WebSocketTest(unittest.TestCase):
                 moved = [e for e in got if e.get("type") == "message" and e.get("kind") == events.AI_MOVE]
                 self.assertTrue(moved)
                 self.assertIn("move", moved[0])
+
+
+class CloudFailRestTest(unittest.TestCase):
+    """⚠️ 云端 LLM 不可用（未配置地址 / 断网 / 抛异常）时：REST 通道仍须正常应答、棋盘自洽。"""
+
+    def test_move_ok_without_cloud_llm(self):
+        for llm in (LLMClient(base_url=""), FailSafeTest.BoomLLM()):
+            with TestClient(create_app(engine=StubEngine(), llm=llm, autostart=False)) as client:
+                self.assertTrue(client.get("/api/health").json()["ok"])
+                self.assertEqual(client.get("/api/state").json()["move_count"], 0)
+                r = client.post("/api/move", json={"x": 3, "y": 3})
+                self.assertEqual(r.status_code, 200)
+                body = r.json()
+                self.assertTrue(body["ok"])
+                self.assertFalse(body["busy"])
+                st = body["state"]
+                self.assertEqual(len(st["stones"]), st["move_count"])   # 棋盘状态自洽
+                self.assertGreaterEqual(st["move_count"], 1)
+
+    def test_ws_never_pushes_error_text(self):
+        """玩家可见文本里不许出现「调用出错」：点评与落子宣告都退化为兜底台词。"""
+        for llm in (LLMClient(base_url=""), FailSafeTest.ErrLLM()):    # 未配置地址 / 401
+            with TestClient(create_app(engine=StubEngine(), llm=llm, autostart=False)) as client:
+                with client.websocket_connect("/ws") as ws:
+                    self.assertEqual(ws.receive_json()["type"], "hello")
+                    self.assertTrue(client.post("/api/move", json={"x": 3, "y": 3}).json()["ok"])
+
+                    got = []
+                    for _ in range(60):
+                        e = ws.receive_json()
+                        got.append(e)
+                        if any(x.get("type") == "message" and x.get("kind") == events.AI_MOVE for x in got):
+                            break
+
+                    moved = [e for e in got if e.get("type") == "message" and e.get("kind") == events.AI_MOVE]
+                    self.assertTrue(moved, "落子宣告必须照常（Review Focus #3）")
+                    for e in got:
+                        self.assertNotIn("调用出错", str(e.get("text", "")))
 
 
 if __name__ == "__main__":
