@@ -27,6 +27,9 @@ server_run.log
 gtp_logs/
 shots/
 
+# —— SDD 工作区（本地临时产物，不入库）——
+.superpowers/
+
 # —— 系统 ——
 Thumbs.db
 desktop.ini
