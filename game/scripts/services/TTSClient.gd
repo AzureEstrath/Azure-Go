@@ -24,11 +24,11 @@ const HTTP_TIMEOUT_SLOW := 240.0     # CosyVoice 系列 CPU 很慢：给足时�
 const _DROP_RE := "[\\x{1F000}-\\x{1FAFF}\\x{2190}-\\x{2BFF}\\x{FE00}-\\x{FE0F}\\x{2600}-\\x{27BF}\\x{FF61}-\\x{FF9F}\\x{30FB}\\x{FF65}\\x{2000}-\\x{200F}\\x{0370}-\\x{03FF}]"
 
 ## 朗读方式：system=Windows 系统语音（零配置可用）；openai=OpenAI 兼容服务（云端 /v1/audio/speech）
-var mode := "system"
-var base_url := "http://127.0.0.1:9880/v1"
-var model := "cosyvoice3"
+var mode := "openai"
+var base_url := "https://api.openai.com/v1"
+var model := "tts-1"
 var api_key := ""            # 云端 OpenAI 兼容 TTS：非空则发送 Authorization: Bearer <key>
-var voice := "azure"
+var voice := "中文女"
 var speed := 1.0
 var pitch := 1.0              # 播放层音调：直接改播放速率（会略带动语速）
 var mood_pitch := 0.0         # 情绪区域的瞬时音高偏移（叠加在 pitch 上、不写回配置；±0.1 以内）

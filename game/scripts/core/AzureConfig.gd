@@ -2,13 +2,20 @@ class_name AzureConfig
 extends RefCounted
 ## 配置加载/保存：优先读「可执行文件同目录 / config.json」，其次项目内 res://config.json
 
+## 朗读方式只有 system / openai 两种（与左侧栏下拉一一对应）：旧配置里的 "cosyvoice" 等未知值一律回落云端 openai
+const TTS_MODES := ["system", "openai"]
+## 旧配置里已废弃的本地引擎音色 id（Main 的 _is_removed_voice 未覆盖的三个）→ 回落模板默认音色。
+## 这里用黑名单而非白名单：tts_voice 允许手填任意服务商音色，白名单会把用户自填值冲掉。
+const LEGACY_TTS_VOICES := ["azure", "azure-fast", "melo"]
+const TTS_VOICE_DEFAULT := "中文女"
+
 var max_visits := 500
 var joseki_teach := true          # 定式导学：识别对局中走出的定式并讲解（右侧栏可关；关掉=行为零变化）
 # —— 前后端架构 ——
 # 编排（KataGo / LLM / 定式 / 情绪）全部在后端服务进程，游戏只做渲染与语音，经 REST + WebSocket 通信
 var backend_url := "http://127.0.0.1:8000"   # 后端服务地址（WS 地址由其推导）
-var llm_base_url := "http://localhost:8080/v1"
-var llm_model := "qwen3.5"
+var llm_base_url := "https://api.deepseek.com/v1"   # 云端 LLM（OpenAI 兼容）地址；示例见 README 第四节
+var llm_model := "deepseek-chat"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
 var llm_think_mode := 0           # 思考档位：0=快速（不思考） 1=中等（限定推理预算） 2=强思考（自由推理）
 var vrm_path := "D:/KataGo/assets/Azure.vrm"
@@ -18,11 +25,11 @@ var prompt_user_name := "Estarth" # 玩家称呼；会替换提示词中的「Es
 var prompt_phase_notes: Dictionary = {}  # 覆盖阶段提示，键为阶段名（如 after_player / own_turn）
 # —— 云端语音（OpenAI 兼容 /v1/audio/speech；system=Windows 系统语音兜底）——
 var tts_enabled := false
-var tts_mode := "system"          # system / openai
-var tts_base_url := "http://127.0.0.1:9880/v1"
-var tts_model := "cosyvoice3"
+var tts_mode := "openai"          # openai（云端 OpenAI 兼容 /v1/audio/speech）/ system（Windows 系统语音兜底）
+var tts_base_url := "https://api.openai.com/v1"
+var tts_model := "tts-1"
 var tts_api_key := ""             # 云端 TTS（OpenAI 兼容 /v1/audio/speech）的 API Key；留空则不发送
-var tts_voice := "中文女"
+var tts_voice := TTS_VOICE_DEFAULT
 var tts_speed := 1.0
 var tts_pitch := 1.0              # 播放层音调（0.8~1.3，会略带动语速）
 var tts_volume := 1.0
@@ -69,11 +76,11 @@ static func load_config() -> AzureConfig:
 			if typeof(pn) == TYPE_DICTIONARY:
 				c.prompt_phase_notes = (pn as Dictionary).duplicate()
 			c.tts_enabled = bool(d.get("tts_enabled", c.tts_enabled))
-			c.tts_mode = str(d.get("tts_mode", c.tts_mode))
+			c.tts_mode = _normalize_tts_mode(str(d.get("tts_mode", c.tts_mode)))
 			c.tts_base_url = str(d.get("tts_base_url", c.tts_base_url))
 			c.tts_model = str(d.get("tts_model", c.tts_model))
 			c.tts_api_key = str(d.get("tts_api_key", c.tts_api_key))
-			c.tts_voice = str(d.get("tts_voice", c.tts_voice))
+			c.tts_voice = _normalize_tts_voice(str(d.get("tts_voice", c.tts_voice)))
 			c.tts_speed = float(d.get("tts_speed", c.tts_speed))
 			c.tts_pitch = float(d.get("tts_pitch", c.tts_pitch))
 			c.tts_volume = float(d.get("tts_volume", c.tts_volume))
@@ -82,6 +89,17 @@ static func load_config() -> AzureConfig:
 			c.tts_batch_speak = bool(d.get("tts_batch_speak", c.tts_batch_speak))
 			c.tts_long_chunk = bool(d.get("tts_long_chunk", c.tts_long_chunk))
 	return c
+
+## 旧配置归一化：v2.x 的 "cosyvoice"（本地 CosyVoice 表单接口）已不是合法朗读方式，一律回落云端 openai，
+## 避免「存储值 ≠ 下拉显示值」（下拉只有 system / openai，未知值会让它默认落在 system 上）
+static func _normalize_tts_mode(v: String) -> String:
+	var m := v.strip_edges().to_lower()
+	return m if m in TTS_MODES else "openai"
+
+## 旧配置归一化：本地引擎专用的旧音色 id（azure / azure-fast / melo）已不可用，回落模板默认音色
+static func _normalize_tts_voice(v: String) -> String:
+	var s := v.strip_edges()
+	return TTS_VOICE_DEFAULT if s.to_lower() in LEGACY_TTS_VOICES else s
 
 ## 写回配置文件（语音设置改动后调用，下次启动仍生效）
 func save() -> bool:

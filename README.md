@@ -96,32 +96,26 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）、本地 LLM / VLM �
 
 ## 三、`config.json` 字段
 
-放在**可执行文件同目录**即可覆盖包内默认值。新增/关键项如下：
+放在**可执行文件同目录**即可覆盖包内默认值；全部字段如下：
 
 | 字段 | 含义 |
 | --- | --- |
-| `katago_bin` / `katago_model` / `katago_config` | KataGo 可执行文件、权重、GTP 配置 |
-| `max_visits` | KataGo 每手搜索次数，越大越强越慢 |
-| `llm_base_url` / `llm_model` | **LLM 的 OpenAI 兼容地址与模型名**（本地或云端） |
-| `llm_api_key` | **云端 LLM 的 API Key**；非空则发送 `Authorization: Bearer <key>`，本地服务留空 |
-| `llm_think_mode` | **思考档位**：`0`=快速（直答，首字快）/ `1`=中等（推理限预算并催收尾，约 4~7 秒）/ `2`=强思考（自由推理，更慢更好）；默认 `0`；开局设置面板里也能改（旧键 `llm_think_strong` 自动迁移） |
+| `max_visits` | KataGo 每手搜索次数，越大越强越慢（引擎在后端/云服务侧，客户端不跑 KataGo） |
 | `joseki_teach` | **定式导学**：识别你与 Azure 走出的常见定式（讲解 + 棋盘高亮手顺）；右侧栏也能切；默认 `true`，关掉=不识别不打扰 |
-| `llm_auto_start` / `llm_port` | **本地 LLM 自动起停**：`llm_base_url` 指向本机时随游戏一并拉起（已在跑则跳过，退出游戏自动清理）；端口应与 `llm_base_url` 一致 |
-| `llm_exe` / `llm_model_path` | 本地 `llama-server.exe` / 主模型 gguf 路径（留空由启动器自动探测） |
-| `vlm_base_url` / `vlm_auto_start` / `vlm_port` | 窥屏搭话的 VLM 服务：留空=用本地服务（游戏负责拉起），填了视为外部服务、不碰本地 |
-| `vlm_exe` / `vlm_model` / `vlm_mmproj` | 本地 `llama-server.exe` / VLM gguf / 视觉编码器 mmproj 路径（留空自动探测） |
+| `backend_url` | **远程后端地址**：编排、KataGo 与 LLM 都在后端进程，游戏只做渲染与语音（WebSocket 地址由其推导） |
+| `llm_base_url` / `llm_model` | **云端 LLM 的 OpenAI 兼容地址与模型名** |
+| `llm_api_key` | **云端 LLM 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
+| `llm_think_mode` | **思考档位**：`0`=快速（直答，首字快）/ `1`=中等（推理限预算并催收尾，约 4~7 秒）/ `2`=强思考（自由推理，更慢更好）；默认 `0`；开局设置面板里也能改（旧键 `llm_think_strong` 自动迁移） |
 | `prompt_system` | **覆盖系统提示词（人设全文）**；留空用内置 Azure 人设 |
 | `prompt_user_name` | **玩家称呼**，替换提示词中的「Estarth」（默认 Estarth） |
 | `prompt_phase_notes` | **覆盖各阶段提示**，键：`observe` / `after_player` / `own_turn` / `just_moved` / `analyze` / `chat` / `summary` |
 | `vrm_path` | 虚拟形象 `.vrm` 路径 |
 | `tts_enabled` | 是否启用语音 |
-| `tts_mode` | `system`（Windows 系统语音，零配置兜底）/ `openai`（OpenAI 兼容 `/v1/audio/speech`，可云端）/ `cosyvoice`（本地 CosyVoice 表单接口） |
-| `tts_base_url` | 语音服务地址，默认 `http://127.0.0.1:9880`（cosyvoice 模式**不带** `/v1`） |
-| `tts_model` / `tts_voice` | 语音模型名 / 音色 id |
+| `tts_mode` | `openai`（云端 OpenAI 兼容 `/v1/audio/speech`，默认）/ `system`（Windows 系统语音，服务连不上时也会临时降级到它） |
+| `tts_base_url` | **云端语音服务地址**（OpenAI 兼容，含 `/v1`，如 `https://api.openai.com/v1`） |
+| `tts_model` / `tts_voice` | 云端语音模型名 / 音色 id（音色名随服务商而定，也可手填） |
 | `tts_api_key` | **云端 TTS 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
 | `tts_speed` / `tts_pitch` / `tts_volume` | 语速 / 音调（播放层变调）/ 音量 |
-| `tts_auto_start` | 启动游戏时自动拉起本地 CosyVoice 服务（仅 `cosyvoice` 模式），退出时一并清理 |
-| `tts_bf16` / `tts_short_prompt` | 本地 CosyVoice 加速开关（需重启语音服务） |
 | `tts_limit_len` / `tts_sync_speak` / `tts_batch_speak` / `tts_long_chunk` | 短回复 / 同步说话 / 整段合成 / 长句合并（立即生效） |
 
 ---
@@ -148,40 +142,37 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）、本地 LLM / VLM �
 
 ## 五、接语音（TTS，可选）
 
-- **默认 `system`**：Windows 系统语音，零配置即可发声。
-- **云端 `openai`**：任何 OpenAI 兼容 `/v1/audio/speech` 服务（如 OpenAI、部分云厂商），
+- **云端 `openai`（默认）**：任何 OpenAI 兼容 `/v1/audio/speech` 服务（如 OpenAI、部分云厂商），
   填 `tts_base_url` / `tts_model` / `tts_voice` / `tts_api_key`。
-- **本地 `cosyvoice`**：用 `server\` 自建 CosyVoice（最像 Azure 原声）。
+- **`system` 兜底**：Windows 系统语音，零配置即可发声；云端服务连不上时游戏会**自动临时降级为它**
+  （不报错、不改配置），服务恢复后再切回。
+- **自建 CosyVoice 也走 `openai`**：`server\` 的 `azure_tts_server.py` 同样实现了 OpenAI 兼容的
+  `/v1/audio/speech`，把 `tts_mode` 保持 `openai`、`tts_base_url` 指向 `http://127.0.0.1:9880/v1` 即可。
   1. 自备 CosyVoice 权重，放到 `server\pretrained_models\` 下；
   2. 建虚拟环境并安装依赖（`server\requirements_win.txt`、`requirements.txt`）；
-  3. 双击 `server\start_tts_server.bat`，服务监听 `http://127.0.0.1:9880`；
-  4. `config.json` 改 `tts_mode=cosyvoice`、`tts_voice=azure`。
-  > 服务未启动时游戏会**自动临时降级为系统语音**，不报错、不改配置。
+  3. 双击 `server\start_tts_server.bat` 手动启动服务（游戏不再自动拉起），服务监听 `http://127.0.0.1:9880`。
 
 ---
 
-## 六、远程后端（前后端分离，可选）
+## 六、远程后端（唯一的运行方式）
 
-游戏默认 `backend_mode = "local"`：KataGo 算棋、LLM 讲解、语音合成全在客户端进程内完成，
-**与旧版行为一致**。若想把「对局编排 + KataGo / LLM」挪到独立进程（例如多客户端共享一个后端、
-或在别的主机上跑后端），可切换到 **remote 模式**——本仓库附带可选的 **Python 后端**（`backend\`，FastAPI）。
+对局编排、KataGo 与 LLM 都在**后端进程**（`backend\`，FastAPI + REST + WebSocket）里；游戏客户端只做渲染、
+输入与语音播放，**不启动任何模型服务**（没有 local 模式）。后端连不上时只在状态栏提示，不影响界面操作。
 
 - **启动后端**：双击 `backend\run_server.bat`（或 `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`），
   监听 `http://127.0.0.1:8000`。依赖 `fastapi` / `uvicorn` / `httpx`（见 `backend\requirements.txt`）。
-- **切换配置**：`config.json` 里
+- **配置**：`config.json` 里
   ```json
-  "backend_mode": "remote",
   "backend_url": "http://127.0.0.1:8000"
   ```
-  也可命令行临时指定：`AzureGoGodot.exe --backend=remote --backend-url=http://127.0.0.1:8000`。
+  也可命令行临时指定：`AzureGoGodot.exe --backend-url=http://127.0.0.1:8000`（只影响本次运行，不写回配置）。
 - **接口契约**：
-  - REST：`/api/move|hint|analyze|chat|summarize|undo|reset|config|reveal|interaction|idle|peer|mood/tick`，
-    以及 `GET /api/state`、`GET /health`。
+  - REST：`/api/move|hint|analyze|chat|summarize|undo|reset|config|reveal|interaction|idle|mood/tick`，
+    以及 `GET /api/state`、`GET /api/health`。
   - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki`。
 - **后端配置**：后端进程用环境变量 `AZURE_CONFIG` 指定 `config.json`；未设置时依次在
   可执行目录 → 项目目录 → `..\game\config.json` 查找。
-- **注意**：remote 模式依赖后端进程与本机 Python 环境，**不随分享包分发**；
-  分享包默认仍是 local 模式，无需后端即可游玩。
+- **注意**：后端依赖本机 Python 环境，需按上面的命令自行启动；后端不在时游戏只提示、不崩溃。
 
 ---
 
