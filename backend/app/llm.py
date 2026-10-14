@@ -58,7 +58,7 @@ class LLMClient:
         self._base_ready = True
         if "://localhost" in self.base_url:
             self.base_url = self.base_url.replace("://localhost", "://127.0.0.1")
-            print("[LLM] localhost → 127.0.0.1（Godot 只把 localhost 解析为 IPv6，直连会卡顿）")
+            print("[LLM] localhost → 127.0.0.1（避免解析到 IPv6 ::1 导致连接卡顿）")
 
     def _local_target(self) -> bool:
         return ("127.0.0.1" in self.base_url) or ("localhost" in self.base_url) or ("::1" in self.base_url)

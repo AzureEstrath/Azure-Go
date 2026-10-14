@@ -44,11 +44,13 @@ var _path := ""
 var _raw: Dictionary = {}       # 原样保存读到的配置，写回时只覆盖改动项（保留相对路径等写法）
 var cli_locked: Dictionary = {} # 被命令行覆盖过的字段（Main 里登记）：save() 不回写，保持「CLI 只影响本次运行」
 
-static func load_config() -> AzureConfig:
+## 读取配置；`path` 留空时按「可执行文件同目录 / config.json」→「res://config.json」依次查找（测试可传入临时文件）
+static func load_config(path := "") -> AzureConfig:
 	var c := AzureConfig.new()
 	var exe_dir := OS.get_executable_path().get_base_dir()
 	var text := ""
-	for p in [exe_dir.path_join("config.json"), "res://config.json"]:
+	var candidates: Array = [path] if path != "" else [exe_dir.path_join("config.json"), "res://config.json"]
+	for p in candidates:
 		if FileAccess.file_exists(p):
 			var f := FileAccess.open(p, FileAccess.READ)
 			if f != null:
@@ -112,9 +114,10 @@ func save() -> bool:
 		path = ProjectSettings.globalize_path(path)
 	var d := _raw.duplicate()
 	d["_说明"] = "云端模型（LLM / 语音 TTS）与远程后端服务的地址与参数。打包发布时把本文件放在与可执行文件同一目录即可覆盖。"
-	d.erase("katago_bin")                         # 本地编排已删除：旧配置里的 KataGo 键不再写回（读到时也一并清掉）
-	d.erase("katago_model")
-	d.erase("katago_config")
+	# katago_bin / katago_model / katago_config 不在这里删除：它们是**后端**在用的活配置
+	# （backend/app/config.py 读取并交给 KataGoEngine），且 game/config.json 就是后端的配置文件
+	# （backend/run_server.bat 通过 AZURE_CONFIG 指过来）。前端已无这些字段，既不读也不改，
+	# 只需随 _raw 原样保留，否则用户配好的非默认 KataGo 路径会在游戏存档时被抹掉。
 	d["max_visits"] = max_visits
 	d["joseki_teach"] = joseki_teach
 	d.erase("backend_mode")                       # 只剩「连后端」一条路径：旧配置里的 backend_mode 不再写回

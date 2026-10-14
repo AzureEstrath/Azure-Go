@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from app import events
 from app.llm import LLMClient
 from app.main import create_app
-from test_agent import FailSafeTest, StubEngine, StubLLM
+from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM
 
 
 def _client():
@@ -98,7 +98,7 @@ class CloudFailRestTest(unittest.TestCase):
     """⚠️ 云端 LLM 不可用（未配置地址 / 断网 / 抛异常）时：REST 通道仍须正常应答、棋盘自洽。"""
 
     def test_move_ok_without_cloud_llm(self):
-        for llm in (LLMClient(base_url=""), FailSafeTest.BoomLLM()):
+        for llm in (LLMClient(base_url=""), BoomLLM()):
             with TestClient(create_app(engine=StubEngine(), llm=llm, autostart=False)) as client:
                 self.assertTrue(client.get("/api/health").json()["ok"])
                 self.assertEqual(client.get("/api/state").json()["move_count"], 0)
@@ -113,7 +113,7 @@ class CloudFailRestTest(unittest.TestCase):
 
     def test_ws_never_pushes_error_text(self):
         """玩家可见文本里不许出现「调用出错」：点评与落子宣告都退化为兜底台词。"""
-        for llm in (LLMClient(base_url=""), FailSafeTest.ErrLLM()):    # 未配置地址 / 401
+        for llm in (LLMClient(base_url=""), ErrLLM()):    # 未配置地址 / 401
             with TestClient(create_app(engine=StubEngine(), llm=llm, autostart=False)) as client:
                 with client.websocket_connect("/ws") as ws:
                     self.assertEqual(ws.receive_json()["type"], "hello")

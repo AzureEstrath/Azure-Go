@@ -1,0 +1,77 @@
+"""测试替身（stub）与工厂：不触网、不起子进程。
+
+单独成文件，是为了不让 `test_main.py` 从 `test_agent.py` 里 import `TestCase` 子类——
+那样 unittest 会把它当成 `test_main` 的模块属性再收集一次（`FailSafeTest` 的 6 个用例重复）。
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app import events
+from app.agent import AzureAgent
+
+
+class StubEngine:
+    """固定返回的假引擎：候选点覆盖常见位置，便于断言确定性的应手。"""
+
+    CAND = ["Q16", "D4", "Q4", "D16", "K10", "C3", "R14", "F16", "J3", "O16", "C16", "R4"]
+
+    def __init__(self):
+        self.calls = []
+        self.dead = False
+
+    async def analyze(self, moves):
+        self.calls.append([list(m) for m in moves])
+        return {
+            "rootInfo": {"winrate": 0.5, "scoreLead": 0.0},
+            "moveInfos": [{"move": m, "visits": 1} for m in self.CAND],
+            "ownership": [0.0] * 361,
+        }
+
+    def is_dead(self):
+        return self.dead
+
+    def last_error(self):
+        return ""
+
+
+class StubLLM:
+    def __init__(self, text="嗯~ 这一步我看着挺顺。"):
+        self.think_mode = 0
+        self.text = text
+        self.calls = []
+        self.base_url = "http://localhost:8080/v1"
+
+    async def chat(self, messages, max_tokens=300, no_think=False):
+        self.calls.append((list(messages), max_tokens, no_think))
+        return self.text
+
+
+class BoomLLM:
+    """chat 直接抛异常（云端 500 / 断连一类）。"""
+
+    think_mode = 0
+    base_url = "https://api.example.com/v1"
+
+    async def chat(self, messages, max_tokens=300, no_think=False):
+        raise RuntimeError("云端 500")
+
+
+class ErrLLM:
+    """真实失败形态：断网 / 401 / 429 / 超时在 LLMClient 里是「调用出错：…」文案（不抛异常）。"""
+
+    think_mode = 0
+    base_url = "https://api.example.com/v1"
+
+    async def chat(self, messages, max_tokens=300, no_think=False):
+        return "调用出错：HTTP 401（检查模型名是否为 qwen3.5）"
+
+
+def mk_agent():
+    """造一套 stub 装配：返回 (agent, engine, llm, bus)。"""
+    eng = StubEngine()
+    llm = StubLLM()
+    bus = events.RecordingBus()
+    return AzureAgent(eng, llm, bus), eng, llm, bus
