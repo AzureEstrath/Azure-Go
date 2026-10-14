@@ -669,36 +669,6 @@ class AzureAgent:
         self.st.chat_history.append({"role": "assistant", "content": reply})
         self._emit(events.message(events.AI_IDLE, reply))
 
-    async def peer_remark(self, info):
-        """窥屏搭话：长时间无操作时偷看一眼屏幕，切去了别的窗口就结合看到的内容说一句。"""
-        if self.busy:
-            return
-        self._mood_event("peek")
-        title = str(info.get("fg_title", "")).strip()
-        vlm = str(info.get("vlm", "")).strip()
-        ocr = str(info.get("ocr", "")).strip()
-        if len(ocr) > 220:
-            ocr = ocr[:220] + "…"
-        seen = ""
-        if vlm != "":
-            seen += "屏幕画面：%s\n" % vlm
-        if ocr != "":
-            seen += "屏幕文字（OCR）：%s\n" % ocr
-        if seen == "":
-            seen = "（没能看清具体内容）\n"
-        prompt = ("Estarth 很久没碰棋盘了。你悄悄瞥了一眼他的屏幕——他现在开着的窗口是「%s」，%s"
-                  + "用你自己的口吻主动对他说一句很短的话（30字以内）：自然地带出你看到了什么（他在看什么、忙什么），"
-                  + "好奇、有点小情绪，但别像监视器一样复述细节、也别责备他；如果他只是在看别的页面，就顺着内容搭话。1句，慵懒亲切。") % (title if title != "" else "未知窗口", seen)
-        reply = await self._reply([
-            self._sys_msg(),
-            self._user_msg(prompts.context_block(self.st.moves, self.st.memory_log, self.st.chat_history, "chat", True, self.st.last_katago, self.st.board)),
-            {"role": "user", "content": prompt},
-        ], 120)
-        if self._llm_failed(reply):
-            reply = "唔…跑去忙别的啦？我还在这儿等你哦。"
-        self.st.chat_history.append({"role": "assistant", "content": reply})
-        self._emit(events.message(events.AI_IDLE, reply))
-
     async def summarize(self, note=""):
         """对局总结。"""
         if self.busy:

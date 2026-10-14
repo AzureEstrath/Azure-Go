@@ -56,6 +56,10 @@ class RestTest(unittest.TestCase):
             self.assertTrue(client.post("/api/reset").json()["ok"])
             self.assertEqual(client.get("/api/state").json()["move_count"], 0)
 
+    def test_peer_endpoint_gone(self):
+        with _client() as client:
+            self.assertEqual(client.post("/api/peer", json={"fg_title": "x"}).status_code, 404)
+
 
 class WebSocketTest(unittest.TestCase):
     def test_hello_on_connect(self):

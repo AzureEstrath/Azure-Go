@@ -12,7 +12,6 @@
     POST /api/reveal                        落子宣告语音开始（需要 round-trip 的客户端）
     POST /api/interaction {what}            玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话
-    POST /api/peer        {fg_title, ocr, vlm}  窥屏搭话
     POST /api/mood/tick                     情绪心跳（向基线回落）
     GET  /api/state                         当前棋盘权威快照
     GET  /api/health                        引擎/LLM 状态
@@ -175,14 +174,6 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
         await s.idle_remark()
-        return ok()
-
-    @app.post("/api/peer")
-    async def peer(body: dict):
-        s = a()
-        if s.busy:
-            return {"ok": False, "busy": True, "state": s.st.payload()}
-        await s.peer_remark({"fg_title": body.get("fg_title", ""), "ocr": body.get("ocr", ""), "vlm": body.get("vlm", "")})
         return ok()
 
     @app.post("/api/mood/tick")

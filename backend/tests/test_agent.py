@@ -157,6 +157,21 @@ class FlowTest(unittest.TestCase):
             "第二手不应重算已缓存的「落子前局面」",
         )
 
+    def test_peek_removed(self):
+        agent, _eng, _llm, _bus = _mk()
+        self.assertFalse(hasattr(agent, "peer_remark"))
+
+    def test_idle_remark_still_works(self):
+        """删掉窥屏后，闲置主动搭话必须照常（Review Focus 第四条）。"""
+
+        async def run():
+            agent, _eng, _llm, bus = _mk()
+            await agent.idle_remark()
+            return bus
+
+        bus = asyncio.run(run())
+        self.assertEqual(len(bus.messages(events.AI_IDLE)), 1)
+
 
 class ControlTest(unittest.TestCase):
     def test_undo_restores_snapshot(self):
