@@ -52,21 +52,24 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 │   ├─ run_hidden.vbs       隐藏窗口启动（游戏自动拉起时调用，随包移动可用）
 │   ├─ start_tts_server*.bat 手动启动脚本
 │   ├─ voices.json          克隆音色的参考音频与文本
+│   ├─ third_party\OpenVoice\ 快速克隆音色转换（源码；权重 .pth 另行获取）
 │   └─ sherpa_voices.json   轻量音色清单（小雅 / 少女 / 女声）
 ├─ backend\                 远程后端（前后端分离，可选；FastAPI + REST + WebSocket）
 │   ├─ app\                 对局编排 / KataGo·LLM 客户端 / 情感模型
 │   ├─ tests\               后端单元测试（含情感模型黄金样本）
 │   ├─ requirements.txt     后端依赖
 │   └─ run_server.bat       一键启动后端（监听 127.0.0.1:8000）
+├─ peek\                    窥屏 VLM 服务（可选）：azure_peek.py 截图理解 / start_vlm_server.py 启动
 └─ tools\build_pck.ps1      重建游戏 PCK（分享版只需替换 .pck）
 ```
 
 **模型与资产**（体积大，不随源码仓库分发，见 GitHub **Releases**）：
 `katago.exe` + `*.dll`、`model-b18c384nbt.bin.gz`（KataGo 权重）、`Azure.vrm`（形象）、
-CosyVoice 权重（`pretrained_models` / `sherpa_models`）、本地 LLM / VLM 的 gguf。
+CosyVoice 权重（`pretrained_models` / `sherpa_models`）、OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、本地 LLM / VLM 的 gguf。
 
-**本地服务启动脚本**（`start_llm_server.py`、`peek\start_vlm_server.py`）属于本机部署文件：
-分享包根目录已附带 `start_llm_server.py`；游戏启动时用本机 python 拉起对应服务（锁 + 健康检查
+**本地服务启动脚本**：`start_llm_server.py` 属于本机部署文件（分享包根目录已附带）；
+`peek\` 窥屏 VLM 服务随源码仓库提供（`azure_peek.py` + `start_vlm_server.py`）。
+游戏启动时用本机 python 拉起对应服务（锁 + 健康检查
 防重复），退出时清理由游戏拉起的进程，缺环境自动跳过。
 
 ---
