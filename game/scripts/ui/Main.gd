@@ -12,10 +12,7 @@ const BUBBLE_SYS := Color(1.0, 0.953, 0.804)
 signal setup_confirmed
 
 var cfg: AzureConfig
-var katago: KataGoEngine
-var llm: LLMClient
-## 对局编排入口：本地模式为 AzureAgent（同进程编排），remote 模式为 NetClient（后端服务进程）。
-## 两者的信号与方法面完全一致，故此处不写死类型（按 cfg.backend_mode 动态选择）。
+## 对局编排入口：NetClient（编排与 KataGo/LLM 都在后端服务进程）。不写死类型，与信号接线解耦。
 var agent
 var board: Board3D
 var ambience: Ambience
@@ -152,15 +149,12 @@ func _find_tts_dir() -> String:
 	return exe_dir.path_join("cosyvoice")
 
 ## 命令行覆盖：--llm=http://host:port/v1  --model=模型名  --key=云端API Key（均不写回配置）
-## 另有架构开关：--backend=local|remote 与 --backend-url=http://host:port
+## 另有 --backend-url=http://host:port 指定后端服务地址
 func _apply_cli_overrides() -> void:
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--backend-url="):
 			cfg.backend_url = a.substr("--backend-url=".length())
 			cfg.cli_locked["backend_url"] = true
-		elif a.begins_with("--backend="):
-			cfg.backend_mode = a.substr("--backend=".length())
-			cfg.cli_locked["backend_mode"] = true
 		elif a.begins_with("--llm="):
 			cfg.llm_base_url = a.substr("--llm=".length())
 			cfg.cli_locked["llm_base_url"] = true
@@ -1539,47 +1533,12 @@ func _is_local_url(url: String) -> bool:
 
 # ================= 服务与接线 =================
 
-func _build_services() -> void:
-	if cfg.backend_mode == "remote":
-		_build_services_remote()                  # 前后端分离：编排在后端服务进程
-		return
-	# —— 本地模式（默认）：编排在本进程，行为与旧版完全一致 ——
-	katago = KataGoEngine.new()
-	katago.max_visits = cfg.max_visits
-	add_child(katago)
-	if katago.start(cfg.katago_bin, cfg.katago_model, cfg.katago_config):
-		_set_status("KataGo 已就绪：%s" % cfg.katago_bin)
-	else:
-		_set_status("KataGo 启动失败：%s" % katago.last_error(), true)
-
-	llm = LLMClient.new()
-	llm.base_url = cfg.llm_base_url
-	llm.model = cfg.llm_model
-	llm.api_key = cfg.llm_api_key
-	llm.think_mode = cfg.llm_think_mode
-	llm.relaunch_cb = _ensure_llm_url             # 对局中服务掉线（偶发 GPU 故障打死 llama-server）时自动重新拉起
-	add_child(llm)
-
-	_build_client_tts()                           # 语音/窥屏属客户端（渲染与交互在本进程）
-	_ensure_llm_url()                             # 本地模式：启动时一并拉起本地 LLM 服务（已有实例则跳过）
-
-	AzurePrompts.configure(cfg)                   # 注入 config.json 的自定义人设/称呼/阶段提示
-	agent = AzureAgent.new()
-	add_child(agent)
-	agent.setup(katago, llm)
-	agent.limit_len = cfg.tts_limit_len       # 右侧栏「短回复」开关
-	agent.joseki_teach = cfg.joseki_teach     # 右侧栏「定式导学」开关
-	_wire_agent()
-	llm.probe_models()
-	_warm_up_engine()                             # 后台预热 KataGo：把首次 OpenCL 调优放在开局前完成
-
-## 前后端分离（remote）：编排与 KataGo/LLM 都在后端服务进程；游戏只做渲染、语音与窥屏，
-## 通过 NetClient 以 REST（命令）+ WebSocket（事件）与后端通信。信号接线与本地模式共用。
 const NetClientScript := preload("res://scripts/net/NetClient.gd")
 
-func _build_services_remote() -> void:
+## 装配服务：编排与 KataGo/LLM 都在后端服务进程；游戏只做渲染、语音与窥屏，
+## 通过 NetClient 以 REST（命令）+ WebSocket（事件）与后端通信。
+func _build_services() -> void:
 	_build_client_tts()                           # 语音/窥屏仍归客户端（本进程拉起）
-	AzurePrompts.configure(cfg)
 	agent = NetClientScript.new()
 	agent.base_url = cfg.backend_url
 	agent.net_status.connect(_on_net_status)
@@ -1628,20 +1587,9 @@ func _wire_agent() -> void:
 	add_child(mood_timer)
 	agent.sync_mood(true)                         # 初始「平静」立即生效（表情/音高一次对齐）
 
-## 后端连接状态（仅 remote 模式）：连上/断开提示进状态栏
+## 后端连接状态：连上/断开提示进状态栏
 func _on_net_status(text: String, bad: bool) -> void:
 	_set_status(text, bad)
-
-## 预热 KataGo：首次运行需 OpenCL 调优（约 1~3 分钟），提前触发，避免玩家第一手时干等
-func _warm_up_engine() -> void:
-	if katago == null:
-		return
-	_set_status("KataGo 正在启动（首次运行需调优，约 1~3 分钟）…")
-	var r := await katago.analyze([])
-	if r.has("error"):
-		_set_status("KataGo 启动失败：%s" % str(r["error"]), true)
-	else:
-		_set_status("KataGo 已就绪")
 
 ## 本地语音服务没启动时自动降级到系统语音（只影响本次运行，不改配置）
 func _on_tts_fallback(_kind: String) -> void:

@@ -2,16 +2,11 @@ class_name AzureConfig
 extends RefCounted
 ## 配置加载/保存：优先读「可执行文件同目录 / config.json」，其次项目内 res://config.json
 
-var katago_bin := "bin/katago/katago.exe"
-var katago_model := "models/model-b18c384nbt.bin.gz"   # 现代 b18c384nbt（v1.18 引擎，16 线程下 500 visits ≈ 2s/手）
-var katago_config := "bin/katago/default_gtp.cfg"
 var max_visits := 500
 var joseki_teach := true          # 定式导学：识别对局中走出的定式并讲解（右侧栏可关；关掉=行为零变化）
 # —— 前后端架构 ——
-# "local"（默认）：对局编排在游戏进程内（KataGo/LLM 同进程，行为与旧版完全一致）
-# "remote"：对局编排在后端服务进程（KataGo/LLM 归后端），游戏只做渲染与语音，经 REST + WebSocket 通信
-var backend_mode := "local"
-var backend_url := "http://127.0.0.1:8000"   # 后端服务地址（remote 模式；WS 地址由其推导）
+# 编排（KataGo / LLM / 定式 / 情绪）全部在后端服务进程，游戏只做渲染与语音，经 REST + WebSocket 通信
+var backend_url := "http://127.0.0.1:8000"   # 后端服务地址（WS 地址由其推导）
 var llm_base_url := "http://localhost:8080/v1"
 var llm_model := "qwen3.5"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
@@ -25,7 +20,7 @@ var vrm_path := "D:/KataGo/assets/Azure.vrm"
 # —— 提示词自定义（留空则用内置 Azure 人设）——
 var prompt_system := ""           # 覆盖系统提示词（人设全文）；留空用内置
 var prompt_user_name := "Estarth" # 玩家称呼；会替换提示词中的「Estarth」
-var prompt_phase_notes: Dictionary = {}  # 覆盖阶段提示，键见 AzurePrompts.PHASE_NOTE
+var prompt_phase_notes: Dictionary = {}  # 覆盖阶段提示，键为阶段名（如 after_player / own_turn）
 # —— 本地语音（自建 CosyVoice 3 等 OpenAI 兼容服务）——
 var tts_enabled := false
 var tts_mode := "system"          # system / openai / cosyvoice
@@ -72,12 +67,8 @@ static func load_config() -> AzureConfig:
 		var d = JSON.parse_string(text)
 		if typeof(d) == TYPE_DICTIONARY:
 			c._raw = (d as Dictionary).duplicate()
-			c.katago_bin = str(d.get("katago_bin", c.katago_bin))
-			c.katago_model = str(d.get("katago_model", c.katago_model))
-			c.katago_config = str(d.get("katago_config", c.katago_config))
 			c.max_visits = int(d.get("max_visits", c.max_visits))
 			c.joseki_teach = bool(d.get("joseki_teach", c.joseki_teach))
-			c.backend_mode = str(d.get("backend_mode", c.backend_mode))
 			c.backend_url = str(d.get("backend_url", c.backend_url))
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
@@ -118,9 +109,6 @@ static func load_config() -> AzureConfig:
 			c.vlm_model = str(d.get("vlm_model", c.vlm_model))
 			c.vlm_mmproj = str(d.get("vlm_mmproj", c.vlm_mmproj))
 			c.vlm_port = int(d.get("vlm_port", c.vlm_port))
-	c.katago_bin = _resolve(c.katago_bin, exe_dir)
-	c.katago_model = _resolve(c.katago_model, exe_dir)
-	c.katago_config = _resolve(c.katago_config, exe_dir)
 	if c.vlm_exe != "":
 		c.vlm_exe = _resolve(c.vlm_exe, exe_dir)
 	if c.vlm_model != "":
@@ -142,12 +130,12 @@ func save() -> bool:
 		path = ProjectSettings.globalize_path(path)
 	var d := _raw.duplicate()
 	d["_说明"] = "KataGo / 本地 LLM / 本地语音 的路径与参数。打包发布时把本文件放在与可执行文件同一目录即可覆盖。"
-	d["katago_bin"] = d.get("katago_bin", katago_bin)
-	d["katago_model"] = d.get("katago_model", katago_model)
-	d["katago_config"] = d.get("katago_config", katago_config)
+	d.erase("katago_bin")                         # 本地编排已删除：旧配置里的 KataGo 键不再写回（读到时也一并清掉）
+	d.erase("katago_model")
+	d.erase("katago_config")
 	d["max_visits"] = max_visits
 	d["joseki_teach"] = joseki_teach
-	d["backend_mode"] = backend_mode
+	d.erase("backend_mode")                       # 只剩「连后端」一条路径：旧配置里的 backend_mode 不再写回
 	d["backend_url"] = backend_url
 	d["llm_base_url"] = llm_base_url
 	d["llm_model"] = llm_model
