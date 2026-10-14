@@ -11,20 +11,14 @@ var llm_base_url := "http://localhost:8080/v1"
 var llm_model := "qwen3.5"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
 var llm_think_mode := 0           # 思考档位：0=快速（不思考） 1=中等（限定推理预算） 2=强思考（自由推理）
-# —— 本地 LLM 服务（llama-server 常驻，游戏启动时一并拉起；也可指向远程服务）——
-var llm_auto_start := true        # base_url 指向本机时，启动游戏自动拉起本地 LLM 服务
-var llm_exe := ""                 # llama-server.exe 路径；留空由启动器自动探测
-var llm_model_path := ""          # 主模型 gguf 路径；留空由启动器自动探测
-var llm_port := 8080              # 本地服务端口（应和 base_url 里的端口一致）
 var vrm_path := "D:/KataGo/assets/Azure.vrm"
 # —— 提示词自定义（留空则用内置 Azure 人设）——
 var prompt_system := ""           # 覆盖系统提示词（人设全文）；留空用内置
 var prompt_user_name := "Estarth" # 玩家称呼；会替换提示词中的「Estarth」
 var prompt_phase_notes: Dictionary = {}  # 覆盖阶段提示，键为阶段名（如 after_player / own_turn）
-# —— 本地语音（自建 CosyVoice 3 等 OpenAI 兼容服务）——
+# —— 云端语音（OpenAI 兼容 /v1/audio/speech；system=Windows 系统语音兜底）——
 var tts_enabled := false
-var tts_mode := "system"          # system / openai / cosyvoice
-var tts_auto_start := true        # 启动游戏时自动拉起本地语音服务（无窗口）
+var tts_mode := "system"          # system / openai
 var tts_base_url := "http://127.0.0.1:9880/v1"
 var tts_model := "cosyvoice3"
 var tts_api_key := ""             # 云端 TTS（OpenAI 兼容 /v1/audio/speech）的 API Key；留空则不发送
@@ -33,19 +27,10 @@ var tts_speed := 1.0
 var tts_pitch := 1.0              # 播放层音调（0.8~1.3，会略带动语速）
 var tts_volume := 1.0
 # —— 语音加速开关（右侧栏可改）——
-var tts_bf16 := true              # CosyVoice LLM 权重降为 bfloat16：约快 20~28%，个别词可能读错
-var tts_short_prompt := false     # 用 ~2.7s 短参考替代 6.3s：实测耗时基本不变（会变慢/音色略变），默认关
 var tts_limit_len := true         # 限制 Azure 回复长度（点评 1 句/聊天 2 句）→ 语音等待随字数下降
 var tts_sync_speak := true        # 同步说话：Azure 文字等语音就绪后再一起显示（关掉则文字立即显示）
 var tts_batch_speak := false      # 整段合成：连发的多条消息合并成一段连续朗读；关=逐句（第一句播完等第二句合成）
 var tts_long_chunk := false       # 长句合并：单次 TTS 合成上限 100→160 字（首句更慢；关=100 更快出第一句）
-# —— 窥屏 VLM（本地 llama-server，ROCm GPU 常驻；也可指向远程 OpenAI 兼容服务）——
-var vlm_base_url := ""            # 留空=自动使用本地 llama-server（游戏侧负责拉起）；填了则视为外部服务，不碰本地
-var vlm_auto_start := true        # 是否允许游戏侧拉起本地 VLM 服务（本机没有 llama-server 时自动跳过）
-var vlm_exe := ""                 # llama-server.exe 路径；留空自动探测（D:/KataGo/llamacpp-rocm）
-var vlm_model := ""               # VLM gguf；留空自动探测（D:/KataGo/models/Qwen2.5-VL-3B-Instruct-IQ4_NL.gguf）
-var vlm_mmproj := ""              # 视觉编码器 gguf；留空自动探测
-var vlm_port := 8090
 
 var _path := ""
 var _raw: Dictionary = {}       # 原样保存读到的配置，写回时只覆盖改动项（保留相对路径等写法）
@@ -77,10 +62,6 @@ static func load_config() -> AzureConfig:
 				c.llm_think_mode = clampi(int(d.get("llm_think_mode", c.llm_think_mode)), 0, 2)
 			else:
 				c.llm_think_mode = 2 if bool(d.get("llm_think_strong", false)) else 0   # 旧键（bool）迁移
-			c.llm_auto_start = bool(d.get("llm_auto_start", c.llm_auto_start))
-			c.llm_exe = str(d.get("llm_exe", c.llm_exe))
-			c.llm_model_path = str(d.get("llm_model_path", c.llm_model_path))
-			c.llm_port = int(d.get("llm_port", c.llm_port))
 			c.vrm_path = str(d.get("vrm_path", c.vrm_path))
 			c.prompt_system = str(d.get("prompt_system", c.prompt_system))
 			c.prompt_user_name = str(d.get("prompt_user_name", c.prompt_user_name))
@@ -89,7 +70,6 @@ static func load_config() -> AzureConfig:
 				c.prompt_phase_notes = (pn as Dictionary).duplicate()
 			c.tts_enabled = bool(d.get("tts_enabled", c.tts_enabled))
 			c.tts_mode = str(d.get("tts_mode", c.tts_mode))
-			c.tts_auto_start = bool(d.get("tts_auto_start", c.tts_auto_start))
 			c.tts_base_url = str(d.get("tts_base_url", c.tts_base_url))
 			c.tts_model = str(d.get("tts_model", c.tts_model))
 			c.tts_api_key = str(d.get("tts_api_key", c.tts_api_key))
@@ -97,28 +77,10 @@ static func load_config() -> AzureConfig:
 			c.tts_speed = float(d.get("tts_speed", c.tts_speed))
 			c.tts_pitch = float(d.get("tts_pitch", c.tts_pitch))
 			c.tts_volume = float(d.get("tts_volume", c.tts_volume))
-			c.tts_bf16 = bool(d.get("tts_bf16", c.tts_bf16))
-			c.tts_short_prompt = bool(d.get("tts_short_prompt", c.tts_short_prompt))
 			c.tts_limit_len = bool(d.get("tts_limit_len", c.tts_limit_len))
 			c.tts_sync_speak = bool(d.get("tts_sync_speak", c.tts_sync_speak))
 			c.tts_batch_speak = bool(d.get("tts_batch_speak", c.tts_batch_speak))
 			c.tts_long_chunk = bool(d.get("tts_long_chunk", c.tts_long_chunk))
-			c.vlm_base_url = str(d.get("vlm_base_url", c.vlm_base_url))
-			c.vlm_auto_start = bool(d.get("vlm_auto_start", c.vlm_auto_start))
-			c.vlm_exe = str(d.get("vlm_exe", c.vlm_exe))
-			c.vlm_model = str(d.get("vlm_model", c.vlm_model))
-			c.vlm_mmproj = str(d.get("vlm_mmproj", c.vlm_mmproj))
-			c.vlm_port = int(d.get("vlm_port", c.vlm_port))
-	if c.vlm_exe != "":
-		c.vlm_exe = _resolve(c.vlm_exe, exe_dir)
-	if c.vlm_model != "":
-		c.vlm_model = _resolve(c.vlm_model, exe_dir)
-	if c.vlm_mmproj != "":
-		c.vlm_mmproj = _resolve(c.vlm_mmproj, exe_dir)
-	if c.llm_exe != "":
-		c.llm_exe = _resolve(c.llm_exe, exe_dir)
-	if c.llm_model_path != "":
-		c.llm_model_path = _resolve(c.llm_model_path, exe_dir)
 	return c
 
 ## 写回配置文件（语音设置改动后调用，下次启动仍生效）
@@ -129,7 +91,7 @@ func save() -> bool:
 	if path.begins_with("res://"):
 		path = ProjectSettings.globalize_path(path)
 	var d := _raw.duplicate()
-	d["_说明"] = "KataGo / 本地 LLM / 本地语音 的路径与参数。打包发布时把本文件放在与可执行文件同一目录即可覆盖。"
+	d["_说明"] = "云端模型（LLM / 语音 TTS）与远程后端服务的地址与参数。打包发布时把本文件放在与可执行文件同一目录即可覆盖。"
 	d.erase("katago_bin")                         # 本地编排已删除：旧配置里的 KataGo 键不再写回（读到时也一并清掉）
 	d.erase("katago_model")
 	d.erase("katago_config")
@@ -142,30 +104,34 @@ func save() -> bool:
 	d["llm_api_key"] = llm_api_key
 	d["llm_think_mode"] = llm_think_mode
 	d.erase("llm_think_strong")                   # 旧 bool 键已被 llm_think_mode 取代，写回时清掉
-	d["llm_auto_start"] = llm_auto_start
-	d["llm_port"] = llm_port
-	d["llm_exe"] = d.get("llm_exe", llm_exe)
-	d["llm_model_path"] = d.get("llm_model_path", llm_model_path)
+	d.erase("llm_auto_start")                     # 本地 LLM 服务编排已删除：旧键不再写回，让 v2.x 配置自我清理
+	d.erase("llm_port")
+	d.erase("llm_exe")
+	d.erase("llm_model_path")
 	d["vrm_path"] = d.get("vrm_path", vrm_path)
-	d["vlm_base_url"] = vlm_base_url
-	d["vlm_port"] = vlm_port
+	d.erase("vlm_base_url")                       # 窥屏 VLM 已删除：旧键不再写回
+	d.erase("vlm_auto_start")
+	d.erase("vlm_exe")
+	d.erase("vlm_model")
+	d.erase("vlm_mmproj")
+	d.erase("vlm_port")
 	d.merge({
 		"tts_enabled": tts_enabled,
 		"tts_mode": tts_mode,
-		"tts_auto_start": tts_auto_start,
 		"tts_base_url": tts_base_url,
 		"tts_model": tts_model,
 		"tts_voice": tts_voice,
 		"tts_speed": tts_speed,
 		"tts_pitch": tts_pitch,
 		"tts_volume": tts_volume,
-		"tts_bf16": tts_bf16,
-		"tts_short_prompt": tts_short_prompt,
 		"tts_limit_len": tts_limit_len,
 		"tts_sync_speak": tts_sync_speak,
 		"tts_batch_speak": tts_batch_speak,
 		"tts_long_chunk": tts_long_chunk,
 	}, true)
+	d.erase("tts_auto_start")                     # 本地语音服务拉起已删除：旧键不再写回
+	d.erase("tts_bf16")
+	d.erase("tts_short_prompt")
 	for k in cli_locked:                      # 命令行覆盖过的字段保持原值：--llm/--model/--key 只影响本次运行
 		if _raw.has(k):
 			d[k] = _raw[k]
@@ -177,17 +143,3 @@ func save() -> bool:
 	f.store_string(JSON.stringify(d, "  "))
 	f.close()
 	return true
-
-## 相对路径依次在「可执行文件目录 → 项目目录 → 常见 KataGo 安装目录」下查找
-static func _resolve(p: String, exe_dir: String) -> String:
-	if p.is_absolute_path():
-		return p
-	var cands: Array[String] = [
-		exe_dir.path_join(p),
-		ProjectSettings.globalize_path("res://").path_join(p),
-		"D:/KataGo".path_join(p),
-	]
-	for c in cands:
-		if FileAccess.file_exists(c):
-			return c
-	return cands[0]

@@ -176,13 +176,6 @@ func player_interaction(what: String) -> void:
 func idle_remark() -> void:
 	_post("/api/idle")
 
-func peer_remark(info: Dictionary) -> void:
-	_post("/api/peer", {
-		"fg_title": info.get("fg_title", ""),
-		"ocr": info.get("ocr", ""),
-		"vlm": info.get("vlm", ""),
-	})
-
 func tick_mood() -> void:
 	_post("/api/mood/tick")
 

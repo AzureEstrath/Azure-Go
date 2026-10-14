@@ -1,11 +1,10 @@
 class_name TTSClient
 extends Node
-## 本地 TTS 客户端：请求本机自建的语音服务（OpenAI 兼容 /v1/audio/speech，推荐 CosyVoice 3），
-## 只做「文本 → 音频字节 → 播放」。模型推理在本地服务进程里跑（可用 GPU），游戏侧几乎零开销；
-## 全程 localhost，不联网。
+## TTS 客户端：请求 OpenAI 兼容的语音服务（`/v1/audio/speech`），只做「文本 → 音频字节 → 播放」；
+## 合成在服务端完成，本进程只负责排队、预取与播放，不再拉起任何本地服务。
 
 signal status(text: String)
-signal auto_fallback(kind: String)     # 本地服务连不上时临时降级（不写配置）
+signal auto_fallback(kind: String)     # 语音服务连不上时临时降级（不写配置）
 signal speaking_changed(on: bool)      # 开始/结束朗读（化身说话时歪头用）
 signal utterance_started(group: int)   # 一条消息的音频开始播放（group=speak() 的分组号；0=试听）
 signal speech_skipped(group: int)      # 跳过朗读（服务加载中）：文字照常显示，只是没有声音
@@ -25,8 +24,7 @@ const HTTP_TIMEOUT_SLOW := 240.0     # CosyVoice 系列 CPU 很慢：给足时�
 ## 讲话时要丢掉的装饰：emoji、箭头/符号、半角假名颜文字等
 const _DROP_RE := "[\\x{1F000}-\\x{1FAFF}\\x{2190}-\\x{2BFF}\\x{FE00}-\\x{FE0F}\\x{2600}-\\x{27BF}\\x{FF61}-\\x{FF9F}\\x{30FB}\\x{FF65}\\x{2000}-\\x{200F}\\x{0370}-\\x{03FF}]"
 
-## 朗读方式：system=Windows 系统语音（零配置可用）；openai=CosyVoice 等服务(OpenAI 兼容)；
-## cosyvoice=CosyVoice 官方 fastapi（/inference_sft 表单接口）
+## 朗读方式：system=Windows 系统语音（零配置可用）；openai=OpenAI 兼容服务（云端 /v1/audio/speech）
 var mode := "system"
 var base_url := "http://127.0.0.1:9880/v1"
 var model := "cosyvoice3"
@@ -65,7 +63,6 @@ var _next_start := false
 var _next_kind := ""                   # 预取流的类型
 var _play_kind := ""                   # 正在播放的声音类型
 var _drop_result := false              # 在途请求的结果已作废（取消走神搭话）：到达时直接丢弃
-var fast_voices := {}                  # 服务端标记为轻量的音色 id（sherpa/melo）：不需要按句拆分
 var service_loading := false           # Main 置位：本地语音服务正在加载模型（加载期不出声、也不降级系统语音）
 var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think / pat）
 var allow_fillers := true              # 是否允许自动插语气词：只在对局互动中允许，闲置搭话/开场问候不插（Main 控制）
@@ -240,20 +237,10 @@ func _process(delta: float) -> void:
 func clear_fallback() -> void:
 	_prefer_mode = ""
 
-## 探测本地服务是否就绪；就绪则从系统语音兜底切回原引擎
+## 探测语音服务是否就绪；就绪则从系统语音兜底切回原引擎
 func _probe_service() -> void:
-	var prefer := _prefer_mode if _prefer_mode != "" else mode
-	var url := ""
-	if prefer == "cosyvoice":
-		var b := base_url.rstrip("/")
-		if b.ends_with("/v1"):
-			b = b.substr(0, b.length() - 3)
-		url = b + "/health"
-	else:
-		# OpenAI 兼容服务（含云端）：探标准 /models；只要服务在线就会有 HTTP 响应
-		url = base_url.strip_edges().rstrip("/") + "/models"
-	if url.contains("://localhost"):
-		url = url.replace("://localhost", "://127.0.0.1")
+	# OpenAI 兼容服务（含云端）：探标准 /models；只要服务在线就会有 HTTP 响应
+	var url := base_url.strip_edges().rstrip("/") + "/models"
 	_http.timeout = 4.0
 	_probing = true
 	_http_busy = true
@@ -450,8 +437,6 @@ func is_slow_engine() -> bool:
 	var v := voice.strip_edges().to_lower()
 	if v.ends_with("-fast"):
 		return false                       # 快速克隆版（melo + 音色转换）很快
-	if fast_voices.get(v, false):
-		return false                       # 服务端标记为轻量（engine=sherpa，如小雅/少女音）：不必拆句
 	return v != "melo" and v != "sherpa" and v != "zh_en" and not v.begins_with("melo")
 
 # ================= 内部 =================
@@ -512,17 +497,12 @@ func _pump(force := false) -> void:
 	_req_kind = str(item.get("kind", ""))
 	_req_text = text                             # 记录在途文本：连接失败可回队重试，不再丢句
 	_busy = true
-	var headers: PackedStringArray
-	var payload := ""
-	if mode == "cosyvoice":                      # CosyVoice 官方 fastapi：表单接口
-		headers = _with_auth(PackedStringArray(["Content-Type: application/x-www-form-urlencoded"]))
-		payload = "tts_text=%s&spk_id=%s" % [text.uri_encode(), voice.uri_encode()]
-	else:                                        # OpenAI 兼容 /v1/audio/speech
-		headers = _with_auth(PackedStringArray(["Content-Type: application/json"]))
-		payload = JSON.stringify({
-			"model": model, "input": text, "voice": voice,
-			"speed": speed, "response_format": "mp3",
-		})
+	# OpenAI 兼容 /v1/audio/speech
+	var headers := _with_auth(PackedStringArray(["Content-Type: application/json"]))
+	var payload := JSON.stringify({
+		"model": model, "input": text, "voice": voice,
+		"speed": speed, "response_format": "mp3",
+	})
 	_last_url = _endpoint()
 	_http_busy = true
 	_http_since = Time.get_ticks_msec()
@@ -538,10 +518,9 @@ func _pump(force := false) -> void:
 		status.emit("Azure 正在开口…（本句合成中，约 %d 秒）" % int(ceil(text.length() * 1.2)))
 
 func _endpoint() -> String:
-	var b := base_url.rstrip("/")
-	return b + ("/inference_sft" if mode == "cosyvoice" else "/audio/speech")
+	return base_url.rstrip("/") + "/audio/speech"
 
-## 本地服务无需鉴权；填了 api_key（云端 OpenAI 兼容 TTS）则带 Bearer
+## 云端 OpenAI 兼容 TTS：填了 api_key 就带 Bearer（留空则不发送）
 func _with_auth(h: PackedStringArray) -> PackedStringArray:
 	var key := api_key.strip_edges()
 	if key != "":
