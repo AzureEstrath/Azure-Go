@@ -10,7 +10,6 @@ signal utterance_started(group: int)   # 一条消息的音频开始播放（gro
 signal speech_skipped(group: int)      # 跳过朗读（服务加载中）：文字照常显示，只是没有声音
 
 const QUEUE_MAX := 3
-const LOADING_HOLD_MAX := 6             # 语音服务加载期间最多暂存多少条待读消息（超出丢最旧的并放行其文字）
 const FAIL_COOLDOWN := 6.0
 const MAX_CHARS := 300
 const FILLER_FORCE_GAP_MS := 4000      # 任意两个语气词之间的最小间隔（force 也不能贴脸连播，防多路叠着响）
@@ -52,7 +51,6 @@ var _cooldown := 0.0
 var _base_ready := false
 var _next_stream: AudioStream = null   # 边播边合成的下一句（预取），消除句间空白/卡住
 var _queue: Array[Dictionary] = []     # 朗读队列：{text, group, start, kind}；group 保证「一条消息一次 utterance_started」
-var _loading_hold: Array[Dictionary] = []   # 服务加载期暂存的整条消息：就绪后按序补读（不再跳过朗读）
 var _group_seq := 0                    # 消息分组号（每次 speak() 自增）
 var _req_group := 0                    # 在途合成请求属于哪一组
 var _req_start := false                # 在途请求是否为该组的第一块
@@ -63,7 +61,6 @@ var _next_start := false
 var _next_kind := ""                   # 预取流的类型
 var _play_kind := ""                   # 正在播放的声音类型
 var _drop_result := false              # 在途请求的结果已作废（取消走神搭话）：到达时直接丢弃
-var service_loading := false           # Main 置位：本地语音服务正在加载模型（加载期不出声、也不降级系统语音）
 var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think / pat）
 var allow_fillers := true              # 是否允许自动插语气词：只在对局互动中允许，闲置搭话/开场问候不插（Main 控制）
 var _filler_player: AudioStreamPlayer = null
@@ -154,18 +151,6 @@ func begin_filler_turn() -> void:
 ## 三维情绪区域 → 音高微调（由 Main 在 mood_changed 时下发；只影响本句听感，不改用户配置）
 func set_mood_pitch(p: float) -> void:
 	mood_pitch = clampf(p, -0.15, 0.15)
-
-## Main 在语音服务健康检查结束（就绪或超时）后调用：解除「加载中」闸门并立刻开始朗读
-func notify_service_ready() -> void:
-	service_loading = false
-	_cooldown = 0.0
-	# 加载期间排队的整条消息：现在按序补读（文字端仍按「同步说话」规则跟着语音开口才出现）
-	if not _loading_hold.is_empty():
-		var held := _loading_hold
-		_loading_hold = []
-		for it in held:
-			_enqueue(str(it["text"]), int(it["group"]), str(it.get("kind", "")))
-	_pump()
 
 ## 播放预制欢迎语音（assets/voice/welcome_<名字>.wav）：开场问候零等待，不必等引擎合成。
 ## 有对应文件才播并返回 true（调用方据此把文字直接显示）；否则返回 false，走普通语音流程。
@@ -258,17 +243,6 @@ func speak(text: String, kind := "") -> int:
 	var t := clean_for_speech(text)
 	if t == "":
 		return 0
-	if service_loading and mode != "system":
-		# 本地服务正在加载模型：本条先排队等它就绪再读（绝不降级系统语音——用户会突然听到 Windows 音色）。
-		# 这里不发 speech_skipped：调用方的文字会一直等到这条真正开口才显示（同步说话模式）
-		_group_seq += 1
-		var lg := _group_seq
-		_loading_hold.append({"text": t, "group": lg, "kind": kind})
-		while _loading_hold.size() > LOADING_HOLD_MAX:
-			var old: Dictionary = _loading_hold.pop_front()   # 排太久了：丢最旧的一条，放行它的文字
-			speech_skipped.emit.call_deferred(int(old["group"]))
-		status.emit("语音服务加载中：本条已排队，就绪后自动朗读")
-		return lg
 	_group_seq += 1
 	var g := _group_seq
 	_enqueue(t, g, kind)
@@ -276,7 +250,6 @@ func speak(text: String, kind := "") -> int:
 	return g
 
 ## 是否还在忙（合成中/排队中/正在播放）。「同步说话」用它判断文字该等语音，还是直接显示。
-## 注意：加载期暂存的 _loading_hold 不算「在说」——棋盘锁与落子揭示不该被它拖住
 func is_speaking() -> bool:
 	return _speaking or _busy or _http_busy or _next_stream != null or not _queue.is_empty()
 
@@ -285,10 +258,7 @@ func stop() -> void:
 	for it in _queue:
 		if bool(it.get("start", false)):
 			speech_skipped.emit.call_deferred(int(it["group"]))
-	for it2 in _loading_hold:
-		speech_skipped.emit.call_deferred(int(it2["group"]))
 	_queue.clear()
-	_loading_hold.clear()
 	_next_stream = null
 	_next_kind = ""
 	if _player != null and _player.playing:
@@ -319,13 +289,6 @@ func cancel_kind(kind: String) -> bool:
 		else:
 			kept.append(it)
 	_queue = kept
-	var kept_hold: Array[Dictionary] = []
-	for it in _loading_hold:
-		if str(it.get("kind", "")) == kind:
-			hit = true                                # 还没轮到补读的走神搭话：直接丢掉（文字也不显示）
-		else:
-			kept_hold.append(it)
-	_loading_hold = kept_hold
 	if _next_stream != null and _next_kind == kind:   # 预取的那一段也属于被取消的消息
 		_next_stream = null
 		_next_kind = ""
@@ -478,8 +441,6 @@ func _pump(force := false) -> void:
 		return
 	if not force and (not enabled or _cooldown > 0.0):
 		return
-	if service_loading and mode != "system":
-		return                                   # 本地服务正在加载：本轮不请求（notify_service_ready 后恢复）
 	if mode == "system":
 		if _sapi_pid > 0 and OS.is_process_running(_sapi_pid):
 			return                               # 上一句还在读
@@ -593,18 +554,13 @@ func _on_done(result: int, code: int, _headers: PackedStringArray, body: PackedB
 		if conn_failed and mode != "system":
 			# 出队的这句先放回队首（原来会静默丢弃）
 			_queue.push_front({"text": _req_text, "group": _req_group, "start": _req_start, "kind": _req_kind})
-			if service_loading:
-				# 服务还在加载模型：绝不降级系统语音（否则会突然冒出 Windows 音色），等它就绪
-				status.emit("语音服务正在加载模型，本条等它就绪后再读")
-				_cooldown = 2.0
-			else:
-				# 本地服务没启动：临时改走系统语音，保证「有声音」，但不写回配置
-				_cooldown = 0.0
-				_prefer_mode = mode                       # 记住原引擎，服务就绪后自动切回
-				_recover_at = Time.get_ticks_msec() + 8000
-				mode = "system"
-				auto_fallback.emit("system")
-				_pump()
+			# 服务连不上：临时改走系统语音，保证「有声音」，但不写回配置
+			_cooldown = 0.0
+			_prefer_mode = mode                       # 记住原引擎，服务就绪后自动切回
+			_recover_at = Time.get_ticks_msec() + 8000
+			mode = "system"
+			auto_fallback.emit("system")
+			_pump()
 			return
 		_cooldown = FAIL_COOLDOWN
 		_set_speaking(false)
