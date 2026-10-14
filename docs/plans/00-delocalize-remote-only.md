@@ -261,10 +261,12 @@ git commit -m "refactor(game): 只保留 remote 模式，删除本地编排与�
 - Produces: `Main.gd` 中不再出现任何 `OS.create_process` 调用；`TTSClient` 只认 `system` / `openai`
 
 - [ ] **Step 1: 删除代码** — 按 `Files` 逐项删除；`_process()` 的闲置逻辑保留「到点调 `agent.idle_remark()`」这一步。
-- [ ] **Step 2: 确认前端不再拉起进程**
+- [ ] **Step 2: 确认只剩“播放与清洗”，不再拉起任何服务**
 
-Run: `rg -n "create_process|wscript|\.bat|wscript\.exe|azure_peek|start_llm_server|start_vlm_server" game`
+Run: `rg -n "create_process|wscript|azure_peek|start_llm_server|start_vlm_server|_spawn_tts_server|_autostart_tts|_peek_|PEEK_" game`
 Expected: 无匹配
+
+> 注意：`clean_for_speech / _split_sentences / _chunk_for_slow` **本任务不删**——它们的后端替代品（`backend/app/speech_text.py`）属于计划 05，先删会留下“前端不会清洗、后端还没有清洗”的回归窗口。它们随计划 05 Task 4 一起搬走。
 
 - [ ] **Step 3: 冒烟验证**
 
