@@ -34,7 +34,7 @@
 
 - **仓库 clone 下来跑不起来是正常的**：`katago.exe`/`*.dll`、`model.bin`、`Azure.vrm`、CosyVoice 权重都不入库（见 `.gitignore` 与 README「模型与资产」，走 GitHub Releases）。不要试图补齐、生成或提交这些大文件。
 - 配置读取顺序：**可执行文件同目录 `config.json` → `res://config.json`**；`game/config.json` 只是随包模板。游戏内设置面板会**写回** config.json，而 CLI `--llm/--model/--key/--backend-url` 被记进 `cli_locked`、只影响本次运行——改配置逻辑时别破坏这个区分。
-- 后端配置走环境变量 `AZURE_CONFIG`；未设置时依次在可执行目录 → 项目目录 → `..\game\config.json` 查找（`backend/app/config.py` 的 `load`）。相对路径仍会在可执行目录 → 项目目录 → `D:/KataGo` 下解析，这条只服务 `katago_*`（计划 01 随引擎服务化一起清掉）。
+- 后端配置走环境变量 `AZURE_CONFIG`；未设置时 `backend/app/config.py` 的 `load` 依次找 `<当前工作目录>/config.json` → `backend/config.json`（`backend\run_server.bat` 会先把 `..\AzureGoGodot\config.json` 或 `..\game\config.json` 写进 `AZURE_CONFIG`）。相对路径在 `[config 文件所在目录] → backend/ → D:/KataGo` 下解析（`_resolve`），这条只服务 `katago_*`（计划 01 随引擎服务化一起清掉）。
 - 不要拿 `game/config.json` 当字段默认值来源：模板（随包样例：`max_visits=100`、`tts_enabled=true`、`tts_pitch=1.02`、`tts_volume=0.65`、`vrm_path` 用相对值）与 `AzureConfig.gd` 的代码默认值并不一致，这是既有且有意的。以 `AzureConfig.gd` 为准，字段清单看 README 第三节。
 - `vrm_path` 建议写**绝对路径**（相对路径要能被 Godot 解析到，否则形象加载失败）。
 - 场景引用带 `uid://`（`Main.tscn` 的 ext_resource），`*.gd.uid` 与 `*.import` 已入库：移动/重命名脚本或资源时同步更新它们，不要手写 uid。

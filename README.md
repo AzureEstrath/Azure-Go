@@ -46,7 +46,7 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 │   ├─ requirements.txt     后端依赖
 │   └─ run_server.bat       一键启动后端（监听 127.0.0.1:8000）
 ├─ server\                  自建语音服务（CosyVoice 3，可选；**需自己启动**，游戏不再拉起）
-│   ├─ azure_tts_server.py  FastAPI 服务：OpenAI 兼容 `/v1/audio/speech`、`/health`、`/v1/voices`
+│   ├─ azure_tts_server.py  FastAPI 服务：OpenAI 兼容 `/v1/audio/speech`、`/health`、`/voices`（另有 `/v1/models`）
 │   ├─ run_hidden.vbs       隐藏窗口启动（手动启动自建服务时用）
 │   ├─ start_tts_server*.bat 手动启动脚本
 │   ├─ voices.json          克隆音色的参考音频与文本
@@ -73,7 +73,8 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
 4. 玩家**执黑先行**：左键落子，右键拖拽旋转视角，滚轮缩放。
 
 `config.json` 放在**可执行文件同目录**即可覆盖包内默认值（源码运行时读 `game\config.json`）。
-语音默认走 **Windows 系统语音**，零配置；聊天/讲解需要按第四节接上一个大模型 API。
+语音默认走云端 `openai`（模板指向 OpenAI，填 `tts_api_key` 即可用）；服务连不上时会自动临时降级为
+**Windows 系统语音**。聊天/讲解需要按第四节接上一个大模型 API。
 
 ---
 
@@ -101,9 +102,10 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
 | `tts_speed` / `tts_pitch` / `tts_volume` | 语速 / 音调（播放层变调）/ 音量 |
 | `tts_limit_len` / `tts_sync_speak` / `tts_batch_speak` / `tts_long_chunk` | 短回复 / 同步说话 / 整段合成 / 长句合并（立即生效） |
 
-> - `tts_base_url` / `tts_model` / `tts_voice` 要**配套**：模板里的 `https://api.openai.com/v1` 配 `tts-1`，
->   若只想填 Key 就用 OpenAI；换其他服务商时地址、模型名、音色 id 都要按服务商的取值改，
->   否则会合成失败并**静默降级为系统语音**（不报错、不改配置）。
+> - `tts_base_url` / `tts_model` / `tts_voice` 要**配套**：模板的三件套是 `https://api.openai.com/v1` + `tts-1` + `中文女`，
+>   其中 `中文女` **不是** OpenAI 的音色 id——想在 OpenAI 上「只填 Key」的话，音色要一并改成 `alloy` / `nova` / `onyx`
+>   之类的 OpenAI 音色（音色 id 也可手填）；换其他服务商时地址、模型名、音色 id 都按服务商的取值改。
+>   三件套不匹配时合成会失败并**静默降级为系统语音**（不报错、不改配置），表现为「有声音，但是 Windows 系统语音」。
 > - `katago_bin` / `katago_model` / `katago_config` **不在上表**：它们由**后端**读取（当前后端仍自行拉起
 >   KataGo 进程，计划 01 会改成独立的 KataGo 服务 + `katago_url`），客户端忽略这些键。
 
@@ -122,7 +124,7 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
 - **也可在游戏里改**：开局前的「出发前的准备」面板能直接填地址 / 模型名 / API Key（确认后写回 `config.json`），不用手动编辑。
 - **云端**：DeepSeek / OpenAI / 通义 / 硅基流动 等 OpenAI 兼容服务，填地址、模型名与 Key。
 - **自建服务**：vLLM / LM Studio / llama.cpp server 等，`llm_api_key` 留空即可——游戏只按地址请求，不负责启动它。
-- 命令行临时指定（不写回配置）：`AzureGoGodot.exe --llm=http://localhost:8080/v1 --model=你的模型名 --key=你的密钥`
+- 命令行临时指定（不写回配置）：`AzureGoGodot.exe --llm=https://api.deepseek.com/v1 --model=deepseek-chat --key=你的密钥`（指向自建服务时把地址换成它的，如 `http://127.0.0.1:8080/v1`）
 - 没接 LLM 时：**对局功能照常可用**，只是讲解/闲聊退化为兜底台词。
 
 ---
@@ -146,7 +148,7 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
 对局编排、KataGo 与 LLM 都在**后端进程**（`backend\`，FastAPI + REST + WebSocket）里；游戏客户端只做渲染、
 输入与语音播放，**不启动任何模型服务**（没有 local 模式）。后端连不上时只在状态栏提示，不影响界面操作。
 
-- **启动后端**：双击 `backend\run_server.bat`（或 `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`），
+- **启动后端**：双击 `backend\run_server.bat`（等价的手动启动：`cd backend` 后 `python -m app.main`），
   监听 `http://127.0.0.1:8000`。依赖 `fastapi` / `uvicorn` / `httpx`（见 `backend\requirements.txt`）。
 - **配置**：`config.json` 里
   ```json
@@ -157,8 +159,9 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
   - REST：`/api/move|hint|analyze|chat|summarize|undo|reset|config|reveal|interaction|idle|mood/tick`，
     以及 `GET /api/state`、`GET /api/health`。
   - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki`。
-- **后端配置**：后端进程用环境变量 `AZURE_CONFIG` 指定 `config.json`；未设置时依次在
-  可执行目录 → 项目目录 → `..\game\config.json` 查找。
+- **后端配置**：后端进程用环境变量 `AZURE_CONFIG` 指定 `config.json`；未设置时依次找 `<当前工作目录>\config.json`
+  → `backend\config.json`（`backend\app\config.py` 的 `load`）。`backend\run_server.bat` 会先把
+  `..\game\config.json`（或 `..\AzureGoGodot\config.json`）写进 `AZURE_CONFIG`，所以双击启动时用的是游戏那份配置。
 - **注意**：后端依赖本机 Python 环境，需按上面的命令自行启动；后端不在时游戏只提示、不崩溃。
 
 ---
@@ -201,12 +204,12 @@ KataGo 引擎与权重遵循其上游许可。
 - **代码整理**：`game\scripts\` 按职责重新分类为 `core` / `ai` / `services` / `ui` 四个子目录（引用与场景同步更新）；清理过期注释与只写不读的死变量，行为不变。
 
 ### v1.4.0
-- **定式导学**：对局中走出常见定式（点三三 / 小飞挂 / 双飞燕…，入门定式库取自 KataGo 自对弈实测）时，Azure 讲解要点、棋盘按手顺点亮高亮轨迹；你偏离已吻合的定式时，她会轻轻提一句常规形状（点到即止）。识别零引擎与额外 LLM 调用（成型讲解直接替换该手点评）；悔棋回滚后可重新讲解；右侧栏「定式导学」可关，关掉行为与旧版一致。
-- **发言更像真人**：提示词删掉可被照抄的示例句、补「说话方式」小节；LLM 侧开启重复惩罚；完全相同的重复句直接抑制。新增导演层：重要点评前有犹豫节拍、聊天面板逐字打字（确定性规则，零额外开销）。
+- **定式导学**：对局中走出常见定式（点三三 / 小飞挂 / 双飞燕…，入门定式库取自 KataGo 自对弈实测）时，Azure 讲解要点、棋盘按手顺点亮高亮轨迹；你偏离已吻合的定式时，她会轻轻提一句常规形状（点到即止）。识别纯本地计算、零引擎与额外 LLM 调用（成型讲解直接替换该手点评）；悔棋回滚后可重新讲解；右侧栏「定式导学」可关，关掉行为与旧版一致。
+- **发言更像真人**：提示词删掉可被照抄的示例句、补「说话方式」小节；LLM 侧开启重复惩罚；完全相同的重复句直接抑制。新增导演层：重要点评前有犹豫节拍、聊天面板逐字打字（确定性本地规则，零额外开销）。
 - **语气词与情绪**：预制语音（欢迎语 + 语气词）扩到 20 条——新增 加油 / 得意 / 傲娇 / 叹气 四类语气，并全部以新一轮高精度音色合成逐条择优替换，更接近 Azure 声线；新增 `[[tone:…]]` 情绪标记与去重（同一情绪 30 秒内只出声一次）、语气词不叠响、思考声每回合限一次。
 - **思考三档**：快速 / 中等（推理限 token 预算并注入收尾提示）/ 强思考，设置面板与 `config.json` 均可选；旧 `llm_think_strong` 自动迁移。
-- **本机 LLM 服务更稳**：对局中看护本机 LLM 服务，意外退出（如 GPU 故障）自动重新拉起；llama-server 加载期 503 显示「正在加载」而不是报错。
-- **语音加载期不再误用系统音色**：本机语音模型加载期间只出文字、绝不降级为 Windows 音色；TTS 地址指向外部 API 时不拉起 / 不等待本机服务。
+- **本地服务更稳**：对局中看护本地 LLM 服务，意外退出（如 GPU 故障）自动重新拉起；llama-server 加载期 503 显示「正在加载」而不是报错。
+- **语音加载期不再误用系统音色**：本地语音模型加载期间只出文字、绝不降级为 Windows 音色；TTS 地址指向外部 API 时不拉起 / 不等待本地服务。
 - **对局进程观**：按手数识别布局 / 中盘 / 收官，让她的口吻与当前进程匹配（治刚开局就喊「反击」「缠斗」）。
 
 ### v1.3.1
@@ -215,19 +218,19 @@ KataGo 引擎与权重遵循其上游许可。
 
 ### v1.3.0
 - **开局设置面板**：启动时先弹出「出发前的准备」——选择**快速 / 强思考**，并可直接修改 **LLM / 语音 TTS / 看屏幕 VLM** 的 API 配置（默认沿用上次的值，只有改过的才写回 `config.json`；命令行 `--llm/--model/--key` 的临时覆盖不会写回）。**（v3.0.0 起面板只剩 LLM 与语音 TTS。）**
-- **强思考模式**：思考型模型（Qwen3 等）可选「先推理再回答」（更慢、质量更好）；本机服务自动放行推理段，云端 API 不支持时自动回退，不影响使用。
+- **强思考模式**：思考型模型（Qwen3 等）可选「先推理再回答」（更慢、质量更好）；本地服务自动放行推理段，云端 API 不支持时自动回退，不影响使用。
 - 语音修正：取消「首块短切」分句合成——短消息整句一次合成、连续读完，不再开口碎句。
 - 看屏幕修正：游戏窗口在前台（玩家就在游戏里）时不再白起 python 进程；超时不再残留孤儿进程、失败不再占用冷却；结果文件按次命名；VLM 服务未就绪时等待重试（不再白白回退 CPU）。
 - 修复 `start_qwen35b.bat` 误杀看屏幕 VLM 的 llama-server（现在只结束占用 8080 的旧实例）。
 
 ### v1.2.0
 - **开场秒开口**：第一句欢迎语改为**预制语音**（`assets\voice\welcome_<玩家名>.wav`），启动即播、零等待；缺文件自动回退普通合成。
-- **本机服务随游戏自动起停**：启动时一并拉起本机 LLM / CosyVoice / 看屏幕 VLM 服务，退出时清理由游戏拉起的进程（缺环境自动跳过，不影响使用）。**（v3.0.0 已移除：游戏不再拉起任何服务。）**
+- **本地服务随游戏自动起停**：启动时一并拉起本地 LLM / CosyVoice / 看屏幕 VLM 服务，退出时清理由游戏拉起的进程（缺环境自动跳过，不影响使用）。**（v3.0.0 已移除：游戏不再拉起任何服务。）**
 - 新增 `llm_auto_start` / `llm_exe` / `llm_model_path` / `llm_port` 与 `vlm_*` 配置项。
 - 提速：LLM 前缀缓存复用；思考型模型默认关思考（云端不认自动回退）；CosyVoice 边播边合成、长句合并（可开关）。
 
 ### v1.1.0
-- 长闲置**看屏幕搭话**：空闲时截屏 + OCR + 本机 VLM 看图，Azure 主动找你说话（缺环境自动降级为普通搭话）。
+- 长闲置**看屏幕搭话**：空闲时截屏 + OCR + 本地 VLM 看图，Azure 主动找你说话（缺环境自动降级为普通搭话）。
 - 点评跨回合去重；落子宣告不复读；走神搭话语音可整句作废。
 
 本人技术有限，但想象力绝对够，后续版本更新取决于ai以及我的计算机&人工智能学习深度(:-])
