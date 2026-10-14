@@ -1,9 +1,9 @@
 """后端配置（对应 ``AzureConfig.gd`` 中与后端相关的字段）。
 
-前后端分离后，config.json 仍只有一份：客户端只读它需要的（渲染/TTS/VLM/VRM 等），
+前后端分离后，config.json 仍只有一份：客户端只读它需要的（渲染 / 语音 TTS / VRM 等），
 后端只读引擎与 LLM、提示词自定义部分。这里只保留后端需要的字段，避免两边职责重叠。
 
-相对路径解析顺序与 Godot 版一致：可执行文件目录 → 项目目录 → D:/KataGo。
+相对路径解析顺序：可执行文件目录 → 项目目录 → D:/KataGo（前端不再解析路径，这一条只服务后端的引擎配置）。
 """
 
 import json
@@ -19,8 +19,8 @@ class AzureConfig:
         self.katago_config = r"D:\KataGo\bin\katago\default_gtp.cfg"
         self.max_visits = 500
         self.joseki_teach = True
-        self.llm_base_url = "http://localhost:8080/v1"
-        self.llm_model = "qwen3.5"
+        self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
+        self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
         self.llm_think_mode = 0
         # —— 提示词自定义（留空则用内置 Azure 人设）——

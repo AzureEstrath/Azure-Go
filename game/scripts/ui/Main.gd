@@ -274,7 +274,7 @@ func _build_right_panel(root: Control) -> void:
 	_style_check(_chk_joseki, "定式导学")
 	info.add_child(_chk_joseki)
 
-	# 加速开关（bf16 / 短参考需重启语音服务；短回复、同步说话、整段合成、长句合并立即生效）
+	# 语音开关（短回复、同步说话、整段合成、长句合并，均立即生效）
 	var acc := GridContainer.new()
 	acc.columns = 2
 	acc.add_theme_constant_override("h_separation", 12)
@@ -341,7 +341,7 @@ func _build_right_panel(root: Control) -> void:
 	_lbl_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(_lbl_status)
 
-## 左侧（与右侧等宽）：本地语音朗读设置
+## 左侧（与右侧等宽）：语音朗读设置
 func _build_left_panel(root: Control) -> void:
 	var panel := PanelContainer.new()
 	_left_panel = panel
@@ -393,7 +393,7 @@ func _build_left_panel(root: Control) -> void:
 	vb.add_child(_field_label("服务地址（上面第 2 项才需要）"))
 	var le_url := LineEdit.new()
 	le_url.text = cfg.tts_base_url
-	le_url.tooltip_text = "例如 http://127.0.0.1:9880/v1"
+	le_url.tooltip_text = "云端 OpenAI 兼容语音服务地址，例如 https://api.openai.com/v1（自建服务填它的地址）"
 	le_url.text_submitted.connect(func(_t): _apply_tts_fields())
 	le_url.focus_exited.connect(_apply_tts_fields)
 	vb.add_child(le_url)
@@ -423,7 +423,8 @@ func _build_left_panel(root: Control) -> void:
 	vrow.add_theme_constant_override("separation", 6)
 	vb.add_child(vrow)
 	var b_refresh := Button.new()
-	b_refresh.text = "刷新音色列表"
+	b_refresh.text = "重填音色候选"
+	b_refresh.tooltip_text = "音色候选是本地静态列表，点一下按当前配置重填下拉框；具体音色 id 也可在右侧手填"
 	b_refresh.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	b_refresh.pressed.connect(_refresh_voices)
 	vrow.add_child(b_refresh)
@@ -637,9 +638,9 @@ func _fill_voice_items() -> void:
 			_tts_voice_opt.select(i)
 			break
 
-## 已移除的音色（男声 / 韩语女 / 旧克隆音色）；azure 是新的克隆音色，保留
+## 已移除的音色（男声 / 韩语女 / 旧克隆音色）：清单以 AzureConfig.LEGACY_TTS_VOICES 为准，不再各存一份
 static func _is_removed_voice(v: String) -> bool:
-	return v in ["中文男", "日语男", "英文男", "韩语女", "azure-soft", "azure-brisk", "azure-calm"]
+	return v in AzureConfig.LEGACY_TTS_VOICES
 
 func _on_voice_selected(i: int) -> void:
 	var vid := str(_tts_voice_opt.get_item_metadata(i))
@@ -653,7 +654,7 @@ func _on_voice_selected(i: int) -> void:
 	cfg.save()
 	_tts_status.text = "音色已切换：%s" % vid
 
-## 「刷新音色列表」按钮：音色不再由服务端提供，这里只按静态候选重填一次下拉框
+## 「重填音色候选」按钮：音色不再由服务端提供，这里只按静态候选重填一次下拉框
 func _refresh_voices() -> void:
 	_fill_voice_items()
 	_tts_status.text = "音色候选已重填（%d 项，也可手填服务商音色）" % _tts_voice_opt.item_count
@@ -831,7 +832,7 @@ func _deliver_msg(kind: String, text: String, tone: String) -> void:
 		_flush_pending_ai()
 	_add_msg_now(kind, text)
 
-## 把新一句并进攒着的文本：不用换行（CosyVoice 会把 \n 当分句甚至丢掉），按标点补齐句读
+## 把新一句并进攒着的文本：不用换行（部分语音服务会把 \n 当分句甚至丢掉），按标点补齐句读
 static func _join_batch(cur: String, add: String) -> String:
 	var a := add.strip_edges()
 	if a == "":
@@ -1195,7 +1196,7 @@ func _build_setup_panel() -> void:
 	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(sub)
 
-	vb.add_child(_field_label("思考模式（只影响本地 Qwen3 这类思考型模型）"))
+	vb.add_child(_field_label("思考模式（只影响 Qwen3 这类思考型模型）"))
 	var think_opt := OptionButton.new()
 	think_opt.fit_to_longest_item = false
 	think_opt.add_item("快速：不思考，首字 1~2 秒（推荐）")
@@ -1207,9 +1208,9 @@ func _build_setup_panel() -> void:
 
 	var llm_body := _setup_section(vb, "LLM 对话 API（点评 / 聊天）")
 	var le_llm_url := _setup_field(llm_body, "服务地址", cfg.llm_base_url,
-		"本地：http://127.0.0.1:8080/v1；云端：OpenAI 兼容地址（本机地址时游戏会自动拉起本地服务）")
+		"云端 OpenAI 兼容地址，如 https://api.deepseek.com/v1（也可指向自建服务）")
 	var le_llm_model := _setup_field(llm_body, "模型名", cfg.llm_model,
-		"本地 llama-server 通常任意名皆可；云端填服务商要求的模型 id")
+		"填服务商要求的模型 id，如 deepseek-chat")
 	var le_llm_key := _setup_field(llm_body, "API Key（只有云端需要）", cfg.llm_api_key,
 		"留空=不发送 Authorization；只会存在本机的 config.json 里")
 
@@ -1302,7 +1303,7 @@ func _build_services() -> void:
 	_wire_agent()
 	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
 
-## 客户端侧语音：只是播放器/合成请求方，不拉起任何本地服务
+## 客户端侧语音：只负责请求云端合成与播放，不启动任何模型服务
 func _build_client_tts() -> void:
 	tts = TTSClient.new()
 	tts.enabled = cfg.tts_enabled

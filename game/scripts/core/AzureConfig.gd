@@ -4,7 +4,7 @@ extends RefCounted
 
 ## 朗读方式只有 system / openai 两种（与左侧栏下拉一一对应）：旧配置里的 "cosyvoice" 等未知值一律回落云端 openai
 const TTS_MODES := ["system", "openai"]
-## 旧配置里已废弃的本地引擎音色 id → 回落模板默认音色；清单与 Main._is_removed_voice() 同源（core 不依赖 ui，两处各列一份）。
+## 旧配置里已废弃的本地引擎音色 id → 回落模板默认音色；清单是**唯一副本**，UI（`Main._is_removed_voice()`）直接引用它。
 ## 自建 CosyVoice 服务仍在用的活音色（azure / azure-fast / melo）**不在此列**，必须原样保留（该服务默认音色就是 azure）。
 ## 这里用黑名单而非白名单：tts_voice 允许手填任意服务商音色，白名单会把用户自填值冲掉。
 const LEGACY_TTS_VOICES := ["中文男", "日语男", "英文男", "韩语女", "azure-soft", "azure-brisk", "azure-calm"]

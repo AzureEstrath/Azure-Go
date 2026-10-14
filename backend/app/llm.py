@@ -1,7 +1,7 @@
-"""本地 LLM（OpenAI 兼容 /v1/chat/completions）调用（对应 ``LLMClient.gd``）。
+"""LLM（OpenAI 兼容 /v1/chat/completions）调用。
 
-与 Godot 版一致：剥离思考段落；思考档位只影响「她怎么想」，推理段永不显示给玩家。
-Godot 用 HTTPRequest 节点；Python 侧用 httpx.AsyncClient，串行化与重试阶梯保持一致。
+剥离思考段落；思考档位只影响「她怎么想」，推理段永不显示给玩家。
+用 httpx.AsyncClient，串行化与重试阶梯沿用旧客户端的实现。
 
 对外接口：``chat(messages, max_tokens, no_think) -> str``（失败返回可读错误说明）。
 """
@@ -140,11 +140,11 @@ class LLMClient:
             "max_tokens": max_tokens,
             "temperature": 0.7,
             "top_p": 0.9,
-            # 降复读（OpenAI 兼容参数，llama-server 原生支持）：
+            # 降复读（OpenAI 兼容参数，支持它的服务端更稳）：
             # 让她少用重复的口头禅和句式，发言更像人
             "frequency_penalty": 0.4,
             "presence_penalty": 0.2,
-            "cache_prompt": True,               # 复用上轮 KV 前缀：本地点评首字更快
+            "cache_prompt": True,               # 复用上轮 KV 前缀：点评首字更快
         }
         with_think = not self._think_params_unsupported
         if with_think:

@@ -7,7 +7,7 @@ signal status(text: String)
 signal auto_fallback(kind: String)     # 语音服务连不上时临时降级（不写配置）
 signal speaking_changed(on: bool)      # 开始/结束朗读（化身说话时歪头用）
 signal utterance_started(group: int)   # 一条消息的音频开始播放（group=speak() 的分组号；0=试听）
-signal speech_skipped(group: int)      # 跳过朗读（服务加载中）：文字照常显示，只是没有声音
+signal speech_skipped(group: int)      # 跳过朗读（队列溢出或被取消）：文字照常显示，只是没有声音
 
 const QUEUE_MAX := 3
 const FAIL_COOLDOWN := 6.0
@@ -38,7 +38,7 @@ var enabled := false
 var _sapi_pid := -1          # 系统语音的子进程
 var _last_url := ""
 var _speaking := false
-var _prefer_mode := ""       # 临时降级前的引擎模式（本地服务就绪后自动切回）
+var _prefer_mode := ""       # 临时降级前的引擎模式（语音服务恢复后自动切回）
 var _recover_at := 0         # 下次探测服务可用性的时刻（ms）
 var _probing := false        # 在途请求是否为「恢复探测」
 var _http_busy := false      # Godot 的 HTTPRequest 同时只能有一个请求，单独跟踪避免 ERR_BUSY
@@ -92,7 +92,7 @@ const FILLER_FILES := {
 	"sigh": ["filler_sigh_1.wav", "filler_sigh_2.wav"],          # 叹气/可惜：唉……、哎呀
 	"cheer": ["filler_cheer_1.wav", "filler_cheer_2.wav"],       # 惊叹/赞叹：哇！、好哎~
 	"proud": ["filler_proud_1.wav", "filler_proud_2.wav"],       # 小得意/撒娇：哼哼~、诶嘿
-	"hmph": ["filler_hmph_1.wav", "filler_hmph_2.wav"],          # 生气/得意的哼：窥屏发言前专用
+	"hmph": ["filler_hmph_1.wav", "filler_hmph_2.wav"],          # 生气/得意的哼：情绪区域爆发时用
 }
 
 ## 载入预制语气词：res://assets/voice/ 下按清单加载
@@ -213,7 +213,7 @@ func _process(delta: float) -> void:
 		_sapi_pid = -1
 		_on_spoken()                             # 系统语音：本句读完，接着读下一句
 	if _prefer_mode != "" and not _http_busy and not _busy and Time.get_ticks_msec() >= _recover_at:
-		_probe_service()                         # 临时降级中：定期看看本地服务好了没
+		_probe_service()                         # 临时降级中：定期探测语音服务是否恢复
 	# 合成等待超过 1.6 秒又没在出声：插一句预制语气词，别让等待显得像卡住
 	if _http_busy and not _speaking and _next_stream == null and Time.get_ticks_msec() - _http_since > 1600:
 		play_filler("think")
@@ -392,7 +392,7 @@ func _chunk_for_slow(text: String) -> Array[String]:
 		out.append(text)
 	return out
 
-## 是否为慢速神经网络引擎（CosyVoice 克隆/预设；melo 与系统语音不算）。
+## 是否为慢速神经网络引擎（自建 CosyVoice 的克隆/预设音色；melo 与系统语音不算）。
 ## 导演层也用它判断犹豫节拍时长：慢引擎缩短犹豫，避免雪上加霜。
 func is_slow_engine() -> bool:
 	if mode == "system":
@@ -410,7 +410,7 @@ func _set_speaking(v: bool) -> void:
 	_speaking = v
 	speaking_changed.emit(v)
 
-## 分块并入朗读队列（speak 与加载期补读共用）。慢引擎按「整句」合并成较大的块；
+## 分块并入朗读队列（speak 的入队实现）。慢引擎按「整句」合并成较大的块；
 ## 队列满了丢最旧的——丢的若是某条消息的首块，说明这条再也不会开口，补发 speech_skipped
 ## 让它的文字照常显示，并把该消息剩余的分块一并清掉（避免无文字配半截语音）。
 func _enqueue(text: String, group: int, kind: String) -> void:
@@ -475,7 +475,7 @@ func _pump(force := false) -> void:
 		print("[TTS] 请求无法发出：%s  URL=%s" % [error_string(err), _last_url])
 		status.emit("TTS 请求发送失败（%s）：%s" % [error_string(err), _last_url])
 	elif is_slow_engine():
-		# 慢引擎（CosyVoice）：让用户知道在合成、大概要等多久，消除「文字出了但没声音」的割裂感
+		# 慢引擎（自建 CosyVoice）：让用户知道正在合成、大概要等多久，消除「文字出了但没声音」的割裂感
 		status.emit("Azure 正在开口…（本句合成中，约 %d 秒）" % int(ceil(text.length() * 1.2)))
 
 func _endpoint() -> String:
@@ -521,7 +521,7 @@ func _speak_system(text: String, group: int, start: bool, kind := "") -> void:
 			utterance_started.emit.call_deferred(group)   # 延到本帧末：调用方先把待显示文字入队
 		status.emit("正在朗读…（系统语音）")
 
-## Godot 只把 localhost 解析为 IPv6，本地服务多监听 IPv4，统一改写成 127.0.0.1
+## Godot 只把 localhost 解析为 IPv6，自建服务多监听 IPv4，统一改写成 127.0.0.1
 func _ensure_base() -> void:
 	if _base_ready:
 		return

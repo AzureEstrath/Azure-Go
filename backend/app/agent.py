@@ -1,8 +1,7 @@
-"""对局编排（对应 ``AzureAgent.gd``）。
+"""对局编排（后端权威：对局、聊天、闲置搭话、情绪与定式都在这一层）。
 
-职责与 Godot 版逐行一致：玩家落子 → Azure 点评 → Azure 思考并落子；提示/分析/聊天/闲置/窥屏/总结/悔棋。
-差别只有一处：Godot 里 Agent 直接 emit signal 给界面，这里改为把事件交给 EventBus
-（事件契约见 ``events.py``），由 WS 推给客户端。
+职责：玩家落子 → Azure 点评 → Azure 思考并落子；提示/分析/聊天/闲置/总结/悔棋。
+结果不直接返回给界面，而是交给 EventBus（事件契约见 ``events.py``），由 WS 推给客户端。
 
 音画同步：``ai_move`` 事件带 ``move`` 坐标，客户端等她「落子宣告」的语音开始播放时本地揭示棋子；
 后端把这一手**已落到内部棋谱**、可见更新延后（``reveal_move()`` 供需要 round-trip 的客户端调用）。
@@ -100,7 +99,7 @@ class AzureAgent:
 
     @staticmethod
     def _llm_failed(t) -> bool:
-        """LLM 调用失败的统一判据（与闲置/窥屏的兜底判据一致）。"""
+        """LLM 调用失败的统一判据（与闲置搭话的兜底判据一致）。"""
         t = (t or "").strip()
         return t == "" or t.startswith("调用出错") or "脑子有点转不过来" in t
 

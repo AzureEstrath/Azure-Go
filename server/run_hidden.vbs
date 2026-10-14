@@ -1,4 +1,4 @@
-' 隐藏窗口启动一个命令行程序（游戏自动拉起本地语音服务用）。
+' 隐藏窗口启动一个命令行程序（手动启动自建语音服务用）。
 ' pythonw.exe 加载 CosyVoice 时会静默崩溃，所以改用 python.exe + 本脚本隐藏窗口。
 ' 用法: wscript run_hidden.vbs <程序路径> [参数...]
 Set sh = CreateObject("WScript.Shell")

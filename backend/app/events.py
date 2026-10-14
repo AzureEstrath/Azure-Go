@@ -1,6 +1,6 @@
-"""客户端事件契约与事件总线（对应 AzureAgent.gd 的 6 个 signal）。
+"""客户端事件契约与事件总线（对应前端 `NetClient.gd` 的 6 个 signal）。
 
-AzureAgent.gd 通过 6 个 signal 把结果推给界面；分离后改为「后端发事件 → WS 推给客户端」。
+前端的 6 个 signal 由后端事件驱动；分离后是「后端发事件 → WS 推给客户端」。
 本模块把契约集中在一处，避免各处 magic string：
 
     message       ↔  message(kind, text)        对话/点评/落子宣告（kind 见下）
@@ -11,18 +11,18 @@ AzureAgent.gd 通过 6 个 signal 把结果推给界面；分离后改为「后�
     joseki        ↔  joseki_event(payload)      定式高亮轨迹（kind/corner/points）
 
 事件统一为 dict，``type`` 字段走对应构造器；客户端按 type 分发。
-message.kind 取值与 AzureAgent 的 message.emit 完全一致：
+message.kind 取值与前端 message 信号一致：
     ai / ai_comment / ai_move / ai_idle / user / system
 
 ``ai_move`` 额外带 ``move`` 字段（{x, y, gtp, pass}）；客户端在落子宣告语音开始时
-``POST /api/reveal`` 让后端把这一手推到棋盘（round-trip，与本地模式「语音开始才 reveal」语义一致）。
+``POST /api/reveal`` 让后端把这一手推到棋盘（round-trip：语音开始才揭示那一手）。
 """
 
 # —— message.kind ——
 AI = "ai"                    # 一般台词（提示/分析/总结/虚着说明等）
 AI_COMMENT = "ai_comment"    # 重要点评（导演层据此加犹豫节拍）
 AI_MOVE = "ai_move"          # 落子宣告（带坐标；语音开始时揭示）
-AI_IDLE = "ai_idle"          # 闲置/窥屏搭话（玩家一回来可整句作废）
+AI_IDLE = "ai_idle"          # 闲置搭话（玩家一回来可整句作废）
 USER = "user"
 SYSTEM = "system"
 

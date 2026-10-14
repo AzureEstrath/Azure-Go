@@ -1,24 +1,24 @@
 class_name NetClient
 extends Node
-## 前端网络客户端（前后端分离的「远程」模式）。
+## 前端网络客户端：连远程后端（前端唯一的装配路径，编排与 KataGo/LLM 都在后端进程）。
 ##
-## 与 AzureAgent 暴露**完全相同的信号与方法面**，因此 Main.gd 的 agent.* 调用点无需改动：
+## 对 Main.gd 暴露的信号与方法面（Main 的 agent.* 调用点只认这套契约）：
 ##   - 命令：REST POST（/api/move /api/hint /api/analyze /api/chat ... 见 docs）
 ##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki；连上先收 hello 同步）
 ##
-## 音画同步仍在客户端本地完成：`ai_move` 那条「落子宣告」的语音开始时，Main 调 reveal_move()，
+## 音画同步仍在客户端完成：`ai_move` 那条「落子宣告」的语音开始时，Main 调 reveal_move()，
 ## 这里 POST /api/reveal 让后端把已落到内部棋谱的那一手推给界面显示。
 ##
-## 说明：本地模式（AzureAgent）行为不变；此客户端只在 cfg.backend_mode == "remote" 时启用。
+## 说明：前端没有任何本地编排实现，本客户端就是唯一入口；连不上后端时只发 net_status 提示。
 
-# —— 与 AzureAgent 一致的对外契约 ——
+# —— 对外契约（信号 + 方法）——
 signal message(kind: String, text: String)
 signal state_changed(payload: Dictionary)
 signal info_changed(winrate: float, score: float)
 signal busy_changed(busy: bool)
 signal mood_changed(payload: Dictionary)
 signal joseki_event(payload: Dictionary)
-## 连接状态提示（仅 remote 模式；Main 接到状态栏）
+## 连接状态提示（Main 接到状态栏）
 signal net_status(text: String, bad: bool)
 
 const RECONNECT_MIN := 1.0
@@ -43,7 +43,7 @@ var _retry_wait := RECONNECT_MIN
 var _retry_in := 0.0
 var _settings_dirty := false
 
-## 与 AzureAgent 同名占位（remote 模式下引擎/LLM 都在后端，这里不需要）
+## 占位（引擎/LLM 都在后端，这里不需要初始化；保留签名让 Main 的调用点统一）
 func setup(_engine = null, _client = null) -> void:
 	pass
 
@@ -140,7 +140,7 @@ static func _without_type(d: Dictionary) -> Dictionary:
 	out.erase("type")
 	return out
 
-# ================= 命令（REST，与 AzureAgent 方法一一对应） =================
+# ================= 命令（REST，与 Main 的调用点一一对应） =================
 
 func player_move(x: int, y: int) -> void:
 	_post("/api/move", {"x": x, "y": y})

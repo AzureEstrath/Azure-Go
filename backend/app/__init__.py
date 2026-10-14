@@ -1,6 +1,7 @@
 """Azure 后端（前后端分离后的服务端）。
 
-目录约定（与 Godot 客户端 scripts/ 一一对应，便于对齐与回归）：
+目录约定（本目录的模块最初与 Godot 客户端 scripts/ 一一对应；**v3.0.0 起客户端侧的实现
+已删除**，下表只作来源记录，不再有可对齐的 GDScript 文件）：
 
     coords.py   ↔  game/scripts/core/Coords.gd
     board.py    ↔  game/scripts/core/GoBoard.gd
