@@ -138,6 +138,7 @@ func save() -> bool:
 		"tts_mode": tts_mode,
 		"tts_base_url": tts_base_url,
 		"tts_model": tts_model,
+		"tts_api_key": tts_api_key,
 		"tts_voice": tts_voice,
 		"tts_speed": tts_speed,
 		"tts_pitch": tts_pitch,
