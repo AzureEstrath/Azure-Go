@@ -57,7 +57,7 @@
 
 ## 三、目标架构 API 清单
 
-**REST 命令**（既有 13 个，契约不变）
+**REST 命令**（既有 12 个，契约不变）
 `/api/move` `/api/hint` `/api/analyze` `/api/chat` `/api/summarize` `/api/undo` `/api/reset` `/api/config` `/api/reveal` `/api/interaction` `/api/idle` `/api/mood/tick`
 **REST 查询**：`GET /api/health`、`GET /api/state`
 **REST 删除**：`POST /api/peer`（D5）

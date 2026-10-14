@@ -70,6 +70,8 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
    （用相对路径时文件必须能被 Godot 解析到，否则形象加载失败）。
    **KataGo 的 `katago.exe` / 权重 / `default_gtp.cfg` 由后端使用**，客户端不读这些路径。
 3. 启动后端（`backend\run_server.bat`，见第六节），再启动游戏。
+   > 后端在**启动时**读取 `config.json`（LLM / 提示词 / KataGo 等，见第三节「读取方」列），
+   > 所以改这些字段、或在游戏设置面板里改完 LLM 地址/Key 后，都要**重启后端**才生效。
 4. 玩家**执黑先行**：左键落子，右键拖拽旋转视角，滚轮缩放。
 
 `config.json` 放在**可执行文件同目录**即可覆盖包内默认值（源码运行时读 `game\config.json`）。
@@ -79,29 +81,35 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 
 ---
 
-## 三、`config.json` 字段（客户端）
+## 三、`config.json` 字段
 
-放在**可执行文件同目录**即可覆盖包内默认值；全部字段如下：
+**这个文件前后端共用**：放在**可执行文件同目录**即可覆盖包内默认值（源码运行时读 `game\config.json`）。
+下表「读取方」一列标出谁读它、什么时候读：
 
-| 字段 | 含义 |
-| --- | --- |
-| `max_visits` | KataGo 每手搜索次数，越大越强越慢（引擎在后端侧，客户端不跑 KataGo） |
-| `joseki_teach` | **定式导学**：识别你与 Azure 走出的常见定式（讲解 + 棋盘高亮手顺）；右侧栏也能切；默认 `true`，关掉=不识别不打扰 |
-| `backend_url` | **远程后端地址**：编排、KataGo 与 LLM 都在后端进程，游戏只做渲染与语音（WebSocket 地址由其推导） |
-| `llm_base_url` / `llm_model` | **云端 LLM 的 OpenAI 兼容地址与模型名** |
-| `llm_api_key` | **云端 LLM 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
-| `llm_think_mode` | **思考档位**：`0`=快速（直答，首字快）/ `1`=中等（推理限预算并催收尾，约 4~7 秒）/ `2`=强思考（自由推理，更慢更好）；默认 `0`；开局设置面板里也能改（旧键 `llm_think_strong` 自动迁移） |
-| `prompt_system` | **覆盖系统提示词（人设全文）**；留空用内置 Azure 人设 |
-| `prompt_user_name` | **玩家称呼**，替换提示词中的「Estarth」（默认 Estarth） |
-| `prompt_phase_notes` | **覆盖各阶段提示**，键：`observe` / `after_player` / `own_turn` / `just_moved` / `analyze` / `chat` / `summary` |
-| `vrm_path` | 虚拟形象 `.vrm` 路径；**建议填绝对路径**（相对路径要能被 Godot 解析到，否则形象加载失败） |
-| `tts_enabled` | 是否启用语音 |
-| `tts_mode` | `openai`（云端 OpenAI 兼容 `/v1/audio/speech`，默认）/ `system`（Windows 系统语音，服务连不上时也会临时降级到它） |
-| `tts_base_url` | **云端语音服务地址**（OpenAI 兼容，含 `/v1`，如 `https://api.openai.com/v1`） |
-| `tts_model` / `tts_voice` | 云端语音模型名 / 音色 id（音色名随服务商而定，也可手填） |
-| `tts_api_key` | **云端 TTS 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
-| `tts_speed` / `tts_pitch` / `tts_volume` | 语速 / 音调（播放层变调）/ 音量 |
-| `tts_limit_len` / `tts_sync_speak` / `tts_batch_speak` / `tts_long_chunk` | 短回复 / 同步说话 / 整段合成 / 长句合并（立即生效） |
+- **后端（启动时）**：`backend\run_server.bat` 启动时一次性读入，**改完必须重启后端才生效**
+  （游戏内设置面板写回的 LLM 地址 / 模型名 / Key / 思考档位也属于这一类）。
+- **后端（实时）**：经 `/api/config` 转发，改完立即生效。
+- **客户端**：游戏进程自己读，改完（或下次启动）即时生效。
+
+| 字段 | 读取方 | 含义 |
+| --- | --- | --- |
+| `backend_url` | 客户端 | **远程后端地址**：编排、KataGo 与 LLM 都在后端进程，游戏只做渲染与语音（WebSocket 地址由其推导） |
+| `max_visits` | 后端（启动时） | KataGo 每手搜索次数，越大越强越慢（引擎在后端侧，客户端不跑 KataGo） |
+| `joseki_teach` | 后端（实时） | **定式导学**：识别你与 Azure 走出的常见定式（讲解 + 棋盘高亮手顺）；右侧栏也能切；默认 `true`，关掉=不识别不打扰 |
+| `llm_base_url` / `llm_model` | 后端（启动时） | **云端 LLM 的 OpenAI 兼容地址与模型名** |
+| `llm_api_key` | 后端（启动时） | **云端 LLM 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
+| `llm_think_mode` | 后端（启动时） | **思考档位**：`0`=快速（直答，首字快）/ `1`=中等（推理限预算并催收尾，约 4~7 秒）/ `2`=强思考（自由推理，更慢更好）；默认 `0`；开局设置面板里也能改（旧键 `llm_think_strong` 自动迁移） |
+| `prompt_system` | 后端（启动时） | **覆盖系统提示词（人设全文）**；留空用内置 Azure 人设 |
+| `prompt_user_name` | 后端（启动时） | **玩家称呼**，替换提示词中的「Estarth」（默认 Estarth） |
+| `prompt_phase_notes` | 后端（启动时） | **覆盖各阶段提示**，键：`observe` / `after_player` / `own_turn` / `just_moved` / `analyze` / `chat` / `summary` |
+| `vrm_path` | 客户端 | 虚拟形象 `.vrm` 路径；**建议填绝对路径**（相对路径要能被 Godot 解析到，否则形象加载失败） |
+| `tts_enabled` | 客户端 | 是否启用语音 |
+| `tts_mode` | 客户端 | `openai`（云端 OpenAI 兼容 `/v1/audio/speech`，默认）/ `system`（Windows 系统语音，服务连不上时也会临时降级到它） |
+| `tts_base_url` | 客户端 | **云端语音服务地址**（OpenAI 兼容，含 `/v1`，如 `https://api.openai.com/v1`） |
+| `tts_model` / `tts_voice` | 客户端 | 云端语音模型名 / 音色 id（音色名随服务商而定，也可手填） |
+| `tts_api_key` | 客户端 | **云端 TTS 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
+| `tts_speed` / `tts_pitch` / `tts_volume` | 客户端 | 语速 / 音调（播放层变调）/ 音量 |
+| `tts_limit_len` / `tts_sync_speak` / `tts_batch_speak` / `tts_long_chunk` | 客户端 | 短回复 / 同步说话 / 整段合成 / 长句合并（立即生效） |
 
 > - `tts_base_url` / `tts_model` / `tts_voice` 要**配套**：模板的三件套是 `https://api.openai.com/v1` + `tts-1` + `中文女`，
 >   其中 `中文女` **不是** OpenAI 的音色 id——用 OpenAI 的话要把音色一并改成 `alloy` / `nova` / `onyx` 之类的
@@ -113,7 +121,8 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 >   → **不出声**：左侧语音栏与底部状态行显示「TTS 无响应（HTTP 400）…」，Azure 的文字照常显示，
 >   冷却 6 秒后继续尝试队列里的下一句。**音色 / 模型配错不会自动降级**，只会没声音 + 一行报错。
 > - `katago_bin` / `katago_model` / `katago_config` **不在上表**：它们由**后端**读取（当前后端仍自行拉起
->   KataGo 进程，计划 01 会改成独立的 KataGo 服务 + `katago_url`），客户端忽略这些键。
+>   KataGo 进程，计划 01 会改成独立的 KataGo 服务 + `katago_url`）。客户端**保留但不读**这些键——
+>   游戏内保存设置时会**原样写回**，不会把它们抹掉（`game\config.json` 就是后端的配置文件，见第六节）。
 
 ---
 
@@ -128,6 +137,7 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 ```
 
 - **也可在游戏里改**：开局前的「出发前的准备」面板能直接填地址 / 模型名 / API Key（确认后写回 `config.json`），不用手动编辑。
+  ⚠️ 后端只在**启动时**读取这几个字段（游戏面板不会实时通知后端），所以改完要**重启后端**才生效。
 - **云端**：DeepSeek / OpenAI / 通义 / 硅基流动 等 OpenAI 兼容服务，填地址、模型名与 Key。
 - **自建服务**：vLLM / LM Studio / llama.cpp server 等，`llm_api_key` 留空即可——游戏只按地址请求，不负责启动它。
 - 命令行临时指定（不写回配置）：`AzureGoGodot.exe --llm=https://api.deepseek.com/v1 --model=deepseek-chat --key=你的密钥`（指向自建服务时把地址换成它的，如 `http://127.0.0.1:8080/v1`）

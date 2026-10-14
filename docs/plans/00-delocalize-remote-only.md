@@ -248,7 +248,7 @@ git commit -m "refactor(game): 只保留 remote 模式，删除本地编排与�
 **Files:**
 - Modify: `game/scripts/ui/Main.gd`
   - 删窥屏：`PEEK_COOLDOWN_MS/PEEK_TIMEOUT_MS`、`_peek_*`、`_vlm_starter`、`_peek_available()`、`_ensure_vlm_url()`、`_start_peek()`、`_tick_peek()`、`_process()` 里的窥屏分支、`_deliver_msg` 里 `kind == "ai_idle"` 的 `_peek_hmph` 分支、`_cancel_idle_speech`/`_bump_activity` 里对 `_peek_hmph`/`_peek_*` 的引用
-  - 删本地语音拉起：`_tts_dir`、`_find_tts_dir()`、`_autostart_tts()`、`_spawn_tts_server()`、`_restart_tts_server()`、`_health_url()`、`_service_started_or_starting()`、`_tts_health_once()`、`_wait_tts_health()`、`_on_acc_toggled()`、`_kill_lock()`、`_read_lock_pid()`、`_exit_tree()` 里对它的调用
+  - 删本地语音拉起：`_tts_dir`、`_find_tts_dir()`、`_autostart_tts()`、`_spawn_tts_server()`、`_restart_tts_server()`、`_health_url()`、`_service_started_or_starting()`、`_tts_health_once()`、`_wait_tts_health()`、`_kill_lock()`、`_read_lock_pid()`、`_exit_tree()` 里对它的调用（`_on_acc_toggled()` **保留**：bf16/短参考两个勾选框虽删，它仍是 4 处活调用点）
   - 删 `_ensure_llm_url()`、`_llm_starter`、`_llm_py`、`_is_local_url()`、`_url_port()`
   - 左栏：删「bf16 加速」「短参考」两个 `_acc_check`（原 323~325 行附近）与 `tts_auto_start` 勾选框（原 482~483 行附近）
   - 设置面板：删「窥屏 VLM API」整段（原 1443~1446 行附近），`_apply_setup()` 去掉 `vlm_url/vlm_port` 形参
@@ -263,8 +263,8 @@ git commit -m "refactor(game): 只保留 remote 模式，删除本地编排与�
 - [ ] **Step 1: 删除代码** — 按 `Files` 逐项删除；`_process()` 的闲置逻辑保留「到点调 `agent.idle_remark()`」这一步。
 - [ ] **Step 2: 确认只剩“播放与清洗”，不再拉起任何服务**
 
-Run: `rg -n "create_process|wscript|azure_peek|start_llm_server|start_vlm_server|_spawn_tts_server|_autostart_tts|_peek_|PEEK_" game`
-Expected: 无匹配
+Run: `rg -n "wscript|azure_peek|start_llm_server|start_vlm_server|_spawn_tts_server|_autostart_tts|_peek_|PEEK_" game`
+Expected: 无匹配（`OS.create_process` **保留**：系统语音兜底那条路径本任务不删，故不列入本 grep）
 
 > 注意：`clean_for_speech / _split_sentences / _chunk_for_slow` **本任务不删**——它们的后端替代品（`backend/app/speech_text.py`）属于计划 05，先删会留下“前端不会清洗、后端还没有清洗”的回归窗口。它们随计划 05 Task 4 一起搬走。
 
