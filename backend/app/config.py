@@ -23,11 +23,6 @@ class AzureConfig:
         self.llm_model = "qwen3.5"
         self.llm_api_key = ""
         self.llm_think_mode = 0
-        # —— 本地 LLM 服务（llama-server，由后端拉起与看护）——
-        self.llm_auto_start = True
-        self.llm_port = 8080
-        self.llm_exe = ""
-        self.llm_model_path = ""
         # —— 提示词自定义（留空则用内置 Azure 人设）——
         self.prompt_system = ""
         self.prompt_user_name = "Estarth"
@@ -75,10 +70,6 @@ class AzureConfig:
             self.llm_think_mode = max(0, min(2, int(d.get("llm_think_mode", self.llm_think_mode))))
         else:
             self.llm_think_mode = 2 if bool(d.get("llm_think_strong", False)) else 0   # 旧键（bool）迁移
-        self.llm_auto_start = bool(d.get("llm_auto_start", self.llm_auto_start))
-        self.llm_port = int(d.get("llm_port", self.llm_port))
-        self.llm_exe = str(d.get("llm_exe", self.llm_exe))
-        self.llm_model_path = str(d.get("llm_model_path", self.llm_model_path))
         self.prompt_system = str(d.get("prompt_system", self.prompt_system))
         self.prompt_user_name = str(d.get("prompt_user_name", self.prompt_user_name))
         pn = d.get("prompt_phase_notes")
@@ -90,10 +81,6 @@ class AzureConfig:
             self.katago_bin = _resolve(self.katago_bin, exe_dir)
             self.katago_model = _resolve(self.katago_model, exe_dir)
             self.katago_config = _resolve(self.katago_config, exe_dir)
-        if self.llm_exe:
-            self.llm_exe = _resolve(self.llm_exe, exe_dir)
-        if self.llm_model_path:
-            self.llm_model_path = _resolve(self.llm_model_path, exe_dir)
 
     def has_paths(self) -> bool:
         """KataGo 三件套是否用户显式配置过（都指向存在的文件）。"""

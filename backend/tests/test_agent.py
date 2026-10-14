@@ -269,5 +269,27 @@ class HelperTest(unittest.TestCase):
         self.assertEqual((x, y), (9, 9))          # 空盘：就近中心
 
 
+class FailSafeTest(unittest.TestCase):
+    """云端 LLM 失败 / 未配置时：busy 必须归位，健康面必须可用。"""
+
+    class BoomLLM:
+        think_mode = 0
+        base_url = "https://api.example.com/v1"
+
+        async def chat(self, messages, max_tokens=300, no_think=False):
+            raise RuntimeError("云端 500")
+
+    def test_busy_released_when_llm_raises(self):
+        agent, eng, _llm, bus = _mk()
+        agent.llm = self.BoomLLM()
+
+        async def run():
+            await agent.player_move(3, 3)
+
+        asyncio.run(run())
+        self.assertFalse(agent.busy)
+        self.assertFalse(bus.of_type("busy")[-1]["busy"])
+
+
 if __name__ == "__main__":
     unittest.main()

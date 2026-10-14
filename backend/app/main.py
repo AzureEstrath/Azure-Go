@@ -25,14 +25,13 @@ REST 应答统一返回 {"ok": bool, "state": <棋盘快照>}：命令是否被�
 """
 
 import asyncio
-import functools
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from . import config as config_mod
-from . import coords, events, prompts, services
+from . import coords, events, prompts
 from .agent import AzureAgent
 from .engine import KataGoEngine
 from .llm import LLMClient
@@ -53,7 +52,6 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         prompts.configure(cfg)
-        watch_task = None
         if agent is None:
             eng = engine if engine is not None else KataGoEngine(cfg.katago_bin, cfg.katago_model, cfg.katago_config, cfg.max_visits)
             cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key, think_mode=cfg.llm_think_mode)
@@ -63,16 +61,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
                 if not ok:
                     print("[KataGo] 启动失败：" + eng.last_error())
                 asyncio.create_task(cli.probe_models())
-                cli.relaunch_cb = functools.partial(services.ensure_local_llm, cfg)   # 服务编排：本地 LLM 掉了就重拉
-                services.ensure_local_llm(cfg)                                        # 启动时一并拉起（幂等，启动器自带锁）
-                watch = getattr(cli, "watch_loop", None)                             # 对局中看护：持续不可达时自动重拉
-                if watch is not None:
-                    watch_task = asyncio.create_task(watch())
         else:
             app.state.agent = agent
         yield
-        if watch_task is not None:
-            watch_task.cancel()
         if autostart:
             await app.state.agent.katago.shutdown()
             await app.state.agent.llm.close()
@@ -224,5 +215,5 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
-    print("Azure 后端启动...（KataGo / 本地 LLM 由本进程拉起与看护）")
+    print("Azure 后端启动...（KataGo 由本进程拉起，LLM 走云端）")
     uvicorn.run(app, host="127.0.0.1", port=8000)

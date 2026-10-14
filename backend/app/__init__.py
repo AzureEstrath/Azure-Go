@@ -14,7 +14,6 @@
     agent.py    ↔  game/scripts/ai/AzureAgent.gd
     events.py   ↔  WS 事件契约（对应 AzureAgent 的 signal）
     main.py     ↔  FastAPI 入口（REST + WS 路由装配）
-    services.py ↔  本地服务编排（现 Main.gd 服务拉起/看护的职责）
 
 行为对齐：tests/golden/ 存放由 Godot 端导出的期望输出（golden），
 tests/ 下的用例逐模块比对，保证「现有效果不变」。

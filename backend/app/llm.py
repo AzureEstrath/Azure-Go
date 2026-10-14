@@ -23,22 +23,15 @@ _URL_RE = re.compile(r"^(https?)://([^:/]+)(?::(\d+))?")
 
 FAIL_TEXT = "唔...我脑子有点转不过来了"
 
-# 对局中看护本地服务：与 Godot LLMClient.gd 的 _watch_tick 一致
-WATCH_INTERVAL = 15.0     # 看护轮询间隔（秒）
-WATCH_TRIGGER = 3         # 连续 3 次（约 45 秒）不可达才触发重新拉起
-WATCH_COOLDOWN = 120.0    # 触发后 2 分钟内不重复触发（留给启动器自愈的时间）
-
 
 class LLMClient:
     def __init__(self, base_url="http://localhost:8080/v1", model="qwen3.5", api_key="", timeout_sec=120.0,
-                 think_mode=0, relaunch_cb=None):
+                 think_mode=0):
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
         self.timeout_sec = timeout_sec
         self.think_mode = think_mode
-        # 服务看护：持续不可达时回调重新拉起（启动器自带重试与并发去重，可放心重复调用）
-        self.relaunch_cb = relaunch_cb
 
         self._client = None
         self._lock = asyncio.Lock()
@@ -261,39 +254,3 @@ class LLMClient:
         except Exception:
             pass
 
-    # ================= 看护（本地服务） =================
-
-    async def watch_loop(self):
-        """对局中看护本地服务：持续不可达时回调 ``relaunch_cb`` 重新拉起。
-
-        与 Godot ``LLMClient.gd`` 的 ``_watch_tick`` 一致：每 WATCH_INTERVAL 秒探一次，
-        连续 WATCH_TRIGGER 次不可达才触发，触发后 WATCH_COOLDOWN 秒内不重复触发
-        （留给启动器自愈的时间）。只对本机目标生效；未接回调则空转（可放心常驻）。
-        """
-        fails = 0
-        last = 0.0
-        while True:
-            await asyncio.sleep(WATCH_INTERVAL)
-            if self.relaunch_cb is None:
-                continue
-            self._ensure_base()
-            if not self._local_target():
-                continue
-            if await self._reachable():
-                fails = 0
-                continue
-            fails += 1
-            if fails < WATCH_TRIGGER:
-                continue
-            now = time.monotonic()
-            if now - last < WATCH_COOLDOWN:
-                continue
-            last = now
-            fails = 0
-            print("[LLM] 本地服务已无响应，请求重新拉起…")
-            try:
-                r = self.relaunch_cb()
-                if asyncio.iscoroutine(r):
-                    await r
-            except Exception:                   # noqa: BLE001
-                pass
