@@ -1,82 +1,110 @@
-"""常驻 KataGo analysis 子进程（对应 ``KataGoEngine.gd``）。
+"""KataGo analysis 客户端：对接独立的 KataGo 云服务（HTTP），不再自己拉起子进程。
 
-与 Godot 版一致：行分隔 JSON 请求/响应，moves 必须是带颜色的配对 [["B","Q16"],["W","D4"]]。
-Godot 用 ``OS.execute_with_pipe`` + 每帧轮询；Python 侧改用 ``asyncio`` 子进程与读行任务，
-语义不变：请求超时 30s、启动（首次响应）超时 180s、stderr 必须持续排空否则 KataGo 会卡死。
+服务侧接口（见 ``katago_service/server.py``）：
+    ``GET  /health``  → ``{"ok": bool, "state": "warming"|"ready"|"dead", "katago_error": str}``
+    ``POST /analyze`` → 200 引擎响应原文｜503 未就绪/已死｜401 鉴权失败
 
-对外接口与 Godot 版一一对应：``start() / is_dead() / last_error() / stderr_tail() / analyze() / shutdown()``。
+对外接口与子进程版一一对应：``start() / is_dead() / last_error() / stderr_tail() / analyze() / shutdown()``，
+``agent.py`` 与 ``prompts.py`` 因此无需改动（``analyze()`` 的请求体逐字段照抄旧实现）。
+
+子进程时代的两条硬约束——stderr 必须持续排空（否则缓冲区写满后 KataGo 卡死）、读行缓冲必须显式放大到
+64MB（否则带 ownership 的超大 JSON 会触发「Separator is not found」并被误判为进程死亡）——随引擎一起
+搬进了 ``katago_service/proc.py``；本文件不再持有管道，也就没有这两处坑。
+
+**就绪判定只认 ``state``，不认 ``ok``**：服务预热期会回 ``{"ok": false, "state": "warming"}``，
+按 ``ok`` 判会把「正在加载模型」误当成「不可用」。
 """
 
 import asyncio
-import json
-import os
+import time
 
-REQ_TIMEOUT_MS = 30000
-STARTUP_TIMEOUT_MS = 180000
+import httpx
 
-# asyncio 子进程默认单行上限 64 KiB：KataGo 带 includeOwnership 的回应是一整行
-# 超大 JSON（可达数百 KB~数 MB），会触发「Separator is not found」并误判为进程死亡。
-# Godot 版按字节扫描无此限制，这里必须显式放大读行缓冲。
-_STREAM_LIMIT = 64 * 1024 * 1024
+DEFAULT_URL = "http://127.0.0.1:8100"
+REQ_TIMEOUT_MS = 30000          # 单次 /analyze 超时
+READY_TIMEOUT_MS = 180000       # 等 /health 变 ready 的上限（首次分析要等引擎加载模型）
+READY_POLL_SEC = 1.0            # 预热期的轮询间隔
 
-# 日志重定向到后端可写目录：避免污染项目目录，也避免 KataGo 因 logDir 不可写而出错
-_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "katago")
+STATE_WARMING = "warming"
+STATE_READY = "ready"
+STATE_DEAD = "dead"
 
-DEFAULT_EXE = r"D:\KataGo\bin\katago\katago.exe"
-DEFAULT_MODEL = r"D:\KataGo\models\model-b18c384nbt.bin.gz"
-DEFAULT_CFG = r"D:\KataGo\bin\katago\default_gtp.cfg"
+
+def _health_state(resp):
+    """解析 ``/health`` 响应，返回 ``(state, body)``；形状不对时 ``state`` 为空串。"""
+    if resp.status_code != 200:
+        return "", {}
+    try:
+        body = resp.json()
+    except Exception:
+        return "", {}
+    if not isinstance(body, dict):
+        return "", {}
+    state = body.get("state")
+    return (state if state in (STATE_WARMING, STATE_READY, STATE_DEAD) else ""), body
 
 
 class KataGoEngine:
-    def __init__(self, exe=DEFAULT_EXE, model=DEFAULT_MODEL, cfg=DEFAULT_CFG, max_visits=500):
-        self.exe = exe
-        self.model = model
-        self.cfg = cfg
+    def __init__(self, url=DEFAULT_URL, token="", max_visits=500,
+                 timeout_ms=REQ_TIMEOUT_MS, ready_timeout_ms=READY_TIMEOUT_MS,
+                 client=None, ready_poll_sec=READY_POLL_SEC):
+        self.url = (url or DEFAULT_URL).rstrip("/")
+        self.token = token or ""
         self.max_visits = max_visits
+        self.timeout_ms = int(timeout_ms)
+        self.ready_timeout_ms = int(ready_timeout_ms)
+        self.ready_poll_sec = ready_poll_sec
 
-        self._proc = None
-        self._read_task = None
-        self._err_task = None
+        # 请求头只在构造时算一次；未配置 token（本机回环调试）就不带 Authorization
+        self._headers = {"Authorization": "Bearer " + self.token} if self.token else {}
+        self._timeout_s = max(self.timeout_ms, 1) / 1000.0
+        self._client = client if client is not None else httpx.AsyncClient(timeout=self._timeout_s)
+
         self._seq = 0
-        self._pending = {}              # id -> asyncio.Future
-        self._stderr_tail = []
+        self._stderr_tail = []          # 历史字段：见 stderr_tail()
         self._dead = False
         self._last_error = ""
-        self._ever_replied = False
 
     # ================= 生命周期 =================
 
     async def start(self) -> bool:
-        for path, what in ((self.exe, "可执行文件"), (self.model, "模型文件"), (self.cfg, "配置文件")):
-            if not os.path.isfile(path):
-                self._fail("找不到 KataGo %s：%s" % (what, path))
+        """探 ``/health`` 并等到 ``state == "ready"``。
+
+        ``warming`` 只是「还在加载模型」，继续轮询；``dead`` 或连不上才算失败（置 ``_dead``）。
+        探测本身出别的岔子（响应不可解析、状态码异常）时返回 False 但**不判死**：
+        云服务是可恢复的，把结论写死只会让棋盘永久锁死，真实原因交给后续 ``analyze()`` 报。
+        """
+        deadline = time.monotonic() + self.ready_timeout_ms / 1000.0
+        while True:
+            try:
+                resp = await self._client.get(self._url("/health"), headers=self._headers,
+                                              timeout=self._timeout_s)
+            except httpx.TimeoutException:
+                self._fail("连不上 KataGo 云服务：健康检查超时（%s）" % self.url)
                 return False
-        try:
-            os.makedirs(_LOG_DIR, exist_ok=True)
-        except Exception:
-            pass
-        args = [
-            self.exe, "analysis",
-            "-model", self.model,
-            "-config", self.cfg,
-            "-analysis-threads", "1",
-            "-override-config", "logDir=%s" % _LOG_DIR,
-        ]
-        try:
-            self._proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                limit=_STREAM_LIMIT,
-            )
-        except Exception as e:
-            self._fail("无法启动 KataGo 子进程：%s" % e)
+            except httpx.TransportError as e:
+                self._fail("连不上 KataGo 云服务：%s（%s）" % (e, self.url))
+                return False
+            except Exception as e:
+                self._record_error("KataGo 云服务健康检查失败：%s" % e)
+                return False
+
+            state, body = _health_state(resp)
+            if state == STATE_READY:
+                print("[KataGo] 云服务已就绪：%s" % self.url)
+                return True
+            if state == STATE_DEAD:
+                self._fail("KataGo 云服务报告引擎已死：%s" % (body.get("katago_error") or "未知原因"))
+                return False
+            if state == STATE_WARMING:
+                if time.monotonic() >= deadline:
+                    self._record_error("等待 KataGo 云服务预热超时（%d ms）" % self.ready_timeout_ms)
+                    return False
+                await asyncio.sleep(self.ready_poll_sec)
+                continue
+            # 响应不是 /health 的形状：立刻放弃（不空转到超时），但同样不判死
+            self._record_error("KataGo 云服务健康检查响应异常（HTTP %d）" % resp.status_code)
             return False
-        self._read_task = asyncio.create_task(self._read_stdout())
-        self._err_task = asyncio.create_task(self._drain_stderr())
-        print("[KataGo] 已启动 pid=%d  (%s)" % (self._proc.pid, self.exe))
-        return True
 
     def is_dead(self) -> bool:
         return self._dead
@@ -85,106 +113,40 @@ class KataGoEngine:
         return self._last_error
 
     def stderr_tail(self, n=3) -> str:
+        """历史字段：子进程时代是引擎 stderr 尾部；改为云服务后不再产生，保留以兼容调用方。"""
         tail = self._stderr_tail[-n:] if n > 0 else self._stderr_tail
         return " | ".join(tail)
 
-    def _fail(self, reason):
-        self._dead = True
+    def _record_error(self, reason) -> str:
         self._last_error = reason
         print("[KataGo] " + reason)
-        self._reject_all(reason)
+        return reason
 
-    def _reject_all(self, reason):
-        for fut in list(self._pending.values()):
-            if not fut.done():
-                fut.set_result({"error": reason})
-        self._pending.clear()
+    def _fail(self, reason):
+        self._dead = True
+        self._record_error(reason)
 
     async def shutdown(self):
-        for t in (self._read_task, self._err_task):
-            if t is not None:
-                t.cancel()
-        self._read_task = None
-        self._err_task = None
-        proc = self._proc
-        self._proc = None
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                await proc.wait()
-            except Exception:
-                pass
-
-    # ================= 读行 =================
-
-    async def _drain_stderr(self):
-        """stderr 必须持续排空，否则缓冲区写满后 KataGo 会卡死。"""
-        proc = self._proc
+        """只关闭 httpx 客户端：引擎进程归 KataGo 云服务所有，后端不再杀进程。"""
         try:
-            while True:
-                line = await proc.stderr.readline()
-                if not line:
-                    break
-                t = line.decode("utf-8", "replace").strip()
-                if t:
-                    self._stderr_tail.append(t)
-                    if len(self._stderr_tail) > 20:
-                        self._stderr_tail.pop(0)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-
-    async def _read_stdout(self):
-        proc = self._proc
-        try:
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                t = line.decode("utf-8", "replace").strip()
-                if not t:
-                    continue
-                try:
-                    obj = json.loads(t)
-                except Exception:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                rid = str(obj.get("id", ""))
-                fut = self._pending.pop(rid, None)
-                if fut is not None and not fut.done():
-                    if "error" in obj:
-                        self._last_error = "%s (field=%s)" % (obj["error"], obj.get("field", ""))
-                        print("[KataGo] " + self._last_error)
-                    fut.set_result(obj)
-        except asyncio.CancelledError:
-            raise
+            await self._client.aclose()
         except Exception as e:
-            if not self._dead:
-                self._fail("KataGo 输出读取失败：%s" % e)
-            return
-        # stdout 关闭 = 进程退出
-        if not self._dead:
-            self._dead = True
-            self._last_error = "KataGo 进程已退出：" + self.stderr_tail()
-            self._reject_all(self._last_error)
+            print("[KataGo] 关闭 HTTP 客户端出错：%s" % e)
+
+    def _url(self, path) -> str:
+        return self.url + path
 
     # ================= 分析 =================
 
     async def analyze(self, moves) -> dict:
-        if self._dead:
-            return {"error": "KataGo 未运行：" + self._last_error}
-        if self._proc is None or self._proc.stdin is None:
-            return {"error": "KataGo 管道不可用"}
+        """请求一次分析；失败一律返回 ``{"error": <可读中文>}``（``agent.py`` 靠 ``"error" in analysis`` 判定）。
 
+        连接类错误与超时重试 **1 次**：重试在本次调用内部完成、只返回一个结果，
+        不会让同一手被分析两次而把 ``pre_analysis`` 缓存写脏。
+        """
         self._seq += 1
-        rid = "r%d" % self._seq
         req = {
-            "id": rid,
+            "id": "r%d" % self._seq,
             "moves": moves,
             "rules": "chinese",
             "komi": 7.5,
@@ -193,28 +155,46 @@ class KataGoEngine:
             "maxVisits": self.max_visits,
             "includeOwnership": True,       # 逐点归属（+ = 黑）：用于「双方实地估算」
         }
-        loop = asyncio.get_event_loop()
-        fut = loop.create_future()
-        self._pending[rid] = fut                     # 先登记再写，避免错过响应
-        try:
-            self._proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
-            await self._proc.stdin.drain()
-        except Exception as e:
-            self._pending.pop(rid, None)
-            self._fail("KataGo 管道写入失败（%s）" % e)
-            if not fut.done():
-                fut.cancel()
-            return {"error": self._last_error}
+        err = ""
+        for _ in range(2):                  # 首次 + 重试 1 次
+            try:
+                resp = await self._client.post(self._url("/analyze"), json=req,
+                                               headers=self._headers, timeout=self._timeout_s)
+            except httpx.TimeoutException:
+                err = "KataGo 云服务响应超时（%d ms）" % self.timeout_ms
+                continue
+            except httpx.TransportError as e:
+                err = "连不上 KataGo 云服务：%s（%s）" % (e, self.url)
+                continue
+            except Exception as e:
+                err = "KataGo 云服务请求失败：%s" % e
+                break
+            return self._parse_reply(resp)
+        return {"error": self._record_error(err)}
 
-        limit_ms = REQ_TIMEOUT_MS if self._ever_replied else STARTUP_TIMEOUT_MS
+    def _parse_reply(self, resp) -> dict:
+        """200 → 引擎响应原文（引擎自报的 ``error`` 字段是合法应答，交调用方判断）；非 200 → 可读中文错误。"""
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except Exception as e:
+                return {"error": self._record_error("KataGo 云服务响应无法解析：%s" % e)}
+            if not isinstance(data, dict):
+                return {"error": self._record_error("KataGo 云服务响应不是 JSON 对象")}
+            if "error" in data:             # 引擎的合法应答：只记录，不影响调用方判定
+                self._record_error("%s (field=%s)" % (data["error"], data.get("field", "")))
+            else:
+                # 分析成功即摘掉「死」标记：云服务重启后能自愈，棋盘不会被永久锁死
+                self._dead = False
+                self._last_error = ""
+            return data
+        msg = ""
         try:
-            result = await asyncio.wait_for(fut, timeout=limit_ms / 1000.0)
-        except asyncio.TimeoutError:
-            self._pending.pop(rid, None)
-            self._last_error = "KataGo 分析超时（%d ms）" % limit_ms
-            return {"error": self._last_error}
-        except asyncio.CancelledError:
-            self._pending.pop(rid, None)
-            raise
-        self._ever_replied = True
-        return result
+            body = resp.json()
+            if isinstance(body, dict):
+                msg = str(body.get("error", ""))
+        except Exception:
+            pass
+        if not msg:
+            msg = "KataGo 云服务返回 HTTP %d" % resp.status_code
+        return {"error": self._record_error(msg)}
