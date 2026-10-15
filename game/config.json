@@ -44,6 +44,7 @@
   "tts_speed": 1.0,
   "tts_pitch": 1.02,
   "tts_volume": 0.65,
+  "tts_timeout_sec": 30,
   "tts_limit_len": true,
   "tts_sync_speak": true,
   "tts_batch_speak": false,

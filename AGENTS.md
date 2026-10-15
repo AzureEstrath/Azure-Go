@@ -6,7 +6,7 @@
 
 3D 围棋陪练：Godot 4 前端 + 远程后端（Python / FastAPI）+ KataGo 云服务（Python / FastAPI）+ 云端模型（OpenAI 兼容的 LLM 与语音 TTS）。
 
-- `game/` —— 游戏本体（GDScript）。`scenes/Main.tscn` 只挂了 `scripts/ui/Main.gd`，其余节点与 UI 全在代码里构建；`scripts/` 按 `core`（配置/坐标）、`net`（后端客户端）、`services`（TTS 客户端）、`ui`（渲染与交互）分类。
+- `game/` —— 游戏本体（GDScript）。`scenes/Main.tscn` 只挂了 `scripts/ui/Main.gd`，其余节点与 UI 全在代码里构建；`scripts/` 按 `core`（配置/坐标）、`net`（后端客户端）、`services`（语音播放器 / 配对状态机）、`ui`（渲染与交互）分类。
 - `backend/` —— **唯一权威**：对局编排、定式识别、情绪模型、提示词都在这里，通过 REST + WebSocket 对外；KataGo 只是它连的一个 HTTP 服务（`katago_url`），`game/` 只连它的 `backend_url`，自身不含任何编排实现。
 - `katago_service/` —— **KataGo 云服务**（独立部署，可先起、也可单独重启）：FastAPI + 常驻 `katago analysis` 子进程，对外 `POST /analyze`（请求/响应都是引擎原文）与 `GET /health`（`warming`/`ready`/`dead`），可选 Bearer 鉴权，启动即后台预热。后端 `app/engine.py` 只是它的客户端；引擎本体与权重归**部署侧**持有，不入库。
 - `server/` —— CosyVoice 3 语音服务（可选自建，**不再由游戏拉起**，要自己跑 `start_tts_server*.bat`）。**288/370 个入库文件是上游 CosyVoice 代码**（`server/cosyvoice/`、`examples/`、`runtime/`、`.github/`、根 `README.md` 都是上游内容），本项目自己写的只有 `azure_tts_server.py`、`clone_voice.py`、`voices.json`、`sherpa_voices.json`、`run_hidden.vbs`、`start_tts_server*.bat`。不要顺手重排/美化上游目录。`server/third_party/Matcha-TTS` 是 git submodule。
@@ -20,6 +20,7 @@
 - **回合编排在一张状态图里**（`app/agent_graph.py`，LangGraph）：拓扑 `prepare → decide →（条件边 tools → decide，可反复）→ speak → finalize`。六个需要 LLM 编排的公开方法（`player_move` / `hint` / `analyze_position` / `chat` / `idle_remark` / `summarize`）在 `agent.py` 里只做「构造状态 → 跑图」（`player_move` 一次公开调用＝三次 `ainvoke`：`after_player → own_turn → just_moved`，中间数据经 `TurnState["data"]` 透传），其余六个同步方法（`undo` / `reset_game` / `set_allow_pass` / `reveal_move` / `tick_mood` / `player_interaction`）仍是同步方法 + 直接发事件。**改图时必须守住 5 条硬规则与 `busy` 的 `try/finally`**：`busy` 由调用图的公开方法拥有，节点里的 `_set_busy(False)` 位置**按阶段编码、不许随意挪动**（挪了会让 `busy_seq` 或「chat 先解锁再发话」回退）；`decide` 内**总 LLM 调用次数**上限 `MAX_LLM_CALLS_PER_TURN = 4`（含工具轮）。`speak` 阶段还有一条**可选**的 `token` 流式通道（`stream_tokens`，默认关闭，关闭时事件序列与没有它时逐字一致）；去重闸门只对 `finalize` 里发出的台词类 `message` 生效。
 - **发言侧工具**（`app/tools.py`：`katago_analyze` / `joseki_lookup` / `board_query`）：`tools_enabled` 默认 `false`（关闭时行为与没有工具完全一致），只在 `hint()`（observe）与落子宣告（own_turn）两处启用——工具请求走**条件边工具轮**（`agent_graph._decide_tool_round` + `tools` 节点）这条**主实现**，`agent._tool_loop` 现仅在「工具开但链不可用」的降级路径被调用（此时等价于 `_reply`）；工具次数有硬上限（`max_tool_calls`，配置只能收紧）、单工具 10 秒超时；工具输出只回给模型，`tool` WS 事件只喂前端状态栏，**永不进台词**。**本计划有意放宽**：工具/模型**可以参与落点候选**（`_candidate_from_text` + `_resolve_ai_move`），三条边界——候选点必须过 `board.is_legal(...)`、`pass` 只在 `allow_pass` 时可用、**任何情况下都产出可用落点**。
 - **长期记忆**（`app/memory.py` + `app/memory_service.py`）**默认关闭**（`memory_enabled=false`）：关闭时**零开销**——不建库、不调 embedding，且提示词与没有这个功能时**逐字符一致**。开启后**自动**写入点只有 `summarize()` 成功出总结之后（只写总结，兜底台词不写），召回点在 `chat()` 与她自己落子前（`own_turn` 阶段）两处；`embed_*` 任一为空 / 401 / 超时一律降级为关键词检索，任何记忆故障都只打日志、绝不影响对局（`busy` 照常归位）。管理面是 `/api/memory/query|write|stats|forget`（关闭时查询面可用、写入被拒），写 / 查推 `memory` WS 事件——**纯元数据**，前端只记一行日志；agent 自己的召回 / 写入**不发**事件。两条不能回退的硬规则：**同步记忆调用不得直接放进 `async def`**——`_long_term` / `_remember_game` 与两个管理端点都必须 `await asyncio.to_thread(...)`（单 uvicorn 事件循环会被慢 embedding 冻住，单次上限 `embed_timeout`，默认 10 秒）；**召回是两级**——向量命中不足 `memory_top_k` 条时用关键词补齐未命中的行（无向量的老行 / 写入时 embedding 失败的行不得被有向量的行压掉），`memory_top_k=0` 与显式 `k≤0` 都表示不召回（管理面返回空列表，不兜底成 3）。
+- **语音链路（v3.5.0 起）整体在后端**：清洗 / 分句 / 分块 / `[[tone:…]]` 剥离在 `app/speech_text.py`，云端合成 + LRU 缓存（**条数 32 / 8 MiB 双向淘汰**，单条超预算直接不插）+ fail-closed 降级在 `app/tts.py`；后端每发一条要念的台词都**紧接**一条 `speech` 事件（`turn_id` + `seq`，**同回合从 1 递增、跨回合重置**），音频经 `GET /api/tts/audio/{id}` 取回（试听是 `POST /api/tts/speak`）。前端 `TTSClient.gd` 退化为播放器（`play_audio` / `speak_system`），配对与兜底交给 `SpeechPairing.gd`（`Main.gd` 只留胶水）。**四条不能回退的硬规则**：① **清洗规则只在后端一处**——前端 `TTSClient.gd` 不得再出现清洗 / 分句 / 合成；② **`reveal` 时机不许改**——仍在 `ai_move` 那条语音**开始播放**时由前端 `POST /api/reveal`；③ **任何异常都不得让 `busy` 卡死**——合成失败整条降级 `mode:"system"`（文字照常、回合不卡），配对侧不得留下悬空记录（`got && !played` 会恒真 → 棋盘永久锁死）；④ 语音关闭（`tts_enabled=false`）时**零请求、零 `speech` 事件**，文字照常。`SpeechPairing.gd` 的状态机守一条不变量：**任何已登记、且不属于「有意不显示」的两类（`tomb` / `forget_idle`）的台词，最终一定会被显示一次**——无论 `speech` 到没到、配对位是否过 TTL、那一轮是否 `busy`、音频端点回什么。改这两侧时要跑的门卫：后端 `tests/test_tts_backend.py` / `tests/test_speech_text.py` / `tests/test_main.py`，前端 `tests/test_tts.gd` / `tests/test_speech_pairing.gd` / `tests/test_config.gd`。
 - KataGo 是**独立部署的云服务**（`katago_service/`），后端只连 `katago_url` / `katago_token` / `katago_timeout_ms`，**仓库里只有客户端**：`backend/` 里**不得**再引入拉起 `katago` 子进程的代码——`katago.exe` / 权重 / analysis cfg 由服务侧的 `--katago-exe/--model/--config` 或 `KATAGO_EXE/KATAGO_MODEL/KATAGO_CONFIG` 提供，`game/` 连这几个字段都不读。
 - peek（看屏幕搭话）已整体移除（前端 `_peek_*`、`POST /api/peer`、`peer_remark`、VLM 配置都没了）；闲置主动搭话走 `POST /api/idle` + `ai_idle` 事件。
 - 分发：`tools/` 下的 PCK 打包脚本已删除，PCK 打包流程不再维护；`game/export_presets.cfg` 保留，可用 Godot 自带导出做个人分发。
@@ -33,7 +34,9 @@
 - 测试：
   - `cd backend && python -m unittest discover -s tests` —— 后端全量（标准库 `unittest`，不用 pytest；先 `pip install -r backend/requirements.txt`）。
   - `cd katago_service && python -m unittest discover -s tests` —— KataGo 云服务全量（同样 `unittest`，用假引擎，不依赖真实 KataGo 与公网）。
-  - `godot --path game --headless --script res://tests/test_tts.gd` —— 文本清洗 / 服务不可用降级 / WAV 解析，不需要外部服务（会真的拉起一次系统语音进程，音量已压到最低）。
+  - `godot --path game --headless --script res://tests/test_tts.gd` —— 语音播放器（WAV / MP3 解析、队列上限、系统语音指令），不需要外部服务（会真的拉起一次系统语音进程，音量已压到最低）。
+  - `godot --path game --headless --script res://tests/test_speech_pairing.gd` —— 语音配对状态机（不变量 / TTL / 兜底），纯逻辑、无外部依赖。
+  - `godot --path game --headless --script res://tests/test_config.gd` —— 客户端配置读写（含未知键原样保留）。
 - 新增/移动资源后先 `godot --headless --path game --import` 重新生成导入信息。
 - 调试参数走 `OS.get_cmdline_user_args()`，**必须放在 `--` 之后**：`-- --shot=out.png`（渲染数帧后截图退出）、`-- --demo`、`-- --setup`（只画设置面板供截图）。
 
@@ -59,4 +62,4 @@
 fix(chat,ai): 非相邻原样复读窗口去重 + 方位词按坐标核对（v1.5.0）
 ```
 
-版本号同时写进 `README.md` 的「更新」小节（当前 v3.4.0）。
+版本号同时写进 `README.md` 的「更新」小节（当前 v3.5.0）。

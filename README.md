@@ -16,12 +16,13 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 > **人设与提示词也能在 `config.json` 里直接改**。客户端（`game\`）只做渲染、输入与语音播放，
 > 连不上后端时只在状态栏提示。
 >
-> 当前版本 **v3.4.0**：后端对局编排搬进一张 **LangGraph 状态图**
-> （`backend\app\agent_graph.py`：`prepare → decide →（条件边工具轮）speak → finalize`）——
-> 「怎么想、怎么说、下哪里」的顺序第一次显式成形，工具因此可以**参与落点候选**；
-> AI 原话去重从客户端**下沉到后端**（最近 8 条窗口，前端只兜 WS 重连乱序）；并新增**可选流式输出**
-> （`stream_tokens`，默认关闭：开启后她的台词逐段推送、首字更快；气泡最终内容仍以完整 `message` 收口）。
-> 详见第四节「流式输出」与「九、更新」。
+> 当前版本 **v3.5.0**：**语音链路整体搬到后端**——说话文本的清洗 / 分句 / 语气标记剥离
+> （`backend\app\speech_text.py`）与云端合成 + LRU 缓存 + 失败降级（`backend\app\tts.py`）都在后端完成；
+> 后端在每条要念的台词之后**紧发一条 `speech` 事件**（`turn_id` + `seq` 配对，音频按 `id` 经
+> `GET /api/tts/audio/{id}` 取回），客户端 `TTSClient` 退化为**播放器**，配对与兜底交给
+> `SpeechPairing` 状态机（任何已登记的台词最终一定会被显示一次）；合成失败一律降级为
+> **Windows 系统语音**，文字永不消失。新增 `tts_timeout_sec`（默认 30 秒）。
+> 详见第五节「接语音」与「九、更新」。
 
 ---
 
@@ -36,16 +37,17 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 │   │   │                   Board3D.gd       3D 棋盘绘制与交互（含定式高亮轨迹）
 │   │   │                   AzureAvatar.gd   VRM 形象、表情、视线、风场
 │   │   │                   Ambience.gd      环境/风
-│   │   ├─ services\        TTSClient.gd     语音客户端（system / openai）
+│   │   ├─ services\        TTSClient.gd     语音播放器（按后端 speech 指令出声）
+│   │   │                   SpeechPairing.gd 台词与语音的配对状态机（兜底不丢字）
 │   │   ├─ core\            AzureConfig.gd   config.json 读写
 │   │   │                   Coords.gd        坐标换算（棋盘坐标标签）
 │   │   └─ net\             NetClient.gd     远程后端客户端（REST + WebSocket）
 │   ├─ assets\voice\        预制语音：开场欢迎语 + 20 条语气词（即播零等待，与情绪/表情绑定）
-│   ├─ tests\               语音测试脚本（test_tts.gd）
+│   ├─ tests\               语音测试脚本（test_tts.gd / test_speech_pairing.gd / test_config.gd）
 │   ├─ config.json          客户端参数模板（见第三节）
 │   └─ export_presets.cfg   Godot 导出预设（个人导出用）
 ├─ backend\                 远程后端（唯一权威：对局编排 / LLM / 情绪 / 定式；FastAPI + REST + WebSocket）
-│   ├─ app\                 对局编排 / LangChain 链（LLM + 提示词） / 情感模型 / 发言侧工具 / 长期记忆
+│   ├─ app\                 对局编排 / LangChain 链（LLM + 提示词） / 情感模型 / 发言侧工具 / 长期记忆 / 语音（清洗 + 合成）
 │   ├─ tests\               后端单元测试（含情感模型黄金样本）
 │   ├─ requirements.txt     后端依赖
 │   ├─ run_server.bat       一键启动后端（监听 127.0.0.1:8000）
@@ -89,7 +91,8 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 
 `config.json` 放在**可执行文件同目录**即可覆盖包内默认值（源码运行时读 `game\config.json`）。
 语音默认走云端 `openai`（模板指向 OpenAI）：要填好 `tts_api_key`，并按第三节把 `tts_voice` 从 `中文女` 换成
-OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降级为 **Windows 系统语音**。
+OpenAI 的音色，才能真正出声；**合成在后端**，云端不可用（连不上 / 超时 / 服务端报错）时后端会自动**整条降级**
+为 **Windows 系统语音**，文字照常显示。
 聊天/讲解需要按第四节接上一个大模型 API。
 
 ---
@@ -107,7 +110,9 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
   `llm_extra_body` / `llm_think_extra_body` / `stream_tokens` / `tools_enabled` / `max_tool_calls` 与
   `memory_enabled` / `memory_db_path` / `embed_base_url` / `embed_model` / `embed_api_key` /
   `embed_timeout` / `memory_top_k` / `memory_max_inject_chars` 只由后端消费；
-  客户端不读它们，但**写回配置时会原样保留**（游戏内保存设置不会把这些键弄丢）。
+  语音侧的 `tts_base_url` / `tts_model` / `tts_api_key` / `tts_timeout_sec` 也只由后端消费
+  （`tts_long_chunk` 客户端只留一个勾选框、分块本身在后端）；这些键客户端不参与计算，
+  但**写回配置时会原样保留**（游戏内保存设置不会把它们弄丢）。
 
 | 字段 | 读取方 | 含义 |
 | --- | --- | --- |
@@ -135,23 +140,31 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 | `prompt_user_name` | 后端（启动时） | **玩家称呼**，替换提示词中的「Estarth」（默认 Estarth） |
 | `prompt_phase_notes` | 后端（启动时） | **覆盖各阶段提示**，键：`observe` / `after_player` / `own_turn` / `just_moved` / `analyze` / `chat` / `summary` |
 | `vrm_path` | 客户端 | 虚拟形象 `.vrm` 路径；**建议填绝对路径**（相对路径要能被 Godot 解析到，否则形象加载失败） |
-| `tts_enabled` | 客户端 | 是否启用语音 |
-| `tts_mode` | 客户端 | `openai`（云端 OpenAI 兼容 `/v1/audio/speech`，默认）/ `system`（Windows 系统语音，服务连不上时也会临时降级到它） |
-| `tts_base_url` | 客户端 | **云端语音服务地址**（OpenAI 兼容，含 `/v1`，如 `https://api.openai.com/v1`） |
-| `tts_model` / `tts_voice` | 客户端 | 云端语音模型名 / 音色 id（音色名随服务商而定，也可手填） |
-| `tts_api_key` | 客户端 | **云端 TTS 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
-| `tts_speed` / `tts_pitch` / `tts_volume` | 客户端 | 语速 / 音调（播放层变调）/ 音量 |
-| `tts_limit_len` / `tts_sync_speak` / `tts_batch_speak` / `tts_long_chunk` | 客户端 | 短回复 / 同步说话 / 整段合成 / 长句合并（立即生效） |
+| `tts_enabled` | 客户端 + 后端（启动时） | 是否启用语音；后端据此决定要不要合成（关闭时零请求、不发 `speech` 事件，文字照常） |
+| `tts_mode` | 后端（启动时）+ 客户端 | `openai`（云端 OpenAI 兼容 `/v1/audio/speech`，默认）/ `system`（Windows 系统语音）；后端按它决定合成路由，客户端只作本地镜像（两边都把未知值回落 `openai`） |
+| `tts_base_url` | 后端（启动时） | **云端语音服务地址**（OpenAI 兼容，含 `/v1`，如 `https://api.openai.com/v1`）；`openai` 模式留空＝视为未启用（只出文字） |
+| `tts_model` | 后端（启动时） | 云端语音模型名 |
+| `tts_voice` | 后端（启动时）+ 客户端 | 音色 id（随服务商而定，也可手填）；后端用它合成，客户端系统语音兜底时也拿它选音色 |
+| `tts_api_key` | 后端（启动时） | **云端 TTS 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
+| `tts_speed` | 后端（启动时）+ 客户端 | 语速：后端合成时传给服务商，客户端系统语音兜底也用它 |
+| `tts_pitch` / `tts_volume` | 客户端 | 音调（播放层变调，会略带动语速）/ 音量 |
+| `tts_timeout_sec` | 后端（启动时） | **单次合成超时**（秒，默认 `30`）；超时（含 `≤0` / 脏值退回默认）**整条降级**为系统语音，回合不卡死 |
+| `tts_limit_len` | 客户端 + 后端（实时） | **短回复**（限制她每次只说 1~2 句）：客户端勾选后经 `/api/config` 转发后端，**立即生效** |
+| `tts_sync_speak` | 客户端 | **同步说话**：文字等这条语音就绪后再显示（**立即生效**） |
+| `tts_batch_speak` | 客户端 | **整段排队播报**：连发的多条台词合并成一段连续朗读（**立即生效**）；语义变化见下方说明 |
+| `tts_long_chunk` | 后端（启动时） | **长句合并**：后端单块字数上限 `100` → `160`（关 = 100，首句更快）；改完要**重启后端** |
 
 > - `tts_base_url` / `tts_model` / `tts_voice` 要**配套**：模板的三件套是 `https://api.openai.com/v1` + `tts-1` + `中文女`，
 >   其中 `中文女` **不是** OpenAI 的音色 id——用 OpenAI 的话要把音色一并改成 `alloy` / `nova` / `onyx` 之类的
 >   OpenAI 音色（音色 id 也可手填）；换其他服务商时地址、模型名、音色 id 都按服务商的取值改。
-> - **两种失败表现不一样**：
->   ① 服务**连不上**（断网 / 地址写错 / 服务没启动）→ **自动临时降级**为 Windows 系统语音继续朗读，
->   服务恢复后自动切回云端（不报错、不改配置）；
->   ② 服务**能连上但拒绝了这次请求**（音色 / 模型名不被接受，例如用 `中文女` 调 OpenAI 会返回 HTTP 400）
->   → **不出声**：左侧语音栏与底部状态行显示「TTS 无响应（HTTP 400）…」，Azure 的文字照常显示，
->   冷却 6 秒后继续尝试队列里的下一句。**音色 / 模型配错不会自动降级**，只会没声音 + 一行报错。
+> - **合成在后端，失败一律降级、不出错刷屏**：服务**连不上**（断网 / 地址写错 / 服务没启动）、**超时**、
+>   服务端**拒绝了这次请求**（音色 / 模型名不被接受，例如用 `中文女` 调 OpenAI 返回 HTTP 400）或响应解析不了，
+>   后端都把这一条**整条降级**为「用 Windows 系统语音念」的 `system` 指令（`speech` 事件的 `mode` 变成 `system`），
+>   文字照常显示、回合不卡；下一句仍会重新尝试云端合成，服务恢复后自动回到云端（不报错、不改配置）。
+>   后端控制台会留一行 `[TTS] …` 的降级日志（合成失败 / 单条音频超过缓存预算）便于排查。
+> - **`tts_long_chunk` 现在是后端的分块开关**：它决定后端单次合成的字数上限（关 = 100 / 开 = 160），
+>   改完要重启后端；`tts_batch_speak` 的语义也变了——合成改成「一行一条」之后，它从「一次请求合成一整段」
+>   变成**整段排队连续播报**（仍影响观感与时延，但不再减少合成请求数），仍在前端即时生效。
 > - **KataGo 引擎路径类的旧键（可执行文件 / 权重 / analysis 配置三件套）不在上表，也不再有任何读取方**：
 >   它们是「后端自行拉起 KataGo 进程」时代的旧键（v3.0.0 及更早），v3.1.0 起 KataGo 由独立云服务提供，
 >   后端只连 `katago_url`。游戏内保存设置时会**把这几个旧键一并清掉**（自我清理，见
@@ -278,15 +291,61 @@ curl -X POST http://127.0.0.1:8000/api/memory/forget -H "Content-Type: applicati
 
 ## 五、接语音（TTS，可选）
 
+**合成在后端、前端只播放**（v3.5.0 起）：她说什么、怎么切句、什么语气都由后端决定
+（清洗 / 分句 / `[[tone:…]]` 剥离见 `backend\app\speech_text.py`，云端合成 + 缓存 + 降级见
+`backend\app\tts.py`）。后端每发一条要念的台词，都会**紧接**补一条 WS `speech` 事件，用
+`turn_id` + `seq` 与那条 `message` 一一配对；客户端 `TTSClient` 退化为播放器，只按指令出声：
+
+- `speech.mode == "openai"`：按事件里的 `id` 去 `GET /api/tts/audio/{id}` 取回音频播放（后端把合成结果按
+  **条数 32 / 8 MiB 双向 LRU** 缓存；被淘汰或后端重启后取不到，这种情况只显示文字、不阻塞）；
+- `speech.mode == "system"`：用 `text`（后端已清洗好，**不再含**语气标记）交给 **Windows 系统语音**念；
+- 语音关闭（`tts_enabled=false`）时后端**一条 `speech` 都不发**、也不发起任何合成请求，文字照常显示。
+
+**两种模式**
+
 - **云端 `openai`（默认）**：任何 OpenAI 兼容 `/v1/audio/speech` 服务（如 OpenAI、部分云厂商），
-  填 `tts_base_url` / `tts_model` / `tts_voice` / `tts_api_key`。
-- **`system` 兜底**：Windows 系统语音，零配置即可发声；云端服务连不上时游戏会**自动临时降级为它**
-  （不报错、不改配置），服务恢复后再切回。
-- **自建 CosyVoice 也走 `openai`**：`server\` 的 `azure_tts_server.py` 同样实现了 OpenAI 兼容的
-  `/v1/audio/speech`，把 `tts_mode` 保持 `openai`、`tts_base_url` 指向 `http://127.0.0.1:9880/v1` 即可。
-  1. 自备 CosyVoice 权重，放到 `server\pretrained_models\` 下；
-  2. 建虚拟环境并安装依赖（`server\requirements_win.txt`、`requirements.txt`）；
-  3. 双击 `server\start_tts_server.bat` 手动启动服务（游戏不会自动拉起），服务监听 `http://127.0.0.1:9880`。
+  填 `tts_base_url` / `tts_model` / `tts_voice` / `tts_api_key`——这几个字段现在由**后端启动时**读取
+  （改完要**重启后端**），加 `tts_timeout_sec`（默认 30 秒）控制单次合成超时。
+- **`system` 兜底**：Windows 系统语音，零配置即可发声；**后端合成失败（连不上 / 超时 / 服务端拒绝 /
+  响应解析不了）时后端把这一条整条改发 `system` 指令**（不报错、不改配置），下一句仍会重试云端。
+  左侧栏第 1 项「系统语音」也可以主动把整条链路切到它。
+
+**已知取舍**
+
+- **有 4 条短提示只有文字、没有语音**：`undo` 的两条（回档点不存在 / 已回档）与 `reset_game`、
+  `set_allow_pass`——它们是同步方法，无法 `await` 合成；文字照常显示。
+- **两栏的生效范围不同**：朗读方式 / 服务地址 / 模型（左栏「语音设置」）与长句合并（右栏「语音开关」）
+  现在只对**后端重启**生效（合成归后端，前端不再自行合成）；「同步说话」「整段合成」「短回复」仍是
+  前端 / 请求级**即时生效**（`tts_limit_len` 经 `/api/config` 转发后端）。界面在这些项上会提示
+  「重启后端后生效」。
+- **`speech` 与 `message` 的配对**：后端保证 `speech` **紧随**对应 `message` 之后发出；`seq` 是
+  **同一个 `turn_id` 内**从 1 开始的序号，**跨回合会重置**——客户端必须按 `turn_id + seq` 配对，
+  不能只看 `seq`。
+- **两条前端固有的错配窗口**（音频序列本身仍然正确，只是**归属 / 顺序**可能错一位）：
+  ① 「这手不成立」是唯一一条 `busy=false` 且带语音的台词，玩家可以马上再落一手与它交错；
+  ② 本地被去重的台词会留下一个占位（tomb）却永远收不到 `speech`，它可能「用掉」下一条的语音。
+  两者都有自愈：被顶掉的那句仍会在回合结束时放出文字，**不锁死棋盘、不静音全局**。
+  后续选项（暂未实现）：让这条提示留在 `busy` 窗口内，或给 `message` 也带上 `turn_id`。
+- **流式的保证边界**见第四节「流式输出」（成对 think 区间保证 `token` 与台词都干净；「只剩收尾标记」与
+  未闭合 `think` 的**畸形**形态只保证最终 `message` 与 TTS 干净）。
+
+**两个语音端点**（对局中由 `speech` 事件驱动，这两个是**试听 / 手动**用的；失败只回可读错误，不 500）：
+
+```bash
+# 试听：直接返回 audio/wav；合成不出音频（语音关闭 / 系统语音模式 / 空文本 / 合成失败）→ 409
+curl -X POST http://127.0.0.1:8000/api/tts/speak -H "Content-Type: application/json" \
+  -d '{"text":"你好呀"}' -o preview.wav
+# 取一条已合成的音频（speech 事件 mode=openai 时带的 id）；未命中 / 已被淘汰 / 后端重启过 → 404
+curl -o line.wav http://127.0.0.1:8000/api/tts/audio/音频id
+```
+
+> `-d '…'` 的单引号写法在 **PowerShell 7 / Git Bash** 可用；**cmd.exe** 要改写成 `-d "{\"text\":\"…\"}"`。
+
+**自建 CosyVoice 也走 `openai`**：`server\` 的 `azure_tts_server.py` 同样实现了 OpenAI 兼容的
+`/v1/audio/speech`，把 `tts_mode` 保持 `openai`、`tts_base_url` 指向 `http://127.0.0.1:9880/v1` 即可。
+1. 自备 CosyVoice 权重，放到 `server\pretrained_models\` 下；
+2. 建虚拟环境并安装依赖（`server\requirements_win.txt`、`requirements.txt`）；
+3. 双击 `server\start_tts_server.bat` 手动启动服务（游戏不会自动拉起），服务监听 `http://127.0.0.1:9880`。
 
 ---
 
@@ -308,12 +367,15 @@ curl -X POST http://127.0.0.1:8000/api/memory/forget -H "Content-Type: applicati
   也可命令行临时指定：`AzureGoGodot.exe --backend-url=http://127.0.0.1:8000`（只影响本次运行，不写回配置）。
 - **接口契约**：
   - REST：`/api/move|hint|analyze|chat|summarize|undo|reset|config|reveal|interaction|idle|mood/tick`，
-    以及 `GET /api/state`、`GET /api/health`，和长期记忆管理面 `/api/memory/query|write|stats|forget`
-    （见第四节「长期记忆（跨局记得你）」）。
-  - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki / tool / token / memory`
+    以及 `GET /api/state`、`GET /api/health`，长期记忆管理面 `/api/memory/query|write|stats|forget`
+    （见第四节「长期记忆（跨局记得你）」），语音的试听 / 取音频两个端点 `POST /api/tts/speak`、
+    `GET /api/tts/audio/{audio_id}`（见第五节「接语音」）。
+  - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki / tool / token / speech / memory`
     （`tool` 是发言侧工具的开始 / 结束，只喂状态栏提示，不进入对话；`token` 是可选流式增量，仅
-    `stream_tokens` 开启时才有、默认关闭，气泡最终内容仍以随后的 `message` 为准；`memory` 是记忆管理
-    动作的元数据，只记一行日志，不进台词、不产生界面变化）。
+    `stream_tokens` 开启时才有、默认关闭，气泡最终内容仍以随后的 `message` 为准；`speech` 是每条台词的
+    **语音指令**——`mode=openai` 时按 `id` 取上面的音频端点、`mode=system` 时用 `text` 交系统语音，与对应
+    `message` 同 `turn_id`、`seq` 递增配对，语音关着时根本不发；`memory` 是记忆管理动作的元数据，
+    只记一行日志，不进台词、不产生界面变化）。
   - `GET /api/health` 返回 `{ok, katago_dead, katago_error, katago_url, llm_url, memory_rows}`（字段都改为描述所连云服务：
     地址 / 引擎是否还在 / 最近错误）。其中 `katago_dead` 与 `katago_error` 必须**成对读**：
     - `katago_dead` 表示**引擎已经没了**：`start()` 探活失败、或分析时发生**传输层失败**（连接被拒 / 连接或
@@ -388,7 +450,32 @@ KataGo 引擎与权重遵循其上游许可。
 
 ## 九、更新
 
-### v3.4.0（当前）
+### v3.5.0（当前）
+- **语音链路整体搬到后端**：新增 `backend\app\speech_text.py`（清洗 / 分句 / 分块 / `[[tone:…]]` 剥离，
+  从 `TTSClient.gd` 与 `Main.gd:_strip_tone` 逐条移植）与 `backend\app\tts.py`（云端合成客户端：**条数 32 /
+  8 MiB 双向 LRU**、单条超预算直接不插、多块按格式拼接、任一步失败**整条**降级）；后端每发一条要念的
+  台词都**紧接**一条 `speech` 事件（`turn_id` + `seq` 配对），音频经 `GET /api/tts/audio/{id}` 取回；
+  新增端点 `POST /api/tts/speak`（试听）。见第五节「接语音」。
+- **前端退化为播放器**：`TTSClient.gd` 不再清洗 / 分句 / 合成，只有 `play_audio(bytes, seq)` 与
+  `speak_system(text, seq)` 两个入口；新增 `SpeechPairing.gd`（可测的配对状态机）守住不变量
+  「任何已登记、且不属于「有意不显示」两类的台词**最终一定会被显示一次**」——音频取不回 / HTTP 200 但
+  body 为空 / 字节解析不了 / `speech` 没到 / 连接断开，都会**先显示文字再收账**，**绝不静默丢字、
+  绝不锁死棋盘**。
+- **降级与超时**：后端合成失败（连不上 / 超时 / 非 200 / 解析失败）一律改发 `mode:"system"` 指令，
+  文字照常、回合不卡（fail-closed）；新增配置 `tts_timeout_sec`（单次合成超时，默认 `30` 秒，
+  `≤0` 与脏值退回默认）。**清洗规则不再在前端出现**（语气标记已由后端剥净，不会被系统语音念出来）。
+- **`tts_batch_speak` 的语义变化**：合成改成「一行一条」之后，它从「一次请求合成一整段」变成
+  **整段排队连续播报**（仍影响观感 / 时延，但不再减少合成请求数）；`tts_long_chunk` 现在是**后端**的
+  分块上限开关（单块 `100` → `160` 字），改完要重启后端。
+- **已知取舍**：4 条同步方法的短提示只有文字没有语音；朗读方式 / 服务地址 / 模型 / 长句合并只对
+  **后端重启**生效；`speech` 与 `message` 按 `turn_id` + `seq` 配对（`seq` 同回合递增、**跨回合重置**）；
+  两条前端固有的错配窗口（非法手提示与第二次落子交错、tomb 占位吃掉下一条语音）各自有兜底。
+  详见第五节「接语音」。
+- **文档与配置**：WS 事件清单由 9 类增至 **10 类**（新增 `speech`，连接建立时的 `hello` 另算）；
+  `game\config.json` 模板新增 `tts_timeout_sec: 30`（**不删任何 `tts_*` 键**——`tts_limit_len` /
+  `tts_batch_speak` / `tts_long_chunk` 都还有活的读取方）；README 字段表与 `AGENTS.md` 同步。
+
+### v3.4.0
 - **回合编排显式成一张状态图**：新增 `backend\app\agent_graph.py`（LangGraph），拓扑
   `prepare → decide →（条件边 tools → decide，可反复）→ speak → finalize`；六个需要 LLM 编排的公开方法
   （`player_move` / `hint` / `analyze_position` / `chat` / `idle_remark` / `summarize`）在 `agent.py` 里只做
@@ -396,7 +483,7 @@ KataGo 引擎与权重遵循其上游许可。
   `player_move` 一次公开调用＝**三次 `ainvoke`**（`after_player → own_turn → just_moved`，中间数据经
   `TurnState["data"]` 透传、`turn_id` 三阶段共用）；其余 `undo` / `reset_game` / `set_allow_pass` /
   `reveal_move` / `tick_mood` / `player_interaction` 仍是同步方法、直接发事件。**公开契约不变**：
-  端点、事件形状与 `AzureAgent` 公开方法签名一行未动，客户端 `NetClient.gd` 一行未改。
+  端点、事件形状与 `AzureAgent` 公开方法签名一行未动，客户端 `NetClient.gd` 仅新增 `token_event` 一条。
 - **条件边工具轮与落点候选**：工具请求改由 `decide` 后的条件边驱动（`tools → decide`，回到模型再来一轮，
   直到没有请求或预算用尽）；`decide` 内**总 LLM 调用次数**上限 `MAX_LLM_CALLS_PER_TURN = 4`（含工具轮），
   工具预算仍是 `MAX_TOOL_CALLS = 2` / 单工具 10 秒超时。工具/模型现在**可以参与落点候选**

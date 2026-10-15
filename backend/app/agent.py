@@ -538,7 +538,7 @@ class AzureAgent:
         ``tests/test_tools.py`` 直接覆盖**（保留是为了不删既有守卫，且两条语义必须与图对齐——
         尤其「超额工具的每个 ``tool_call_id`` 都要补一条预算 ``ToolMessage``」）。
 
-        只在 ``hint()`` 与 ``_ai_turn()`` 的落子宣告两处启用（且 ``tools_enabled`` 为真）：
+        只在 ``hint()`` 与落子宣告（``own_turn`` 阶段）两处启用（且 ``tools_enabled`` 为真）：
         聊天/闲置这类短回合不走 tool loop，免得白等工具往返的时延。
 
         硬规则：
