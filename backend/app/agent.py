@@ -23,7 +23,7 @@ from .agent_graph import (
 from .board import SIZE as BOARD_SIZE
 from .emotion import EmotionModel
 from .joseki import JosekiRecognizer
-from .llm_chain import content_of, stream_delta_of
+from .llm_chain import chunk_text_of, content_of
 from .state import GameState
 from .tools import TOOLS, failed as tool_failed
 
@@ -171,6 +171,18 @@ class AzureAgent:
             "data": dict(data or {}),
         }
         return await self.graph.ainvoke(state)
+
+    def _is_repeat_prefix(self, text) -> bool:
+        """``text``（strip 后）是否还是去重窗口里某句原话的**前缀**（整句相等也算）。
+
+        流式扣留的判据（S37）：只要累加的可见文本还是某句的前缀，就先扣住已经收到的增量不发——
+        整句原样复读时**一条 token 都不发**（它的 ``message`` 也照旧被闸门拦下）；一旦分叉
+        （确认是另一句新话）立刻把积压的增量按序补发。空串不算前缀，否则一开局就会把全部扣住。
+        """
+        norm = str(text or "").strip()
+        if norm == "":
+            return False
+        return any(str(line).startswith(norm) for line in self._recent_lines)
 
     def _new_turn(self) -> str:
         """开启一次公开编排调用：生成新的 ``turn_id``（同一回合的多个阶段一路沿用，S33）。"""
@@ -436,7 +448,7 @@ class AzureAgent:
         return src.bind(extra_body=body)
 
     def _stream_chunks(self, messages, max_tokens=300):
-        """本次出话的可流式来源：返回「逐块产出可见文本」的异步生成器；不可流式时返回 ``None``。
+        """本次出话的可流式来源：返回「逐块产出**回答原文**」的异步生成器；不可流式时返回 ``None``。
 
         ``stream_tokens`` 关闭（默认）时**直接返回 None**——关闭态一个 ``token`` 事件都不会发，
         事件序列与没有这个功能时逐字一致（S31③）。开启后优先用实时取到的 LangChain 链
@@ -446,8 +458,9 @@ class AzureAgent:
         否则 openai 客户端会静默退回 api.openai.com 真连外网。输出上限按线上键 ``max_tokens``
         绑进请求体（理由同 ``_bind_tools``：``ChatOpenAI`` 的 ``max_tokens`` 会被改名）。
 
-        每块都经 ``llm_chain.stream_delta_of`` 取文本：**只认回答的 content 通道**，推理段
-        （``reasoning_content`` / ``reasoning`` / think 段）永不进 delta；空块直接跳过（不发事件）。
+        每块经 ``llm_chain.chunk_text_of`` 取**原文**（只认回答的 content 通道，``reasoning_content``
+        之类的推理字段一概不读），空块直接跳过；think 段的剥离**不在这里**做——chunk 会把标签切块，
+        必须由 ``ThinkStream`` 在**累加文本**上跨块剥离（见 ``llm_chain.ThinkStream``）。
         """
         if not self.stream_tokens or not self._chain_ok():
             return None
@@ -460,9 +473,9 @@ class AzureAgent:
 
         async def gen():
             async for chunk in src.astream(messages):
-                delta = stream_delta_of(chunk)
-                if delta != "":
-                    yield delta
+                text = chunk_text_of(chunk)
+                if text != "":
+                    yield text
 
         return gen()
 

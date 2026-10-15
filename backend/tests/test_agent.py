@@ -811,7 +811,7 @@ class StreamGuardTest(unittest.TestCase):
 
         self.assertEqual(bus.messages(events.AI), [])              # 重复句不发 message
         deltas = [str(e["delta"]) for e in bus.of_type("token")]
-        self.assertNotEqual("".join(deltas), "我在的~")             # 完整重复句不得出现在事件里
+        self.assertEqual(deltas, [])                              # S37：整句复读一条 token 都不发（不留残余气泡）
 
     def test_new_sentence_starting_with_a_window_line_is_not_truncated(self):
         """判据是「相等」不是「包含」：以窗口里那句开头的新话，流式下照样完整发出。"""
@@ -867,4 +867,132 @@ class RealChainStreamTest(unittest.TestCase):
         self.assertEqual("".join(str(e["delta"]) for e in toks), "你好~")
         self.assertTrue(all(str(e["turn_id"]) == agent.turn_id for e in toks))
         self.assertEqual([str(m["text"]) for m in bus.messages(events.AI)], ["你好~"])   # 气泡以 message 为准
+
+
+# —— 以下为 Task 5 首轮评审 S36/S37 的补充守卫（纯追加）——
+
+
+class StreamThinkTest(unittest.TestCase):
+    """S36：think 段被**切块**（含无配对开标签的收尾标记）时也不得漏进 delta 与 message。
+
+    首轮的 `StreamGuardTest` 只喂 `additional_kwargs` 里的推理字段，抓不到「推理段写在 content
+    通道、标签被切到不同块」这条路——下面的替身专门复现评审探针的两种形态。
+    """
+
+    class SplitTagLLM(StubLLM):
+        """评审探针复现的形态：开标签被切块，随后是无配对开标签的收尾标记。"""
+
+        async def astream(self, messages, max_tokens=300):
+            for piece in ["<thi", "nk>内部推理：我要不要理他", "<｜end▁of▁thinking｜>", "你好~"]:
+                yield piece
+
+    class MarkerOnlyLLM(StubLLM):
+        """无配对开标签：标记之前全是推理（标记自身也被切块）。"""
+
+        async def astream(self, messages, max_tokens=300):
+            for piece in ["<｜end", "▁of▁thinking｜>", "你好~"]:
+                yield piece
+
+    class PairTagLLM(StubLLM):
+        """成对标签被切块：标签两侧的正文都要照常发出。"""
+
+        async def astream(self, messages, max_tokens=300):
+            for piece in ["先", "<th", "ink>推理</thi", "nk>后"]:
+                yield piece
+
+    class UnclosedLLM(StubLLM):
+        """未闭合的开标签：`content_of` 的兜底是整条作废（空串）。"""
+
+        async def astream(self, messages, max_tokens=300):
+            for piece in ["<th", "ink>还没闭合"]:
+                yield piece
+
+    class WindowPrefixLLM(StubLLM):
+        """只吐窗口那句的前缀（比窗口句短）：一条 token 都不发，但台词照旧出。"""
+
+        async def astream(self, messages, max_tokens=300):
+            for piece in ["我", "在"]:
+                yield piece
+
+    def _run(self, llm):
+        agent, _eng, _llm, bus = _mk()
+        agent.llm = llm
+        agent.stream_tokens = True
+        asyncio.run(agent.chat("在吗"))
+        deltas = [str(e["delta"]) for e in bus.of_type("token")]
+        texts = [str(m["text"]) for m in bus.messages(events.AI)]
+        return agent, bus, deltas, texts
+
+    def test_split_think_tag_never_leaks_across_chunks(self):
+        """C1 核心：`<thi`/`nk>…` 被切块 + 收尾标记 ⇒ delta 与 message 都不含推理段。"""
+        from app.llm_chain import content_of
+        from types import SimpleNamespace
+
+        _agent, _bus, deltas, texts = self._run(self.SplitTagLLM())
+
+        # ① 推理段、标签、标记一个字都不许进事件
+        self.assertTrue(deltas, "标记之后的正文该发出来")
+        for s in deltas + texts:
+            self.assertNotIn("内部推理", s)
+            self.assertNotIn("think", s)
+            self.assertNotIn("｜end", s)
+        # ② 增量拼起来是最终台词的前缀（这里恰好相等）
+        self.assertEqual("".join(deltas), "你好~")
+        # ③ 最终 message 与「对同一条原文调 content_of」同构
+        raw = "".join(["<thi", "nk>内部推理：我要不要理他", "<｜end▁of▁thinking｜>", "你好~"])
+        self.assertEqual(texts, [content_of(SimpleNamespace(content=raw))])
+        self.assertEqual(texts, ["你好~"])
+
+    def test_marker_without_open_tag_hides_the_prefix(self):
+        """无配对开标签的收尾标记：标记（含被切块的前半截）不漏，正文只在标记之后可见。"""
+        _agent, _bus, deltas, texts = self._run(self.MarkerOnlyLLM())
+        self.assertEqual(deltas, ["你好~"])
+        self.assertEqual(texts, ["你好~"])
+
+    def test_paired_tag_split_across_chunks_keeps_both_sides(self):
+        """成对标签被切块：标签以外的正文（两侧）都完整发出，标签本身不漏。"""
+        _agent, _bus, deltas, texts = self._run(self.PairTagLLM())
+        self.assertEqual("".join(deltas), "先后")
+        self.assertEqual(texts, ["先后"])
+        for s in deltas:
+            self.assertNotIn("推理", s)
+            self.assertNotIn("think", s)
+
+    def test_unclosed_think_falls_back_without_leaking(self):
+        """未闭合 ⇒ `content_of` 兜底成空串 ⇒ 与不开流式一样由兜底台词顶上，推理段一个字不漏。"""
+        _agent, _bus, deltas, texts = self._run(self.UnclosedLLM())
+        self.assertEqual(deltas, [])
+        self.assertTrue(texts and texts[0] != "")          # S16：不断言具体是哪一句兜底
+        for s in texts:
+            self.assertNotIn("还没闭合", s)
+            self.assertNotIn("think", s)
+
+    def test_repeat_prefix_holds_until_it_diverges(self):
+        """S37：还是窗口句的前缀 ⇒ 继续扣留；分叉后积压的增量按序补发（顺序不乱、一条不少）。"""
+        agent, _eng, _llm, bus = _mk()
+
+        class DivergingLLM(StubLLM):
+            async def astream(self, messages, max_tokens=300):
+                for piece in ["我在的~", "，怎么啦？"]:
+                    yield piece
+
+        agent.llm = DivergingLLM()
+        agent.stream_tokens = True
+        agent._note_line("我在的~")
+        asyncio.run(agent.chat("在吗"))
+
+        deltas = [str(e["delta"]) for e in bus.of_type("token")]
+        self.assertEqual(deltas, ["我在的~", "，怎么啦？"])
+        self.assertEqual([str(m["text"]) for m in bus.messages(events.AI)], ["我在的~，怎么啦？"])
+
+    def test_prefix_of_a_window_line_at_eof_emits_no_token_but_keeps_message(self):
+        """S37 边界：整句只是窗口句的前缀（更短）⇒ 不发 token；台词照旧由 message 兜住（不丢话）。"""
+        agent, _eng, _llm, bus = _mk()
+        agent.llm = self.WindowPrefixLLM()
+        agent.stream_tokens = True
+        agent._note_line("我在的~")
+        asyncio.run(agent.chat("在吗"))
+
+        self.assertEqual(bus.of_type("token"), [])
+        self.assertEqual([str(m["text"]) for m in bus.messages(events.AI)], ["我在"])
 

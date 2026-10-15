@@ -33,9 +33,10 @@
   ``_set_busy`` 自带去重，多调一次不会产生多余的 ``busy`` 事件。
 - 台词一律经 ``agent.clean_reply()``（``_reply()`` 内部必经），推理段永不进台词；
 - speak 阶段还有一条**可选**（默认关闭，``agent.stream_tokens``）的流式通道：``_streamed_text``
-  逐块推 ``token`` 事件（delta 只来自回答的 content 通道、推理段永不外泄、去重闸门同样生效），
-  台词仍以 ``_finalize_*`` 里经 ``clean_reply`` + ``_emit_deduped`` 的完整 ``message`` 收口；
-  关闭时一个 ``token`` 都不发，事件序列与没有这个功能时逐字一致；
+  逐块推 ``token`` 事件（``ThinkStream`` 在累加文本上**跨块**剥离 think 段——标签被切块 / 收尾标记
+  都不漏，delta 只来自回答的 content 通道；去重闸门同样生效、整句复读一条 token 都不发），
+  台词仍以 ``_finalize_*`` 里经 ``clean_reply`` + ``_emit_deduped`` 的完整 ``message`` 收口，
+  且与「对整条原文调 ``content_of``」同构；关闭时一个 ``token`` 都不发，事件序列与没有这个功能时逐字一致；
 - ``build_graph(agent)`` 用闭包捕获 ``agent``，模块级不持有任何可变状态：同一个 ``agent`` 重建图
   是安全的，不同 ``agent`` 各有一张图。
 """
@@ -49,7 +50,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 
 from . import coords, events, prompts
-from .llm_chain import content_of
+from .llm_chain import ThinkStream, content_of, content_text_of
 from .tools import TOOLS
 
 # 节点名（顺序即拓扑顺序）：prepare → decide → speak → finalize
@@ -715,36 +716,48 @@ async def _streamed_text(agent, msgs, max_tokens):
     """speak 阶段的出话：``stream_tokens`` 开启且来源支持 ``astream`` 时逐块发 ``token``，返回完整台词。
 
     返回 ``None`` 表示「这次不走流式」，调用方回落到 ``agent._reply``——默认关闭时走的永远是那条路，
-    事件序列与没有这个功能时逐字一致（S31③）。三条不可回退的约束：
+    事件序列与没有这个功能时逐字一致（S31③）。四条不可回退的约束：
 
-    - delta 只来自回答的 content 通道（``agent._stream_chunks`` 里按 ``content_of`` 取），
-      推理段（``reasoning_content`` / think 段）永不进事件、空块不发事件（硬规则 3）；
-    - 去重闸门对流式路径同样生效（S32）：累加到这里**刚好等于窗口里某句原话**的那一块先扣住不发，
-      整句确实是原样复读时收尾那块就留在手里（token 流里只剩一个真前缀），随后的 ``message`` 也照样
-      被 ``_emit_deduped`` 拦下；若后面还有内容把它续长（只是以那句开头的**新话**），再按序补发，
-      不会误截。判据仍是「相等」，不是「包含」。
-    - 流式本身失败（连接断开 / 服务端报错）**绝不影响这一回合**：返回 ``None`` 让调用方走非流式那条路，
+    - **推理段永不显示（跨块也必须成立）**：``agent._stream_chunks`` 只吐回答原文（content 通道），
+      think 段的剥离由 ``ThinkStream`` 在**累加文本**上跨块完成——标签被切块、或模型用
+      ``<｜end▁of▁thinking｜>`` 收尾（标记之前全是推理）都不漏；空增量不发事件（硬规则 3）；
+    - **台词定稿与整条原文同构**：结束时对**累加原文**走 ``llm_chain.content_text_of``（即
+      ``content_of`` 的纯文本版，含「未闭合 ``<think>`` → 空串」的兜底），再经 ``clean_reply``——
+      与非流式路径（``LLMClient.chat`` → ``content_of`` → ``clean_reply``）逐字同一条规则；
+    - **去重闸门对流式路径同样生效**（S32/S37）：累加的可见文本**还是窗口里某句的前缀**时先扣住
+      已收到的增量不发，一旦分叉（确认是新话）立刻按序补发；整句原样复读 ⇒ 一条 ``token`` 都不发
+      （它的 ``message`` 也照旧被 ``_emit_deduped`` 拦下），前端不会留下没收口的残余气泡。
+      判据仍是「相等」，不是「包含」（以那句开头的新话照样完整发出）；
+    - **流式本身失败**（连接断开 / 服务端报错）**绝不影响这一回合**：返回 ``None`` 让调用方走非流式那条路，
       台词必定完整（前端的气泡最终内容以 ``message`` 为准，会被整条替换）。
     """
     chunks = agent._stream_chunks(msgs, max_tokens)
     if chunks is None:
         return None
-    parts = []
-    emitted = 0
+    stream = ThinkStream()
+    deltas = []                                 # 收到的可见增量（按序）
+    sent = 0                                    # 已经发出去的条数
+    acc = ""                                    # 可见文本累加（扣留判据用它）
+    held = True                                 # 是否仍在「可能只是某句前缀」的扣留区
     try:
-        async for delta in chunks:
-            parts.append(delta)
-            if agent._is_repeat(agent.clean_reply("".join(parts))):
-                continue                            # 这一句如果就此打住就是重复：先扣住，不再外发
-            for d in parts[emitted:]:               # 没被拦住：把扣住的块按序补发
-                agent._emit(events.token(agent.turn_id, d))
-            emitted = len(parts)
+        async for piece in chunks:
+            delta = stream.feed(piece)
+            if delta == "":
+                continue                        # 这一块全是推理段 / 标记 / 滞留尾巴：不发事件
+            deltas.append(delta)
+            acc += delta
+            if held and not agent._is_repeat_prefix(agent.clean_reply(acc)):
+                held = False                    # 分叉了：确认是新话，积压的增量按序补发
+            if not held:
+                for d in deltas[sent:]:
+                    agent._emit(events.token(agent.turn_id, d))
+                sent = len(deltas)
     except Exception as e:                          # noqa: BLE001 —— 流式失败退回非流式，绝不抛出
         print("[Agent] 流式输出失败（退回非流式）：%s" % e)
         return None
-    text = "".join(parts)
+    text = content_text_of(stream.raw)              # 定稿：与「对整条原文调 content_of」同构
     if text == "":
-        return ""                                   # 空内容：交给调用方的兜底判据
+        return ""                                   # 未闭合兜底 / 空内容：交给调用方的兜底判据
     return agent.clean_reply(text)
 
 
