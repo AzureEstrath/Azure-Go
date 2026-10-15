@@ -16,10 +16,9 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 > **人设与提示词也能在 `config.json` 里直接改**。客户端（`game\`）只做渲染、输入与语音播放，
 > 连不上后端时只在状态栏提示。
 >
-> 当前版本 **v3.1.0**：**KataGo 也搬进了独立的云服务**——后端不再自己拉起引擎进程，只留一个 HTTP
-> 客户端（`katago_url`），服务可以先起、也可以单独重启。客户端仍然**只保留「连远程后端」一种运行方式**：
-> 本地编排、本地模型服务拉起、看屏幕搭话（peek）与 PCK 打包流程全部删除，所有模型改为云端。
-> 详见「九、更新」。
+> 当前版本 **v3.2.0**：后端 LLM 调用改走 **LangChain**（LCEL 链 + 结构化输出），并新增**发言侧工具**——
+> 她自己决定要不要复算局面、查定式、核对盘面，**默认关闭**；开启后也**只影响她怎么说，不影响她下哪里**。
+> 客户端只多了一条「她正在查资料…」的状态栏提示。详见「九、更新」。
 
 ---
 
@@ -43,7 +42,7 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 │   ├─ config.json          客户端参数模板（见第三节）
 │   └─ export_presets.cfg   Godot 导出预设（个人导出用）
 ├─ backend\                 远程后端（唯一权威：对局编排 / LLM / 情绪 / 定式；FastAPI + REST + WebSocket）
-│   ├─ app\                 对局编排 / KataGo·LLM 客户端 / 情感模型 / 提示词
+│   ├─ app\                 对局编排 / LangChain 链（LLM + 提示词） / 情感模型 / 发言侧工具
 │   ├─ tests\               后端单元测试（含情感模型黄金样本）
 │   ├─ requirements.txt     后端依赖
 │   └─ run_server.bat       一键启动后端（监听 127.0.0.1:8000）
@@ -100,6 +99,9 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
   （游戏内设置面板写回的 LLM 地址 / 模型名 / Key / 思考档位也属于这一类）。
 - **后端（实时）**：经 `/api/config` 转发，改完立即生效。
 - **客户端**：游戏进程自己读，改完（或下次启动）即时生效。
+- **后端专用（客户端不读）**：`katago_url` / `katago_token` / `katago_timeout_ms` 与
+  `llm_extra_body` / `llm_think_extra_body` / `tools_enabled` / `max_tool_calls` 只由后端消费；
+  客户端不读它们，但**写回配置时会原样保留**（游戏内保存设置不会把这些键弄丢）。
 
 | 字段 | 读取方 | 含义 |
 | --- | --- | --- |
@@ -112,6 +114,10 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 | `llm_base_url` / `llm_model` | 后端（启动时） | **云端 LLM 的 OpenAI 兼容地址与模型名** |
 | `llm_api_key` | 后端（启动时） | **云端 LLM 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
 | `llm_think_mode` | 后端（启动时） | **思考档位**：`0`=快速（直答，首字快）/ `1`=中等（推理限预算并催收尾，约 4~7 秒）/ `2`=强思考（自由推理，更慢更好）；默认 `0`；开局设置面板里也能改（旧键 `llm_think_strong` 自动迁移） |
+| `llm_extra_body` | 后端（启动时） | **透传给云端 LLM 的请求体扩展字段**（JSON 对象，如 `{"top_k": 40}`）：每次请求都并入。服务商不认这些字段（HTTP 400/422）时后端自动去掉扩展字段重试一次，且本次会话不再发送它们（设计好的降级，不是故障）。输出上限按线上键 `max_tokens` 发送；在这里显式写 `max_tokens` / `max_completion_tokens` 可覆盖后端注入的预算（服务商只认新键时的退路） |
+| `llm_think_extra_body` | 后端（启动时） | 同上，但**只在思考档位开启（`llm_think_mode` > 0）时**并入（如 `{"reasoning_effort": "high"}`）；不开思考档位时完全不发 |
+| `tools_enabled` | 后端（启动时） | **发言侧工具**总开关，默认 `false`：开启后她在「提示」与「落子宣告」两个回合可自主复算局面 / 查定式 / 核对盘面——**只影响她怎么说，不影响她下哪里**（见第四节「工具（发言侧）」） |
+| `max_tool_calls` | 后端（启动时） | 一次发言里**工具执行次数**上限（默认 `2`；代码侧硬上限也是 `2`，配置只能收紧、不能放宽） |
 | `prompt_system` | 后端（启动时） | **覆盖系统提示词（人设全文）**；留空用内置 Azure 人设 |
 | `prompt_user_name` | 后端（启动时） | **玩家称呼**，替换提示词中的「Estarth」（默认 Estarth） |
 | `prompt_phase_notes` | 后端（启动时） | **覆盖各阶段提示**，键：`observe` / `after_player` / `own_turn` / `just_moved` / `analyze` / `chat` / `summary` |
@@ -157,6 +163,22 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 - **自建服务**：vLLM / LM Studio / llama.cpp server 等，`llm_api_key` 留空即可——游戏只按地址请求，不负责启动它。
 - 命令行临时指定（不写回配置）：`AzureGoGodot.exe --llm=https://api.deepseek.com/v1 --model=deepseek-chat --key=你的密钥`（指向自建服务时把地址换成它的，如 `http://127.0.0.1:8080/v1`）
 - 没接 LLM 时：**对局功能照常可用**，只是讲解/闲聊退化为兜底台词。
+- 后端内部走 **LangChain**（`ChatOpenAI`）：上面三个字段照旧填，服务商专有参数用 `llm_extra_body` /
+  `llm_think_extra_body` 透传（见第三节）；调用失败一律降级为可读提示 + 兜底台词，不会卡住棋盘。
+
+### 工具（发言侧）
+
+**默认关闭**（`tools_enabled: false`，改成 `true` 即开启）：行为与没有工具时完全一致。开启后她**只在两个回合**可以自己查资料——
+「提示」与「落子宣告」——且**只影响她怎么说，绝不影响她下哪里**（落点仍由后端算棋决定）。
+
+- 三个工具：`katago_analyze`（复算局面：黑方胜率 / 目差 / 候选点）、`joseki_lookup`（查入门定式库）、
+  `board_query`（把局面画成紧凑盘面图，核对坐标与归属）。
+- **代价**：这两个回合会多出几次模型往返（工具执行次数受 `max_tool_calls` 与代码硬上限约束、单工具 10 秒超时），
+  回答会变慢；闲聊 / 闲置搭话 / 点评等路径**不启用**工具，时延不受影响。
+- **工具输出永不直接给玩家看**：返回的盘面 / JSON 只回到模型手里，玩家看到的仍是她据此重写的自然语言；
+  客户端只多一类 `tool` 事件（开始 / 结束），仅用于状态栏提示（「她正在查资料…」）。
+- 改完 `tools_enabled` / `max_tool_calls` 要**重启后端**；`POST /api/config` 也能实时切换 `tools_enabled`
+  （客户端界面暂未提供入口）。
 
 ---
 
@@ -181,7 +203,8 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 **不启动任何模型服务**（没有 local 模式）。后端连不上时只在状态栏提示，不影响界面操作。
 
 - **启动后端**：双击 `backend\run_server.bat`（等价的手动启动：`cd backend` 后 `python -m app.main`），
-  监听 `http://127.0.0.1:8000`。依赖 `fastapi` / `uvicorn` / `websockets` / `httpx`（见 `backend\requirements.txt`）。
+  监听 `http://127.0.0.1:8000`。依赖 `fastapi` / `uvicorn` / `websockets` / `httpx` /
+  `langchain-core` / `langchain-openai`（见 `backend\requirements.txt`；LLM 调用走 LangChain）。
   > `websockets` 不能省：裸装 `uvicorn` 不带 WebSocket 实现，缺了它 `/ws` 会拒绝升级（404），
   > 客户端只会一直显示「未连接后端」。
 - **配置**：`config.json` 里
@@ -192,7 +215,8 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 - **接口契约**：
   - REST：`/api/move|hint|analyze|chat|summarize|undo|reset|config|reveal|interaction|idle|mood/tick`，
     以及 `GET /api/state`、`GET /api/health`。
-  - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki`。
+  - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki / tool`
+    （`tool` 是发言侧工具的开始 / 结束，只喂状态栏提示，不进入对话）。
   - `GET /api/health` 返回 `{ok, katago_dead, katago_error, katago_url, llm_url}`（字段都改为描述所连云服务：
     地址 / 引擎是否还在 / 最近错误）。其中 `katago_dead` 与 `katago_error` 必须**成对读**：
     - `katago_dead` 表示**引擎已经没了**：`start()` 探活失败、或分析时发生**传输层失败**（连接被拒 / 连接或
@@ -266,7 +290,26 @@ KataGo 引擎与权重遵循其上游许可。
 
 ## 九、更新
 
-### v3.1.0（当前）
+### v3.2.0（当前）
+- **后端 LLM 调用改走 LangChain**：新增 `backend\app\llm_chain.py`（`ChatOpenAI` 的唯一装配点）与
+  `backend\app\prompt_chains.py`（七阶段提示的 `ChatPromptTemplate` 链）；`llm.py` 退化为薄适配器
+  （对外 `chat()` 契约不变，台词仍必经 `clean_reply()` 与去 think 段的 `content_of()`）。依赖锁定
+  `langchain-core>=1.0` / `langchain-openai>=1.0`（`backend\requirements.txt`）；旧的本地地址预检与
+  `probe_models` 探测随之删除。
+- **可配置的请求体扩展字段**：新增 `llm_extra_body`（始终并入）与 `llm_think_extra_body`（仅思考档位开启时并入），
+  透传服务商专有参数（`top_k` / `reasoning_effort` 等）；输出上限按线上键 `max_tokens` 发送，服务商拒绝
+  （HTTP 400/422）时自动去掉扩展字段重试一次。**推理段永不显示给玩家**：只取 `AIMessage.content`，
+  `reasoning_content` / `response_metadata` 一律不进台词。
+- **情绪增量改为结构化输出**：情绪微调改用 `with_structured_output`（`function_calling` 方式——DeepSeek 等
+  服务商不认 `response_format.json_schema`，工具调用则是公共能力），拿不到时静默回落到原有的正则解析，
+  行为与旧版一致。
+- **发言侧工具（默认关闭）**：新增 `backend\app\tools.py`（`katago_analyze` / `joseki_lookup` / `board_query`）
+  与受限 tool loop——只在「提示」与「落子宣告」两个回合启用，工具次数有硬上限（默认 `2` 次、单工具 10 秒超时）、
+  工具输出永不直接当台词；**只影响她怎么说，不影响她下哪里**（落点仍由后端算棋决定）。新增配置
+  `tools_enabled` / `max_tool_calls`；客户端新增 `tool` 事件，只用于状态栏「她正在查资料…」提示。
+  见第四节「工具（发言侧）」。
+
+### v3.1.0
 - **KataGo 独立成云服务**：新增 `katago_service\`（FastAPI + 常驻 `katago analysis` 子进程）：`POST /analyze`（请求/响应即引擎原文）、`GET /health`（`warming` / `ready` / `dead`）、可选 Bearer 鉴权、启动即后台预热（OpenCL 首次调优挪到部署阶段，端口不会被预热堵住），另有 `run_server.bat` 与 `--host/--port/--token/--katago-exe/--model/--config/--analysis-threads` 入口 + `KATAGO_*` 环境变量兜底。部署见第六节「KataGo 服务部署」。
 - **后端改为 HTTP 客户端**：`backend\app\engine.py` 重写为连 `/health` + `/analyze` 的客户端（就绪判定只看 `state`，不认 `ok`；超时/连接失败重试 1 次后返回可读错误），不再持有引擎子进程——`agent.py` / `prompts.py` 一行未改。子进程时代的两条坑（stderr 必须持续排空、读行缓冲放大到 64MB）随引擎搬进 `katago_service\proc.py`。
 - **配置换血**：后端与模板里的 KataGo **引擎路径三件套**（可执行文件 / 权重 / analysis 配置）换成 `katago_url`（默认 `http://127.0.0.1:8100`）/ `katago_token` / `katago_timeout_ms`；`game\config.json` 模板与 README 字段表同步，`AzureConfig.save()` 改为把这三个旧键**自我清理**（此前为兼容后端共用同一份配置而刻意保留）。后端不再解析引擎路径（`_resolve` 删除），`GET /api/health` 增加 `katago_url`。

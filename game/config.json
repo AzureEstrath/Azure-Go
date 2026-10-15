@@ -13,6 +13,11 @@
   "llm_model": "deepseek-chat",
   "llm_api_key": "",
   "llm_think_mode": 0,
+  "llm_extra_body": {},
+  "llm_think_extra_body": {},
+
+  "tools_enabled": false,
+  "max_tool_calls": 2,
 
   "prompt_system": "",
   "prompt_user_name": "Estarth",

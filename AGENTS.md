@@ -16,6 +16,8 @@
 
 - 前端只有一条装配路径：`Main.gd` → `NetClient`（REST 命令 + WebSocket 事件）。**没有 local 模式**，前端不启动任何模型服务（`OS.create_process` 只剩系统语音那条）。
 - 模型全在云端：LLM（`llm_base_url` / `llm_model` / `llm_api_key` / `llm_think_mode`）与语音（`tts_mode=openai` + `tts_base_url` / `tts_model` / `tts_voice` / `tts_api_key`）；`tts_mode=system` 是 Windows 系统语音兜底。
+- 后端 LLM 走 **LangChain**：`app/llm_chain.py` 是 `ChatOpenAI` 的唯一装配点（`llm.py` 只是保留 `chat()` 契约的薄适配器），七阶段提示经 `app/prompt_chains.py` 的 `ChatPromptTemplate` 链构造。`llm_extra_body` / `llm_think_extra_body` 是**透传给服务商的请求体扩展字段**（前者始终并入，后者只在 `llm_think_mode > 0` 时并入）；输出上限按**线上键 `max_tokens`** 发送，服务商拒绝（400/422）时去掉扩展字段重试一次（`_extra_body_unsupported`）——这是设计好的降级，不是故障。
+- **发言侧工具**（`app/tools.py`：`katago_analyze` / `joseki_lookup` / `board_query`）**只影响她怎么说，不影响她下哪里**——落点仍由 `agent._pick_ai_move` 决定；`tools_enabled` 默认 `false`（关闭时行为与没有工具完全一致），只在 `hint()` 与 `_ai_turn()` 的落子宣告两处启用，工具次数有硬上限（`max_tool_calls`，配置只能收紧）、单工具 10 秒超时；工具输出只回给模型，`tool` WS 事件只喂前端状态栏，**永不进台词**。
 - KataGo 是**独立部署的云服务**（`katago_service/`），后端只连 `katago_url` / `katago_token` / `katago_timeout_ms`，**仓库里只有客户端**：`backend/` 里**不得**再引入拉起 `katago` 子进程的代码——`katago.exe` / 权重 / analysis cfg 由服务侧的 `--katago-exe/--model/--config` 或 `KATAGO_EXE/KATAGO_MODEL/KATAGO_CONFIG` 提供，`game/` 连这几个字段都不读。
 - peek（看屏幕搭话）已整体移除（前端 `_peek_*`、`POST /api/peer`、`peer_remark`、VLM 配置都没了）；闲置主动搭话走 `POST /api/idle` + `ai_idle` 事件。
 - 分发：`tools/` 下的 PCK 打包脚本已删除，PCK 打包流程不再维护；`game/export_presets.cfg` 保留，可用 Godot 自带导出做个人分发。
@@ -44,7 +46,7 @@
 - 场景引用带 `uid://`（`Main.tscn` 的 ext_resource），`*.gd.uid` 与 `*.import` 已入库：移动/重命名脚本或资源时同步更新它们，不要手写 uid。
 - **一切外部能力必须优雅降级**（缺后端、缺 KataGo、缺云端 LLM / TTS 都不得崩、不得报错刷屏）：后端返回可读错误且 `busy` 必须归位（不归位＝棋盘永久锁死，本项目最严重的故障形态）；前端连不上后端只在状态栏提示；语音服务不可用时临时降级为系统语音但不改配置。
 - 坐标语义：内部 `Vector2i(x, y)` 中 x=列、y=行，`Coords.gd` 与 GTP 一致（A..T 跳过 I，行号上大下小）。给玩家写方位词前必须按坐标核对：同列只能说「上下」，同行才能说「左右」，核不上就不说方位（README v1.5.0 的硬性要求）。
-- 发言链路有几条不能回退的硬规则：AI 原话按最近 8 条窗口去重（`Main.gd` 的 `AI_DEDUP_WINDOW`）、模型推理段永不显示给玩家、落子宣告不参与复读抑制、走神搭话可整批作废。改 `backend/app/prompts.py` 时保留这些前提，也别在提示词里放可被模型照抄的示例句。
+- 发言链路有几条不能回退的硬规则：**音画同步**（`ai_move` 事件带坐标，客户端等「落子宣告」的语音开始播放才揭示棋子，见 `backend/app/agent.py` 文件头与 `POST /api/reveal`）、AI 原话按最近 8 条窗口去重（`Main.gd` 的 `AI_DEDUP_WINDOW`）、模型推理段永不显示给玩家、落子宣告不参与复读抑制、走神搭话可整批作废。改 `backend/app/agent.py` / `prompts.py` 时保留这些前提（台词一律经 `clean_reply()` / `content_of()`），也别在提示词里放可被模型照抄的示例句。
 
 ## 提交
 
@@ -54,4 +56,4 @@
 fix(chat,ai): 非相邻原样复读窗口去重 + 方位词按坐标核对（v1.5.0）
 ```
 
-版本号同时写进 `README.md` 的「更新」小节（当前 v3.1.0）。
+版本号同时写进 `README.md` 的「更新」小节（当前 v3.2.0）。
