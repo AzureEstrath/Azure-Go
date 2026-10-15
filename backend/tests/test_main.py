@@ -226,6 +226,25 @@ class MemoryApiEnabledTest(unittest.TestCase):
                 self.assertEqual(len(client.post("/api/memory/query", json={"query": "布局", "k": 1}).json()["items"]), 1)
                 self.assertEqual(len(client.post("/api/memory/query", json={"query": "布局"}).json()["items"]), 2)
 
+    def test_top_k_zero_means_no_recall(self):
+        """``memory_top_k=0`` 就是「不召回」：管理面返回空列表，不再兜底成 3 条（M2）。"""
+        from app.config import AzureConfig
+        with tempfile.TemporaryDirectory() as d:
+            cfg = AzureConfig()
+            cfg.memory_enabled = True
+            cfg.memory_db_path = os.path.join(d, "m.db")
+            cfg.memory_top_k = 0
+            app = create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(), autostart=False)
+            with TestClient(app) as client:
+                client.post("/api/memory/write", json={"tag": "t", "text": "布局喜欢点三三"})
+                self.assertEqual(client.get("/api/memory/stats").json()["rows"], 1)
+                # 缺省 k：用配置值 0 → 不召回（与出话路径 recall_for 同一语义）
+                self.assertEqual(client.post("/api/memory/query", json={"query": "点三三"}).json()["items"], [])
+                # 显式 k≤0：同样不召回
+                self.assertEqual(client.post("/api/memory/query", json={"query": "点三三", "k": 0}).json()["items"], [])
+                # 显式正数 k：照常召回
+                self.assertEqual(len(client.post("/api/memory/query", json={"query": "点三三", "k": 1}).json()["items"]), 1)
+
     def test_memory_event_on_write_and_recall(self):
         """``memory`` 事件是元数据（op/tag/text/score），写与查各推一条；前端不产生任何信号。"""
         with tempfile.TemporaryDirectory() as d:

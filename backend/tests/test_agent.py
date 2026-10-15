@@ -7,6 +7,7 @@
 import asyncio
 import os
 import sys
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -425,6 +426,80 @@ class MemoryWiringTest(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual(len(mem.games), 0)
+
+
+class ThreadProbeMemory:
+    """记录召回 / 写入在哪个线程被调用：记忆调用必须走工作线程，不得阻塞事件循环。"""
+
+    def __init__(self):
+        self.threads = []
+        self.games = []
+
+    @property
+    def available(self):
+        return True
+
+    def recall_for(self, query, k=None):
+        self.threads.append(threading.current_thread())
+        return ""
+
+    def remember_game(self, moves, result, summary):
+        self.threads.append(threading.current_thread())
+        self.games.append((len(moves), result, summary))
+
+
+class MemoryOffLoopTest(unittest.TestCase):
+    """记忆调用必须走 ``asyncio.to_thread``：慢 embedding 不得冻住整个事件循环（I2）。"""
+
+    def test_memory_calls_run_off_the_event_loop(self):
+        agent, _eng, _llm, _bus = _mk()
+        mem = ThreadProbeMemory()
+        agent.memory = mem
+        seen = {}
+
+        async def run():
+            seen["loop"] = threading.current_thread()
+            await agent.player_move(3, 3)       # _ai_turn 里的召回
+            await agent.chat("你好")            # chat 里的召回
+            await agent.summarize("备注")       # summarize 里的写入
+
+        asyncio.run(run())
+        self.assertGreaterEqual(len(mem.threads), 3)
+        for t in mem.threads:
+            self.assertIsNot(t, seen["loop"], "记忆调用不得跑在事件循环线程上")
+
+
+class BoomMemory:
+    """召回与写入都抛异常的替身：记忆故障只该打日志，绝不能让这一回合卡死。"""
+
+    @property
+    def available(self):
+        return True
+
+    def recall_for(self, query, k=None):
+        raise RuntimeError("云端 embedding 401")
+
+    def remember_game(self, moves, result, summary):
+        raise RuntimeError("库坏了")
+
+
+class MemoryFailureTest(unittest.TestCase):
+    """记忆故障（I2 的守卫路径）：回合照常走完、``busy`` 归位、台词照常发出。"""
+
+    def test_raising_memory_keeps_turns_alive(self):
+        agent, _eng, _llm, bus = _mk()
+        agent.memory = BoomMemory()
+
+        async def run():
+            await agent.player_move(3, 3)
+            await agent.chat("你好")
+            await agent.summarize("备注")
+
+        asyncio.run(run())
+        self.assertFalse(agent.busy)                                        # busy 必须归位
+        self.assertTrue(bus.messages(events.AI_MOVE))                       # 落子宣告照常
+        texts = [str(e.get("text", "")) for e in bus.messages(events.AI)]
+        self.assertTrue(any(t.startswith("📋 对局总结") for t in texts))     # 总结照常发出
 
 
 if __name__ == "__main__":

@@ -393,6 +393,9 @@ class AzureAgent:
         默认不接线（``memory is None``）或 ``available == False`` 时不注入——
         关闭长期记忆时的提示词与没有这个功能时逐字符一致。召回在出话路径上，
         这里再兜一层异常保护，绝不让记忆把这一回合的 ``busy`` 卡住。
+
+        本方法是**同步**的：调用点必须 ``await asyncio.to_thread(self._long_term, …)``——
+        慢 embedding（最长 ``embed_timeout`` 秒）绝不能冻住事件循环（心跳与落子宣告都在这条循环上）。
         """
         mem = self.memory
         if mem is None or not bool(getattr(mem, "available", False)):
@@ -404,7 +407,10 @@ class AzureAgent:
             return ""
 
     def _remember_game(self, summary, black_wr, score):
-        """把这一局的总结写进长期记忆（``result`` 渲染成一行）；失败只打日志，不影响对局。"""
+        """把这一局的总结写进长期记忆（``result`` 渲染成一行）；失败只打日志，不影响对局。
+
+        同 ``_long_term``：同步实现，调用点走 ``asyncio.to_thread``（写库 + embedding 都在里面）。
+        """
         mem = self.memory
         if mem is None or not bool(getattr(mem, "available", False)):
             return
@@ -701,9 +707,10 @@ class AzureAgent:
             ai_gtp, ai_x, ai_y = pick[0], pick[1], pick[2]
 
             # 跨局长期记忆：本回合一次召回（查询＝最近一手 + 阶段），
-            # 下面「用意」与「落子后感想」两段话共用，不做两次 embedding 往返
+            # 下面「用意」与「落子后感想」两段话共用，不做两次 embedding 往返；
+            # 走 to_thread：慢 embedding 不得冻住事件循环（心情心跳与落子宣告都在这条循环上）
             last_gtp = str(self.st.moves[-1][1]) if self.st.moves else "（空盘）"
-            lt = self._long_term("最近一手 %s，阶段 own_turn" % last_gtp)
+            lt = await asyncio.to_thread(self._long_term, "最近一手 %s，阶段 own_turn" % last_gtp)
 
             # 用意：落子前说明「我准备下在哪、想做什么」
             think_hint = "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
@@ -894,10 +901,11 @@ class AzureAgent:
         self._set_busy(True)
         reply = ""
         try:
+            lt = await asyncio.to_thread(self._long_term, text)     # 慢 embedding 不得冻住事件循环
             msgs = [
                 self._sys_msg(),
                 self._user_msg(prompts.context_block(self.st.moves, self.st.memory_log, self.st.chat_history, "chat", True, self.st.last_katago, self.st.board,
-                                                     long_term=self._long_term(text))),
+                                                     long_term=lt)),
             ]
             hist = self.st.chat_history
             upto = len(hist) - 1            # 最后一条是刚追加的这句，下面单独发，避免重复
@@ -967,7 +975,7 @@ class AzureAgent:
             self.st.finished = True
             self._emit(events.message(events.AI, "📋 对局总结\n" + text))
             if not failed:                          # 只写真总结：兜底台词不是总结，写进去会污染记忆
-                self._remember_game(text, final_wr, final_score)
+                await asyncio.to_thread(self._remember_game, text, final_wr, final_score)
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
             print("[Agent] 总结异常：%s" % e)
             self._emit(events.message(events.AI, "📋 对局总结\n" + self._fallback_line("chat")))

@@ -30,6 +30,8 @@ REST 应答统一返回 {"ok": bool, "state": <棋盘快照>}：命令是否被�
 
 from contextlib import asynccontextmanager
 
+import asyncio
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
@@ -224,9 +226,15 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True, memo
     # 任何记忆故障（死库 / embedding 报错）都只打日志，绝不打成 500、也不影响对局。
 
     def mem_k(body: dict) -> int:
-        """召回条数：请求显式给的 ``k`` 优先，否则用配置的 ``memory_top_k``（保底 1）。"""
-        k = _int(body.get("k"), 0)
-        return k if k > 0 else max(1, int(getattr(cfg, "memory_top_k", 3) or 3))
+        """召回条数：显式 ``k`` 优先（≤0 ＝不召回），否则用配置的 ``memory_top_k``（原始值，0＝不召回）。
+
+        不再把 0 兜底成 3：``memory_top_k=0`` 与出话路径的 ``recall_for`` 同一语义——
+        记忆开着但不召回，管理面据此返回空列表。
+        """
+        raw = body.get("k")
+        if raw is None:
+            return max(0, int(getattr(cfg, "memory_top_k", 3) or 0))
+        return max(0, _int(raw, 0))
 
     def mem_event(op, tag, text, score=0.0):
         """把一次记忆动作作为元数据推给客户端（不是台词；前端只记一行日志）。"""
@@ -240,12 +248,16 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True, memo
 
     @app.post("/api/memory/query")
     async def memory_query(body: dict):
-        """检索长期记忆 → ``{"ok": True, "items": [{id,ts,kind,tag,text,score}]}``。"""
+        """检索长期记忆 → ``{"ok": True, "items": [{id,ts,kind,tag,text,score}]}``。
+
+        召回走 ``asyncio.to_thread``：慢 embedding / 大库扫描不得冻住事件循环。
+        """
         store = mem_store()
         items = []
         if store is not None:
             try:
-                items = list(store.recall(str(body.get("query", "") or ""), mem_k(body)) or [])
+                q = str(body.get("query", "") or "")
+                items = list(await asyncio.to_thread(store.recall, q, mem_k(body)) or [])
             except Exception as e:              # noqa: BLE001
                 print("[Memory] 查询失败（已忽略）：%s" % e)
                 items = []
@@ -256,7 +268,10 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True, memo
 
     @app.post("/api/memory/write")
     async def memory_write(body: dict):
-        """手动写一条长期记忆 → ``{"ok": bool, "id": int|null}``（关闭 / 空文本被拒）。"""
+        """手动写一条长期记忆 → ``{"ok": bool, "id": int|null}``（关闭 / 空文本被拒）。
+
+        写入（含 embedding 往返）同样走 ``asyncio.to_thread``。
+        """
         raw = body.get("text")
         text = str(raw).strip() if isinstance(raw, str) else ""
         tag = str(body.get("tag", "") or "")
@@ -264,7 +279,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True, memo
         if store is None or text == "":
             return {"ok": False, "id": None}
         try:
-            mem_id = store.write(text, kind="fact", tag=tag)
+            mem_id = await asyncio.to_thread(store.write, text, kind="fact", tag=tag)
         except Exception as e:                  # noqa: BLE001
             print("[Memory] 写入失败（已忽略）：%s" % e)
             mem_id = None
