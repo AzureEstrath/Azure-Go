@@ -16,6 +16,7 @@
 直接用它发请求前必须自备同样的判断。
 """
 
+import math
 from types import SimpleNamespace
 
 import openai
@@ -42,8 +43,16 @@ class MoodDelta(BaseModel):
 
 
 def _clamp_delta(x) -> float:
-    """裁剪到 ±``DELTA_MAX``：模型报多大都只许动这么多（与 ``EmotionModel.apply_delta`` 同界）。"""
-    return -DELTA_MAX if x < -DELTA_MAX else (DELTA_MAX if x > DELTA_MAX else float(x))
+    """裁剪到 ±``DELTA_MAX``：模型报多大都只许动这么多（与 ``EmotionModel.apply_delta`` 同界）。
+
+    ``NaN`` / ``±inf`` 一律当 0：比较式（``x < -DELTA_MAX`` 等）对 ``NaN`` 全为 False，放进去会把
+    情绪永久 NaN 掉（``apply_delta`` 的 ``_clampf`` 也拦不住），``mood`` 事件还会发出非法的
+    ``NaN`` JSON。
+    """
+    x = float(x)
+    if not math.isfinite(x):
+        return 0.0
+    return -DELTA_MAX if x < -DELTA_MAX else (DELTA_MAX if x > DELTA_MAX else x)
 
 
 def clean_content(text) -> str:

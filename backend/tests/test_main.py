@@ -134,5 +134,21 @@ class CloudFailRestTest(unittest.TestCase):
                         self.assertNotIn("调用出错", str(e.get("text", "")))
 
 
+class AssemblyTest(unittest.TestCase):
+    """装配接线：cfg 的扩展字段必须经 ``merge_extra_body`` 落到 LLMClient 与链上（Task 4 的接线点）。"""
+
+    def test_cfg_extra_body_reaches_llm_client(self):
+        from app.config import AzureConfig
+        cfg = AzureConfig()
+        cfg.llm_extra_body = {"top_k": 40}
+        cfg.llm_think_mode = 2
+        cfg.llm_think_extra_body = {"reasoning_effort": "high"}
+        app = create_app(cfg=cfg, autostart=False)
+        with TestClient(app):
+            merged = {"top_k": 40, "reasoning_effort": "high"}
+            self.assertEqual(app.state.agent.llm.extra_body, merged)
+            self.assertEqual(app.state.agent.llm.chain.extra_body, merged)   # 链上也带着同一份
+
+
 if __name__ == "__main__":
     unittest.main()

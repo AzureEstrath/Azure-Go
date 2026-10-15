@@ -79,6 +79,17 @@ class MoodDeltaTest(unittest.TestCase):
         out = asyncio.run(c.mood_delta((0.5, 0.5, 0.5), "平静", "x"))
         self.assertEqual(out, [0.4, -0.4, 0.0])
 
+    def test_nan_treated_as_zero(self):
+        """非严格服务商回 ``NaN``（Python 的 json 默认放行）：必须当 0，绝不许把情绪 NaN 掉。
+
+        比较式（``x < -DELTA_MAX`` 等）对 ``NaN`` 全为 False，漏进去会永久污染三维情绪，
+        ``mood`` 事件还会发出非法的 ``NaN`` JSON。
+        """
+        c = _client(lambda req: httpx.Response(200, json=_tool_call_reply(
+            '{"dv": NaN, "dc": 0.1, "da": 0.2}')))
+        out = asyncio.run(c.mood_delta((0.5, 0.5, 0.5), "平静", "x"))
+        self.assertEqual(out, [0.0, 0.1, 0.2])
+
     def test_missing_field_returns_none(self):
         """模型漏字段（schema 校验失败）也算拿不到：静默返回 None，绝不抛给上层。"""
         c = _client(lambda req: httpx.Response(200, json=_tool_call_reply(json.dumps({"dv": 0.1}))))

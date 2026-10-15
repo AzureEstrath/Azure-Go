@@ -104,6 +104,43 @@ class ChatTest(unittest.TestCase):
         out = asyncio.run(c.chat([{"role": "user", "content": "hi"}]))
         self.assertTrue(out.startswith("调用出错："))
 
+    def test_transport_error_does_not_mark_unsupported(self):
+        """传输层失败（连接被拒/断开）不许扣「服务端拒绝参数」的帽子：那会永久去掉扩展字段。
+
+        判据只看 HTTP 400/422（``_strip_on_reject``）；连接失败连响应都没有，更不该重试。
+        """
+        calls = []
+
+        def handler(req):
+            calls.append(req)
+            raise httpx.ConnectError("boom", request=req)
+
+        c = _client(handler, extra_body={"top_k": 40})
+        out = asyncio.run(c.chat([{"role": "user", "content": "hi"}]))
+        self.assertTrue(out.startswith("调用出错："))
+        self.assertFalse(c._extra_body_unsupported)
+        self.assertEqual(c.extra_body, {"top_k": 40})
+        self.assertEqual(len(calls), 1)                       # 传输层失败不做重试
+
+    def test_rate_limit_503_and_timeout_messages(self):
+        """429 / 503 / 超时各自给可读中文：运维看文案能分辨原因，玩家只看到「调用出错：…」。"""
+        c = _client(lambda req: httpx.Response(429, json={"error": {"message": "slow down"}}))
+        out = asyncio.run(c.chat([{"role": "user", "content": "hi"}]))
+        self.assertIn("429", out)
+        self.assertIn("限流", out)
+
+        c = _client(lambda req: httpx.Response(503, json={"error": {"message": "down"}}))
+        out = asyncio.run(c.chat([{"role": "user", "content": "hi"}]))
+        self.assertIn("503", out)
+
+        def handler(req):
+            raise httpx.ReadTimeout("slow", request=req)
+
+        c = _client(handler, timeout_sec=7.0)
+        out = asyncio.run(c.chat([{"role": "user", "content": "hi"}]))
+        self.assertIn("超时", out)
+        self.assertIn("7 秒", out)
+
     def test_400_strips_extra_body_and_retries_once(self):
         seen = []
 
@@ -220,6 +257,18 @@ class ChatTest(unittest.TestCase):
         out = asyncio.run(c.chat([{"role": "user", "content": "hi"}], 32, True))
         self.assertEqual(out, "嗯")
         self.assertEqual(seen[0]["max_tokens"], 32)   # no_think：不加推理预算
+
+    def test_reason_budget_ladder(self):
+        """思考档位 1/2 各追加一段推理预算（+160 / +800）；档位 0 与 no_think 都不追加。"""
+        from app.llm import REASON_BUDGET_MED, REASON_BUDGET_STRONG
+        self.assertEqual((REASON_BUDGET_MED, REASON_BUDGET_STRONG), (160, 800))
+        c = _client(lambda req: httpx.Response(200, json=_reply("好")))
+        self.assertEqual(c._budget(100, False), 100)
+        c.think_mode = 1
+        self.assertEqual(c._budget(100, False), 260)
+        c.think_mode = 2
+        self.assertEqual(c._budget(100, False), 900)
+        self.assertEqual(c._budget(100, True), 100)   # no_think 优先：强思考也不追加
 
 
 class ChainTest(unittest.TestCase):
