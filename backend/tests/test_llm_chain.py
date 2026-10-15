@@ -101,6 +101,12 @@ class BuildModelTest(unittest.TestCase):
         m = build_chat_model(cfg)
         self.assertIn("api.example.com", str(m.openai_api_base))
 
+    def test_max_retries_zero_bounds_attempts(self):
+        """Q9：SDK 默认重试 2 次（单次调用最坏 3×timeout，busy 会被拖住几分钟），必须显式压回 0。"""
+        m = build_chat_model(_Cfg())
+        self.assertEqual(m.max_retries, 0)
+        self.assertEqual(m.root_async_client.max_retries, 0)     # 真的传到了 openai 客户端，不只是字段
+
     def test_empty_api_key_builds_but_fails_at_request(self):
         """模板里 llm_api_key 为空：构造必须成功，失败推迟到请求期（哨兵 key）。"""
         def handler(req):

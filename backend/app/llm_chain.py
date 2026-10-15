@@ -45,6 +45,9 @@ def build_chat_model(cfg, *, http_client=None, http_async_client=None, timeout=N
 
     ``timeout``（秒）缺省时用 ``DEFAULT_TIMEOUT_SEC``：调用方（``LLMClient.timeout_sec``）
     传什么就是什么，不能只留一个不起作用的常量。
+
+    ``max_retries`` 固定 0：SDK 默认重试 2 次，配合超时最坏能拖住 ``busy`` 几分钟——失败走
+    可读错误 + 兜底台词才是设计好的降级（要重试由上层自己决定）。
     """
     extra = merge_extra_body(cfg)
     return ChatOpenAI(
@@ -56,6 +59,7 @@ def build_chat_model(cfg, *, http_client=None, http_async_client=None, timeout=N
         frequency_penalty=frequency_penalty,     # 降复读：少用重复的口头禅和句式
         presence_penalty=presence_penalty,
         timeout=DEFAULT_TIMEOUT_SEC if timeout is None else timeout,
+        max_retries=0,
         http_client=http_client,
         http_async_client=http_async_client,
         **({"extra_body": extra} if extra else {}),
