@@ -179,5 +179,72 @@ class AgentSystemMessageTest(unittest.TestCase):
         self.assertTrue(msgs[1]["content"].startswith(head + "\n\n【现在】\n"))
 
 
+class CallSiteRoutingTest(unittest.TestCase):
+    """调用点必须真的走链：with_context 的原文作为 ``context`` 传给 ``build_messages``，不再手工拼两条消息。"""
+
+    def setUp(self):
+        _configure_prompts()
+
+    @staticmethod
+    def _after_move(flow):
+        async def run(agent):
+            await agent.player_move(3, 3)
+            await flow(agent)
+        return run
+
+    def test_context_paths_go_through_chain(self):
+        """把旧的 ``_sys_msg``/``_user_msg`` 换成哨兵后：四条 with_context 流程照常出话，且哨兵从没进过 LLM。"""
+        sentinel = "旧装配哨兵：这条不该出现在消息里"
+
+        async def run(flow):
+            agent, _eng, llm, bus = mk_agent()
+            agent._sys_msg = lambda: {"role": "system", "content": sentinel}
+            agent._user_msg = lambda content: {"role": "user", "content": sentinel}
+            await flow(agent)
+            return agent, llm, bus
+
+        flows = [
+            ("hint", lambda a: a.hint()),
+            ("analyze", self._after_move(lambda a: a.analyze_position())),
+            ("summarize", self._after_move(lambda a: a.summarize("辛苦啦"))),
+            ("player_move", lambda a: a.player_move(3, 3)),
+        ]
+        for tag, flow in flows:
+            agent, llm, _bus = asyncio.run(run(flow))
+            self.assertTrue(llm.calls, "%s：一次 LLM 调用都没有（编排是不是被异常吞掉了）" % tag)
+            self.assertFalse(agent.busy, "%s：busy 没归位" % tag)
+            for msgs, _max_tokens, _no_think in llm.calls:
+                for m in msgs:
+                    self.assertNotEqual(m["content"], sentinel, "%s：又回到手工拼消息了" % tag)
+
+    def test_chain_gets_with_context_verbatim(self):
+        """``build_messages`` 收到的 ``context`` 就是 ``with_context(...)`` 的原文，阶段与模板变量也对得上。"""
+        seen = []
+        real = prompt_chains.build_messages
+
+        def spy(phase, **kw):
+            seen.append((phase, dict(kw)))
+            return real(phase, **kw)
+
+        async def run():
+            agent, _eng, _llm, _bus = mk_agent()
+            prompt_chains.build_messages = spy
+            try:
+                await agent.hint()
+            finally:
+                prompt_chains.build_messages = real
+            return agent
+
+        agent = asyncio.run(run())
+        self.assertEqual([p for p, _kw in seen], ["observe"])
+        _phase, kw = seen[0]
+        head = prompts.context_block(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
+                                     "observe", False, agent.st.last_katago, agent.st.board)
+        self.assertTrue(kw["context"].startswith(head + "\n\n【现在】\n"))
+        self.assertEqual(kw["mood_name"], agent.mood.region_name())
+        self.assertEqual(kw["len_note"], "")
+        self.assertEqual(kw["think_hint"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

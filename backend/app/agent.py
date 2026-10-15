@@ -153,10 +153,23 @@ class AzureAgent:
         )[0]["content"]
 
     def _sys_msg(self):
+        """系统消息：聊天 / 闲置搭话这类「context_block + 历史窗口」的路径用；带 with_context 的路径走 `_phase_messages`。"""
         return {"role": "system", "content": self._sys_content(LEN_NOTE if self.limit_len else "")}
 
     def _sys_teach_msg(self):
+        """`_sys_msg` 的讲解版（教学长度约束）；教学点评的链路径改传 ``len_note=LEN_TEACH_NOTE``。"""
         return {"role": "system", "content": self._sys_content(LEN_TEACH_NOTE if self.limit_len else "")}
+
+    def _phase_messages(self, phase, context, len_note="") -> list:
+        """某阶段的完整消息（系统 + 上下文）：经 ``prompt_chains`` 的链构造。
+
+        必须与旧 ``[_sys_msg(), _user_msg(context)]`` 逐字符一致——模型要看到的字与本次重构前
+        完全相同，一个标点都不能变（tests/test_prompt_chains.py 逐字符锁定）。
+        """
+        return prompt_chains.build_messages(
+            phase, context=context, len_note=len_note,
+            mood_name=self.mood.region_name(), think_hint=self._think_hint(),
+        )
 
     @staticmethod
     def _user_msg(content):
@@ -409,10 +422,10 @@ class AzureAgent:
 
             # ⑤ Azure 点评这一手（定式成型时换成讲解，不额外增加 LLM 调用）
             eval_prompt = ""
-            eval_sys = self._sys_msg()
+            eval_note = LEN_NOTE if self.limit_len else ""
             if str(jk.get("kind", "")) == "formed":
                 eval_prompt = prompts.joseki_teach_prompt(str(jk["name"]), str(jk["key"]), str(jk["corner"]))
-                eval_sys = self._sys_teach_msg()
+                eval_note = LEN_TEACH_NOTE if self.limit_len else ""
             else:
                 if player_rank == 0:
                     eval_prompt = "Estarth下了 %s，这是我算的最优手！胜率%s。轻描淡写夸一下，1-2句。" % (gtp, self._pct(winrate_before))
@@ -437,10 +450,11 @@ class AzureAgent:
                     want = jk.get("expect", (-1, -1))
                     if want[0] >= 0:
                         eval_prompt += " " + prompts.joseki_hint_clause(str(jk["name"]), coords.xy_to_gtp(want[0], want[1]))
-            player_eval = await self._reply([
-                eval_sys,
-                self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, eval_prompt, "after_player", False, self.st.last_katago, self.st.board)),
-            ], 300)
+            player_eval = await self._reply(self._phase_messages(
+                "after_player",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, eval_prompt, "after_player", False, self.st.last_katago, self.st.board),
+                len_note=eval_note,
+            ), 300)
             if str(jk.get("kind", "")) == "formed" and self._llm_failed(player_eval):
                 player_eval = prompts.joseki_fallback(str(jk["name"]), str(jk["key"]))
             elif self._llm_failed(player_eval):     # 云端失败：点评退化为兜底台词
@@ -465,10 +479,10 @@ class AzureAgent:
             think_hint = "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
             think_prompt = "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过Estarth那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。换一个全新的说法，别总用「嗯~」「唔」开头，句式也别和刚才那条点评一样。" % think_hint
             await asyncio.sleep(0.35)
-            think_msg = await self._reply([
-                self._sys_msg(),
-                self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, think_prompt, "own_turn", False, self.st.last_katago, self.st.board)),
-            ], 80)
+            think_msg = await self._reply(self._phase_messages(
+                "own_turn",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, think_prompt, "own_turn", False, self.st.last_katago, self.st.board),
+            ), 80)
             if self._llm_failed(think_msg):         # 云端失败：落子宣告退化为兜底台词（坐标照常揭示）
                 think_msg = self._fallback_line("game")
             # 这条语音开始播放时，界面才把她的子放上棋盘（事件带坐标，客户端本地揭示）
@@ -510,10 +524,10 @@ class AzureAgent:
                 ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (player_eval, think_msg)
             else:
                 ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (ai_gtp, player_eval, think_msg)
-            ai_eval = await self._reply([
-                self._sys_msg(),
-                self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, ai_eval_prompt, "just_moved", False, self.st.last_katago, self.st.board)),
-            ], 120)
+            ai_eval = await self._reply(self._phase_messages(
+                "just_moved",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, ai_eval_prompt, "just_moved", False, self.st.last_katago, self.st.board),
+            ), 120)
             if str(jk2.get("kind", "")) == "formed" and self._llm_failed(ai_eval):
                 ai_eval = prompts.joseki_fallback(str(jk2["name"]), str(jk2["key"]))
             elif self._llm_failed(ai_eval):         # 云端失败：落子后那句退化为兜底台词
@@ -579,10 +593,10 @@ class AzureAgent:
             self._update_katago_brief(analysis, n)
             prompt = "当前局面：%s。我算到的好点：%s。Estarth还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）；换个说法开场，别重复你上一次提示的句式和口头禅。" % (
                 prompts.board_summary(self.st.move_seq), self._py_list(tops))
-            msg = await self._reply([
-                self._sys_msg(),
-                self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "observe", False, self.st.last_katago, self.st.board)),
-            ], 300)
+            msg = await self._reply(self._phase_messages(
+                "observe",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "observe", False, self.st.last_katago, self.st.board),
+            ), 300)
             if self._llm_failed(msg):               # 云端失败：提示退化为兜底台词
                 msg = self._fallback_line("game")
             self._emit(events.message(events.AI_COMMENT, msg))
@@ -616,10 +630,10 @@ class AzureAgent:
             lead = "你略占上风" if azure_wr > 0.5 else ("局面胶着" if azure_wr > 0.45 else "Estarth领先")
             prompt = "当前局面：%s，共%d手。你（Azure，执白）算出的判断：白方胜率约%s（%s），目差%s（正数是你领先）。你在考虑的几个点：%s。请用你自己的视角（我/你，别说「黑方/白棋」）分析当前局势3-4句：局面走向、关键处或薄弱处，可以点醒Estarth；语气慵懒但专业，先结合【当前棋面】核对再说，别提到盘上没有的子。" % (
                 prompts.board_summary(self.st.move_seq), n, self._pct(azure_wr), lead, "%+.1f" % (-score_black), self._py_list(tops))
-            msg = await self._reply([
-                self._sys_msg(),
-                self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "analyze", False, self.st.last_katago, self.st.board)),
-            ], 350)
+            msg = await self._reply(self._phase_messages(
+                "analyze",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "analyze", False, self.st.last_katago, self.st.board),
+            ), 350)
             if self._llm_failed(msg):               # 云端失败：分析退化为兜底台词（形势数据照常下发）
                 msg = self._fallback_line("game")
             self._emit(events.message(events.AI, "📊 " + msg))
@@ -704,10 +718,10 @@ class AzureAgent:
             seq = " → ".join(str(s) for s in self.st.move_seq)
             prompt = "对局结束，共%d手。\n序列：%s\n最终黑胜率：%s，目差：%s\nEstarth备注：%s\n\n写总结：1.对局回顾 2.给Estarth的改进建议 2-3条 3.你的心情\n用Azure口吻，150-250字，慵懒真诚。" % (
                 n, seq, self._pct(final_wr), "%+.1f" % final_score, note)
-            text = await self._reply([
-                self._sys_msg(),
-                self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "summary", False, self.st.last_katago, self.st.board)),
-            ], 600)
+            text = await self._reply(self._phase_messages(
+                "summary",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "summary", False, self.st.last_katago, self.st.board),
+            ), 600)
             if self._llm_failed(text):              # 云端失败：总结退化为兜底台词
                 text = self._fallback_line("chat")
             self.st.finished = True

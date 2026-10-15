@@ -73,10 +73,13 @@ def build_messages(phase, *, context="", prompt="", len_note="", mood_name="", t
                    history=None) -> list[dict]:
     """按阶段拼消息，与旧 ``_sys_msg() + _user_msg(with_context(...))`` 逐字符一致。
 
+    逐字符一致是硬要求：模型要看到的字必须与本次重构前完全相同，一个标点都不能变（测试锁定）。
+
     - ``context``：``prompts.with_context(...)`` 的完整产出（已含【现在】与 prompt）——非空时原样
-      作为最后一条 user 消息（agent 的现状路径）；
-    - ``prompt``：没有 ``context`` 时的回退（计划 04 的图节点复用）——作为 user 消息原样发出，
-      并把该阶段的 ``prompts.phase_note(phase)`` 补进系统消息；
+      作为最后一条 user 消息；**今天的调用点一律走这条路**（见 ``AzureAgent._phase_messages``）；
+    - ``prompt``：没有 ``context`` 时的回退——作为 user 消息原样发出，并把该阶段的
+      ``prompts.phase_note(phase)`` 补进系统消息；这是**计划 04 的图节点入口，今天没有调用点用它**
+      （``len_note``/``mood_name``/``think_hint`` 两条路径共用）；
     - ``history``：夹在系统消息与最后一条 user 消息之间的历史消息（原样透传）。
     """
     msgs = phase_chain(phase).invoke({
