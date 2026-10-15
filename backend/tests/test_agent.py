@@ -606,3 +606,46 @@ class DedupTest(unittest.TestCase):
         from app.agent import AI_DEDUP_WINDOW
         self.assertEqual(AI_DEDUP_WINDOW, 8)
 
+    # —— 计划 04 · Task 4 评审 I1 / S30 追加：窗口上限与判据边界（纯追加）——
+
+    def test_window_evicts_oldest_beyond_eight(self):
+        """窗口上限**严格** 8：压 9 条互不相同的台词，最旧的那条必须被丢出。
+
+        这条用例是硬规则 2「最近 8 条窗口」唯一的会失败守卫——把驱逐逻辑删掉、或把
+        ``> AI_DEDUP_WINDOW`` 放宽（如 ``* 2``），下面的 ``len == 8`` 与
+        ``_is_repeat("第1句") is False`` 都会红。
+        """
+        agent, _eng, _llm, _bus = _mk()
+        for i in range(1, 10):                      # 压 9 条：第1句 ~ 第9句
+            agent._note_line("第%d句" % i)
+        self.assertEqual(len(agent._recent_lines), 8)          # 上限严格 8，不是 9
+        self.assertFalse(agent._is_repeat("第1句"))            # 最旧（第1句）已被丢出窗口
+        self.assertTrue(agent._is_repeat("第9句"))             # 刚说的这句仍在
+        self.assertTrue(agent._is_repeat("第2句"))             # 只丢最旧一条，其余照旧在窗内
+
+    def test_whitespace_is_normalized_before_compare(self):
+        """判据与前端一致：``strip()`` 后**完全相等**才算重复（前后空白不影响）。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent._note_line("我在的~")
+        self.assertTrue(agent._is_repeat("  我在的~  "))        # strip 后完全相等 → 判重复
+        self.assertTrue(agent._is_repeat("我在的~"))
+
+    def test_blank_lines_neither_repeat_nor_enter_window(self):
+        """空串 / 纯空白 / ``None``：既不算重复，也不进窗口（否则会污染窗口把真台词挤出去）。"""
+        agent, _eng, _llm, _bus = _mk()
+        self.assertFalse(agent._is_repeat(""))
+        self.assertFalse(agent._is_repeat("   "))
+        self.assertFalse(agent._is_repeat(None))
+        agent._note_line("")
+        agent._note_line("   ")
+        agent._note_line(None)
+        self.assertEqual(agent._recent_lines, [])              # 一条都没入窗
+
+    def test_substring_is_not_a_repeat(self):
+        """「包含但完全不等」不算重复：判据是相等，不是包含（与前端逐字一致）。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent._note_line("我在的~")
+        self.assertFalse(agent._is_repeat("我在的~，怎么啦？"))   # 以它开头但更长 → 不判重
+        self.assertFalse(agent._is_repeat("我"))                # 只是子串 → 不判重
+        self.assertFalse(agent._is_repeat("我不在的~"))          # 只差一个字 → 不判重
+
