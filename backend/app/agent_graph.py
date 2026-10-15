@@ -33,8 +33,9 @@
   ``_set_busy`` 自带去重，多调一次不会产生多余的 ``busy`` 事件。
 - 台词一律经 ``agent.clean_reply()``（``_reply()`` 内部必经），推理段永不进台词；
 - speak 阶段还有一条**可选**（默认关闭，``agent.stream_tokens``）的流式通道：``_streamed_text``
-  逐块推 ``token`` 事件（``ThinkStream`` 在累加文本上**跨块**剥离 think 段——标签被切块 / 收尾标记
-  都不漏，delta 只来自回答的 content 通道；去重闸门同样生效、整句复读一条 token 都不发），
+  逐块推 ``token`` 事件（``ThinkStream`` 在累加文本上**跨块**剥离 think 段：成对 ``<think>…</think>``
+  与 ``<｜begin▁of▁thinking｜>…<｜end▁of▁thinking｜>`` 区间保证不漏；「只剩收尾标记」的降级形态只保证
+  最终台词干净，边界见该类的「保证边界」；去重闸门同样生效、整句复读一条 token 都不发），
   台词仍以 ``_finalize_*`` 里经 ``clean_reply`` + ``_emit_deduped`` 的完整 ``message`` 收口，
   且与「对整条原文调 ``content_of``」同构；关闭时一个 ``token`` 都不发，事件序列与没有这个功能时逐字一致；
 - ``build_graph(agent)`` 用闭包捕获 ``agent``，模块级不持有任何可变状态：同一个 ``agent`` 重建图
@@ -718,16 +719,20 @@ async def _streamed_text(agent, msgs, max_tokens):
     返回 ``None`` 表示「这次不走流式」，调用方回落到 ``agent._reply``——默认关闭时走的永远是那条路，
     事件序列与没有这个功能时逐字一致（S31③）。四条不可回退的约束：
 
-    - **推理段永不显示（跨块也必须成立）**：``agent._stream_chunks`` 只吐回答原文（content 通道），
-      think 段的剥离由 ``ThinkStream`` 在**累加文本**上跨块完成——标签被切块、或模型用
-      ``<｜end▁of▁thinking｜>`` 收尾（标记之前全是推理）都不漏；空增量不发事件（硬规则 3）；
+    - **推理段永不显示**：``agent._stream_chunks`` 只吐回答原文（content 通道），think 段的剥离由
+      ``ThinkStream`` 在**累加文本**上跨块完成。**保证 delta 与台词都干净**的形态：成对
+      ``<think>…</think>``、``<｜begin▁of▁thinking｜>…<｜end▁of▁thinking｜>`` 区间（含标签/标记被切块，
+      标记自身永不外发）；**只保证最终台词干净**的降级形态（token 流可能短暂出现推理原文，气泡随后
+      由 ``message`` 整条替换）：网关吞掉开始标记、只剩 ``CoT…<｜end▁of▁thinking｜>``，以及未闭合的
+      ``<think>``（台词按 ``content_text_of`` 兜底成兜底句）。空增量不发事件（硬规则 3）；
     - **台词定稿与整条原文同构**：结束时对**累加原文**走 ``llm_chain.content_text_of``（即
       ``content_of`` 的纯文本版，含「未闭合 ``<think>`` → 空串」的兜底），再经 ``clean_reply``——
-      与非流式路径（``LLMClient.chat`` → ``content_of`` → ``clean_reply``）逐字同一条规则；
+      与非流式路径（``LLMClient.chat`` → ``content_of`` → ``clean_reply``）逐字同一条规则
+      （降级形态下 token 流可以脏，**定稿这一步不脏**：TTS 读的就是它）；
     - **去重闸门对流式路径同样生效**（S32/S37）：累加的可见文本**还是窗口里某句的前缀**时先扣住
       已收到的增量不发，一旦分叉（确认是新话）立刻按序补发；整句原样复读 ⇒ 一条 ``token`` 都不发
       （它的 ``message`` 也照旧被 ``_emit_deduped`` 拦下），前端不会留下没收口的残余气泡。
-      判据仍是「相等」，不是「包含」（以那句开头的新话照样完整发出）；
+      判据是「**是窗口某句的前缀**」（不是「相等」、更不是「包含」）：分叉即补发，以那句开头的新话照样完整发出；
     - **流式本身失败**（连接断开 / 服务端报错）**绝不影响这一回合**：返回 ``None`` 让调用方走非流式那条路，
       台词必定完整（前端的气泡最终内容以 ``message`` 为准，会被整条替换）。
     """

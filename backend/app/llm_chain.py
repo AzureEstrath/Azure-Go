@@ -24,12 +24,15 @@ REASON_KEYS = ("reasoning_content", "reasoning")
 
 _TAG_OPEN = "<" + "think" + ">"     # 运行时拼接，和 Godot 版一样避免被外部工具当标记
 _TAG_CLOSE = "</" + "think" + ">"
-# 推理段的收尾标记（有的模型把思维链写在 content 通道里，用它收尾）：标记**之前**的全是推理
+# 推理段的开始 / 收尾标记（有的模型把思维链写在 content 通道里，用它们圈出区间）
+_TAG_BEGIN = "<" + "｜begin▁of▁thinking｜" + ">"
 _TAG_END = "<" + "｜end▁of▁thinking｜" + ">"
 _THINK_RE = re.compile(re.escape(_TAG_OPEN) + r".*?" + re.escape(_TAG_CLOSE), re.S)
+# 成对的 begin…end 区间（含两个标记）：区间两侧的正文都留
+_BEGIN_END_RE = re.compile(re.escape(_TAG_BEGIN) + r".*?" + re.escape(_TAG_END), re.S)
 
 # 需要「尾部滞留」的标记：任何一个的前半截都可能被切到下一块，不能当正文发出去
-_THINK_TOKENS = (_TAG_OPEN, _TAG_CLOSE, _TAG_END)
+_THINK_TOKENS = (_TAG_OPEN, _TAG_CLOSE, _TAG_BEGIN, _TAG_END)
 
 _EMPTY_API_KEY = "EMPTY"        # 空 key 的哨兵：把「缺凭据」从构造期推迟到请求期
 DEFAULT_TIMEOUT_SEC = 120.0     # 与旧 LLMClient 的 timeout_sec 默认值一致
@@ -75,21 +78,30 @@ def build_chat_model(cfg, *, http_client=None, http_async_client=None, timeout=N
 
 
 def _strip_think(text: str) -> str:
-    """剥离推理段（**不 strip**）：收尾标记之前的、以及成对 ``<think>…</think>`` 之内的都不是正文。
+    """剥离推理段（**不 strip**）：标记区间（含标记自身）与成对 ``<think>…</think>`` 之内的都不是正文。
 
     对**整条**原文与**流式累加**文本是同一套规则（``content_text_of`` 与 ``ThinkStream`` 都走这里），
-    所以「逐块拼起来的台词」与「对整条原文调 ``content_of``」同构。
+    所以「逐块拼起来的台词」与「对整条原文调 ``content_of``」同构。三条规则：
+
+    1. ``<｜begin▁of▁thinking｜>…<｜end▁of▁thinking｜>`` 整段（含两个标记）去掉，区间两侧的正文都留；
+    2. 只有开始标记、还没收尾：它之后的先不算正文；
+    3. 只有收尾标记（开始标记被网关吞掉）：它之前的全是推理——**这一条只能事后判定**，
+       标记到达之前已经流出去的内容收不回来（见 ``ThinkStream`` 的保证边界）。
     """
-    if _TAG_END in text:                    # 收尾标记：它之前的部分（含未配对的开标签）全是推理
-        text = text.rsplit(_TAG_END, 1)[1]
-    return _THINK_RE.sub("", text)
+    text = _BEGIN_END_RE.sub("", text)      # ① 成对的 begin…end 区间（含两个标记）
+    i = text.find(_TAG_BEGIN)
+    if i >= 0:
+        text = text[:i]                     # ② 开始标记之后还没收尾：之后的先不算正文
+    elif _TAG_END in text:
+        text = text.rsplit(_TAG_END, 1)[1]  # ③ 只剩收尾标记：它之前全是推理（事后判定）
+    return _THINK_RE.sub("", text)          # ④ 成对 <think>…</think>
 
 
 def _hold_partial_tag(raw: str) -> str:
-    """扣住尾部「可能是某个标记前半截」的最长后缀（``<thi`` / ``</thi`` / ``<｜end`` …）。
+    """扣住尾部「可能是某个标记前半截」的最长后缀（``<thi`` / ``<｜beg`` / ``<｜end`` …）。
 
     丢弃这段的正文不发：下一块补齐了才知道它是标记还是普通文本；留着它就是「标签被切块」时
-    标签本身漏进增量。
+    标签/标记本身漏进增量。
     """
     keep = 0
     for tok in _THINK_TOKENS:
@@ -139,11 +151,20 @@ class ThinkStream:
     （原样返回），开标签自己也可能被切成 ``<thi`` / ``nk>``（连标签都进了增量）。这里用同一套
     规则（``_strip_think``）作用在**累加文本**上，并额外扣住两种「现在还不能当正文发」的尾巴：
 
-    1. 尾部是某个标记的前半截（``<thi`` / `<｜end`` …）：等下一块补齐再判（``_hold_partial_tag``）；
-    2. 已经出现**未闭合**的 ``<think>``：从那里往后先不发，等闭合标签或收尾标记。
+    1. 尾部是某个标记的前半截（``<thi`` / ``<｜beg`` / ``<｜end`` …）：等下一块补齐再判（``_hold_partial_tag``）；
+    2. 已经出现**未闭合**的 ``<think>`` 或只有开始标记：从那之后先不发，等收尾标记/闭合标签。
 
-    于是 ``"".join(feed(块))`` 恒是「到目前为止的可见正文」的真前缀，流结束后由调用方对**整条原文**
-    走 ``content_of`` 定稿——两者同构（未闭合兜底成空串也一致）。
+    **保证边界**（与 ``content_text_of`` 逐条对应，别再往大里说）：
+
+    - **保证不漏**（delta 与最终台词都不含推理段，标记自身也不外发）：成对 ``<think>…</think>``、
+      ``<｜begin▁of▁thinking｜>…<｜end▁of▁thinking｜>`` 区间——含各自的标签/标记被切块的情形
+      （开始标记一到就扣留）；
+    - **只保证最终台词干净**（token 流里可能短暂出现推理原文，气泡随后由 ``message`` 整条替换）：
+      网关吞掉开始标记、只剩 ``CoT…<｜end▁of▁thinking｜>``（标记到达前无法判定它是推理），
+      以及未闭合的 ``<think>``（整条被 ``content_text_of`` 兜底成空串 ⇒ 兜底台词）。
+
+    于是 ``"".join(feed(块))`` 在上面的**第一类**形态下是「可见正文」的真前缀；第二类形态下只保证
+    「发出的每一块都不是标记」且最终 ``message`` == ``content_text_of(整条原文)``。
     """
 
     def __init__(self):
@@ -157,7 +178,7 @@ class ThinkStream:
 
     @property
     def visible(self) -> str:
-        """到目前为止的可见正文（已发出的增量拼起来就是它）。"""
+        """到目前为止的可见正文（第一类形态下就是已发增量拼起来的它）。"""
         return self._out
 
     def feed(self, text) -> str:
@@ -167,8 +188,9 @@ class ThinkStream:
         self._raw += str(text)
         vis = self._visible_now()
         if vis == self._out or not vis.startswith(self._out):
-            # 没长（推理段 / 标记 / 滞留尾巴）：不发。理论上不会「缩」；真缩了也只停发，
-            # 已发出的那段仍是原文里出现过的正文（绝不是推理段），且最终 message 会整条收口。
+            # 没长（推理段 / 标记 / 滞留尾巴）：不发。**降级形态**下可见文本会「缩」（已发出去的是
+            # 事后才判定的推理原文）：这里只停发、不往回补——前面那块收不回来，但标记永不外发，
+            # 且最终 message 与 TTS 恒为干净台词（气泡由 message 整条收口）。
             return ""
         delta = vis[len(self._out):]
         self._out = vis

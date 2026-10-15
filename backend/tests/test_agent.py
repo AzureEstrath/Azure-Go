@@ -996,3 +996,83 @@ class StreamThinkTest(unittest.TestCase):
         self.assertEqual(bus.of_type("token"), [])
         self.assertEqual([str(m["text"]) for m in bus.messages(events.AI)], ["我在"])
 
+
+# —— 以下为 Task 5 二轮复审 S38 的补充守卫（纯追加）——
+
+
+class StreamMarkerFormTest(unittest.TestCase):
+    """S38：开始/收尾标记形态，以及「保证边界」到底保证到哪。
+
+    **更正记录**（本轮 `test_agent.py` 只许追加，故不改上面那条既有用例的 docstring）：
+    `StreamThinkTest.test_marker_without_open_tag_hides_the_prefix` 覆盖的是「收尾标记是流的
+    **第一块**」这个**退化子情形**——那时「标记之前全是推理」在标记到达前就已成立，delta 天然干净，
+    它不能代表真实流序（标记必然最后到达）。真实流序分两类：`<｜begin▁of▁thinking｜>…<｜end…｜>`
+    区间**保证不漏**（下面第一条用例）；网关吞掉开始标记、只剩 `CoT…<｜end…｜>` 属于 S38②
+    **显式接受的降级**——只保证最终 `message`/TTS 干净（下面第二条用例）。
+    """
+
+    class BeginEndLLM(StubLLM):
+        """真实流序 + 两个标记都被切块：区间整段（含标记）不外发。"""
+
+        async def astream(self, messages, max_tokens=300):
+            for piece in ["<｜beg", "in▁of▁thinking｜>", "内部推理：我要不要理他",
+                          "<｜end▁of▁thi", "nking｜>", "你好~"]:
+                yield piece
+
+    class SwallowedBeginLLM(StubLLM):
+        """降级形态：网关吞掉开始标记，只剩 CoT + 收尾标记（标记最后到达）。"""
+
+        async def astream(self, messages, max_tokens=300):
+            for piece in ["内部推理：我要不要理他", "<｜end▁of▁thinking｜>", "你好~"]:
+                yield piece
+
+    def _run(self, llm):
+        agent, _eng, _llm, bus = _mk()
+        agent.llm = llm
+        agent.stream_tokens = True
+        asyncio.run(agent.chat("在吗"))
+        deltas = [str(e["delta"]) for e in bus.of_type("token")]
+        texts = [str(m["text"]) for m in bus.messages(events.AI)]
+        return agent, bus, deltas, texts
+
+    def test_begin_end_interval_never_streams_reasoning_or_markers(self):
+        """S38①：begin…end 跨块 ⇒ delta 里既没有推理正文、也没有任何标记，台词与 content_of 同构。"""
+        from app.llm_chain import content_of
+        from types import SimpleNamespace
+
+        _agent, _bus, deltas, texts = self._run(self.BeginEndLLM())
+        raw = "".join(["<｜beg", "in▁of▁thinking｜>", "内部推理：我要不要理他",
+                       "<｜end▁of▁thi", "nking｜>", "你好~"])
+
+        self.assertEqual(deltas, ["你好~"])
+        for s in deltas + texts:
+            self.assertNotIn("内部推理", s)
+            self.assertNotIn("｜beg", s)
+            self.assertNotIn("｜end", s)
+            self.assertNotIn("▁of▁thinking", s)
+        self.assertEqual(texts, ["你好~"])
+        self.assertEqual(texts, [content_of(SimpleNamespace(content=raw))])   # 与整条原文同构
+
+    def test_swallowed_begin_marker_still_yields_a_clean_message(self):
+        """S38②：降级形态**只承诺最终台词干净**——这里只断言这一点（+ 标记永不外发）。
+
+        保留真流式时不可能在收尾标记到达前判定「前面那些是推理」，故 token 流可能短暂显示推理原文
+        （控制者已裁决接受）。**不**把「推理正文出现在 delta 里」写成期望行为的断言；能承诺的是：
+        两个标记永不外发、最终 `message`（TTS 读的那份）与整条原文的 `content_of` 同构、
+        气泡随后由 `message` 整条收口。
+        """
+        from app.llm_chain import content_of
+        from types import SimpleNamespace
+
+        _agent, _bus, deltas, texts = self._run(self.SwallowedBeginLLM())
+        raw = "".join(["内部推理：我要不要理他", "<｜end▁of▁thinking｜>", "你好~"])
+
+        self.assertEqual(texts, ["你好~"])                    # ← 这一形态下要守的就是这一条
+        self.assertEqual(texts, [content_of(SimpleNamespace(content=raw))])
+        for s in texts:
+            self.assertNotIn("内部推理", s)
+            self.assertNotIn("｜end", s)
+        for s in deltas:                                      # 标记（含被切块的前半截）任何时候都不外发
+            self.assertNotIn("｜end", s)
+            self.assertNotIn("▁of▁thinking", s)
+

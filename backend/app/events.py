@@ -82,10 +82,15 @@ def tool(phase, name, args=None, ok=True, ms=0):
 def token(turn_id, delta):
     """流式输出的一段增量（``stream_tokens`` 开启时才有；默认关闭时一个都不发）。
 
-    ``delta`` 只来自回答的 ``content`` 通道——推理段（``reasoning_content`` / think 段）永不进这里
-    （硬规则 3）；空内容的块不发事件。**它不是台词**：气泡的最终内容一律以随后的 ``message``
-    为准（去重闸门只对 ``message`` 生效），``turn_id`` 用来把同一轮发言的增量与 ``message``、
-    日后的 ``speech`` 配起来（每次公开编排调用生成一次）。
+    ``delta`` 只来自回答的 ``content`` 通道——``reasoning_content`` / ``response_metadata`` 之类的
+    推理字段永不进这里。content 通道里的 think 段由 ``llm_chain.ThinkStream`` 跨块剥离：成对
+    ``<think>…</think>`` 与 ``<｜begin▁of▁thinking｜>…<｜end▁of▁thinking｜>`` 区间**保证不漏**（标记自身
+    也不外发），畸形形态（网关只留收尾标记、未闭合 ``<think>``）下 token 流可能短暂带出推理原文，
+    但**最终 ``message`` 与 TTS 恒为干净台词**（气泡由 ``message`` 整条收口）。
+
+    **它不是台词**：气泡的最终内容一律以随后的 ``message`` 为准（去重闸门只对 ``message`` 生效），
+    ``turn_id`` 用来把同一轮发言的增量与 ``message``、日后的 ``speech`` 配起来
+    （每次公开编排调用生成一次）。
     """
     return {"type": "token", "turn_id": str(turn_id), "delta": str(delta)}
 
