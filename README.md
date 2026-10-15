@@ -16,9 +16,10 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 > **人设与提示词也能在 `config.json` 里直接改**。客户端（`game\`）只做渲染、输入与语音播放，
 > 连不上后端时只在状态栏提示。
 >
-> 当前版本 **v3.2.0**：后端 LLM 调用改走 **LangChain**（LCEL 链 + 结构化输出），并新增**发言侧工具**——
-> 她自己决定要不要复算局面、查定式、核对盘面，**默认关闭**；开启后也**只影响她怎么说，不影响她下哪里**。
-> 客户端只多了一条「她正在查资料…」的状态栏提示。详见「九、更新」。
+> 当前版本 **v3.3.0**：新增**长期记忆**——开启后她跨局记得你（对局总结写进本地 SQLite，
+> 出话前按语义检索注入上下文，云端 embedding 不可用时自动降级为关键词匹配），**默认关闭**，
+> 关闭时不建库、不调 embedding 接口、提示词逐字符不变；另有 `/api/memory/*` 管理端点可查看 / 手动写入 / 忘记。
+> 详见第四节「长期记忆（跨局记得你）」与「九、更新」。
 
 ---
 
@@ -42,10 +43,11 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 │   ├─ config.json          客户端参数模板（见第三节）
 │   └─ export_presets.cfg   Godot 导出预设（个人导出用）
 ├─ backend\                 远程后端（唯一权威：对局编排 / LLM / 情绪 / 定式；FastAPI + REST + WebSocket）
-│   ├─ app\                 对局编排 / LangChain 链（LLM + 提示词） / 情感模型 / 发言侧工具
+│   ├─ app\                 对局编排 / LangChain 链（LLM + 提示词） / 情感模型 / 发言侧工具 / 长期记忆
 │   ├─ tests\               后端单元测试（含情感模型黄金样本）
 │   ├─ requirements.txt     后端依赖
-│   └─ run_server.bat       一键启动后端（监听 127.0.0.1:8000）
+│   ├─ run_server.bat       一键启动后端（监听 127.0.0.1:8000）
+│   └─ data\                运行产物（已 gitignore）：长期记忆库 memory.db（见第四节）
 ├─ katago_service\          KataGo 云服务（独立部署：常驻 `katago analysis` 进程，对外 `/health` + `/analyze`）
 │   ├─ server.py            FastAPI 应用：Bearer 鉴权、串行化、warming/ready/dead 状态与 /health
 │   ├─ proc.py              常驻引擎子进程封装（stderr 持续排空 + 64MB 读行缓冲 + 启动预热）
@@ -99,8 +101,10 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
   （游戏内设置面板写回的 LLM 地址 / 模型名 / Key / 思考档位也属于这一类）。
 - **后端（实时）**：经 `/api/config` 转发，改完立即生效。
 - **客户端**：游戏进程自己读，改完（或下次启动）即时生效。
-- **后端专用（客户端不读）**：`katago_url` / `katago_token` / `katago_timeout_ms` 与
-  `llm_extra_body` / `llm_think_extra_body` / `tools_enabled` / `max_tool_calls` 只由后端消费；
+- **后端专用（客户端不读）**：`katago_url` / `katago_token` / `katago_timeout_ms`、
+  `llm_extra_body` / `llm_think_extra_body` / `tools_enabled` / `max_tool_calls` 与
+  `memory_enabled` / `memory_db_path` / `embed_base_url` / `embed_model` / `embed_api_key` /
+  `memory_top_k` / `memory_max_inject_chars` 只由后端消费；
   客户端不读它们，但**写回配置时会原样保留**（游戏内保存设置不会把这些键弄丢）。
 
 | 字段 | 读取方 | 含义 |
@@ -118,6 +122,11 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 | `llm_think_extra_body` | 后端（启动时） | 同上，但**只在思考档位开启（`llm_think_mode` > 0）时**并入（如 `{"reasoning_effort": "high"}`）；不开思考档位时完全不发 |
 | `tools_enabled` | 后端（启动时） | **发言侧工具**总开关，默认 `false`：开启后她在「提示」与「落子宣告」两个回合可自主复算局面 / 查定式 / 核对盘面——**只影响她怎么说，不影响她下哪里**（见第四节「工具（发言侧）」） |
 | `max_tool_calls` | 后端（启动时） | 一次发言里**工具执行次数**上限（默认 `2`；代码侧硬上限也是 `2`，配置只能收紧、不能放宽） |
+| `memory_enabled` | 后端（启动时） | **长期记忆**总开关，默认 `false`：开启后她跨局记得你（对局总结与显式事实落 SQLite，出话前召回注入）；见第四节「长期记忆（跨局记得你）」 |
+| `memory_db_path` | 后端（启动时） | 长期记忆库路径；留空＝`backend\data\memory.db`（**只在开启时创建**，属运行产物、已 gitignore） |
+| `embed_base_url` / `embed_model` / `embed_api_key` | 后端（启动时） | **云端 embedding 的 OpenAI 兼容地址 / 模型名 / Key**（如 `https://api.openai.com/v1` + `text-embedding-3-small`）；三者**任一为空＝不配向量**，召回自动降级为关键词匹配（不报错、不影响出话） |
+| `memory_top_k` | 后端（启动时） | 每次召回**注入条数**上限（默认 `3`） |
+| `memory_max_inject_chars` | 后端（启动时） | 注入提示词的**总字数**上限（默认 `240`；单条另截到 120 字） |
 | `prompt_system` | 后端（启动时） | **覆盖系统提示词（人设全文）**；留空用内置 Azure 人设 |
 | `prompt_user_name` | 后端（启动时） | **玩家称呼**，替换提示词中的「Estarth」（默认 Estarth） |
 | `prompt_phase_notes` | 后端（启动时） | **覆盖各阶段提示**，键：`observe` / `after_player` / `own_turn` / `just_moved` / `analyze` / `chat` / `summary` |
@@ -180,6 +189,64 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 - 改完 `tools_enabled` / `max_tool_calls` 要**重启后端**；`POST /api/config` 也能实时切换 `tools_enabled`
   （客户端界面暂未提供入口）。
 
+### 长期记忆（跨局记得你）
+
+**默认关闭**（`memory_enabled: false`）：关闭时**零开销**——不创建数据库文件、不调任何 embedding 接口，
+提示词与没有这个功能时**逐字符一致**。开启后她跨局记得你这个人；与「这盘棋」的局内记忆
+（落子评定存档，随对局重置）互不替代。
+
+**存什么**
+
+- **对局总结**：每局 `POST /api/summarize` 成功出总结后，后端把棋谱 + 结果 + 总结落一条归档，
+  并把总结另存为一条可召回的记忆（`kind=game`）。LLM 失败退化为兜底台词时**不写**，防止污染。
+- **显式事实 / 偏好**：经 `POST /api/memory/write` 手动写入（`kind=fact`，如「他喜欢简明，不喜欢复杂战斗」）。
+- **不存**：她的台词、当前盘面描述、模型推理段——长期记忆只收总结与显式事实，越用越准、不会越用越失真。
+- 写入硬上限：单条 200 字（超长截断并标「…」）、同 `tag` + 同 `text` 去重、库内最多 2000 条
+  （超出按时间淘汰最旧）。
+
+**怎么用**
+
+- 两个召回点：**闲聊**（用你这句原话做查询）与**她自己落子前**（用最近一手 + 阶段做查询）；
+  召回文本插在提示词的「【最近的对话】」之后、铁律段之前，措辞明确「不是当前盘面、仅供参考、别照抄」。
+- 注入硬上限：每次最多 `memory_top_k` 条、单条 120 字、总计 `memory_max_inject_chars` 字。
+- 配了 `embed_*` 就按**语义相似度**（云端 embedding + 余弦）排序；**没配 / 401 / 超时**一律降级为
+  **关键词匹配**（不伪造相似度分数）。记忆出任何问题都只打日志、自动降级，**绝不影响对局**（`busy` 照常归位）。
+- 库是 SQLite：`memory_db_path` 留空时落在 `backend\data\memory.db`（运行产物，已 gitignore）；
+  这几个键都在后端**启动时**读取，改完要**重启后端**。
+
+**怎么忘掉 / 查看**
+
+四个管理端点（`memory_enabled=false` 时查询面返回空结果、写入被拒，都不会 500）：
+
+```bash
+# 1) 看她记住了什么（query 必填；k 可省，缺省用 memory_top_k）
+curl -X POST http://127.0.0.1:8000/api/memory/query -H "Content-Type: application/json" \
+  -d '{"query":"Estarth 的偏好","k":3}'
+# → {"ok":true,"items":[{"id":1,"ts":1750000000.0,"kind":"fact","tag":"estarth","text":"…","score":0.83}]}
+
+# 2) 手动记一条（tag 可省；关闭 / 空文本会被拒：{"ok":false,"id":null}）
+curl -X POST http://127.0.0.1:8000/api/memory/write -H "Content-Type: application/json" \
+  -d '{"tag":"estarth","text":"他喜欢简明，不喜欢复杂战斗"}'
+# → {"ok":true,"id":1}
+
+# 3) 看体量：rows=记忆条数、games=对局归档数、has_vectors=有向量的条数、db=库文件路径
+curl http://127.0.0.1:8000/api/memory/stats
+# → {"ok":true,"rows":1,"games":0,"has_vectors":1,"db":"…\\backend\\data\\memory.db"}
+
+# 4) 忘掉指定几条，或一次清空
+curl -X POST http://127.0.0.1:8000/api/memory/forget -H "Content-Type: application/json" -d '{"ids":[1]}'
+curl -X POST http://127.0.0.1:8000/api/memory/forget -H "Content-Type: application/json" -d '{"all":true}'
+# → {"ok":true,"removed":1}
+```
+
+> - `forget` 只清**记忆**（会被召回的部分），不动对局归档；停掉后端后直接删掉库文件（连同 `-wal` / `-shm`）
+>   也能全部忘记。
+> - 示例里 `-d '…'` 的单引号写法在 **PowerShell 7 / Git Bash** 可用；**cmd.exe** 要改写成 `-d "{\"query\":\"…\"}"`。
+> - 管理端点的写 / 查会往 `/ws` 推 `memory` 事件（形状 `{type, op, tag, text, score}`；写一条、
+>   查每条命中一条）——**纯元数据**：客户端只记一行日志，不进台词、不产生界面变化；
+>   **对局中她自己的召回 / 写入不发事件**。
+> - `GET /api/health` 的 `memory_rows` 是当前记忆条数（关闭 / 库不可用时为 `0`）。
+
 ---
 
 ## 五、接语音（TTS，可选）
@@ -214,10 +281,12 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
   也可命令行临时指定：`AzureGoGodot.exe --backend-url=http://127.0.0.1:8000`（只影响本次运行，不写回配置）。
 - **接口契约**：
   - REST：`/api/move|hint|analyze|chat|summarize|undo|reset|config|reveal|interaction|idle|mood/tick`，
-    以及 `GET /api/state`、`GET /api/health`。
-  - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki / tool`
-    （`tool` 是发言侧工具的开始 / 结束，只喂状态栏提示，不进入对话）。
-  - `GET /api/health` 返回 `{ok, katago_dead, katago_error, katago_url, llm_url}`（字段都改为描述所连云服务：
+    以及 `GET /api/state`、`GET /api/health`，和长期记忆管理面 `/api/memory/query|write|stats|forget`
+    （见第四节「长期记忆（跨局记得你）」）。
+  - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki / tool / memory`
+    （`tool` 是发言侧工具的开始 / 结束，只喂状态栏提示，不进入对话；`memory` 是记忆管理动作的元数据，
+    只记一行日志，不进台词、不产生界面变化）。
+  - `GET /api/health` 返回 `{ok, katago_dead, katago_error, katago_url, llm_url, memory_rows}`（字段都改为描述所连云服务：
     地址 / 引擎是否还在 / 最近错误）。其中 `katago_dead` 与 `katago_error` 必须**成对读**：
     - `katago_dead` 表示**引擎已经没了**：`start()` 探活失败、或分析时发生**传输层失败**（连接被拒 / 连接或
       读取错误，相当于旧子进程时代的「管道断了」）都会置位；一次**成功的分析会把它清掉**（云服务重启后可自愈）；
@@ -226,7 +295,8 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
       ——服务还在、只是这一次没答好。所以「`katago_dead=false` + 新的非空 `katago_error`」＝服务**在线但这次
       没答好**，「`katago_dead=true`」＝引擎（或到它的链路）真的没了。运维自检以 `katago_error` 为准；
     - `katago_url` 是后端当前连接的 KataGo 服务地址，便于确认连的是哪台（留空时客户端回退默认回环地址
-      `http://127.0.0.1:8100`）。
+      `http://127.0.0.1:8100`）；
+    - `memory_rows` 是长期记忆库里的记忆条数（未启用 / 库不可用时为 `0`）——一眼看出记忆库是否在用。
 - **后端配置**：后端进程用环境变量 `AZURE_CONFIG` 指定 `config.json`；未设置时依次找 `<当前工作目录>\config.json`
   → `backend\config.json`（`backend\app\config.py` 的 `load`）。`backend\run_server.bat` 会先把
   `..\AzureGoGodot\config.json` 写进 `AZURE_CONFIG`，该文件不存在时改用 `..\game\config.json`——两个都在时用前者。
@@ -290,7 +360,22 @@ KataGo 引擎与权重遵循其上游许可。
 
 ## 九、更新
 
-### v3.2.0（当前）
+### v3.3.0（当前）
+- **长期记忆（默认关闭）**：新增 `backend\app\memory.py`（SQLite 存储 + 检索：有向量按余弦相似度、
+  无向量按关键词）与 `backend\app\memory_service.py`（云端 embedding 装配，`embed_*` 任一为空就不装配
+  embedding 客户端、自动降级为关键词检索）。对局总结成功后写入长期记忆，**闲聊**与**她自己落子前**
+  两处召回注入（插在提示词「【最近的对话】」之后、铁律段之前，措辞强调「不是当前盘面、仅供参考、别照抄」）。
+  **默认关闭时零开销**：不建库、不调 embedding，且提示词与没有这个功能时**逐字符一致**（黄金样本锁定）。
+- **写入与注入都有硬上限**：单条 200 字、同 tag + 同 text 去重、库内最多 2000 条（超出按时间淘汰最旧）；
+  每次最多注入 `memory_top_k`（默认 `3`）条、单条 120 字、总计 `memory_max_inject_chars`（默认 `240`）字。
+  任何记忆故障（库不可写、embedding 401 / 超时）都只打日志、自动降级，**绝不影响对局**。
+- **管理面与配置**：新增 `POST /api/memory/query|write|forget` 与 `GET /api/memory/stats`（查看 / 手动写入 /
+  忘记），`GET /api/health` 增加 `memory_rows`；管理端点的写 / 查另推 `memory` WS 事件（纯元数据，前端只记日志）。
+  新增配置 `memory_enabled` / `memory_db_path` / `embed_base_url` / `embed_model` / `embed_api_key` /
+  `memory_top_k` / `memory_max_inject_chars`，库文件默认在 `backend\data\`（运行产物，已 gitignore）。
+  见第四节「长期记忆（跨局记得你）」。
+
+### v3.2.0
 - **后端 LLM 调用改走 LangChain**：新增 `backend\app\llm_chain.py`（`ChatOpenAI` 的唯一装配点）与
   `backend\app\prompt_chains.py`（七阶段提示的 `ChatPromptTemplate` 链）；`llm.py` 退化为薄适配器
   （对外 `chat()` 契约不变，台词仍必经 `clean_reply()` 与去 think 段的 `content_of()`）。依赖锁定
