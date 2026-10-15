@@ -1778,6 +1778,8 @@ func _report_speech_drop(turn: String, seq: int) -> void:
 
 ## 取音频（GET /api/tts/audio/{id}）。**串行**一次一条：保证 play_audio 的调用顺序 = speech 到达顺序，
 ## 否则两条语音同时取、谁先回来谁先播，音频就会和文字错位。
+## 每个出口都必须给出**结论**：能播就播，不能播（HTTP 失败 / **200 但 body 为空**）一律由
+## `pairing.resolve_fetch()` 收账（finish + 显示文字），绝不把记录留在 `got && !played`（那会锁死棋盘）。
 func _pump_speech_fetch() -> void:
 	if _speech_fetch_busy or _speech_fetch.is_empty():
 		return
@@ -1786,25 +1788,31 @@ func _pump_speech_fetch() -> void:
 	var rec: Dictionary = job["rec"]
 	if agent == null:
 		_speech_fetch_busy = false
-		_speech_audio_failed(rec, "后端未连接")
+		pairing.resolve_fetch(rec, false, 0)
+		_note_audio_failed("后端未连接")
 		_pump_speech_fetch()
 		return
 	agent.fetch_bytes("/api/tts/audio/%s" % str(job["id"]), HTTPClient.METHOD_GET, {},
 		func(ok: bool, code: int, body: PackedByteArray):
 			_speech_fetch_busy = false
-			if ok and not body.is_empty() and not pairing.played(rec):
-				# 取音频期间这条已经作废（走神搭话被取消等）就不再出声；`played` 为真说明它已经出过结果
+			var verdict := pairing.resolve_fetch(rec, ok, body.size())
+			if verdict == "":
+				# 音频到手：交给 TTSClient 播（取回期间没被作废才走得到这里）
 				pairing.set_group(rec, tts.play_audio(body, int(job["seq"]), pairing.kind_of(rec)))
-			elif not ok:
-				_speech_audio_failed(rec, _api_error_text(code, body) if code > 0 else "后端不可达")
+			elif verdict != "done":
+				_note_audio_failed(_audio_why(verdict, code, body))
 			_pump_speech_fetch())
 
-## 音频取不回（404 / 后端断了）：这条语音当作「不会再响」——文字照常显示，并给一句可读提示
-func _speech_audio_failed(rec: Dictionary, why: String) -> void:
+## 取音频失败的原因文案（收账与「文字照常显示」已由 `pairing.resolve_fetch()` 做掉，这里只提示）
+func _audio_why(verdict: String, code: int, body: PackedByteArray) -> String:
+	if verdict == "empty":
+		return "后端返回了空音频"
+	return _api_error_text(code, body) if code > 0 else "后端不可达"
+
+## 取音频失败的提示（状态栏 + 左侧栏）：只提示，不改任何配对状态
+func _note_audio_failed(why: String) -> void:
 	print("[TTS] 取音频失败：%s" % why)
 	_on_tts_status("这段语音的音频取回失败（%s），改为只显示文字" % why)
-	pairing.finish(rec)
-	pairing.display(rec)
 
 ## 配对状态机说「这条台词的文字该出现了」：显示气泡 + 该揭示的落子在这一刻揭示（音画同步）
 func _on_pairing_display(text: String, reveal: bool) -> void:

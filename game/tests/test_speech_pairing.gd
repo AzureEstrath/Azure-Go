@@ -198,8 +198,7 @@ func _run() -> void:
 	var r3b := p3.register("己", false, "")
 	p3.arm(r3b, true)
 	p3.accept_speech("t3", 2)
-	p3.finish(r3b)                                  # Main._speech_audio_failed 的等价物（404 → 收账 + 显示）
-	p3.display(r3b)
+	p3.resolve_fetch(r3b, false, 0)                 # Main`_pump_speech_fetch` 的失败出口（404 → 收账 + 显示）
 	_check("③b 404 时文字照常显示、不锁死", _shown == ["己"] and not p3.busy(_env()))
 
 	# —— ④ 跨回合 turn_id 重置（同回合内 seq 必须递增，跨回合从 1 重新开始） ——
@@ -323,6 +322,53 @@ func _run() -> void:
 	_check("⑧b 出结果后三个语音谓词一起归位",
 			not p8b.busy(_env()) and not p8b.audio_in_flight(_env()) and not p8b.has_pending())
 	_check("⑧b 归位之后 hold_active 才能为假（否则棋盘锁死）", not p8b.hold_active(_env(), false))
+
+	# —— ⑨ forced 释放（断线）也绝不静默丢字：含「还没轮到 _deliver_msg（未 arm）」与整段模式 ——
+	var p9 := _new_pairing()
+	_reset()
+	p9.register("丑", true, "")
+	p9.release_stale(_env(false, true, false), true)     # 断线：音频标记为在途也一并放
+	_check("⑨ 断线时「还没进显示队列」的台词也会被显示（整段模式下不会静默丢字）",
+			_shown == ["丑"] and _reveals[0])
+	_check("⑨ 它同时被收账（不留下会偷下一条语音的配对位）",
+			p9.pair_count() == 0 and not p9.busy(_env()) and not p9.hold_active(_env(), false))
+	_reset()
+	var r9b := p9.register("寅", false, "")
+	p9.arm(r9b, false)                                  # 整段模式：arm 但不随开播显示
+	p9.release_stale(_env(), true)
+	_check("⑨b 整段模式下已 arm、还没显示的台词同样被放出来", _shown == ["寅"])
+	_reset()
+	p9.register("", false, "idle", true)                 # 本地作废的占位
+	p9.release_stale(_env(), true)
+	_check("⑨c tomb 占位仍然不显示（「有意不显示」的语义没被破坏）",
+			_shown.is_empty() and p9.pair_count() == 0)
+
+	# —— ⑩ 取音频的每个出口都有结论：**HTTP 成功但 body 为空**也必须收账（否则棋盘锁死） ——
+	var p10 := _new_pairing()
+	_reset()
+	var r10 := p10.register("卯", true, "")
+	p10.arm(r10, true)
+	p10.accept_speech("t10", 1)
+	p10.set_group(r10, 21)
+	_check("⑩ 已配对（音频在取）：busy 与在途谓词为真", p10.busy(_env()) and p10.audio_in_flight(_env()))
+	_check("⑩ 空 body ⇒ 判定为「不能播」（不是「可以播」）", p10.resolve_fetch(r10, true, 0) == "empty")
+	_check("⑩ 空 body：文字照常显示（含揭示）", _shown == ["卯"] and _reveals[0])
+	_check("⑩ 空 body：busy / 在途谓词一起归位（绝不锁死棋盘）",
+			not p10.busy(_env()) and not p10.audio_in_flight(_env()) and not p10.hold_active(_env(), false))
+	_reset()
+	var r10b := p10.register("辰", false, "")
+	p10.arm(r10b, true)
+	p10.accept_speech("t10", 2)
+	_check("⑩ 取回成功 ⇒ 交给调用方去播（不收账、不显示）",
+			p10.resolve_fetch(r10b, true, 128) == "" and _shown.is_empty())
+	_check("⑩ 取回成功：记录仍在途（等这条语音开播）", p10.busy(_env()) and not p10.played(r10b))
+	_reset()
+	var r10c := p10.register("巳", false, "")
+	p10.arm(r10c, true)
+	p10.accept_speech("t10", 3)
+	p10.finish(r10c)                                    # 取回期间这条已被作废（走神搭话取消等）
+	_check("⑩ 取回时才发现已作废 ⇒ 什么都不做（不播也不显示）",
+			p10.resolve_fetch(r10c, false, 0) == "done" and _shown.is_empty())
 
 	if _fail == 0:
 		print("[pair] PASS：", _total, " 项断言全部通过")

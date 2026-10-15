@@ -23,14 +23,22 @@ extends Node
 ##   `released`   已经「不等它了」（不再算「她在忙」，也就不会把棋盘锁死）
 ##   `wait_display` 「同步说话」开着时：文字等这条语音开播才显示
 ##
-## **不变量（T25，最要紧的一条）**：任何**已登记、且未被本地作废**（非 `tomb`、未被 `forget_idle()`）
-## 的台词，**最终一定会被显示一次**——无论它的 `speech` 到没到、无论配对位是否过了 TTL、
-## 无论那一轮是否还 `busy`：
+## **不变量（T25 / T27，最要紧的一条）**：任何**已登记、且不属于「有意不显示」那两类**的台词，
+## **最终一定会被显示一次**——无论它的 `speech` 到没到、无论配对位是否过了 TTL、无论那一轮是否
+## `busy`、无论音频端点回什么。**有意不显示的只有两类，没有第三类**：
+##   ① `tomb`（本地丢弃：走神作废 / 防复读）；
+##   ② 被 `forget_idle()` 作废的走神搭话。
+## 逐条证明面（每一条都是「先显示、再收账」）：
 ##   · `speech` 到了 → 开播时（`display`）或判定无声时（`finish` + `display`）显示；
-##   · `speech` 没到 → 回合结束时 `release_stale()` 放出来；若那一轮一直 `busy` / 音频一直在途，
-##     TTL 到期时 `prune_expired()` **先显示再清出**；
-##   · 音频取不回 / 解析不了 → 调用方补 `speech_skipped` → 显示（`release_stale` 也会兜底）。
-## 只有两类记录**有意不显示**：`tomb`（本地丢弃）与 `forget_idle()` 作废的走神搭话。
+##   · 音频取不回 / **HTTP 200 但 body 为空** / 字节解析不了 → `resolve_fetch()` 或调用方的
+##     `speech_skipped` → `finish` + `display`；
+##   · `speech` 没到、回合已结束 → `release_stale()` 放出来；
+##   · 连接断了 → `release_stale(forced=true)` 对**每一条还没显示过的**（除 `tomb`）先 `display`
+##     再收账——**包括还没轮到 `_deliver_msg` 的（未 `arm`）**；
+##   · 那一轮一直 `busy` / 音频一直在途 → TTL 到期时 `prune_expired()` 先显示再清出。
+## 与它配对的是**不允许有悬空记录**：任何进了 `got && !played` 的记录都必须有一条路径把它收掉，
+## 否则 `audio_in_flight()` 恒真 → `release_stale()` 永远早退 → **棋盘永久锁死**（本项目头号故障形态）。
+## 所以「取音频」的每个出口都必须给出结论：能播交给调用方播，不能播一律 `resolve_fetch()` 收账。
 
 ## 该把这条台词的文字显示出来了（Main 收到后：`_add_msg_now` + 必要时 `_reveal_move()`）
 signal display_requested(text: String, reveal: bool)
@@ -190,12 +198,27 @@ func prune_expired() -> Array[String]:
 	_pairs = kept
 	return out
 
+## 取音频的**结论判定**（判定全在这儿，调用方只负责「播」与「记一行日志」）。
+## `ok` = HTTP 2xx；`body_size` = 拿到的字节数。`ok` 但 body 为空**同样按失败**处理——
+## 那种记录绝不能停在 `got && !played`（否则 `audio_in_flight()` 恒真 → 棋盘永久锁死）。
+## 返回：`""` = 可以播（调用方去 `play_audio`）/ `"done"` = 这条已作废或已收账，什么都不用做 /
+## 其余 = 失败原因代号（调用方据此打日志；**文字已经显示出来了**）。
+func resolve_fetch(rec: Dictionary, ok: bool, body_size: int) -> String:
+	if bool(rec["played"]):
+		return "done"                              # 取回期间已作废 / 已出结果：不出声，也不用再收账
+	if ok and body_size > 0:
+		return ""                                  # 音频到手：交给调用方去播
+	finish(rec)
+	display(rec)                                   # 先显示再收账：绝不静默丢台词
+	return "empty" if ok else "failed"
+
 ## 回合结束 / WS 断开后，等不到语音的文字不能一直等：直接显示（落子也照常揭示）。
 ## `env` 是外部事实：`turn_active`=后端这一轮还在跑 / `playing`=音频在播或排队 / `fetching`=还有音频请求在途。
 ## 只放文字、**不拆配对位**——那条语音可能还在后端合成，等它到了照样要占它自己的位置、照样要出声；
-## 放掉之后这条不再算「她在忙」（`released`），否则后端一条 `speech` 都不发时棋盘会被锁死。
-## `forced=true`（连接断了）：在途的 `speech` 已经丢了，连配对位一起清掉，返回放掉的文字条数。
-## 配对位的 TTL 清出在 `prune_expired()`（由调用方按帧调用），这里不负责。
+## 释放之后这条不再算「她在忙」（`released`），否则后端一条 `speech` 都不发时棋盘会被锁死。
+## `forced=true`（连接断了）：在途的 `speech` 已经丢了，**每一条还没显示过的**（除 `tomb`）都先
+## `display` 再收账——**包括还没轮到 `_deliver_msg` 的（未 `arm`）**：清掉未显示的记录就等于丢字。
+## 返回放掉的文字条数。配对位的 TTL 清出在 `prune_expired()`（由调用方按帧调用），这里不负责。
 func release_stale(env: Dictionary, forced := false) -> int:
 	if not forced:
 		if bool(env.get("turn_active", false)):
@@ -213,9 +236,11 @@ func release_stale(env: Dictionary, forced := false) -> int:
 				n += 1
 	if forced:
 		for rec in _pairs.duplicate():
-			if not bool(rec["got"]):
-				rec["released"] = true
-				finish(rec)                # 连不上了：这条语音不会再来了
+			if bool(rec["got"]):
+				continue
+			if not bool(rec["displayed"]) and not bool(rec["tomb"]):
+				display(rec)               # 先显示再收账（T25/T27 不变量）：含还没 arm 的（整段模式）
+			finish(rec)                    # `tomb` 有意不显示，直接清掉
 	return n
 
 ## 走神搭话整批作废：文字不再显示；已经配上 / 在取的记录出表（音频由调用方 `cancel_kind("idle")` 停播）。
