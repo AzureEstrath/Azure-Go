@@ -12,7 +12,7 @@ import random
 import re
 import time
 
-from . import coords, events, prompts
+from . import coords, events, prompt_chains, prompts
 from .board import SIZE as BOARD_SIZE
 from .emotion import EmotionModel
 from .joseki import JosekiRecognizer
@@ -135,11 +135,22 @@ class AzureAgent:
             s += " 实地估算：Estarth（黑）约 %.0f 目，Azure（白）约 %.0f 目（按逐点归属估算，仅供参考）。" % (b, w)
         self.st.last_katago = s
 
-    def _sys_content(self, len_note) -> str:
-        s = prompts._t(prompts.system_prompt()) + prompts.mood_note(self.mood.region_name())
+    def _think_hint(self) -> str:
+        """思考风格半句：只在思考档开启时注入（判据与旧 ``_sys_content`` 一致）。"""
         if self.llm is not None and getattr(self.llm, "think_mode", 0) > 0:
-            s += "\n\n【思考风格 · 随心情微调】" + self.mood.think_hint()
-        return s + len_note
+            return self.mood.think_hint()
+        return ""
+
+    def _sys_content(self, len_note) -> str:
+        """系统消息文本：经 ``prompt_chains`` 的模板链构造（人设 + 心情 + 思考风格 + 长度约束）。
+
+        系统消息与阶段无关——阶段提示只在「无 context」的回退路径里补进系统消息，这里既没有
+        context 也没有 prompt，固定按首个阶段取链，产出与旧实现逐字符一致（test_prompt_chains 锁定）。
+        """
+        return prompt_chains.build_messages(
+            prompt_chains.PHASES[0], len_note=len_note,
+            mood_name=self.mood.region_name(), think_hint=self._think_hint(),
+        )[0]["content"]
 
     def _sys_msg(self):
         return {"role": "system", "content": self._sys_content(LEN_NOTE if self.limit_len else "")}
