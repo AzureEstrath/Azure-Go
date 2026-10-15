@@ -194,7 +194,7 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
     以及 `GET /api/state`、`GET /api/health`。
   - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki`。
   - `GET /api/health` 返回 `{ok, katago_dead, katago_error, katago_url, llm_url}`（字段都改为描述所连云服务：
-    地址 / 启动结论 / 最近错误）。其中 `katago_dead` 与 `katago_error` 必须**成对读**：
+    地址 / 引擎是否还在 / 最近错误）。其中 `katago_dead` 与 `katago_error` 必须**成对读**：
     - `katago_dead` 表示**引擎已经没了**：`start()` 探活失败、或分析时发生**传输层失败**（连接被拒 / 连接或
       读取错误，相当于旧子进程时代的「管道断了」）都会置位；一次**成功的分析会把它清掉**（云服务重启后可自愈）；
     - `katago_error` 则在**每次分析失败**时刷新（成功时清空）；
@@ -270,7 +270,7 @@ KataGo 引擎与权重遵循其上游许可。
 - **KataGo 独立成云服务**：新增 `katago_service\`（FastAPI + 常驻 `katago analysis` 子进程）：`POST /analyze`（请求/响应即引擎原文）、`GET /health`（`warming` / `ready` / `dead`）、可选 Bearer 鉴权、启动即后台预热（OpenCL 首次调优挪到部署阶段，端口不会被预热堵住），另有 `run_server.bat` 与 `--host/--port/--token/--katago-exe/--model/--config/--analysis-threads` 入口 + `KATAGO_*` 环境变量兜底。部署见第六节「KataGo 服务部署」。
 - **后端改为 HTTP 客户端**：`backend\app\engine.py` 重写为连 `/health` + `/analyze` 的客户端（就绪判定只看 `state`，不认 `ok`；超时/连接失败重试 1 次后返回可读错误），不再持有引擎子进程——`agent.py` / `prompts.py` 一行未改。子进程时代的两条坑（stderr 必须持续排空、读行缓冲放大到 64MB）随引擎搬进 `katago_service\proc.py`。
 - **配置换血**：后端与模板里的 KataGo **引擎路径三件套**（可执行文件 / 权重 / analysis 配置）换成 `katago_url`（默认 `http://127.0.0.1:8100`）/ `katago_token` / `katago_timeout_ms`；`game\config.json` 模板与 README 字段表同步，`AzureConfig.save()` 改为把这三个旧键**自我清理**（此前为兼容后端共用同一份配置而刻意保留）。后端不再解析引擎路径（`_resolve` 删除），`GET /api/health` 增加 `katago_url`。
-- **服务不可用的表现不变**：KataGo 服务没起 / 地址写错 / 预热中，后端都给出可读中文提示且 `busy` 必归位，棋盘不会永久锁死；`katago_dead` 反映启动探活、`katago_error` 每次失败刷新，两者成对读（见第六节）。
+- **服务不可用的表现不变**：KataGo 服务没起 / 地址写错 / 预热中，后端都给出可读中文提示且 `busy` 必归位，棋盘不会永久锁死；`katago_dead` 在**启动探活失败**或**分析时传输层失败**（连接被拒 / 连接或读取错误）时置位、一次成功分析会清除它，`katago_error` 每次失败刷新，两者成对读（见第六节）。
 
 ### v3.0.0
 - **只保留远程后端**：客户端删除 `AzureAgent / AzurePrompts / KataGoEngine / LLMClient / GoBoard / GameState / Joseki* / EmotionModel` 与端到端测试脚本，装配路径收敛为 `NetClient`（REST 命令 + WebSocket 事件）；`config.json` 删掉运行方式键（`local` / `remote`）、`katago_*`（前端侧）、`llm_auto_start/exe/model_path/port`、`tts_auto_start/bf16/short_prompt`、`vlm_*` 等只服务本机部署的键，旧配置读入后会在下次写回时自我清理，不会崩溃、也不会把旧键写回文件。
