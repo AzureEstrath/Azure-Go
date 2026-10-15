@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import events
 from app.tools import TOOLS, katago_analyze, joseki_lookup
+from helpers import StubLLM
 
 
 class StubEngine:
@@ -226,6 +227,122 @@ class ToolSafetyTest(unittest.TestCase):
         self.assertEqual([t["function"]["name"] for t in seen[0]["tools"]], ["board_query"])
         self.assertEqual(seen[1]["messages"][-1]["role"], "tool")        # 工具结果作为 ToolMessage 回传
         self.assertIn("X = Estarth", seen[1]["messages"][-1]["content"])  # 回给模型的是盘面图，不是台词
+
+
+class _StatusErr(Exception):
+    """带 ``status_code`` 的假异常：形状与 ``openai.APIStatusError`` 一致（安全网只读这个属性）。"""
+
+    def __init__(self, code):
+        super().__init__("HTTP %d" % code)
+        self.status_code = code
+
+
+class _FakeChain:
+    """按脚本回话的假链（``bind_tools`` 原样返回自己）：记录每次 ``bind`` 的扩展字段与调用次数。
+
+    ``reject_first=True`` 时第一次请求抛 HTTP 400 —— 用来验 ``_chain_invoke`` 的
+    「服务端拒绝参数时去掉扩展字段重试一次」安全网。
+    """
+
+    def __init__(self, script, reject_first=False):
+        self.script = list(script)
+        self.reject_first = reject_first
+        self.binds = []                  # 每次 bind 传下来的 extra_body
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def bind(self, **kw):
+        self.binds.append(dict(kw.get("extra_body") or {}))
+        return self
+
+    async def ainvoke(self, messages, **kw):
+        self.calls += 1
+        if self.reject_first and self.calls == 1:
+            raise _StatusErr(400)
+        return self.script.pop(0)
+
+
+class AiTurnToolsTest(unittest.TestCase):
+    """落子宣告那一半的工具启用点（``agent._ai_turn``）——与 ``hint()`` 并列的第二处入口。
+
+    这里跑完整回合（``player_move``）而不是只调 ``_tool_loop``：工具开着时「落点照旧由
+    ``_pick_ai_move`` 决定、音画同步的坐标照发、busy 照归位」这几条硬规则，只有在整条
+    编排里才验证得了（``hint()`` 的启用点已由 ToolSafetyTest 覆盖，这一处此前没有测试）。
+    """
+
+    def _agent(self, chain):
+        from app.agent import AzureAgent
+        bus = events.RecordingBus()
+        a = AzureAgent(StubEngine(), StubLLM(), bus)     # 点评/落子后那几句走假 LLM，工具路径走假链
+        a.chain = chain
+        a.tools_enabled = True
+        return a, bus
+
+    def test_tools_on_ai_turn_keeps_move_and_unlocks(self):
+        call = {"name": "board_query", "args": {}, "id": "c1"}
+        chain = _FakeChain([ToolLoopTest._Ai(tool_calls=[call]),
+                            ToolLoopTest._Ai(content="这手先挂角，把左边的模样撑起来。")])
+        a, bus = self._agent(chain)
+        asyncio.run(a.player_move(3, 3))
+
+        # 工具真的跑了一轮：start/end 成对，且结果是成功的
+        starts = [e for e in bus.of_type("tool") if e["phase"] == "start"]
+        ends = [e for e in bus.of_type("tool") if e["phase"] == "end"]
+        self.assertEqual([e["name"] for e in starts], ["board_query"])
+        self.assertEqual(len(ends), 1)
+        self.assertTrue(ends[0]["ok"])
+
+        # 落子宣告照常：是模型的话（不是兜底台词），且坐标由 _pick_ai_move 决定
+        moves = bus.messages(events.AI_MOVE)
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(moves[0]["text"], "这手先挂角，把左边的模样撑起来。")
+        mv = moves[0]["move"]
+        self.assertEqual((mv["gtp"], mv["x"], mv["y"]), ("Q16", 15, 3))
+        self.assertFalse(mv["pass"])
+
+        # 棋盘必须解锁（不归位＝永久锁死）
+        self.assertFalse(a.busy)
+        self.assertFalse(bus.of_type("busy")[-1]["busy"])
+        self.assertEqual(len(a.st.moves), 2)
+
+    def test_rejected_extra_body_recovers_without_it(self):
+        """服务端拒绝参数（HTTP 400）时工具路径去掉扩展字段重试一次：回合照常出话，不降级成兜底台词。"""
+        chain = _FakeChain([ToolLoopTest._Ai(content="我查过了，这手先守角。")], reject_first=True)
+        a, bus = self._agent(chain)
+        asyncio.run(a.player_move(3, 3))
+
+        self.assertEqual(chain.binds[0], {"max_tokens": 80})     # 第一次带着注入的输出上限（被拒的就是它）
+        self.assertEqual(chain.binds[-1], {})                    # 重试不再带任何扩展字段
+        self.assertEqual(chain.calls, 2)
+        moves = bus.messages(events.AI_MOVE)
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(moves[0]["text"], "我查过了，这手先守角。")
+        self.assertFalse(a.busy)
+
+
+class ExtraBodyRejectTest(unittest.TestCase):
+    """服务端拒绝过扩展字段之后（``llm._extra_body_unsupported``）：工具路径不许再加料。
+
+    不加这道闸，每次工具调用都会先挨一次 400 再走重试（每回合最多两次），
+    与 ``LLMClient._extra_for`` 的「置位后永久不再加料」不一致。
+    """
+
+    def test_extra_body_not_injected_after_provider_reject(self):
+        from app.agent import AzureAgent
+        llm = StubLLM()
+        llm._extra_body_unsupported = True               # 与 LLMClient 被拒后的状态一致
+        chain = _FakeChain([ToolLoopTest._Ai(tool_calls=[{"name": "board_query", "args": {}, "id": "c1"}]),
+                            ToolLoopTest._Ai(content="盘面我看过了。")])
+        a = AzureAgent(StubEngine(), llm, events.RecordingBus())
+        a.chain = chain
+        a.tools_enabled = True
+        out = asyncio.run(a._tool_loop([{"role": "user", "content": "x"}], 120, "observe",
+                                       tools=[t for t in TOOLS if t.name == "board_query"]))
+        self.assertEqual(out, "盘面我看过了。")
+        self.assertEqual(chain.binds, [{}])              # 一个扩展字段都不许再加
+        self.assertEqual(chain.calls, 2)                 # 两次都是模型往返，没有 400 重试
 
 
 if __name__ == "__main__":

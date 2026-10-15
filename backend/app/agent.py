@@ -284,10 +284,15 @@ class AzureAgent:
         ``ainvoke(max_tokens=…)`` 会被 langchain-openai 改名成 ``max_completion_tokens``，
         目标服务端不认）；``bind(extra_body=…)`` 是整体替换，所以先并入链自带的扩展字段。
         没有 ``bind`` 的鸭子类型链（测试替身）只能退回 ``ainvoke`` 参数。
+
+        服务端拒绝过扩展字段（``llm._extra_body_unsupported``）时什么都不加：与
+        ``LLMClient._extra_for`` 同一判据——不加料，工具路径才不会每次调用都白挨一次 400 再重试。
         """
         bound = self.chain.bind_tools(list(pool))
         if not hasattr(bound, "bind"):
             return bound, {"max_tokens": max_tokens}
+        if getattr(self.llm, "_extra_body_unsupported", False):
+            return bound.bind(extra_body={}), {}
         body = dict(getattr(self.chain, "extra_body", None) or {})
         if "max_tokens" not in body and "max_completion_tokens" not in body:
             body["max_tokens"] = max_tokens
