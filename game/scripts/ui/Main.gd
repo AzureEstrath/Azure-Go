@@ -93,6 +93,8 @@ var _lbl_moves: Label
 var _lbl_wr: Label
 var _lbl_score: Label
 var _lbl_status: Label
+var _status_before_tool := ""                  # 她查资料前状态栏的原文案（end 时恢复）
+var _tool_active := false                      # 工具进度是否在跑（start/end 成对，避免重复记原文案）
 var _chk_pass: CheckBox
 var _chk_joseki: CheckBox
 var _bad_box: HBoxContainer
@@ -1332,6 +1334,7 @@ func _wire_agent() -> void:
 	agent.busy_changed.connect(_on_busy_changed)
 	agent.mood_changed.connect(_on_mood_changed)
 	agent.joseki_event.connect(_on_joseki_event)
+	agent.tool_event.connect(_on_tool_event)
 	var mood_timer := Timer.new()                 # 三维情绪向基线回落的心跳：2 秒一次，区域没变时零开销
 	mood_timer.wait_time = 2.0
 	mood_timer.autostart = true
@@ -1382,6 +1385,20 @@ func _on_joseki_event(payload: Dictionary) -> void:
 	if pts.is_empty():
 		return
 	board.highlight_points(pts, str(payload.get("kind", "formed")))
+
+## 她自己查资料（发言侧工具）：只在状态栏提示一句，end 时恢复原文案。
+## 工具返回的原始盘面/JSON 永远不会显示给玩家——她的台词仍由后端生成的对话事件送达。
+func _on_tool_event(payload: Dictionary) -> void:
+	if _lbl_status == null:
+		return
+	if str(payload.get("phase", "")) == "start":
+		if not _tool_active:
+			_status_before_tool = _lbl_status.text     # 记下原状态，工具返回后恢复
+			_tool_active = true
+		_set_status("她正在查资料…")
+	elif _tool_active:
+		_set_status(_status_before_tool)
+		_tool_active = false
 
 ## 左键点在 Azure 头部附近摸摸头：开心 + 微微脸红 + 一句轻快的语气词（情绪模型同步静默加成）
 func _on_head_patted() -> void:

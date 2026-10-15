@@ -8,7 +8,7 @@
     POST /api/summarize   {note}            对局总结
     POST /api/undo        {turn}            俗手回档
     POST /api/reset                         重开一局
-    POST /api/config      {allow_pass}      允许虚着开关
+    POST /api/config      {allow_pass}      允许虚着开关（另见 limit_len / joseki_teach / tools_enabled）
     POST /api/reveal                        落子宣告语音开始（需要 round-trip 的客户端）
     POST /api/interaction {what}            玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话
@@ -16,8 +16,8 @@
     GET  /api/state                         当前棋盘权威快照
     GET  /api/health                        引擎/LLM 状态
 
-事件通道（WebSocket /ws）——后端把 6 类事件推给客户端，契约见 events.py：
-    message / state / info / busy / mood / joseki（连接建立时先发一次 hello 同步）。
+事件通道（WebSocket /ws）——后端把 7 类事件推给客户端，契约见 events.py：
+    message / state / info / busy / mood / joseki / tool（连接建立时先发一次 hello 同步）。
 
 REST 应答统一返回 {"ok": bool, "state": <棋盘快照>}：命令是否被接受由 ok/busy 判断，
 台词等内容一律经由 WS 事件送达（音画同步由客户端本地完成）。
@@ -56,7 +56,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
             cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key,
                                                          think_mode=cfg.llm_think_mode,
                                                          extra_body=merge_extra_body(cfg))
-            app.state.agent = AzureAgent(eng, cli, events.EventBus(), joseki_teach=cfg.joseki_teach)
+            app.state.agent = AzureAgent(eng, cli, events.EventBus(), joseki_teach=cfg.joseki_teach,
+                                         tools_enabled=cfg.tools_enabled, max_tool_calls=cfg.max_tool_calls)
             if autostart:
                 ok = await eng.start()
                 if not ok:
@@ -160,6 +161,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
             s.limit_len = bool(body["limit_len"])
         if "joseki_teach" in body:              # 客户端「定式导学」开关：转发到后端编排
             s.joseki_teach = bool(body["joseki_teach"])
+        if "tools_enabled" in body:             # 发言侧工具开关：开启后她才会在提示/落子宣告里查资料
+            s.tools_enabled = bool(body["tools_enabled"])
         return ok()
 
     @app.post("/api/reveal")

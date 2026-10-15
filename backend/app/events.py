@@ -1,6 +1,6 @@
-"""客户端事件契约与事件总线（对应前端 `NetClient.gd` 的 6 个 signal）。
+"""客户端事件契约与事件总线（对应前端 `NetClient.gd` 的 7 个 signal）。
 
-前端的 6 个 signal 由后端事件驱动；分离后是「后端发事件 → WS 推给客户端」。
+前端的 7 个 signal 由后端事件驱动；分离后是「后端发事件 → WS 推给客户端」。
 本模块把契约集中在一处，避免各处 magic string：
 
     message       ↔  message(kind, text)        对话/点评/落子宣告（kind 见下）
@@ -9,6 +9,7 @@
     busy          ↔  busy_changed(busy)
     mood          ↔  mood_changed(payload)      三维情绪区域（表情/语气词/音高）
     joseki        ↔  joseki_event(payload)      定式高亮轨迹（kind/corner/points）
+    tool          ↔  tool_event(payload)        她自己查资料（start/end，只给状态栏看）
 
 事件统一为 dict，``type`` 字段走对应构造器；客户端按 type 分发。
 message.kind 取值与前端 message 信号一致：
@@ -16,6 +17,9 @@ message.kind 取值与前端 message 信号一致：
 
 ``ai_move`` 额外带 ``move`` 字段（{x, y, gtp, pass}）；客户端在落子宣告语音开始时
 ``POST /api/reveal`` 让后端把这一手推到棋盘（round-trip：语音开始才揭示那一手）。
+
+``tool`` 只描述「她自己查了一次资料」的进度（``phase`` = start/end），**不是台词**：
+前端只用它更新状态栏文案，工具返回的原始文本永远只回到模型手里。
 """
 
 # —— message.kind ——
@@ -58,6 +62,16 @@ def joseki(payload):
     e = {"type": "joseki"}
     e.update(payload)
     return e
+
+
+def tool(phase, name, args=None, ok=True, ms=0):
+    """工具执行进度（只给状态栏用，不是台词）：start 在调用前、end 在返回后。
+
+    ``args`` 只带模型自己给的那份参数（注入的引擎对象不可序列化，也不该外泄）；
+    ``ok``/``ms`` 只在 ``end`` 上有意义，``start`` 固定 ``True``/``0``。
+    """
+    return {"type": "tool", "phase": str(phase), "name": str(name),
+            "args": dict(args or {}), "ok": bool(ok), "ms": int(ms)}
 
 
 def hello(payload, mood_payload, busy):

@@ -12,11 +12,15 @@ import random
 import re
 import time
 
+from langchain_core.messages import ToolMessage
+
 from . import coords, events, prompt_chains, prompts
 from .board import SIZE as BOARD_SIZE
 from .emotion import EmotionModel
 from .joseki import JosekiRecognizer
+from .llm_chain import content_of
 from .state import GameState
+from .tools import TOOLS, failed as tool_failed
 
 # LLM「情绪变化」小调用：限频 + 忙时跳过，保护主对话的响应速度与 KV 前缀缓存
 MOOD_LLM_GAP_MS = 15000
@@ -32,6 +36,20 @@ LEN_NOTE = ("\n\n【本次额外要求 · 优先遵守】\n"
 LEN_TEACH_NOTE = ("\n\n【本次额外要求 · 优先遵守】\n"
                   "- 这是定式讲解：把名称与要点讲清楚，2~3 句即可，别长篇大论\n"
                   "- 不复述局面、不客套，直接开讲就好")
+
+# —— 发言侧工具（她自己决定要不要查资料；只影响怎么说，不影响下哪里）——
+# 工具总次数硬上限：一次发言最多两次，防止「一直查、不回答」
+MAX_TOOL_CALLS = 2
+# 单工具超时（秒）：超时即返回超时文本，不阻塞回合
+TOOL_TIMEOUT_SEC = 10
+# 一次 tool loop 的模型往返硬上限：工具预算之外，还允许若干轮「别再调工具、直接回答」的催促；
+# 到顶就按现有内容收尾（拿不到正文时由调用方的兜底台词顶上），绝不允许无限往返
+MAX_TOOL_ROUNDS = 12
+# 参数里带棋谱的工具：模型没给棋谱时由后端注入当前局面
+MOVE_TOOLS = ("katago_analyze", "board_query")
+# 预算用尽 / 工具超时后给模型的追加指令（作为 ToolMessage 内容，不是台词）
+TOOL_BUDGET_TEXT = "工具调用次数已达上限（%d 次），这次不再执行；请不要再调用任何工具，直接用自然语言回答。"
+TOOL_TIMEOUT_TEXT = "工具执行超时（%d 秒），这次没取到结果；别再重试同一个工具，直接回答。"
 
 # 括号里带「着棋点位」的舞台提示不需要显示，例如（白棋落在 C4）/（第7手 Q16）/（C4）
 _PAREN_GROUP_PATTERN = "[（(][^（()）\\n]{0,40}[）)]"
@@ -62,7 +80,8 @@ CHAT_FALLBACK_LINES = [
 
 
 class AzureAgent:
-    def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False):
+    def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False,
+                 tools_enabled=False, max_tool_calls=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -72,6 +91,12 @@ class AzureAgent:
         self.joseki_teach = joseki_teach
         self.limit_len = limit_len
         self.busy = False
+
+        # —— 发言侧工具：默认关闭，行为与没有工具时完全一致 ——
+        self.tools_enabled = bool(tools_enabled)
+        want = MAX_TOOL_CALLS if max_tool_calls is None else int(max_tool_calls)
+        self.max_tool_calls = max(0, min(want, MAX_TOOL_CALLS))    # 配置只能收紧，不能突破硬上限
+        self._chain = None
 
         self._mood_region = -1
         self._mood_ms = 0
@@ -214,6 +239,143 @@ class AzureAgent:
         except Exception as e:                  # noqa: BLE001
             print("[Agent] LLM 调用异常：%s" % e)
             return ""
+
+    # ================= 发言侧工具（她自己查资料） =================
+
+    @property
+    def chain(self):
+        """LangChain 链：默认实时取 ``llm.chain``。
+
+        ``LLMClient`` 在扩展字段被服务端拒绝后会**重建**链实例，抱住旧引用会一直带着被拒的字段，
+        所以这里每次现取；测试可直接赋值替换（赋值即固定，不再回看 ``llm.chain``）。
+        """
+        if self._chain is not None:
+            return self._chain
+        return getattr(self.llm, "chain", None)
+
+    @chain.setter
+    def chain(self, v):
+        self._chain = v
+
+    def _chain_ok(self) -> bool:
+        """直连链的前置检查（``LLMClient.chat`` 里 ``_url_ok`` 的同一判据）。
+
+        未配置 ``llm_base_url`` 时 openai 客户端会静默退回 api.openai.com：真连外网、单次卡几十秒，
+        所以工具路径也必须先拦（链自己没这个预检）。没接 LLM（测试注入链）时无从查起，按可用处理。
+        """
+        if self.llm is None:
+            return True
+        u = str(getattr(self.llm, "base_url", "") or "").strip().lower()
+        return u.startswith("http://") or u.startswith("https://")
+
+    def _tool_args(self, name, args) -> dict:
+        """补齐工具参数：引擎与当前棋谱由后端注入，模型不必（也不该）自己编。"""
+        out = dict(args or {})
+        if name == "katago_analyze":
+            out["engine"] = self.katago
+        if name in MOVE_TOOLS and not out.get("moves"):
+            out["moves"] = [list(m) for m in self.st.moves]
+        return out
+
+    def _bind_tools(self, pool, max_tokens) -> tuple:
+        """给链绑上工具与本次输出上限，返回 ``(可调用的链, ainvoke 的调用参数)``。
+
+        上限走 ``extra_body`` 的线上键 ``max_tokens``（与 ``LLMClient.chat`` 同一理由：
+        ``ainvoke(max_tokens=…)`` 会被 langchain-openai 改名成 ``max_completion_tokens``，
+        目标服务端不认）；``bind(extra_body=…)`` 是整体替换，所以先并入链自带的扩展字段。
+        没有 ``bind`` 的鸭子类型链（测试替身）只能退回 ``ainvoke`` 参数。
+        """
+        bound = self.chain.bind_tools(list(pool))
+        if not hasattr(bound, "bind"):
+            return bound, {"max_tokens": max_tokens}
+        body = dict(getattr(self.chain, "extra_body", None) or {})
+        if "max_tokens" not in body and "max_completion_tokens" not in body:
+            body["max_tokens"] = max_tokens
+        return bound.bind(extra_body=body), {}
+
+    async def _chain_invoke(self, bound, msgs, kwargs):
+        """发一次工具链请求；服务端拒绝参数（HTTP 400/422）时去掉扩展字段与输出上限重试一次。
+
+        与 ``LLMClient.chat`` 同一安全网：有的 OpenAI 兼容服务遇到未知字段直接 400，
+        工具路径不能因此把本来能说话的回合变成兜底台词。
+        """
+        try:
+            return await bound.ainvoke(msgs, **kwargs)
+        except Exception as e:                  # noqa: BLE001
+            if getattr(e, "status_code", None) not in (400, 422):
+                raise
+            print("[Agent] 工具调用被服务端拒绝参数（HTTP %d），去掉扩展字段与输出上限重试一次" % e.status_code)
+            return await bound.bind(extra_body={}).ainvoke(msgs)
+
+    async def _run_tool(self, by_name, name, args) -> str:
+        """执行一个工具：发 ``tool`` start/end 事件，返回给模型的 ``ToolMessage`` 文本；绝不抛出。
+
+        ``ok`` 的判据只有两个：工具自己给出的失败文本（``tools.FAIL_PREFIX``）、超时。
+        ``args`` 传的是**模型给的那份**——注入的引擎对象不可序列化，也不该推给客户端。
+        """
+        self._emit(events.tool("start", name, args))
+        t0 = time.monotonic()
+        if name not in by_name:
+            text = "没有这个工具（%s），可用的只有：%s。" % (name, "、".join(sorted(by_name)))
+            ok = False
+        else:
+            try:
+                text = str(await asyncio.wait_for(
+                    by_name[name].ainvoke(self._tool_args(name, args)), TOOL_TIMEOUT_SEC))
+                ok = not tool_failed(text)
+            except asyncio.TimeoutError:
+                text = TOOL_TIMEOUT_TEXT % TOOL_TIMEOUT_SEC
+                ok = False
+            except Exception as e:              # noqa: BLE001
+                text = "工具执行失败（%s），这次先不参考它，直接回答。" % e
+                ok = False
+        self._emit(events.tool("end", name, args, ok, int((time.monotonic() - t0) * 1000)))
+        return text
+
+    async def _tool_loop(self, messages, max_tokens, phase="", tools=None) -> str:
+        """受限 tool loop：模型可以在预算内先查资料，再落回一句自然语言。
+
+        只在 ``hint()`` 与 ``_ai_turn()`` 的落子宣告两处启用（且 ``tools_enabled`` 为真）：
+        聊天/闲置这类短回合不走 tool loop，免得白等工具往返的时延。
+
+        硬规则：
+        - 工具次数上限 ``self.max_tool_calls``（默认 ``MAX_TOOL_CALLS``），单工具超时 ``TOOL_TIMEOUT_SEC``；
+          预算用尽后不再执行工具，只追加「别再调工具、直接回答」的指令催它收尾；
+        - 工具与链的任何失败都不许抛出：失败变成可读 ``ToolMessage``，链抛错则返回空串，
+          由调用方的兜底台词顶上（与 ``_reply`` 同一降级）；
+        - 玩家看到的永远是模型重写的自然语言（``clean_reply`` 必经），工具输出只回到模型手里；
+        - 链不可用（没接 LLM / 未配置地址）或预算为 0 时退回 ``_reply``：与不开工具完全同一条路。
+        """
+        pool = list(TOOLS if tools is None else tools)
+        by_name = {t.name: t for t in pool}
+        if self.chain is None or not self._chain_ok() or self.max_tool_calls <= 0:
+            return await self._reply(messages, max_tokens)
+        bound, kwargs = self._bind_tools(pool, max_tokens)
+        msgs = list(messages)
+        used = 0
+        ai = None
+        for _ in range(MAX_TOOL_ROUNDS):
+            try:
+                ai = await self._chain_invoke(bound, msgs, kwargs)
+            except Exception as e:              # noqa: BLE001
+                print("[Agent] tool loop 调用异常（%s）：%s" % (phase, e))
+                return ""
+            calls = list(getattr(ai, "tool_calls", None) or [])
+            if not calls:                       # 没有工具请求：这就是她要说的话
+                return self.clean_reply(content_of(ai))
+            msgs.append(ai)
+            for tc in calls:
+                name = str(tc.get("name", ""))
+                args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                if used >= self.max_tool_calls:  # 预算用尽：不再执行，催它直接回答（不存在的工具同样占预算）
+                    msgs.append(ToolMessage(TOOL_BUDGET_TEXT % self.max_tool_calls,
+                                            tool_call_id=str(tc.get("id", ""))))
+                    continue
+                used += 1
+                msgs.append(ToolMessage(await self._run_tool(by_name, name, args),
+                                        tool_call_id=str(tc.get("id", ""))))
+        print("[Agent] tool loop 到达往返上限（%d 次，%s）：按现有内容收尾" % (MAX_TOOL_ROUNDS, phase))
+        return self.clean_reply(content_of(ai)) if ai is not None else ""
 
     # ================= 三维情绪 =================
 
@@ -505,10 +667,14 @@ class AzureAgent:
             think_hint = "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
             think_prompt = "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过Estarth那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。换一个全新的说法，别总用「嗯~」「唔」开头，句式也别和刚才那条点评一样。" % think_hint
             await asyncio.sleep(0.35)
-            think_msg = await self._reply(self._phase_messages(
+            think_msgs = self._phase_messages(
                 "own_turn",
                 prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, think_prompt, "own_turn", False, self.st.last_katago, self.st.board),
-            ), 80)
+            )
+            if self.tools_enabled:                  # 工具只在这一处与提示启用；落点照旧由 _pick_ai_move 决定
+                think_msg = await self._tool_loop(think_msgs, 80, "own_turn")
+            else:
+                think_msg = await self._reply(think_msgs, 80)
             if self._llm_failed(think_msg):         # 云端失败：落子宣告退化为兜底台词（坐标照常揭示）
                 think_msg = self._fallback_line("game")
             # 这条语音开始播放时，界面才把她的子放上棋盘（事件带坐标，客户端本地揭示）
@@ -619,10 +785,14 @@ class AzureAgent:
             self._update_katago_brief(analysis, n)
             prompt = "当前局面：%s。我算到的好点：%s。Estarth还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）；换个说法开场，别重复你上一次提示的句式和口头禅。" % (
                 prompts.board_summary(self.st.move_seq), self._py_list(tops))
-            msg = await self._reply(self._phase_messages(
+            msgs = self._phase_messages(
                 "observe",
                 prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "observe", False, self.st.last_katago, self.st.board),
-            ), 300)
+            )
+            if self.tools_enabled:                  # 工具只在这一处与落子宣告启用（短回合不背工具往返）
+                msg = await self._tool_loop(msgs, 300, "observe")
+            else:
+                msg = await self._reply(msgs, 300)
             if self._llm_failed(msg):               # 云端失败：提示退化为兜底台词
                 msg = self._fallback_line("game")
             self._emit(events.message(events.AI_COMMENT, msg))

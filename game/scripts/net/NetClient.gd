@@ -4,7 +4,7 @@ extends Node
 ##
 ## 对 Main.gd 暴露的信号与方法面（Main 的 agent.* 调用点只认这套契约）：
 ##   - 命令：REST POST（/api/move /api/hint /api/analyze /api/chat ... 见 docs）
-##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki；连上先收 hello 同步）
+##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool；连上先收 hello 同步）
 ##
 ## 音画同步仍在客户端完成：`ai_move` 那条「落子宣告」的语音开始时，Main 调 reveal_move()，
 ## 这里 POST /api/reveal 让后端把已落到内部棋谱的那一手推给界面显示。
@@ -18,6 +18,8 @@ signal info_changed(winrate: float, score: float)
 signal busy_changed(busy: bool)
 signal mood_changed(payload: Dictionary)
 signal joseki_event(payload: Dictionary)
+## 她自己查资料（phase=start/end）：只给状态栏用，工具返回的原文永远不会走到这里
+signal tool_event(payload: Dictionary)
 ## 连接状态提示（Main 接到状态栏）
 signal net_status(text: String, bad: bool)
 
@@ -131,6 +133,8 @@ func _handle_packet(raw: String) -> void:
 			mood_changed.emit(_without_type(d))
 		"joseki":
 			joseki_event.emit(_without_type(d))
+		"tool":
+			tool_event.emit(_without_type(d))
 
 static func _dict(v) -> Dictionary:
 	return v if typeof(v) == TYPE_DICTIONARY else {}

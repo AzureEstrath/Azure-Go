@@ -25,6 +25,9 @@ class AzureConfig:
         # —— 请求体扩展字段（透传给 OpenAI 兼容服务，如 top_k / reasoning_effort）——
         self.llm_extra_body = {}            # 始终并入
         self.llm_think_extra_body = {}      # 仅思考档位开启（think_mode > 0）时并入
+        # —— 发言侧工具（她自己查盘/复算/查定式；只影响怎么说，不影响下哪里）——
+        self.tools_enabled = False          # 默认关闭：行为与没有工具时完全一致
+        self.max_tool_calls = 2             # 一次发言的工具次数上限（agent 侧还有硬上限）
         # —— 提示词自定义（留空则用内置 Azure 人设）——
         self.prompt_system = ""
         self.prompt_user_name = "Estarth"
@@ -77,6 +80,8 @@ class AzureConfig:
         tb = d.get("llm_think_extra_body")
         if isinstance(tb, dict):
             self.llm_think_extra_body = dict(tb)
+        self.tools_enabled = bool(d.get("tools_enabled", self.tools_enabled))
+        self.max_tool_calls = max(0, int(d.get("max_tool_calls", self.max_tool_calls)))
         self.prompt_system = str(d.get("prompt_system", self.prompt_system))
         self.prompt_user_name = str(d.get("prompt_user_name", self.prompt_user_name))
         pn = d.get("prompt_phase_notes")
