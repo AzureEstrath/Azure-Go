@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import events
 from app.agent import AzureAgent
-from helpers import BoomLLM, ErrLLM
+from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM
 from helpers import mk_agent as _mk
 
 
@@ -337,6 +337,94 @@ class FailSafeTest(unittest.TestCase):
             texts = [str(e.get("text", "")) for e in bus.messages(events.AI)]
             self.assertTrue(any(t.startswith("📋 对局总结") for t in texts), tag)
             self._assert_says_something(tag, bus, events.AI)
+
+
+class FakeMemory:
+    def __init__(self, text=""):
+        self.text = text
+        self.games = []
+
+    @property
+    def available(self):
+        return True
+
+    def recall_for(self, query, k=None):
+        return self.text
+
+    def remember_game(self, moves, result, summary):
+        self.games.append((len(moves), result, summary))
+
+
+class MemoryWiringTest(unittest.TestCase):
+    def test_constructor_accepts_memory(self):
+        """构造参数接口：main.py 的 lifespan 用 ``memory=`` 注入。"""
+        mem = FakeMemory()
+        agent = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus(), memory=mem)
+        self.assertIs(agent.memory, mem)
+
+    def test_no_memory_keeps_long_term_empty(self):
+        agent, _eng, llm, _bus = _mk()
+        agent.memory = None
+
+        async def run():
+            await agent.player_move(3, 3)
+
+        asyncio.run(run())
+        for msgs, _mt, _nt in llm.calls:
+            for m in msgs:
+                if m["role"] == "user":
+                    self.assertNotIn("长期记忆", m["content"])
+
+    def test_memory_text_reaches_prompts(self):
+        agent, _eng, _llm, _bus = _mk()
+        agent.memory = FakeMemory("Estarth 喜欢点三三")
+
+        async def run():
+            await agent.chat("你好")
+
+        asyncio.run(run())
+        # 真实断言：至少一条 user 消息里带上了召回文本
+        sent = [m["content"] for c in agent.llm.calls for m in c[0] if m["role"] == "user"]
+        self.assertTrue(any("Estarth 喜欢点三三" in s for s in sent))
+
+    def test_memory_text_reaches_ai_turn_context(self):
+        """她这一回合（_ai_turn）也要带召回文本——这条走 with_context 的透传路径。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent.memory = FakeMemory("Estarth 喜欢点三三")
+
+        async def run():
+            await agent.player_move(3, 3)
+
+        asyncio.run(run())
+        sent = [m["content"] for c in agent.llm.calls for m in c[0] if m["role"] == "user"]
+        self.assertTrue(any("Estarth 喜欢点三三" in s for s in sent))
+
+    def test_summary_writes_long_term_memory(self):
+        agent, _eng, _llm, _bus = _mk()
+        mem = FakeMemory()
+        agent.memory = mem
+
+        async def run():
+            await agent.player_move(3, 3)
+            await agent.summarize("测试备注")
+
+        asyncio.run(run())
+        self.assertEqual(len(mem.games), 1)
+        self.assertGreater(mem.games[0][0], 0)
+
+    def test_summary_fallback_is_not_stored(self):
+        """云端失败时的兜底台词不算总结：不得写进长期记忆（记忆污染）。"""
+        agent, _eng, _llm, _bus = _mk()
+        mem = FakeMemory()
+        agent.memory = mem
+        agent.llm = ErrLLM()
+
+        async def run():
+            await agent.player_move(3, 3)
+            await agent.summarize("辛苦啦")
+
+        asyncio.run(run())
+        self.assertEqual(len(mem.games), 0)
 
 
 if __name__ == "__main__":

@@ -81,7 +81,7 @@ CHAT_FALLBACK_LINES = [
 
 class AzureAgent:
     def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False,
-                 tools_enabled=False, max_tool_calls=None):
+                 tools_enabled=False, max_tool_calls=None, memory=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -97,6 +97,9 @@ class AzureAgent:
         want = MAX_TOOL_CALLS if max_tool_calls is None else int(max_tool_calls)
         self.max_tool_calls = max(0, min(want, MAX_TOOL_CALLS))    # 配置只能收紧，不能突破硬上限
         self._chain = None
+
+        # —— 跨局长期记忆：默认不接线（None），由 main.py 的 lifespan 注入 MemoryService ——
+        self.memory = memory
 
         self._mood_region = -1
         self._mood_ms = 0
@@ -381,6 +384,35 @@ class AzureAgent:
                                         tool_call_id=str(tc.get("id", ""))))
         print("[Agent] tool loop 到达往返上限（%d 次，%s）：按现有内容收尾" % (MAX_TOOL_ROUNDS, phase))
         return self.clean_reply(content_of(ai)) if ai is not None else ""
+
+    # ================= 长期记忆（跨局） =================
+
+    def _long_term(self, query) -> str:
+        """召回跨局长期记忆的注入文本；未接线 / 未启用 / 任何故障一律返回空串。
+
+        默认不接线（``memory is None``）或 ``available == False`` 时不注入——
+        关闭长期记忆时的提示词与没有这个功能时逐字符一致。召回在出话路径上，
+        这里再兜一层异常保护，绝不让记忆把这一回合的 ``busy`` 卡住。
+        """
+        mem = self.memory
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return ""
+        try:
+            return str(mem.recall_for(str(query or "")) or "")
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 长期记忆召回异常（已忽略）：%s" % e)
+            return ""
+
+    def _remember_game(self, summary, black_wr, score):
+        """把这一局的总结写进长期记忆（``result`` 渲染成一行）；失败只打日志，不影响对局。"""
+        mem = self.memory
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return
+        try:
+            result = "黑方（Estarth）胜率 %s，目差 %s" % (self._pct(black_wr), "%+.1f" % score)
+            mem.remember_game(list(self.st.moves), result, str(summary or ""))
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 长期记忆写入异常（已忽略）：%s" % e)
 
     # ================= 三维情绪 =================
 
@@ -668,13 +700,18 @@ class AzureAgent:
             pick = self._pick_ai_move(after_infos)
             ai_gtp, ai_x, ai_y = pick[0], pick[1], pick[2]
 
+            # 跨局长期记忆：本回合一次召回（查询＝最近一手 + 阶段），
+            # 下面「用意」与「落子后感想」两段话共用，不做两次 embedding 往返
+            last_gtp = str(self.st.moves[-1][1]) if self.st.moves else "（空盘）"
+            lt = self._long_term("最近一手 %s，阶段 own_turn" % last_gtp)
+
             # 用意：落子前说明「我准备下在哪、想做什么」
             think_hint = "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
             think_prompt = "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过Estarth那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。换一个全新的说法，别总用「嗯~」「唔」开头，句式也别和刚才那条点评一样。" % think_hint
             await asyncio.sleep(0.35)
             think_msgs = self._phase_messages(
                 "own_turn",
-                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, think_prompt, "own_turn", False, self.st.last_katago, self.st.board),
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, think_prompt, "own_turn", False, self.st.last_katago, self.st.board, lt),
             )
             if self.tools_enabled:                  # 工具只在这一处与提示启用；落点照旧由 _pick_ai_move 决定
                 think_msg = await self._tool_loop(think_msgs, 80, "own_turn")
@@ -723,7 +760,7 @@ class AzureAgent:
                 ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (ai_gtp, player_eval, think_msg)
             ai_eval = await self._reply(self._phase_messages(
                 "just_moved",
-                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, ai_eval_prompt, "just_moved", False, self.st.last_katago, self.st.board),
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, ai_eval_prompt, "just_moved", False, self.st.last_katago, self.st.board, lt),
             ), 120)
             if str(jk2.get("kind", "")) == "formed" and self._llm_failed(ai_eval):
                 ai_eval = prompts.joseki_fallback(str(jk2["name"]), str(jk2["key"]))
@@ -859,7 +896,8 @@ class AzureAgent:
         try:
             msgs = [
                 self._sys_msg(),
-                self._user_msg(prompts.context_block(self.st.moves, self.st.memory_log, self.st.chat_history, "chat", True, self.st.last_katago, self.st.board)),
+                self._user_msg(prompts.context_block(self.st.moves, self.st.memory_log, self.st.chat_history, "chat", True, self.st.last_katago, self.st.board,
+                                                     long_term=self._long_term(text))),
             ]
             hist = self.st.chat_history
             upto = len(hist) - 1            # 最后一条是刚追加的这句，下面单独发，避免重复
@@ -923,10 +961,13 @@ class AzureAgent:
                 "summary",
                 prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "summary", False, self.st.last_katago, self.st.board),
             ), 600)
-            if self._llm_failed(text):              # 云端失败：总结退化为兜底台词
+            failed = self._llm_failed(text)
+            if failed:                              # 云端失败：总结退化为兜底台词
                 text = self._fallback_line("chat")
             self.st.finished = True
             self._emit(events.message(events.AI, "📋 对局总结\n" + text))
+            if not failed:                          # 只写真总结：兜底台词不是总结，写进去会污染记忆
+                self._remember_game(text, final_wr, final_score)
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
             print("[Agent] 总结异常：%s" % e)
             self._emit(events.message(events.AI, "📋 对局总结\n" + self._fallback_line("chat")))

@@ -14,7 +14,7 @@
     POST /api/idle                          闲置搭话
     POST /api/mood/tick                     情绪心跳（向基线回落）
     GET  /api/state                         当前棋盘权威快照
-    GET  /api/health                        引擎/LLM 状态
+    GET  /api/health                        引擎/LLM/长期记忆状态
 
 事件通道（WebSocket /ws）——后端把 7 类事件推给客户端，契约见 events.py：
     message / state / info / busy / mood / joseki / tool（连接建立时先发一次 hello 同步）。
@@ -34,6 +34,7 @@ from .agent import AzureAgent
 from .engine import KataGoEngine
 from .llm import LLMClient
 from .llm_chain import merge_extra_body
+from .memory_service import MemoryService
 
 
 def _int(v, d=-1):
@@ -51,20 +52,25 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         prompts.configure(cfg)
+        memory = MemoryService(cfg)             # 长期记忆：默认关闭时零开销（不建库、不调接口）
+        app.state.memory = memory
         if agent is None:
             eng = engine if engine is not None else KataGoEngine(cfg.katago_url, cfg.katago_token, cfg.max_visits, cfg.katago_timeout_ms)
             cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key,
                                                          think_mode=cfg.llm_think_mode,
                                                          extra_body=merge_extra_body(cfg))
             app.state.agent = AzureAgent(eng, cli, events.EventBus(), joseki_teach=cfg.joseki_teach,
-                                         tools_enabled=cfg.tools_enabled, max_tool_calls=cfg.max_tool_calls)
+                                         tools_enabled=cfg.tools_enabled, max_tool_calls=cfg.max_tool_calls,
+                                         memory=memory)
             if autostart:
                 ok = await eng.start()
                 if not ok:
                     print("[KataGo] 云服务不可用：" + eng.last_error())
         else:
             app.state.agent = agent
+            app.state.agent.memory = memory     # 注入的 agent 也接上同一个实例
         yield
+        memory.close()                          # 退出时收尾（可重复调用）
         if autostart:
             await app.state.agent.katago.shutdown()
             await app.state.agent.llm.close()
@@ -78,6 +84,16 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
         s = a()
         return {"ok": True, "busy": s.busy, "state": s.st.payload()}
 
+    def memory_rows() -> int:
+        """长期记忆行数：未启用 / 库不可用时为 0（健康面绝不上抛）。"""
+        store = getattr(getattr(app.state, "memory", None), "store", None)
+        if store is None:
+            return 0
+        try:
+            return int(store.stats().get("rows", 0) or 0)
+        except Exception:                       # noqa: BLE001
+            return 0
+
     @app.get("/api/health")
     async def health():
         s = a()
@@ -89,6 +105,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
             # 故可能与引擎实例实际连的地址不同；这里不读引擎实例（测试注入的 stub 没有 .url）。
             "katago_url": cfg.katago_url,
             "llm_url": s.llm.base_url,
+            "memory_rows": memory_rows(),
         }
 
     @app.get("/api/state")

@@ -6,6 +6,7 @@
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,7 +32,7 @@ class RestTest(unittest.TestCase):
             self.assertEqual(r.status_code, 200)
             self.assertTrue(r.json()["ok"])
             self.assertEqual(set(r.json()),
-                             {"ok", "katago_dead", "katago_error", "katago_url", "llm_url"})
+                             {"ok", "katago_dead", "katago_error", "katago_url", "llm_url", "memory_rows"})
 
             self.assertEqual(client.get("/api/state").json()["move_count"], 0)
 
@@ -132,6 +133,30 @@ class CloudFailRestTest(unittest.TestCase):
                     self.assertTrue(moved, "落子宣告必须照常（Review Focus #3）")
                     for e in got:
                         self.assertNotIn("调用出错", str(e.get("text", "")))
+
+
+class MemoryHealthTest(unittest.TestCase):
+    """长期记忆接线：lifespan 构造 ``MemoryService`` 并注入 agent；健康面报行数。"""
+
+    def test_disabled_reports_zero_rows(self):
+        """默认关闭：不建库、健康面报 0（零开销的判据之一）。"""
+        with _client() as client:
+            self.assertEqual(client.get("/api/health").json()["memory_rows"], 0)
+
+    def test_enabled_rows_reach_health_and_close_on_exit(self):
+        from app.config import AzureConfig
+        with tempfile.TemporaryDirectory() as d:
+            cfg = AzureConfig()
+            cfg.memory_enabled = True
+            cfg.memory_db_path = os.path.join(d, "m.db")
+            app = create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(), autostart=False)
+            with TestClient(app) as client:
+                svc = app.state.agent.memory           # lifespan 注入的实例
+                self.assertTrue(svc.available)
+                self.assertIsInstance(svc.remember_fact("Estarth 喜欢点三三", tag="estarth"), int)
+                self.assertEqual(client.get("/api/health").json()["memory_rows"], 1)
+            # 退出时 close()：库已关，统计退回全 0（库文件仍在）
+            self.assertEqual(app.state.memory.store.stats()["rows"], 0)
 
 
 class AssemblyTest(unittest.TestCase):
