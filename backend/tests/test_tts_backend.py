@@ -262,7 +262,10 @@ class SystemModeTest(unittest.TestCase):
             (True, "system", "https://x/v1", True),
             (False, "openai", "https://x/v1", False),
             (False, "system", "", False),
-            (True, "off", "https://x/v1", False),  # 未知模式：未启用
+            # T12：未知 / 旧值镜像前端 _normalize_tts_mode → 回落 openai（有地址即启用）
+            (True, "off", "https://x/v1", True),
+            (True, "cosyvoice", "https://x/v1", True),
+            (True, "cosyvoice", "", False),        # 回落 openai 但没地址：未启用
             (True, "", "", False),
         ]
         for on, mode, url, want in cases:
@@ -371,25 +374,30 @@ class OffLoopTest(unittest.TestCase):
         self.assertIsNot(threads[0], seen["loop"], "合成请求不得跑在事件循环线程上")
 
     def test_slow_synthesis_does_not_stall_the_loop(self):
+        """事件同步版（T14③）：合成"卡住"到主协程放行为止——只有事件循环没被冻住才可能放行。"""
+        release = threading.Event()
+
         def handler(req):
-            time.sleep(0.15)                       # 模拟云端慢合成（同步阻塞）
+            release.wait(5.0)                      # 卡住合成；只应由循环上的 ticker 放行
             return httpx.Response(200, content=WAV)
 
         c = _client(handler)
-        tick = {}
+        ticks = []
 
         async def ticker():
-            await asyncio.sleep(0.02)
-            tick["at"] = time.monotonic()
+            for _ in range(3):
+                await asyncio.sleep(0.01)
+                ticks.append(1)
+            release.set()
 
         async def run():
-            t0 = time.monotonic()
-            await asyncio.gather(c.speak("你好"), ticker())
-            return t0
+            out, _ = await asyncio.gather(c.speak("你好"), ticker())
+            return out
 
-        t0 = asyncio.run(run())
-        self.assertIn("at", tick)
-        self.assertLess(tick["at"] - t0, 0.12, "合成期间事件循环必须还能跑别的任务")
+        # 若合成阻塞事件循环，ticker 永远跑不到 release.set()，这里 2 秒后超时 ⇒ 测试失败
+        out = asyncio.run(asyncio.wait_for(run(), timeout=2.0))
+        self.assertEqual(out["mode"], "openai")
+        self.assertEqual(len(ticks), 3, "合成期间事件循环必须还能跑别的任务")
 
 
 class CloseTest(unittest.TestCase):
@@ -429,6 +437,7 @@ class RobustnessTest(unittest.TestCase):
         c = _client(handler, tts_speed="abc", tts_timeout_sec="abc")
         out = asyncio.run(c.speak("你好"))
         self.assertEqual(out["mode"], "openai")
+        self.assertEqual(out["text"], "", "openai 模式不回传台词文本（T13）")
         self.assertEqual(seen[0]["speed"], 1.0)
         self.assertEqual(c._timeout(), 30.0)
 
@@ -474,3 +483,123 @@ class ConfigWiringTest(unittest.TestCase):
         self.assertEqual(c.tts_speed, 1.0)
         self.assertEqual(c.tts_volume, 1.0)
         self.assertEqual(c.tts_timeout_sec, 30.0)
+
+
+# ============================================================================
+# 评审修复轮（I1 / I2 / T14）新增的用例。
+# ============================================================================
+
+
+class ModeNormalizationTest(unittest.TestCase):
+    """T12 / I1：``tts_mode`` 必须归一化，并镜像前端 ``AzureConfig._normalize_tts_mode``（:98-100）。"""
+
+    def test_case_and_spaces_are_normalized(self):
+        for raw in ("System", "SYSTEM", "  system  "):
+            c = TTSClient(_cfg(tts_mode=raw, tts_base_url=""))
+            self.assertTrue(c.enabled, raw)
+            self.assertEqual(asyncio.run(c.speak("你好"))["mode"], "system", raw)
+        for raw in ("OpenAI", "  openai  "):
+            called = []
+            c = _client(lambda req: called.append(1) or httpx.Response(200, content=WAV), tts_mode=raw)
+            self.assertTrue(c.enabled, raw)
+            self.assertEqual(asyncio.run(c.speak("你好"))["mode"], "openai", raw)
+            self.assertEqual(called, [1], "%r 必须走合成（有声音）" % raw)
+
+    def test_legacy_mode_falls_back_to_openai(self):
+        """旧值 ``cosyvoice``：与前端同一规则回落 openai——判成未启用会让老机器整条语音静默消失。"""
+        called = []
+        c = _client(lambda req: called.append(1) or httpx.Response(200, content=WAV),
+                    tts_mode="cosyvoice")
+        self.assertTrue(c.enabled)
+        out = asyncio.run(c.speak("你好"))
+        self.assertEqual(out["mode"], "openai")
+        self.assertEqual(len(called), 1, "回落 openai 就必须真的走合成")
+        self.assertNotEqual(out["id"], "")
+
+    def test_unknown_mode_without_base_url_stays_silent(self):
+        """回落 openai 但没有地址：仍是未启用（与计划字面的 openai 判据一致）。"""
+        called = []
+        c = _client(lambda req: called.append(1) or httpx.Response(200, content=WAV),
+                    tts_mode="cosyvoice", tts_base_url="")
+        self.assertFalse(c.enabled)
+        self.assertEqual(asyncio.run(c.speak("你好"))["mode"], "none")
+        self.assertEqual(called, [])
+
+
+class TextContractTest(unittest.TestCase):
+    """T13 / I2：``text`` **仅**在 ``mode=="system"`` 时非空（计划 Task 3 的事件契约）。"""
+
+    def test_openai_mode_returns_empty_text(self):
+        c = _client(lambda req: httpx.Response(200, content=WAV))
+        out = asyncio.run(c.speak("[[tone:sigh]]算了。"))
+        self.assertEqual(out["mode"], "openai")
+        self.assertEqual(out["text"], "", "openai 的台词由缓存音频承载，不回传文本")
+        self.assertEqual(out["tone"], "sigh")
+        self.assertNotEqual(out["id"], "")
+
+    def test_none_mode_returns_empty_text(self):
+        called = []
+
+        def handler(req):
+            called.append(1)
+            return httpx.Response(200, content=WAV)
+
+        out = asyncio.run(_client(handler, tts_enabled=False).speak("你好"))
+        self.assertEqual((out["mode"], out["text"]), ("none", ""))
+        out2 = asyncio.run(_client(handler).speak("   "))
+        self.assertEqual((out2["mode"], out2["text"]), ("none", ""))
+        self.assertEqual(called, [], "none 模式零请求")
+
+    def test_system_mode_keeps_the_text(self):
+        c = _client(lambda req: httpx.Response(200, content=WAV), tts_mode="system", tts_base_url="")
+        out = asyncio.run(c.speak("[[tone:cheer]]好棋！"))
+        self.assertEqual((out["mode"], out["text"]), ("system", "好棋！"))
+        # 合成失败降级为 system 时同样要带上文本（前端得靠它念出来）
+        c2 = _client(lambda req: httpx.Response(401))
+        out2 = asyncio.run(c2.speak("[[tone:cheer]]好棋！"))
+        self.assertEqual((out2["mode"], out2["text"], out2["id"]), ("system", "好棋！", ""))
+
+    def test_every_mode_keeps_the_five_keys(self):
+        c = _client(lambda req: httpx.Response(200, content=WAV))
+        self.assertEqual(set(asyncio.run(c.speak("你好"))),
+                         {"id", "mode", "text", "tone", "pitch"})
+
+
+class SingleBlobOverBudgetTest(unittest.TestCase):
+    """T14①：单条就超过字节预算时**直接不插**，不得为了塞不下的一段清空整个缓存。"""
+
+    def test_oversized_audio_does_not_wipe_the_cache(self):
+        c = _client(lambda req: httpx.Response(200, content=WAV))       # 每条 44 字节
+        with mock.patch.object(tts_mod, "TTS_CACHE_MAX_BYTES", 100):
+            keep = asyncio.run(c.speak("留着"))["id"]
+            self.assertIsNotNone(c.audio(keep))
+        with mock.patch.object(tts_mod, "TTS_CACHE_MAX_BYTES", 10):     # 单条 44 > 10
+            out = asyncio.run(c.speak("塞不下"))
+            self.assertEqual(out["mode"], "system")
+            self.assertEqual(out["id"], "")
+        self.assertIsNotNone(c.audio(keep), "塞不下的一条不得把已有缓存清空")
+        self.assertEqual(list(c._cache), [keep], "缓存内容一条不少、一条不多")
+
+
+class _Boom:
+    """``str()`` 就抛的探针：用来制造清洗阶段的异常。"""
+
+    def __str__(self):
+        raise RuntimeError("坏文本")
+
+
+class CleaningFailureTest(unittest.TestCase):
+    """T14②：清洗阶段的异常落 ``system``（计划 Step 3「任何异常 → system」），``none`` 只留给关闭态。"""
+
+    def test_cleaning_exception_degrades_to_system(self):
+        called = []
+        c = _client(lambda req: called.append(1) or httpx.Response(200, content=WAV))
+        out = asyncio.run(c.speak(_Boom()))
+        self.assertEqual(out["mode"], "system")
+        self.assertEqual(out["id"], "")
+        self.assertEqual(called, [], "清洗都失败了，不该再发请求")
+        self.assertEqual(set(out), {"id", "mode", "text", "tone", "pitch"})
+
+    def test_cleaning_exception_when_disabled_stays_none(self):
+        c = _client(lambda req: httpx.Response(200, content=WAV), tts_enabled=False)
+        self.assertEqual(asyncio.run(c.speak(_Boom()))["mode"], "none", "关闭态优先于降级")

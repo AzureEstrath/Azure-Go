@@ -4,7 +4,9 @@
 - 文本侧一律先经 ``speech_text``：``extract_tone`` → ``clean_for_speech`` → ``chunk_for_synthesis``
   （Task 1 已交付），本模块只负责把块送去合成、把结果拼成**一条**音频、按上限缓存；
 - ``tts_mode == "system"`` 时不发任何请求，只回一条「用系统语音念这段文本」的指令——
-  这样系统语音模式的玩家也有声音（T11）；
+  这样系统语音模式的玩家也有声音（T11）；模式值先按 ``_mode`` 归一化（``strip().lower()`` +
+  未知值回落 ``openai``，与前端 ``AzureConfig._normalize_tts_mode`` 同规则，T12）；
+- 返回值的 ``text`` **仅**在 ``mode == "system"`` 时非空（T13，计划 Task 3 的事件契约）；
 - 合成失败（网络错误 / 超时 / 非 200 / 解析失败 / 任一块失败）一律**整条**降级为
   ``mode: "system"``：绝不返回半截音频，也绝不让回合卡死（fail-closed）；
 - ``speak()`` **不抛异常**——它是回合链路的一环，抛出去就会让 ``busy`` 卡死（本项目最严重的故障形态）。
@@ -13,7 +15,7 @@
 1. 网络调用是**同步** ``httpx.Client``，必须经 ``await asyncio.to_thread(...)`` 放出去（T10）：
    一次 10~30 秒的合成直接跑在事件循环上会冻住心跳 / WebSocket / ``reveal``（同计划 03 的 I2）。
 2. 缓存**条数与字节数双向**淘汰（``TTS_CACHE_MAX`` / ``TTS_CACHE_MAX_BYTES``）：长对局 +
-   长总结会累积大量 WAV。
+   长总结会累积大量 WAV；单条就超过字节预算时**直接不插**（先插再淘汰会把整个缓存清空，T14①）。
 
 拼接规则（T1，混格式或任一块失败 ⇒ 整条降级 ``system``）：
 - **单块**：响应原样入缓存——WAV 或 MP3 都接受（云端服务常忽略 ``response_format``）；
@@ -44,6 +46,10 @@ DEFAULT_TIMEOUT_SEC = 30.0
 # 合成端点（OpenAI 兼容的 /audio/speech）
 SPEECH_PATH = "/audio/speech"
 
+# 合法朗读方式（对应前端 ``AzureConfig.gd:6`` 的 ``TTS_MODES``）与未知值回落目标
+TTS_MODES = ("system", "openai")
+DEFAULT_TTS_MODE = "openai"
+
 
 def _text_of(cfg, name: str, default: str = "") -> str:
     """读一个字符串配置项；``None`` / 缺失都当空串。"""
@@ -57,6 +63,19 @@ def _float_cfg(cfg, name: str, default: float) -> float:
         return float(getattr(cfg, name, default))
     except (TypeError, ValueError):
         return default
+
+
+def _mode(cfg) -> str:
+    """归一化 ``tts_mode``：镜像前端 ``AzureConfig._normalize_tts_mode``（``AzureConfig.gd:98-100``）。
+
+    ``strip().lower()`` 后不在 ``TTS_MODES`` 里的一律回落 ``DEFAULT_TTS_MODE``——旧配置里的
+    ``cosyvoice`` 等未知值，前端就是这么回落的（注释原话：「旧配置归一化：v2.x 的 cosyvoice
+    已不是合法朗读方式，一律回落云端 openai」）。**两边读同一份 config.json**（``run_server.bat``
+    的 ``AZURE_CONFIG`` 就回落到游戏目录）：若这里把未知值判成「未启用」，升级后没再存过设置
+    的老机器会 `mode:"none"`、**完全没有任何声音**，而且没有任何日志（评审 I1）。
+    """
+    m = _text_of(cfg, "tts_mode").strip().lower()
+    return m if m in TTS_MODES else DEFAULT_TTS_MODE
 
 
 class TTSClient:
@@ -81,14 +100,14 @@ class TTSClient:
 
         ``system`` 模式**必须**算启用——前端在 Task 4 之后只有「按 ``speech`` 指令播放」这
         一条路，判成未启用等于让系统语音模式的玩家完全没有声音。``openai`` 模式还要求
-        有服务地址；模式既不是 ``system`` 也不是 ``openai``（含空串）一律未启用。
+        有服务地址。模式先按 ``_mode`` 归一化（T12）。
         """
         if not bool(getattr(self.cfg, "tts_enabled", False)):
             return False
-        mode = _text_of(self.cfg, "tts_mode").strip()
+        mode = _mode(self.cfg)
         if mode == "system":
             return True
-        return mode == "openai" and _text_of(self.cfg, "tts_base_url").strip() != ""
+        return _text_of(self.cfg, "tts_base_url").strip() != ""
 
     def audio(self, audio_id: str) -> bytes | None:
         """按 id 取音频；未知 id 返回 ``None``。命中会刷新 LRU 位置。"""
@@ -107,26 +126,29 @@ class TTSClient:
 
         ``mode`` 三态：``openai``（音频已入缓存，``id`` 可查）、``system``（``text`` 可直接
         朗读）、``none``（功能关闭或没有可念的内容，调用方不要发 ``speech`` 事件）。
-        ``pitch`` 固定 ``0.0``——本层拿不到情绪，``speech`` 事件的音高由 agent 侧填（T2）。
+        ``text`` **仅**在 ``mode == "system"`` 时非空（T13）。``pitch`` 固定 ``0.0``——本层
+        拿不到情绪，``speech`` 事件的音高由 agent 侧填（T2）。
 
         **任何路径都不抛异常**：异常 / 超时 / 非 200 / 解析失败全落成 ``system``（关闭时落
-        ``none``），文字照常发。
+        ``none``），文字照常发。关闭态先判：``tts_enabled=false`` 时零开销，且**无论文本多脏
+        都只回 ``none``**（关闭态不该因为一次降级又冒出 ``speech`` 事件）。
         """
+        if not self.enabled:
+            return _result("none", "", "")
         tone, clean = "", ""
         try:
             tone, body = extract_tone("" if text is None else str(text))
             clean = clean_for_speech(body)
         except Exception as e:                  # noqa: BLE001 —— 清洗失败也不能让这一回合炸掉
-            print("[TTS] 文本清洗失败（话不念了）：%s" % e)
-            return _result("none", "", "", "")
+            # 计划 Step 3：「任何异常 → system」；none 是关闭态专用的（T14②）
+            print("[TTS] 文本清洗失败（降级为系统语音）：%s" % e)
+            return _result("system", "", "")
         try:
-            if not self.enabled:
-                return _result("none", clean, tone)
-            # 空 / 纯空白文本没有可念的内容：跳过空块、不发请求（T9 遗留）
+            # 空 / 纯空白文本没有可念的内容：跳过空块、不发请求（T9 遗留）；两种模式都落 none
             chunks = self._chunks(clean)
             if not chunks:
                 return _result("none", clean, tone)
-            if _text_of(self.cfg, "tts_mode").strip() == "system":
+            if _mode(self.cfg) == "system":
                 return _result("system", clean, tone)      # 系统语音：一条指令，零请求
             blob = await self._synthesize(chunks)
             if blob is None:
@@ -223,14 +245,23 @@ class TTSClient:
     # ================= 内部：缓存 =================
 
     def _store(self, audio_id: str, blob: bytes) -> bool:
-        """入缓存并按条数 + 字节数双向淘汰；返回该条是否还在缓存里。"""
+        """入缓存并按条数 + 字节数双向淘汰；返回该条是否可用。
+
+        单条就超过整个字节预算时**直接不插**（T14①）：先插再淘汰会把整个缓存清空——为了
+        一段本来就塞不进去的音频，把别人正在播的音频也一起丢掉。调用方拿到 ``False``
+        应降级为 ``system``。
+        """
+        if len(blob) > TTS_CACHE_MAX_BYTES:
+            print("[TTS] 单条音频 %d 字节超过缓存预算（%d），改用系统语音"
+                  % (len(blob), TTS_CACHE_MAX_BYTES))
+            return False
         self._cache[audio_id] = blob
         self._cache.move_to_end(audio_id)
         self._cache_bytes += len(blob)
         while len(self._cache) > TTS_CACHE_MAX or self._cache_bytes > TTS_CACHE_MAX_BYTES:
             if not self._evict_oldest():
                 break
-        return audio_id in self._cache
+        return True
 
     def _evict_oldest(self) -> bool:
         """淘汰队首（最久未用）；缓存已空返回 ``False``。"""
@@ -242,8 +273,15 @@ class TTSClient:
 
 
 def _result(mode: str, text: str, tone: str, audio_id: str = "") -> dict:
-    """统一的返回形状：``pitch`` 固定 0.0（T2，音高由 agent 侧填）。"""
-    return {"id": audio_id, "mode": mode, "text": text, "tone": tone, "pitch": 0.0}
+    """统一的返回形状：``pitch`` 固定 0.0（T2，音高由 agent 侧填）。
+
+    ``text`` **仅**在 ``mode == "system"`` 时非空（T13 / 计划 Task 3 的事件契约
+    ``docs/plans/05-tts-synthesis-to-backend.md:309`` 与计划假实现 ``:330``）：``openai``
+    的台词由缓存音频承载，``none`` 压根不该发 ``speech`` 事件——把清洗文本一并回传，
+    只会给前端多一个可能与音频错位的文本源。
+    """
+    return {"id": audio_id, "mode": mode, "text": text if mode == "system" else "",
+            "tone": tone, "pitch": 0.0}
 
 
 # ================= 内部：音频拼接（T1） =================
