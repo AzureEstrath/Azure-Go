@@ -343,6 +343,29 @@ func _run() -> void:
 	_check("⑨c tomb 占位仍然不显示（「有意不显示」的语义没被破坏）",
 			_shown.is_empty() and p9.pair_count() == 0)
 
+	# —— ⑨d 整段模式：语音在轮到自己投递前就出结果（合成快 + 导演层犹豫）⇒ 调用方按 played 补显示 ——
+	# 触发链：finish 把 played 记录移出 _pairs（旧 prune），此后 flush/release/prune_expired 都找不到它；
+	# 整段模式 arm(false) 又没有逐句分支那处 `played → display` 补偿，于是这条台词会被静默丢掉。
+	_reset()
+	var p9d := _new_pairing()
+	var r9d := p9d.register("未", false, "")
+	p9d.accept_speech("t9d", 1)
+	p9d.set_group(r9d, 31)
+	p9d.finish(r9d)                                     # 开播早于 _deliver_msg（整段模式 arm(false)）
+	p9d.arm(r9d, false)
+	if p9d.played(r9d):                                 # Main._deliver_msg 整段分支的那处补偿（与逐句同构）
+		p9d.display(r9d)
+	_check("⑨d 整段模式：语音先出结果，调用方按 played 补显示（绝不丢台词）", _shown == ["未"])
+	_check("⑨d 这条已收账、她这一侧不忙（棋盘不会被锁死）",
+			p9d.pair_count() == 0 and not p9d.busy(_env()))
+	_reset()
+	var t9d := p9d.register("", false, "idle", true)
+	p9d.finish(t9d)
+	p9d.arm(t9d, false)
+	if p9d.played(t9d):                                 # 同一补偿路径：tomb 仍然不显示
+		p9d.display(t9d)
+	_check("⑨d tomb 占位走同一补偿路径也不显示（「有意不显示」语义未破）", _shown.is_empty())
+
 	# —— ⑩ 取音频的每个出口都有结论：**HTTP 成功但 body 为空**也必须收账（否则棋盘锁死） ——
 	var p10 := _new_pairing()
 	_reset()

@@ -195,7 +195,10 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
 
     @app.post("/api/reset")
     async def reset():
-        a().reset_game()
+        s = a()
+        if s.busy:
+            return {"ok": False, "busy": True, "state": s.st.payload()}
+        s.reset_game()
         return ok()
 
     @app.post("/api/config")

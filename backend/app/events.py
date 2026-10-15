@@ -1,6 +1,7 @@
-"""客户端事件契约与事件总线（对应前端 `NetClient.gd` 的 7 个 signal）。
+"""客户端事件契约与事件总线（对应前端 `NetClient.gd` 的 10 个 signal）。
 
-前端的 7 个 signal 由后端事件驱动；分离后是「后端发事件 → WS 推给客户端」。
+后端事件驱动前端 signal（其中 `memory` 不对应 signal，前端只记一行日志；反向地，前端的
+`net_status` 是本地连接状态、不由后端事件驱动）；分离后是「后端发事件 → WS 推给客户端」。
 本模块把契约集中在一处，避免各处 magic string：
 
     message       ↔  message(kind, text)        对话/点评/落子宣告（kind 见下）
@@ -11,7 +12,7 @@
     joseki        ↔  joseki_event(payload)      定式高亮轨迹（kind/corner/points）
     tool          ↔  tool_event(payload)        她自己查资料（start/end，只给状态栏看）
     token         ↔  token_event(turn_id, delta) 流式增量（可选、默认关闭；最终内容以 message 为准）
-    speech        ↔  （无信号）                  一条台词对应的语音（音频 id 或系统语音指令）
+    speech        ↔  speech_event(payload)      一条台词对应的语音（音频 id 或系统语音指令）
     memory        ↔  （无信号）                  长期记忆的写入/召回元数据，前端只记一行日志
 
 事件统一为 dict，``type`` 字段走对应构造器；客户端按 type 分发。

@@ -30,6 +30,8 @@ extends Node
 ##   ② 被 `forget_idle()` 作废的走神搭话。
 ## 逐条证明面（每一条都是「先显示、再收账」）：
 ##   · `speech` 到了 → 开播时（`display`）或判定无声时（`finish` + `display`）显示；
+##   · 已 `arm`、但语音先出了结果（`finish` 早于 `_deliver_msg`）→ 不会被 `prune()` 清掉，
+##     由 `flush_pending()` / `release_stale()` 找到并补显示（结构性保证，不再依赖调用方自觉）；
 ##   · 音频取不回 / **HTTP 200 但 body 为空** / 字节解析不了 → `resolve_fetch()` 或调用方的
 ##     `speech_skipped` → `finish` + `display`；
 ##   · `speech` 没到、回合已结束 → `release_stale()` 放出来；
@@ -153,7 +155,9 @@ func has_pending() -> bool:
 
 # ================= 结果与清理 =================
 
-## 这条语音有结论了（已开播 / 判定无声 / 被取消 / 被丢弃）：出表，并通知调用方刷新锁
+## 这条语音有结论了（已开播 / 判定无声 / 被取消 / 被丢弃）：标记出结果、清分组位，并通知调用方刷新锁。
+## 出表交给 `prune()`：**已出结果但还没显示**的（`armed && !displayed && !tomb`）会留在表里，
+## 等 `flush_pending()` / `release_stale()` 把它补显示出来（不变量 T25 的结构性保证）。
 func finish(rec: Dictionary) -> void:
 	if rec.is_empty():
 		return
@@ -163,11 +167,15 @@ func finish(rec: Dictionary) -> void:
 	prune()
 	resolved.emit()
 
-## 出表（只留还没出结果的）
+## 出表：还没出结果的留下；**已出结果但还没显示**的也留下（`armed && !displayed && !tomb`）——
+## 它们马上会被 `flush_pending()` / `release_stale()` 找到并补显示，不变量因此**结构性**成立：
+## 已 `arm` 的台词哪怕语音先出了结果，也不会因为出表而没人管（T25）。
 func prune() -> void:
 	var kept: Array[Dictionary] = []
 	for rec in _pairs:
 		if bool(rec["played"]):
+			if bool(rec["armed"]) and not bool(rec["displayed"]) and not bool(rec["tomb"]):
+				kept.append(rec)
 			continue
 		kept.append(rec)
 	_pairs = kept

@@ -876,6 +876,8 @@ func _deliver_msg(kind: String, text: String, tone: String, rec: Dictionary) -> 
 				_batch_token += 1
 				_release_batch(true)         # 批次按类型分组：走神搭话不跟对局发言混进同一段语音
 			pairing.arm(rec, false)
+			if pairing.played(rec):
+				pairing.display(rec)     # 语音在轮到自己投递前就出结果了（整段模式没有逐句那处补偿）：立刻补上
 			_batch_pending = true
 			_pending_batch_kind = tts_kind
 			_batch_token += 1
@@ -1762,6 +1764,8 @@ func _on_speech_event(payload: Dictionary) -> void:
 	if pairing.is_tomb(rec):
 		pairing.finish(rec)                      # 本地已丢弃的台词：吃掉它自己那条语音，不出声
 		return
+	if tts != null:
+		tts.set_mood_pitch(float(payload.get("pitch", 0.0)))   # T2：每条语音自带音高偏移，开播前落到播放层
 	var kind := pairing.kind_of(rec)
 	if smode == "system":
 		pairing.set_group(rec, tts.speak_system(str(payload.get("text", "")), seq, kind))
