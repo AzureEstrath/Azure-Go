@@ -34,13 +34,16 @@ SYMBOL_RE = re.compile(
     "]"
 )
 
-# 半角 ``[方括号]`` 标记（计划 Interfaces 有意加严；前端只把全角【】转成逗号）。
-# 先匹配双中括号再匹配单中括号，顺带兜住可能泄漏的 ``[[mood:...]]`` 之类标记。
-_BRACKET_RE = re.compile(r"\[\[[^\[\]]*\]\]|\[[^\[\]]*\]")
+# ``[[...]]`` 双中括号标记：这是语气标记（``[[tone:...]]`` / ``[[mood:...]]``）的形态，
+# 整段丢弃，绝不能念出来——Review Focus 的「语气标记泄漏」正指这条（T8①）。
+_MARKER_RE = re.compile(r"\[\[[^\[\]]*\]\]")
 
 # 超长句软切用的断点集合：标点 / 空格 / 换行（句末终止符与 Interfaces 清单一致，另含前端
 # TTSClient.gd:348 里的 ``…``，并补充逗号以便把长句切得更自然）。
 _SOFT_BREAKS = "，,、。！？；…!?;. \n"
+
+# 纯标点/空白的字符集（与前端 TTSClient.gd:371 的 ``_has_word`` 同一份清单）。
+_PUNCT_ONLY = "。！？；…!?;.\n，,、~ "
 
 # 在句末终止符处切分；连续终止符（如「。。」）不切开，避免产生纯标点碎片。
 _SPLIT_RE = re.compile(r"(?<=[。！？；…!?;.\n])(?![。！？；…!?;.\n])")
@@ -52,7 +55,8 @@ def clean_for_speech(text: str) -> str:
         return ""
     s = text.replace("**", "").replace("📊", "").replace("📋", "")
     s = SYMBOL_RE.sub("", s)
-    s = _BRACKET_RE.sub("", s)                        # 半角方括号标记（加严）
+    s = _MARKER_RE.sub("", s)                         # [[...]] 标记整段丢弃（T8①）
+    s = s.replace("[", "，").replace("]", "，")       # 半角单方括号：镜像全角规则、保内容（T8②）
     s = s.replace("【", "，").replace("】", "，")      # 全角括号标题 → 逗号
     s = s.replace("()", "").replace("（）", "")       # 颜文字被清空后剩下的空括号
     s = " ".join(part for part in s.split("\n") if part)
@@ -71,7 +75,7 @@ def extract_tone(text: str) -> tuple[str, str]:
     标记都要从正文里剥掉（未知标记也照删，防止被系统语音念出来）。
     """
     if not text:
-        return "", text if text is not None else ""
+        return "", ""
     m = TONE_RE.search(text)
     tone = m.group(1).lower() if m else ""
     rest = TONE_RE.sub("", text).strip()
@@ -80,14 +84,32 @@ def extract_tone(text: str) -> tuple[str, str]:
     return tone, rest
 
 
+def _has_word(s: str) -> bool:
+    """这段文本里是否含「实字」（非标点/空白）；纯标点碎片不值得单独送去合成。"""
+    for ch in s:
+        if ch not in _PUNCT_ONLY:
+            return True
+    return False
+
+
 def split_sentences(text: str) -> list[str]:
-    """按句末终止符切分并过滤空句；连续终止符不切碎（如「。。」留在同一句）。"""
+    """按句末终止符切分并过滤空句；纯标点碎片并回上一句（如「。。。」），不单独成句。"""
     out: list[str] = []
     for part in _SPLIT_RE.split(text or ""):
         s = part.strip()
         if s:
             out.append(s)
-    return out
+    # 纯标点碎片并回上一句（前端 TTSClient.gd:356-373 的同一规则）；
+    # 前导碎片没有「上一句」可并，按前端语义丢弃——它本就不含可念内容。
+    merged: list[str] = []
+    for p in out:
+        if _has_word(p):
+            merged.append(p)
+        elif merged:
+            merged[-1] += p
+    if not merged:
+        return out                       # 整段皆纯标点：保留原样，交由上层决定
+    return merged
 
 
 def chunk_for_synthesis(text: str, max_chars: int = 100) -> list[str]:
@@ -98,7 +120,7 @@ def chunk_for_synthesis(text: str, max_chars: int = 100) -> list[str]:
     """
     limit = int(max_chars)
     if limit < 1:
-        limit = 1
+        limit = 1        # max_chars<=0 时「每块 <= max_chars」对非空文本不可满足，钳到 1（T9⑤）
     sents = split_sentences(text)
     if not sents and text:
         sents = [text]                    # 全是空白/纯空句：按原文兜底，但仍守住长度上限

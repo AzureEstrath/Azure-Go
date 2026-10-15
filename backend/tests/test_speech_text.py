@@ -27,6 +27,32 @@ class CleanTest(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(clean_for_speech(""), "")
 
+    def test_halfwidth_bracket_keeps_content(self):
+        # T8②：半角单方括号镜像全角规则——只换括号、内容保留
+        out = clean_for_speech("答案是[1]和[2]")
+        self.assertNotIn("[", out)
+        self.assertNotIn("]", out)
+        self.assertIn("1", out)
+        self.assertIn("2", out)
+
+    def test_double_bracket_marker_dropped(self):
+        # T8①：[[...]] 是语气标记形态，整段丢弃，绝不能念出来
+        out = clean_for_speech("[[tone:sigh]]算了")
+        self.assertNotIn("tone:", out)
+        self.assertNotIn("[[", out)
+        self.assertIn("算了", out)
+
+    def test_single_bracket_tone_keeps_content(self):
+        # 单方括号按全角规则：只换括号、保留内容（真正的语气标记由 extract_tone 先剥）
+        out = clean_for_speech("[tone:sigh]算了")
+        self.assertNotIn("[", out)
+        self.assertNotIn("]", out)
+        self.assertIn("tone:sigh", out)
+        self.assertIn("算了", out)
+
+    def test_none_input(self):
+        self.assertEqual(clean_for_speech(None), "")
+
 
 class ToneTest(unittest.TestCase):
     def test_extract_first_only(self):
@@ -60,6 +86,23 @@ class SplitTest(unittest.TestCase):
         chunks = chunk_for_synthesis("甲" * 250, max_chars=100)
         self.assertTrue(all(len(c) <= 100 for c in chunks))
         self.assertGreaterEqual(len(chunks), 3)
+
+
+class BoundaryTest(unittest.TestCase):
+    def test_none_input_across_api(self):
+        self.assertEqual(extract_tone(None), ("", ""))
+        self.assertEqual(split_sentences(None), [])
+        self.assertEqual(chunk_for_synthesis(None), [""])
+
+    def test_max_chars_one(self):
+        chunks = chunk_for_synthesis("甲。乙。", max_chars=1)
+        self.assertTrue(all(len(c) <= 1 for c in chunks))
+        self.assertEqual("".join(chunks), "甲。乙。")
+
+    def test_pure_punct_fragment_merges(self):
+        # T9④：纯标点碎片并回上一句，不单独成句（纯标点半句会被云端 TTS 拒）
+        self.assertEqual(split_sentences("。。。嗯"), ["嗯"])
+        self.assertEqual(split_sentences("你好。！！！"), ["你好。！！！"])
 
 
 if __name__ == "__main__":
