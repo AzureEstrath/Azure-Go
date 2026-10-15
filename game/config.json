@@ -15,6 +15,7 @@
   "llm_think_mode": 0,
   "llm_extra_body": {},
   "llm_think_extra_body": {},
+  "stream_tokens": false,
 
   "tools_enabled": false,
   "max_tool_calls": 2,

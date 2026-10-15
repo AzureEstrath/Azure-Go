@@ -16,10 +16,12 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 > **人设与提示词也能在 `config.json` 里直接改**。客户端（`game\`）只做渲染、输入与语音播放，
 > 连不上后端时只在状态栏提示。
 >
-> 当前版本 **v3.3.0**：新增**长期记忆**——开启后她跨局记得你（对局总结写进本地 SQLite，
-> 出话前按语义检索注入上下文，云端 embedding 不可用时自动降级为关键词匹配），**默认关闭**，
-> 关闭时不建库、不调 embedding 接口、提示词逐字符不变；另有 `/api/memory/*` 管理端点可查看 / 手动写入 / 忘记。
-> 详见第四节「长期记忆（跨局记得你）」与「九、更新」。
+> 当前版本 **v3.4.0**：后端对局编排搬进一张 **LangGraph 状态图**
+> （`backend\app\agent_graph.py`：`prepare → decide →（条件边工具轮）speak → finalize`）——
+> 「怎么想、怎么说、下哪里」的顺序第一次显式成形，工具因此可以**参与落点候选**；
+> AI 原话去重从客户端**下沉到后端**（最近 8 条窗口，前端只兜 WS 重连乱序）；并新增**可选流式输出**
+> （`stream_tokens`，默认关闭：开启后她的台词逐段推送、首字更快；气泡最终内容仍以完整 `message` 收口）。
+> 详见第四节「流式输出」与「九、更新」。
 
 ---
 
@@ -102,7 +104,7 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 - **后端（实时）**：经 `/api/config` 转发，改完立即生效。
 - **客户端**：游戏进程自己读，改完（或下次启动）即时生效。
 - **后端专用（客户端不读）**：`katago_url` / `katago_token` / `katago_timeout_ms`、
-  `llm_extra_body` / `llm_think_extra_body` / `tools_enabled` / `max_tool_calls` 与
+  `llm_extra_body` / `llm_think_extra_body` / `stream_tokens` / `tools_enabled` / `max_tool_calls` 与
   `memory_enabled` / `memory_db_path` / `embed_base_url` / `embed_model` / `embed_api_key` /
   `embed_timeout` / `memory_top_k` / `memory_max_inject_chars` 只由后端消费；
   客户端不读它们，但**写回配置时会原样保留**（游戏内保存设置不会把这些键弄丢）。
@@ -120,7 +122,8 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 | `llm_think_mode` | 后端（启动时） | **思考档位**：`0`=快速（直答，首字快）/ `1`=中等（推理限预算并催收尾，约 4~7 秒）/ `2`=强思考（自由推理，更慢更好）；默认 `0`；开局设置面板里也能改（旧键 `llm_think_strong` 自动迁移） |
 | `llm_extra_body` | 后端（启动时） | **透传给云端 LLM 的请求体扩展字段**（JSON 对象，如 `{"top_k": 40}`）：每次请求都并入。服务商不认这些字段（HTTP 400/422）时后端自动去掉扩展字段重试一次，且本次会话不再发送它们（设计好的降级，不是故障）。输出上限按线上键 `max_tokens` 发送；在这里显式写 `max_tokens` / `max_completion_tokens` 可覆盖后端注入的预算（服务商只认新键时的退路） |
 | `llm_think_extra_body` | 后端（启动时） | 同上，但**只在思考档位开启（`llm_think_mode` > 0）时**并入（如 `{"reasoning_effort": "high"}`）；不开思考档位时完全不发 |
-| `tools_enabled` | 后端（启动时） | **发言侧工具**总开关，默认 `false`：开启后她在「提示」与「落子宣告」两个回合可自主复算局面 / 查定式 / 核对盘面——**只影响她怎么说，不影响她下哪里**（见第四节「工具（发言侧）」） |
+| `stream_tokens` | 后端（启动时） | **输出流式**开关，默认 `false`：开启后她的台词逐段推送（WS `token` 事件），首字更快；**气泡最终内容仍以完整 `message` 为准**（见第四节「流式输出」） |
+| `tools_enabled` | 后端（启动时） | **发言侧工具**总开关，默认 `false`：开启后她在「提示」与「落子宣告」两个回合可自主复算局面 / 查定式 / 核对盘面；工具轮里模型报出的落点也能**参与落点候选**（见第四节「工具（发言侧）」） |
 | `max_tool_calls` | 后端（启动时） | 一次发言里**工具执行次数**上限（默认 `2`；代码侧硬上限也是 `2`，配置只能收紧、不能放宽） |
 | `memory_enabled` | 后端（启动时） | **长期记忆**总开关，默认 `false`：开启后她跨局记得你（对局总结与显式事实落 SQLite，出话前召回注入）；见第四节「长期记忆（跨局记得你）」 |
 | `memory_db_path` | 后端（启动时） | 长期记忆库路径；留空＝`backend\data\memory.db`（**只在开启时创建**，属运行产物、已 gitignore） |
@@ -176,11 +179,31 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 - 后端内部走 **LangChain**（`ChatOpenAI`）：上面三个字段照旧填，服务商专有参数用 `llm_extra_body` /
   `llm_think_extra_body` 透传（见第三节）；调用失败一律降级为可读提示 + 兜底台词，不会卡住棋盘。
 
+### 流式输出（可选，默认关闭）
+
+`stream_tokens: true` 后，她说话时逐段推送（WS `token` 事件，带 `turn_id` 与 `delta`），**首字更快**；
+默认 `false` 时一个 `token` 都不发，事件序列与没有这个功能时**逐字一致**。
+
+- **气泡最终内容以完整 `message` 为准**：`token` 只是过程；收口的那条 `message` 要过 `clean_reply()`
+  与后端的 **8 条窗口去重闸门**（见「九、更新」v3.4.0）之后才发，整句原样复读时连 `token` 也不发，
+  前端不会留下没收口的残余气泡。
+- **推理段永不进 `token`**：增量只取模型回答的 content 通道，content 里的 think 段由后端在**累加文本**上
+  跨块剥离。成对 `<think>…</think>` 与 `<｜begin…｜>…<｜end…｜>` 形态（含标记被切块）**保证增量与台词都干净**；
+  「网关吞掉开始标记、只剩收尾标记」与「未闭合 `think`」这类**畸形**形态下，增量流可能短暂带出原文，
+  但**最终 `message` 与语音恒为干净台词**。
+- **流式本身失败（连接断开 / 服务端报错）绝不影响这一回合**：自动回落为整段出话，台词必定完整。
+- 改完这个字段要**重启后端**才生效。
+
 ### 工具（发言侧）
 
-**默认关闭**（`tools_enabled: false`，改成 `true` 即开启）：行为与没有工具时完全一致。开启后她**只在两个回合**可以自己查资料——
-「提示」与「落子宣告」——且**只影响她怎么说，绝不影响她下哪里**（落点仍由后端算棋决定）。
+**默认关闭**（`tools_enabled: false`，改成 `true` 即开启）：关闭时行为与没有工具时完全一致。开启后她**只在两个回合**可以自己查资料——
+「提示」与「落子宣告」——工具请求由状态图的**条件边工具轮**驱动（模型要工具就先执行、把结果回灌给模型
+再来一轮，直到没有请求或预算用尽）。
 
+- **工具可参与落点候选**（本版有意放宽，v3.2.0 时是「绝不影响她下哪里」）：模型在这一轮里报出的落点
+  （她这句话里出现的 GTP 坐标或虚着）会被后端认出来当候选，但有三条边界——① 候选点必须过棋盘合法性；
+  ② `pass` 只在开了允许虚着时可用；③ **任何情况下都产出可用落点**（候选不合法就回退后端算棋的默认落点），
+  **绝不会因为她报了个坏点而这一手不下**。未开启工具时落点仍完全由后端算棋决定。
 - 三个工具：`katago_analyze`（复算局面：黑方胜率 / 目差 / 候选点）、`joseki_lookup`（查入门定式库）、
   `board_query`（把局面画成紧凑盘面图，核对坐标与归属）。
 - **代价**：这两个回合会多出几次模型往返（工具执行次数受 `max_tool_calls` 与代码硬上限约束、单工具 10 秒超时），
@@ -287,9 +310,10 @@ curl -X POST http://127.0.0.1:8000/api/memory/forget -H "Content-Type: applicati
   - REST：`/api/move|hint|analyze|chat|summarize|undo|reset|config|reveal|interaction|idle|mood/tick`，
     以及 `GET /api/state`、`GET /api/health`，和长期记忆管理面 `/api/memory/query|write|stats|forget`
     （见第四节「长期记忆（跨局记得你）」）。
-  - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki / tool / memory`
-    （`tool` 是发言侧工具的开始 / 结束，只喂状态栏提示，不进入对话；`memory` 是记忆管理动作的元数据，
-    只记一行日志，不进台词、不产生界面变化）。
+  - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki / tool / token / memory`
+    （`tool` 是发言侧工具的开始 / 结束，只喂状态栏提示，不进入对话；`token` 是可选流式增量，仅
+    `stream_tokens` 开启时才有、默认关闭，气泡最终内容仍以随后的 `message` 为准；`memory` 是记忆管理
+    动作的元数据，只记一行日志，不进台词、不产生界面变化）。
   - `GET /api/health` 返回 `{ok, katago_dead, katago_error, katago_url, llm_url, memory_rows}`（字段都改为描述所连云服务：
     地址 / 引擎是否还在 / 最近错误）。其中 `katago_dead` 与 `katago_error` 必须**成对读**：
     - `katago_dead` 表示**引擎已经没了**：`start()` 探活失败、或分析时发生**传输层失败**（连接被拒 / 连接或
@@ -364,7 +388,36 @@ KataGo 引擎与权重遵循其上游许可。
 
 ## 九、更新
 
-### v3.3.0（当前）
+### v3.4.0（当前）
+- **回合编排显式成一张状态图**：新增 `backend\app\agent_graph.py`（LangGraph），拓扑
+  `prepare → decide →（条件边 tools → decide，可反复）→ speak → finalize`；六个需要 LLM 编排的公开方法
+  （`player_move` / `hint` / `analyze_position` / `chat` / `idle_remark` / `summarize`）在 `agent.py` 里只做
+  「构造状态 → 跑图」，引擎调用 / 提示词 / 台词 / 事件 / 记忆标签的顺序全在四个节点里。
+  `player_move` 一次公开调用＝**三次 `ainvoke`**（`after_player → own_turn → just_moved`，中间数据经
+  `TurnState["data"]` 透传、`turn_id` 三阶段共用）；其余 `undo` / `reset_game` / `set_allow_pass` /
+  `reveal_move` / `tick_mood` / `player_interaction` 仍是同步方法、直接发事件。**公开契约不变**：
+  端点、事件形状与 `AzureAgent` 公开方法签名一行未动，客户端 `NetClient.gd` 一行未改。
+- **条件边工具轮与落点候选**：工具请求改由 `decide` 后的条件边驱动（`tools → decide`，回到模型再来一轮，
+  直到没有请求或预算用尽）；`decide` 内**总 LLM 调用次数**上限 `MAX_LLM_CALLS_PER_TURN = 4`（含工具轮），
+  工具预算仍是 `MAX_TOOL_CALLS = 2` / 单工具 10 秒超时。工具/模型现在**可以参与落点候选**
+  （模型原话里的 GTP 坐标或虚着经 `_candidate_from_text` + `_resolve_ai_move` 认下），但有**三条边界**：
+  ① 候选点必须过 `board.is_legal(...)`；② `pass` 只在允许虚着时可用；③ **任何情况下都产出可用落点**
+  （候选不合法就回退后端算棋的默认落点）。`tools_enabled` 默认 `false`，关闭时行为与没有工具完全一致。
+- **AI 原话去重下沉到后端**：`AI_DEDUP_WINDOW = 8`（`backend\app\agent.py`）与判据移进 `finalize` 阶段
+  （`agent_graph._emit_deduped` / `_is_repeat` / `_is_repeat_prefix`）。只有**台词类 `message`** 过闸——
+  `ai_move` 落子宣告永不判重，`state` / `info` / `busy` / `mood` / `joseki` / `tool` 不受影响；
+  「这手不成立 / 空盘提示 / 回档 / 重开 / 虚着开关 / 引擎失败恒定句」等**错误与事件型提示有意不过闸**
+  （连按两次必须照旧还给玩家）；被抑制的台词**照常**写 `memory_log` / `chat_history`。前端 `Main.gd` 的同名
+  常量只作 **WS 重连乱序的兜底**（计划明示的双保险）。
+- **可选流式输出（默认关闭）**：新增配置 `stream_tokens`（默认 `false`）；开启后 `speak` 阶段逐块推
+  `{"type":"token","turn_id","delta"}`，**气泡最终内容仍以经 `clean_reply()` + 去重闸门的完整 `message` 为准**。
+  增量只取模型回答的 content 通道（推理段永不进 `delta`）；成对 think 区间保证增量与台词都干净，
+  「只剩收尾标记」与未闭合 `think` 的畸形形态只保证最终 `message` / 语音干净；流式失败自动回落非流式整段出话。
+  关闭时一个 `token` 都不发，事件序列与没有这个功能时逐字一致。见第四节「流式输出」。
+- **文档与配置**：`game\config.json` 模板新增 `stream_tokens: false`；WS 事件清单由 8 类增至 **9 类**
+  （新增 `token`）；README 字段表与 `AGENTS.md` 同步（编排在状态图里、工具可参与落点候选、去重与 `busy` 的边界）。
+
+### v3.3.0
 - **长期记忆（默认关闭）**：新增 `backend\app\memory.py`（SQLite 存储 + 检索：有向量按余弦相似度、
   无向量按关键词）与 `backend\app\memory_service.py`（云端 embedding 装配，`embed_*` 任一为空就不装配
   embedding 客户端、自动降级为关键词检索）。对局总结成功后写入长期记忆，**闲聊**与**她自己落子前**

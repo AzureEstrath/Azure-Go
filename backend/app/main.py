@@ -20,8 +20,9 @@
     GET  /api/state                         当前棋盘权威快照
     GET  /api/health                        引擎/LLM/长期记忆状态
 
-事件通道（WebSocket /ws）——后端把 8 类事件推给客户端，契约见 events.py：
-    message / state / info / busy / mood / joseki / tool / memory（连接建立时先发一次 hello 同步）。
+事件通道（WebSocket /ws）——后端把 9 类事件推给客户端，契约见 events.py：
+    message / state / info / busy / mood / joseki / tool / token / memory（连接建立时先发一次 hello 同步）。
+    `token` 是可选流式增量（`stream_tokens` 开启时才有，默认关闭；最终内容以 `message` 为准）。
     `memory` 由记忆管理端点推送，是元数据（不是台词），前端只记日志。
 
 REST 应答统一返回 {"ok": bool, "state": <棋盘快照>}：命令是否被接受由 ok/busy 判断，
