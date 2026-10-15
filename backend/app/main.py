@@ -23,7 +23,6 @@ REST 应答统一返回 {"ok": bool, "state": <棋盘快照>}：命令是否被�
 台词等内容一律经由 WS 事件送达（音画同步由客户端本地完成）。
 """
 
-import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -34,6 +33,7 @@ from . import coords, events, prompts
 from .agent import AzureAgent
 from .engine import KataGoEngine
 from .llm import LLMClient
+from .llm_chain import merge_extra_body
 
 
 def _int(v, d=-1):
@@ -53,13 +53,14 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
         prompts.configure(cfg)
         if agent is None:
             eng = engine if engine is not None else KataGoEngine(cfg.katago_url, cfg.katago_token, cfg.max_visits, cfg.katago_timeout_ms)
-            cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key, think_mode=cfg.llm_think_mode)
+            cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key,
+                                                         think_mode=cfg.llm_think_mode,
+                                                         extra_body=merge_extra_body(cfg))
             app.state.agent = AzureAgent(eng, cli, events.EventBus(), joseki_teach=cfg.joseki_teach)
             if autostart:
                 ok = await eng.start()
                 if not ok:
                     print("[KataGo] 云服务不可用：" + eng.last_error())
-                asyncio.create_task(cli.probe_models())
         else:
             app.state.agent = agent
         yield

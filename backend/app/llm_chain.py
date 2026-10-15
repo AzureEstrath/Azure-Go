@@ -35,13 +35,16 @@ def merge_extra_body(cfg) -> dict:
     return merged
 
 
-def build_chat_model(cfg, *, http_client=None, http_async_client=None,
+def build_chat_model(cfg, *, http_client=None, http_async_client=None, timeout=None,
                      temperature=0.7, top_p=0.9, frequency_penalty=0.4,
                      presence_penalty=0.2) -> ChatOpenAI:
     """按配置构造 ChatOpenAI；扩展字段为空时不带 ``extra_body``（不改请求体形状）。
 
     空 ``llm_api_key``（模板现状）与空 ``llm_base_url`` 都不得在构造期抛错：
     缺凭据时用哨兵值顶上，失败推迟到请求期，由上层映射成可读错误走兜底台词。
+
+    ``timeout``（秒）缺省时用 ``DEFAULT_TIMEOUT_SEC``：调用方（``LLMClient.timeout_sec``）
+    传什么就是什么，不能只留一个不起作用的常量。
     """
     extra = merge_extra_body(cfg)
     return ChatOpenAI(
@@ -52,7 +55,7 @@ def build_chat_model(cfg, *, http_client=None, http_async_client=None,
         top_p=top_p,
         frequency_penalty=frequency_penalty,     # 降复读：少用重复的口头禅和句式
         presence_penalty=presence_penalty,
-        timeout=DEFAULT_TIMEOUT_SEC,
+        timeout=DEFAULT_TIMEOUT_SEC if timeout is None else timeout,
         http_client=http_client,
         http_async_client=http_async_client,
         **({"extra_body": extra} if extra else {}),
