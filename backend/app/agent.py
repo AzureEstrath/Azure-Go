@@ -41,7 +41,10 @@ LEN_TEACH_NOTE = ("\n\n【本次额外要求 · 优先遵守】\n"
                   "- 这是定式讲解：把名称与要点讲清楚，2~3 句即可，别长篇大论\n"
                   "- 不复述局面、不客套，直接开讲就好")
 
-# —— 发言侧工具（她自己决定要不要查资料；只影响怎么说，不影响下哪里）——
+# —— 发言侧工具（她自己决定要不要查资料）——
+# 计划 02 的规则是「工具只影响怎么说、不影响下哪里」；计划 04 有意放宽（S21）：工具/模型在预算内
+# 报出的落点可以成为候选，但必须过合法性边界（见 ``_resolve_ai_move``），默认仍回退
+# ``_pick_ai_move``。``tools_enabled`` 默认 false，影响面有界。
 # 工具总次数硬上限：一次发言最多两次，防止「一直查、不回答」
 MAX_TOOL_CALLS = 2
 # 单工具超时（秒）：超时即返回超时文本，不阻塞回合
@@ -58,6 +61,12 @@ TOOL_TIMEOUT_TEXT = "工具执行超时（%d 秒），这次没取到结果；�
 # 括号里带「着棋点位」的舞台提示不需要显示，例如（白棋落在 C4）/（第7手 Q16）/（C4）
 _PAREN_GROUP_PATTERN = "[（(][^（()）\\n]{0,40}[）)]"
 _MOVE_HINT_PATTERN = "[A-HJ-Ta-hj-t]\\s?\\d{1,2}|落子|落在|虚着|pass|着子|第\\s?\\d+\\s?手"
+
+# 从模型原话里认落点候选用的 GTP 坐标（大写列 A..T 跳过 I + 1~2 位行号）。
+# 只认大写、且前后不能再粘字母数字，免得把 "Top3"、"a1" 这类普通词误认成坐标；
+# 合法性一概交给 ``_resolve_ai_move``（所以误认也只会退回落点默认策略）。
+_MOVE_TOKEN_PATTERN = r"(?<![A-Za-z0-9])[A-HJ-T]\d{1,2}(?!\d)"
+_PASS_WORD_PATTERN = r"pass|虚着|不落子|弃权"
 
 # 闲置搭话兜底台词
 IDLE_LINES = [
@@ -113,6 +122,8 @@ class AzureAgent:
 
         self._group_re = re.compile(_PAREN_GROUP_PATTERN)
         self._hint_re = re.compile(_MOVE_HINT_PATTERN)
+        self._move_token_re = re.compile(_MOVE_TOKEN_PATTERN)
+        self._pass_word_re = re.compile(_PASS_WORD_PATTERN, re.IGNORECASE)
 
     # ================= 回合状态图 =================
 
@@ -140,6 +151,7 @@ class AzureAgent:
             "messages": [],
             "reply": "",
             "tool_calls": 0,
+            "wants_tools": False,
             "move": None,
             "turn_id": str(turn_id or ""),
             "data": dict(data or {}),
@@ -684,6 +696,41 @@ class AzureAgent:
         if best[0] >= 0:
             return [coords.xy_to_gtp(best[0], best[1]), best[0], best[1]]
         return ["pass", -1, -1]
+
+    def _candidate_from_text(self, text) -> dict | None:
+        """从模型原话里认出它自己报出的落点候选（S21）：GTP 坐标或虚着；认不出返回 ``None``。
+
+        只做「认」，**不做合法性判断**——合法性由 ``_resolve_ai_move`` 统一把关（与
+        ``_pick_ai_move`` 同一判据），这样「模型报了个坏点」也一定能回退到可用落点。
+        """
+        t = str(text or "")
+        if t == "":
+            return None
+        if self._pass_word_re.search(t):
+            return {"pass": True}
+        m = self._move_token_re.search(t)
+        if m is None:
+            return None
+        return {"pass": False, "gtp": m.group(0)}
+
+    def _resolve_ai_move(self, candidate, move_infos) -> list:
+        """落点定案（S21 三条不可回退的边界），返回 ``[gtp, x, y]``：
+
+        1. 模型候选点必须过 ``board.is_legal(x, y, "white")["ok"]`` 才用，否则回退 ``_pick_ai_move``；
+        2. ``pass`` 只在 ``st.allow_pass`` 为真时可用（沿用 ``_pick_ai_move`` 的既有判据）；
+        3. **任何情况下都产出可用落点**——``_pick_ai_move`` 本身就保证这一点（合法点或允许时的 pass），
+           所以候选再离谱也不会「这一手不下」。
+        """
+        if isinstance(candidate, dict):
+            if candidate.get("pass"):
+                if self.st.allow_pass:
+                    return ["pass", -1, -1]
+            else:
+                gtp = str(candidate.get("gtp") or "")
+                xy = coords.gtp_to_xy(gtp)
+                if xy[0] >= 0 and self.st.board.is_legal(xy[0], xy[1], "white")["ok"]:
+                    return [gtp, xy[0], xy[1]]
+        return self._pick_ai_move(list(move_infos or []))
 
     # ================= 其余功能 =================
 
