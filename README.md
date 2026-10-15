@@ -104,7 +104,7 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 - **后端专用（客户端不读）**：`katago_url` / `katago_token` / `katago_timeout_ms`、
   `llm_extra_body` / `llm_think_extra_body` / `tools_enabled` / `max_tool_calls` 与
   `memory_enabled` / `memory_db_path` / `embed_base_url` / `embed_model` / `embed_api_key` /
-  `memory_top_k` / `memory_max_inject_chars` 只由后端消费；
+  `embed_timeout` / `memory_top_k` / `memory_max_inject_chars` 只由后端消费；
   客户端不读它们，但**写回配置时会原样保留**（游戏内保存设置不会把这些键弄丢）。
 
 | 字段 | 读取方 | 含义 |
@@ -125,7 +125,8 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 | `memory_enabled` | 后端（启动时） | **长期记忆**总开关，默认 `false`：开启后她跨局记得你（对局总结与显式事实落 SQLite，出话前召回注入）；见第四节「长期记忆（跨局记得你）」 |
 | `memory_db_path` | 后端（启动时） | 长期记忆库路径；留空＝`backend\data\memory.db`（**只在开启时创建**，属运行产物、已 gitignore） |
 | `embed_base_url` / `embed_model` / `embed_api_key` | 后端（启动时） | **云端 embedding 的 OpenAI 兼容地址 / 模型名 / Key**（如 `https://api.openai.com/v1` + `text-embedding-3-small`）；三者**任一为空＝不配向量**，召回自动降级为关键词匹配（不报错、不影响出话） |
-| `memory_top_k` | 后端（启动时） | 每次召回**注入条数**上限（默认 `3`） |
+| `embed_timeout` | 后端（启动时） | **单次 embedding 请求超时**（秒，默认 `10`）；网络差或想让降级更快发生时可调小（≤0 / 脏值退回默认）。召回 / 写入已移出事件循环，这里只决定单次请求最长等多久 |
+| `memory_top_k` | 后端（启动时） | 每次召回**注入条数**上限（默认 `3`；`0`＝记忆开着但不召回，管理面查询同样返回空列表） |
 | `memory_max_inject_chars` | 后端（启动时） | 注入提示词的**总字数**上限（默认 `240`；单条另截到 120 字） |
 | `prompt_system` | 后端（启动时） | **覆盖系统提示词（人设全文）**；留空用内置 Azure 人设 |
 | `prompt_user_name` | 后端（启动时） | **玩家称呼**，替换提示词中的「Estarth」（默认 Estarth） |
@@ -209,8 +210,11 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 - 两个召回点：**闲聊**（用你这句原话做查询）与**她自己落子前**（用最近一手 + 阶段做查询）；
   召回文本插在提示词的「【最近的对话】」之后、铁律段之前，措辞明确「不是当前盘面、仅供参考、别照抄」。
 - 注入硬上限：每次最多 `memory_top_k` 条、单条 120 字、总计 `memory_max_inject_chars` 字。
-- 配了 `embed_*` 就按**语义相似度**（云端 embedding + 余弦）排序；**没配 / 401 / 超时**一律降级为
-  **关键词匹配**（不伪造相似度分数）。记忆出任何问题都只打日志、自动降级，**绝不影响对局**（`busy` 照常归位）。
+- 配了 `embed_*` 就按**语义相似度**（云端 embedding + 余弦）排序，**向量命中不足 `memory_top_k` 条时用
+  关键词从其余记忆里补齐**（没向量的老行 / 写入时 embedding 失败的行不会被有向量的行压掉）；
+  **没配 / 401 / 超时**一律降级为**关键词匹配**（不伪造相似度分数）。记忆出任何问题都只打日志、自动降级，
+  **绝不影响对局**（`busy` 照常归位）；召回 / 写入都在工作线程里执行（`asyncio.to_thread`），
+  云端 embedding 卡住也不会冻住后端事件循环（单次最长等 `embed_timeout` 秒，默认 10）。
 - 库是 SQLite：`memory_db_path` 留空时落在 `backend\data\memory.db`（运行产物，已 gitignore）；
   这几个键都在后端**启动时**读取，改完要**重启后端**。
 
@@ -219,7 +223,7 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 四个管理端点（`memory_enabled=false` 时查询面返回空结果、写入被拒，都不会 500）：
 
 ```bash
-# 1) 看她记住了什么（query 必填；k 可省，缺省用 memory_top_k）
+# 1) 看她记住了什么（query 必填；k 可省，缺省用 memory_top_k；memory_top_k=0 或显式 k≤0 ＝不召回，返回空列表）
 curl -X POST http://127.0.0.1:8000/api/memory/query -H "Content-Type: application/json" \
   -d '{"query":"Estarth 的偏好","k":3}'
 # → {"ok":true,"items":[{"id":1,"ts":1750000000.0,"kind":"fact","tag":"estarth","text":"…","score":0.83}]}
@@ -372,8 +376,11 @@ KataGo 引擎与权重遵循其上游许可。
 - **管理面与配置**：新增 `POST /api/memory/query|write|forget` 与 `GET /api/memory/stats`（查看 / 手动写入 /
   忘记），`GET /api/health` 增加 `memory_rows`；管理端点的写 / 查另推 `memory` WS 事件（纯元数据，前端只记日志）。
   新增配置 `memory_enabled` / `memory_db_path` / `embed_base_url` / `embed_model` / `embed_api_key` /
-  `memory_top_k` / `memory_max_inject_chars`，库文件默认在 `backend\data\`（运行产物，已 gitignore）。
-  见第四节「长期记忆（跨局记得你）」。
+  `embed_timeout`（默认 10 秒） / `memory_top_k` / `memory_max_inject_chars`，库文件默认在 `backend\data\`
+  （运行产物，已 gitignore）。见第四节「长期记忆（跨局记得你）」。
+- **召回与阻塞**：向量命中不足 `memory_top_k` 条时用关键词从其余记忆里补齐（没向量的老行 / 写入时
+  embedding 失败的行不会被压掉）；召回 / 写入（她的两处 + 管理端点）都走 `asyncio.to_thread`，
+  云端 embedding 卡住也不会冻住后端事件循环。
 
 ### v3.2.0
 - **后端 LLM 调用改走 LangChain**：新增 `backend\app\llm_chain.py`（`ChatOpenAI` 的唯一装配点）与
