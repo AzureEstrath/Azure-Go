@@ -165,7 +165,9 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 输入与语音播放，**不启动任何模型服务**（没有 local 模式）。后端连不上时只在状态栏提示，不影响界面操作。
 
 - **启动后端**：双击 `backend\run_server.bat`（等价的手动启动：`cd backend` 后 `python -m app.main`），
-  监听 `http://127.0.0.1:8000`。依赖 `fastapi` / `uvicorn` / `httpx`（见 `backend\requirements.txt`）。
+  监听 `http://127.0.0.1:8000`。依赖 `fastapi` / `uvicorn` / `websockets` / `httpx`（见 `backend\requirements.txt`）。
+  > `websockets` 不能省：裸装 `uvicorn` 不带 WebSocket 实现，缺了它 `/ws` 会拒绝升级（404），
+  > 客户端只会一直显示「未连接后端」。
 - **配置**：`config.json` 里
   ```json
   "backend_url": "http://127.0.0.1:8000"
@@ -202,6 +204,7 @@ KataGo 引擎与权重遵循其上游许可。
 
 ### v3.0.0（当前）
 - **只保留远程后端**：客户端删除 `AzureAgent / AzurePrompts / KataGoEngine / LLMClient / GoBoard / GameState / Joseki* / EmotionModel` 与端到端测试脚本，装配路径收敛为 `NetClient`（REST 命令 + WebSocket 事件）；`config.json` 删掉运行方式键（`local` / `remote`）、`katago_*`（前端侧）、`llm_auto_start/exe/model_path/port`、`tts_auto_start/bf16/short_prompt`、`vlm_*` 等只服务本机部署的键，旧配置读入后会在下次写回时自我清理，不会崩溃、也不会把旧键写回文件。
+- **补齐后端的 WebSocket 依赖**：`backend\requirements.txt` 增列 `websockets`。此前只有裸 `uvicorn`，不含任何 WS 实现，`/ws` 的升级请求会被拒成 404 —— 远程模式还是可选项时被掩盖，v3.0.0 让它成为唯一运行方式后就成了致命问题（客户端只会一直显示「未连接后端」）。
 - **模型全云端**：LLM 与语音 TTS 一律走 OpenAI 兼容 API（`llm_*` / `tts_base_url` / `tts_model` / `tts_voice` / `tts_api_key`），`tts_mode` 默认改为 `openai`；`system` 只作连不上时的临时兜底（不写回配置）。后端不再拉起本地 LLM 服务（`services.py` 与看护逻辑删除），`backend/app/config.py` 的内置默认值改为云端示例。
 - **看屏幕搭话（peek）整体移除**：前后端的 `peer_remark` / `POST /api/peer` / `_peek_*` / VLM 配置与情绪条目全部删除；闲置主动搭话仍走 `POST /api/idle` + `ai_idle`（随 peek 一起删掉的只有发言前那声「哼」，情绪区域爆发时仍会用同一段语气词）。
 - **客户端不再拉起任何服务**：语音服务改为手动启动（`server\start_tts_server*.bat`），游戏只请求与播放；PCK 打包脚本删除，`export_presets.cfg` 保留供个人导出。
