@@ -41,5 +41,37 @@ class GraphFailSafeTest(unittest.TestCase):
         self.assertEqual([e["busy"] for e in bus.of_type("busy")][-1], False)
 
 
+class GraphTopologyTest(unittest.TestCase):
+    """拓扑守卫：本任务唯一的实质产出是「四条无条件边」，必须真的锁住。
+
+    `GraphShapeTest` 只比对了 `NODE_NAMES`（常量自比）和「有没有 `ainvoke`」（任何 `compile()`
+    结果都为真），`build_graph` 漏接一条边、接错方向、或偷偷引入条件边，它都照样绿。
+    这里直接读 langgraph 编译后的图：节点集合 + **边集合**（一条不多一条不少）+ 每条边都非条件边。
+    """
+
+    def test_topology_is_the_unconditional_chain(self):
+        from app.agent_graph import build_graph
+        agent, _eng, _llm, _bus = _mk()
+        g = build_graph(agent).get_graph()
+
+        # 节点：langgraph 1.x 会把哨兵节点 __start__ / __end__ 一并列出来
+        nodes = {str(n) for n in g.nodes}
+        self.assertEqual(nodes, {"__start__", "prepare", "decide", "speak", "finalize", "__end__"})
+
+        # 边：恰好是 START→prepare→decide→speak→finalize→END，一条不多一条不少
+        edges = {(str(e.source), str(e.target)) for e in g.edges}
+        self.assertEqual(edges, {
+            ("__start__", "prepare"),
+            ("prepare", "decide"),
+            ("decide", "speak"),
+            ("speak", "finalize"),
+            ("finalize", "__end__"),
+        })
+
+        # 本任务的硬约束：拓扑等价 ⇒ 一条条件边都不许有
+        for e in g.edges:
+            self.assertFalse(e.conditional, "边 %s→%s 是条件边（本任务只允许无条件边）" % (e.source, e.target))
+
+
 if __name__ == "__main__":
     unittest.main()
