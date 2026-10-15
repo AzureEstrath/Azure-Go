@@ -10,13 +10,15 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 **大模型** 负责讲解与闲聊，**语音合成** 让 Azure 开口说话，
 **Godot 4** 场景里是一个会眨眼、歪头、注视你的青蓝色 AI 少女 Azure。
 
-> 面向「**不想在本机部署大模型/语音**」的玩家：对局编排、KataGo 与模型调用都在
-> **远程后端**（`backend\`）里，**LLM 与 TTS 都走可自定义的 OpenAI 兼容 API**（填地址 + API Key），
+> 面向「**不想在本机部署大模型/语音**」的玩家：对局编排与模型调用都在
+> **远程后端**（`backend\`）里，**KataGo 由独立部署的云服务**（`katago_service\`）提供，
+> **LLM 与 TTS 都走可自定义的 OpenAI 兼容 API**（填地址 + API Key），
 > **人设与提示词也能在 `config.json` 里直接改**。客户端（`game\`）只做渲染、输入与语音播放，
 > 连不上后端时只在状态栏提示。
 >
-> 当前版本 **v3.0.0**：**只保留「连远程后端」一种运行方式**——客户端内的本地编排、
-> 本地模型服务拉起、看屏幕搭话（peek）与 PCK 打包流程全部删除，所有模型改为云端。
+> 当前版本 **v3.1.0**：**KataGo 也搬进了独立的云服务**——后端不再自己拉起引擎进程，只留一个 HTTP
+> 客户端（`katago_url`），服务可以先起、也可以单独重启。客户端仍然**只保留「连远程后端」一种运行方式**：
+> 本地编排、本地模型服务拉起、看屏幕搭话（peek）与 PCK 打包流程全部删除，所有模型改为云端。
 > 详见「九、更新」。
 
 ---
@@ -40,11 +42,17 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 │   ├─ tests\               语音测试脚本（test_tts.gd）
 │   ├─ config.json          客户端参数模板（见第三节）
 │   └─ export_presets.cfg   Godot 导出预设（个人导出用）
-├─ backend\                 远程后端（唯一权威：对局编排 / KataGo / LLM / 情绪；FastAPI + REST + WebSocket）
+├─ backend\                 远程后端（唯一权威：对局编排 / LLM / 情绪 / 定式；FastAPI + REST + WebSocket）
 │   ├─ app\                 对局编排 / KataGo·LLM 客户端 / 情感模型 / 提示词
 │   ├─ tests\               后端单元测试（含情感模型黄金样本）
 │   ├─ requirements.txt     后端依赖
 │   └─ run_server.bat       一键启动后端（监听 127.0.0.1:8000）
+├─ katago_service\          KataGo 云服务（独立部署：常驻 `katago analysis` 进程，对外 `/health` + `/analyze`）
+│   ├─ server.py            FastAPI 应用：Bearer 鉴权、串行化、warming/ready/dead 状态与 /health
+│   ├─ proc.py              常驻引擎子进程封装（stderr 持续排空 + 64MB 读行缓冲 + 启动预热）
+│   ├─ tests\               服务单元测试（假引擎，不依赖真实 KataGo）
+│   ├─ requirements.txt     服务依赖（fastapi / uvicorn）
+│   └─ run_server.bat       一键启动服务（监听 127.0.0.1:8100，见第六节）
 ├─ server\                  自建语音服务（CosyVoice 3，可选；**需自己启动**，游戏不再拉起）
 │   ├─ azure_tts_server.py  FastAPI 服务：OpenAI 兼容 `/v1/audio/speech`、`/health`、`/voices`（另有 `/v1/models`）
 │   ├─ run_hidden.vbs       隐藏窗口启动（手动启动自建服务时用）
@@ -55,8 +63,9 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 ```
 
 **模型与资产**（体积大，不随源码仓库分发，见 GitHub **Releases**）：
-`katago.exe` + `*.dll`、`model-b18c384nbt.bin.gz`（KataGo 权重）、`Azure.vrm`（形象）、
-CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
+`katago.exe` + `*.dll`、`model-b18c384nbt.bin.gz`（KataGo 权重）——这两个归 **KataGo 云服务的部署侧**持有
+（见第六节「KataGo 服务部署」），本仓库只含连它的客户端；
+`Azure.vrm`（形象）、CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
 
 ---
 
@@ -68,9 +77,10 @@ CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
    ```
 2. 把 `Azure.vrm`（形象）放到可访问位置，并把 `vrm_path` 填成 **绝对路径**
    （用相对路径时文件必须能被 Godot 解析到，否则形象加载失败）。
-   **KataGo 的 `katago.exe` / 权重 / `default_gtp.cfg` 由后端使用**，客户端不读这些路径。
-3. 启动后端（`backend\run_server.bat`，见第六节），再启动游戏。
-   > 后端在**启动时**读取 `config.json`（LLM / 提示词 / KataGo 等，见第三节「读取方」列），
+   **KataGo 的 `katago.exe` / 权重 / analysis 配置文件归 KataGo 云服务部署侧持有**，客户端不读这些路径。
+3. 先启动 **KataGo 云服务**（`katago_service\run_server.bat`，见第六节「KataGo 服务部署」），
+   再启动后端（`backend\run_server.bat`，见第六节），最后启动游戏。
+   > 后端在**启动时**读取 `config.json`（LLM / 提示词 / KataGo 服务地址等，见第三节「读取方」列），
    > 所以改这些字段、或在游戏设置面板里改完 LLM 地址/Key 后，都要**重启后端**才生效。
 4. 玩家**执黑先行**：左键落子，右键拖拽旋转视角，滚轮缩放。
 
@@ -93,8 +103,11 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 
 | 字段 | 读取方 | 含义 |
 | --- | --- | --- |
-| `backend_url` | 客户端 | **远程后端地址**：编排、KataGo 与 LLM 都在后端进程，游戏只做渲染与语音（WebSocket 地址由其推导） |
-| `max_visits` | 后端（启动时） | KataGo 每手搜索次数，越大越强越慢（引擎在后端侧，客户端不跑 KataGo） |
+| `backend_url` | 客户端 | **远程后端地址**：编排与 LLM 都在后端进程，游戏只做渲染与语音（WebSocket 地址由其推导） |
+| `max_visits` | 后端（启动时） | KataGo 每手搜索次数，越大越强越慢（由后端逐次分析请求传给云服务，客户端不跑 KataGo） |
+| `katago_url` | 后端（启动时） | **KataGo 云服务地址**（默认 `http://127.0.0.1:8100`）；引擎在独立服务里，后端只发 HTTP 请求（见第六节「KataGo 服务部署」） |
+| `katago_token` | 后端（启动时） | **KataGo 云服务的 Bearer 令牌**；与服务侧 `KATAGO_SERVICE_TOKEN` / `--token` 一致，服务未配令牌时留空（仅限本机回环调试） |
+| `katago_timeout_ms` | 后端（启动时） | 单次分析超时（毫秒，默认 `30000`）；超时/连接失败会重试 1 次，仍失败才报「云服务不可用」 |
 | `joseki_teach` | 后端（实时） | **定式导学**：识别你与 Azure 走出的常见定式（讲解 + 棋盘高亮手顺）；右侧栏也能切；默认 `true`，关掉=不识别不打扰 |
 | `llm_base_url` / `llm_model` | 后端（启动时） | **云端 LLM 的 OpenAI 兼容地址与模型名** |
 | `llm_api_key` | 后端（启动时） | **云端 LLM 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
@@ -120,9 +133,11 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 >   ② 服务**能连上但拒绝了这次请求**（音色 / 模型名不被接受，例如用 `中文女` 调 OpenAI 会返回 HTTP 400）
 >   → **不出声**：左侧语音栏与底部状态行显示「TTS 无响应（HTTP 400）…」，Azure 的文字照常显示，
 >   冷却 6 秒后继续尝试队列里的下一句。**音色 / 模型配错不会自动降级**，只会没声音 + 一行报错。
-> - `katago_bin` / `katago_model` / `katago_config` **不在上表**：它们由**后端**读取（当前后端仍自行拉起
->   KataGo 进程，计划 01 会改成独立的 KataGo 服务 + `katago_url`）。客户端**保留但不读**这些键——
->   游戏内保存设置时会**原样写回**，不会把它们抹掉（`game\config.json` 就是后端的配置文件，见第六节）。
+> - **KataGo 引擎路径类的旧键（可执行文件 / 权重 / analysis 配置三件套）不在上表，也不再有任何读取方**：
+>   它们是「后端自行拉起 KataGo 进程」时代的旧键（v3.0.0 及更早），v3.1.0 起 KataGo 由独立云服务提供，
+>   后端只连 `katago_url`。游戏内保存设置时会**把这几个旧键一并清掉**（自我清理，见
+>   `game\scripts\core\AzureConfig.gd` 的 `save()`），不影响对局；引擎本体与权重归服务部署侧持有，
+>   不入本仓库（见第一节「模型与资产」）。
 
 ---
 
@@ -161,8 +176,9 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
 
 ## 六、远程后端（唯一的运行方式）
 
-对局编排、KataGo 与 LLM 都在**后端进程**（`backend\`，FastAPI + REST + WebSocket）里；游戏客户端只做渲染、
-输入与语音播放，**不启动任何模型服务**（没有 local 模式）。后端连不上时只在状态栏提示，不影响界面操作。
+对局编排、LLM 与定式识别都在**后端进程**（`backend\`，FastAPI + REST + WebSocket）里；KataGo 由**独立部署的
+云服务**（`katago_service\`）提供，后端只连它（见下方「KataGo 服务部署」）。游戏客户端只做渲染、输入与语音播放，
+**不启动任何模型服务**（没有 local 模式）。后端连不上时只在状态栏提示，不影响界面操作。
 
 - **启动后端**：双击 `backend\run_server.bat`（等价的手动启动：`cd backend` 后 `python -m app.main`），
   监听 `http://127.0.0.1:8000`。依赖 `fastapi` / `uvicorn` / `websockets` / `httpx`（见 `backend\requirements.txt`）。
@@ -177,10 +193,51 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
   - REST：`/api/move|hint|analyze|chat|summarize|undo|reset|config|reveal|interaction|idle|mood/tick`，
     以及 `GET /api/state`、`GET /api/health`。
   - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki`。
+  - `GET /api/health` 返回 `{ok, katago_dead, katago_error, katago_url, llm_url}`（字段现都表示「云服务」的
+    状态）。其中 `katago_dead` 与 `katago_error` 必须**成对读**：
+    - `katago_dead` 只反映**启动探活**的结论——它仅由引擎客户端的 `start()` 置位，一次**成功的分析会把它清掉**；
+    - `katago_error` 则在**每次分析失败**时刷新（成功时清空）；
+    - 所以「`katago_dead=false` 但 `katago_error` 是新的非空值」＝ 服务是**中途掉线**（启动时好好的、跑着跑着没了），
+      而不是「启动就没起来」。运维自检以 `katago_error` 为准，`katago_dead` 只当启动结论看；
+    - `katago_url` 是后端当前连接的 KataGo 服务地址，便于确认连的是哪台（留空时客户端回退默认回环地址
+      `http://127.0.0.1:8100`）。
 - **后端配置**：后端进程用环境变量 `AZURE_CONFIG` 指定 `config.json`；未设置时依次找 `<当前工作目录>\config.json`
   → `backend\config.json`（`backend\app\config.py` 的 `load`）。`backend\run_server.bat` 会先把
   `..\AzureGoGodot\config.json` 写进 `AZURE_CONFIG`，该文件不存在时改用 `..\game\config.json`——两个都在时用前者。
 - **注意**：后端依赖本机 Python 环境，需按上面的命令自行启动；后端不在时游戏只提示、不崩溃。
+  KataGo 服务没起或 `katago_url` 写错时，后端启动横幅会打印「`[KataGo] 云服务不可用：…`」并继续运行——
+  对局时该手退化为可读提示、`busy` 必归位、棋盘不会锁死；把地址改对后**重启后端**即可。
+
+### KataGo 服务部署
+
+KataGo 不再由后端进程拉起，而是**独立部署的云服务**（`katago_service\`）：FastAPI 里常驻一个
+`katago analysis` 子进程，启动即**后台预热**（OpenCL 首次调优挪到部署阶段），对外只暴露
+`POST /analyze`（请求/响应都是引擎原文）与 `GET /health`。后端通过 `katago_url` 连它，因此服务可以
+先起、也可以单独重启，对局侧只会拿到「云服务不可用」的可读提示。
+
+- **机器要求**：能跑 KataGo 的机器（Windows + 显卡驱动；纯 CPU 也能跑，只是慢）。引擎本体
+  `katago.exe` / `*.dll`、权重 `model-b18c384nbt.bin.gz`、analysis 配置文件（如 `analysis_example.cfg`）
+  都归**这台机器**持有，不入本仓库（见第一节「模型与资产」）。
+- **装依赖**：`pip install -r katago_service\requirements.txt`（`fastapi` / `uvicorn`；`httpx` 只给测试用）。
+- **启动**：双击 `katago_service\run_server.bat`。脚本**必须原样跑**——它自己 `cd` 到仓库根目录，
+  因为 `katago_service` 是包，`python -m katago_service.server` 要求父目录在 `sys.path` 上。
+  等价的手动命令是**在仓库根目录**执行：
+  ```
+  python -m katago_service.server --port 8100 --token <令牌> --katago-exe <katago.exe> --model <权重> --config <analysis cfg> [--analysis-threads N]
+  ```
+  参数留空则由环境变量兜底：`KATAGO_HOST` / `KATAGO_SERVICE_TOKEN` / `KATAGO_EXE` / `KATAGO_MODEL` /
+  `KATAGO_CONFIG`（对**直接执行**与**经 `run_server.bat`** 两种方式都生效）。默认监听 `127.0.0.1:8100`。
+- **自检**：`curl http://127.0.0.1:8100/health` → `{"ok": true, "state": "ready", "katago_error": "", ...}`。
+  模型加载期间 `state` 是 `warming`（此时 `/analyze` 立刻回 503 可读错误，不会挂到客户端超时，也不会
+  让游戏卡住）；引擎起不来则是 `dead`，`katago_error` 给出原因。日志在 `katago_service\logs\katago\`。
+- **鉴权与暴露面**：服务配了 token（`--token` / `KATAGO_SERVICE_TOKEN`）就必须带
+  `Authorization: Bearer <token>`，后端读 `katago_token` 对应它；不配 token 只允许**本机回环调试**。
+  跨机部署要显式 `--host 0.0.0.0` 或 `KATAGO_HOST=0.0.0.0`——此时服务启动会打印一条「对外监听且未配置
+  token」的告警（**只是告警、不阻止启动**，回环调试仍可无 token）。
+  **务必只在内网 / TLS 反代之后暴露，并配上 token。**
+- **端口/地址要对上**：服务默认 8100、后端 `katago_url` 默认 `http://127.0.0.1:8100`；换机器或换端口时
+  两边一起改（服务侧 `--port`，后端侧 `katago_url`）。`katago_url` / `katago_token` /
+  `katago_timeout_ms` 都在后端**启动时**读取，改完重启后端。
 
 ---
 
@@ -202,7 +259,13 @@ KataGo 引擎与权重遵循其上游许可。
 
 ## 九、更新
 
-### v3.0.0（当前）
+### v3.1.0（当前）
+- **KataGo 独立成云服务**：新增 `katago_service\`（FastAPI + 常驻 `katago analysis` 子进程）：`POST /analyze`（请求/响应即引擎原文）、`GET /health`（`warming` / `ready` / `dead`）、可选 Bearer 鉴权、启动即后台预热（OpenCL 首次调优挪到部署阶段，端口不会被预热堵住），另有 `run_server.bat` 与 `--host/--port/--token/--katago-exe/--model/--config/--analysis-threads` 入口 + `KATAGO_*` 环境变量兜底。部署见第六节「KataGo 服务部署」。
+- **后端改为 HTTP 客户端**：`backend\app\engine.py` 重写为连 `/health` + `/analyze` 的客户端（就绪判定只看 `state`，不认 `ok`；超时/连接失败重试 1 次后返回可读错误），不再持有引擎子进程——`agent.py` / `prompts.py` 一行未改。子进程时代的两条坑（stderr 必须持续排空、读行缓冲放大到 64MB）随引擎搬进 `katago_service\proc.py`。
+- **配置换血**：后端与模板里的 KataGo **引擎路径三件套**（可执行文件 / 权重 / analysis 配置）换成 `katago_url`（默认 `http://127.0.0.1:8100`）/ `katago_token` / `katago_timeout_ms`；`game\config.json` 模板与 README 字段表同步，`AzureConfig.save()` 改为把这三个旧键**自我清理**（此前为兼容后端共用同一份配置而刻意保留）。后端不再解析引擎路径（`_resolve` 删除），`GET /api/health` 增加 `katago_url`。
+- **服务不可用的表现不变**：KataGo 服务没起 / 地址写错 / 预热中，后端都给出可读中文提示且 `busy` 必归位，棋盘不会永久锁死；`katago_dead` 反映启动探活、`katago_error` 每次失败刷新，两者成对读（见第六节）。
+
+### v3.0.0
 - **只保留远程后端**：客户端删除 `AzureAgent / AzurePrompts / KataGoEngine / LLMClient / GoBoard / GameState / Joseki* / EmotionModel` 与端到端测试脚本，装配路径收敛为 `NetClient`（REST 命令 + WebSocket 事件）；`config.json` 删掉运行方式键（`local` / `remote`）、`katago_*`（前端侧）、`llm_auto_start/exe/model_path/port`、`tts_auto_start/bf16/short_prompt`、`vlm_*` 等只服务本机部署的键，旧配置读入后会在下次写回时自我清理，不会崩溃、也不会把旧键写回文件。
 - **补齐后端的 WebSocket 依赖**：`backend\requirements.txt` 增列 `websockets`。此前只有裸 `uvicorn`，不含任何 WS 实现，`/ws` 的升级请求会被拒成 404 —— 远程模式还是可选项时被掩盖，v3.0.0 让它成为唯一运行方式后就成了致命问题（客户端只会一直显示「未连接后端」）。
 - **模型全云端**：LLM 与语音 TTS 一律走 OpenAI 兼容 API（`llm_*` / `tts_base_url` / `tts_model` / `tts_voice` / `tts_api_key`），`tts_mode` 默认改为 `openai`；`system` 只作连不上时的临时兜底（不写回配置）。后端不再拉起本地 LLM 服务（`services.py` 与看护逻辑删除），`backend/app/config.py` 的内置默认值改为云端示例。
