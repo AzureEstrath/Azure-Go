@@ -504,3 +504,65 @@ class MemoryFailureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# —— 以下为计划 04 · Task 2 追加（既有断言一个字符都没改；追加在 guard 之后，
+#    是为了让上面的既有内容保持逐字节不变——`unittest.main()` 在本仓的唯一跑法
+#    `python -m unittest discover -s tests` 下不会执行）——
+
+
+class GraphNodeExceptionTest(unittest.TestCase):
+    """S9：图里的节点**真的抛出**时，`busy` 必须归位、棋盘不得被永久锁死。
+
+    与 `FailSafeTest` 不同，这里不是「LLM 返回错误文案」而是异常从 `graph.ainvoke` 里冒出来：
+    把节点会调用的 `agent._pick_ai_move`（decide 节点）与 `agent.katago.analyze`（prepare 节点）
+    换成抛异常的替身。异常只有公开方法的 `try/finally` 兜得住——去掉那对 `try/finally`，
+    下面的 busy 断言与「随后还能照常出话」都会红。
+    """
+
+    def test_node_exception_releases_busy_and_unlocks(self):
+        agent, _eng, _llm, bus = _mk()
+
+        def boom(_infos):
+            raise RuntimeError("节点炸了（模拟工具超时 / 返回解析失败）")
+
+        agent._pick_ai_move = boom
+        asyncio.run(agent.player_move(3, 3))
+
+        # 异常确实发生在图中间：玩家那手的点评已发，她那一手还没宣告
+        self.assertTrue(bus.messages(events.AI_COMMENT), "点评阶段应已跑完")
+        self.assertEqual(bus.messages(events.AI_MOVE), [], "异常应发生在落子宣告之前")
+
+        # ① busy 归位 ② busy 事件序列最后一条是 False（且没有多余的 True/False）
+        self.assertFalse(agent.busy)
+        seq = [e["busy"] for e in bus.of_type("busy")]
+        self.assertTrue(seq)
+        self.assertIs(seq[-1], False)
+        self.assertEqual(seq, [True, False])
+
+        # ③ 棋盘没被永久锁死：还原替身，随后照样能出话
+        del agent._pick_ai_move                 # 删掉实例上的替身，回到类方法
+        before = len(bus.messages())
+        asyncio.run(agent.hint())
+        self.assertFalse(agent.busy)
+        self.assertGreater(len(bus.messages()), before, "异常之后必须还能正常出话")
+        self.assertIs([e["busy"] for e in bus.of_type("busy")][-1], False)
+
+    def test_engine_exception_degrades_with_fallback_line(self):
+        """引擎在节点里抛出：公开方法的兜底路径照旧给玩家一句可读台词，且 busy 归位。"""
+
+        async def boom(_moves):
+            raise RuntimeError("引擎连接被拒绝")
+
+        agent, _eng, _llm, bus = _mk()
+        agent.katago.analyze = boom
+        asyncio.run(agent.hint())
+
+        self.assertFalse(agent.busy)
+        self.assertIs([e["busy"] for e in bus.of_type("busy")][-1], False)
+        texts = [str(e.get("text", "")).strip() for e in bus.messages(events.AI_COMMENT)]
+        self.assertTrue(texts, "引擎异常时应有兜底台词")
+        self.assertTrue(all(t != "" for t in texts))
+        for e in bus.messages():
+            self.assertNotIn("调用出错", str(e.get("text", "")))
+
