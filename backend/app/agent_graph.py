@@ -707,11 +707,26 @@ def _speak_node(agent):
 
 # ================= ④ finalize：发事件、写 memory_log、归位 busy =================
 
+def _emit_deduped(agent, kind, text):
+    """发一条**非落子宣告**的 ``message`` 事件：窗口内一字不差的原话不再推给前端。
+
+    只做「发事件」这一道闸门（S25/S26）：调用方的 ``memory_log`` / ``chat_history`` 写入**照常**发生；
+    被抑制时**不发任何替代事件**；被抑制的那句照常入窗（S27，与前端 ``_recent_ai_texts`` 一致）。
+    ``ai_move`` 落子宣告不走这里（在 ``_speak_own_turn`` 里直发），永不受判重。
+    """
+    from .agent import AI_DEDUP_WINDOW        # 延迟导入：agent ↔ agent_graph 是模块级循环依赖
+    if agent._is_repeat(text):
+        print("[Agent] 原话去重（最近 %d 条内一字不差）已抑制：%s" % (AI_DEDUP_WINDOW, text))
+    else:
+        agent._emit(events.message(kind, text))
+    agent._note_line(text)
+
+
 async def _finalize_after_player(agent, data):
     """点评入档并发给玩家（tag ``E``）。**不归位 busy**：本回合还有她自己的落子。"""
     text = str(data.get("reply") or "")
     agent.st.log_memory("E", text, len(agent.st.moves))
-    agent._emit(events.message(events.AI_COMMENT, text))
+    _emit_deduped(agent, events.AI_COMMENT, text)
 
 
 async def _finalize_own_turn(agent, data):
@@ -723,7 +738,7 @@ async def _finalize_just_moved(agent, data):
     """落子后感想入档（tag ``A``）、发事件、定式轨迹，然后归位 busy 与情绪小调用。"""
     text = str(data.get("reply") or "")
     agent.st.log_memory("A", text, len(agent.st.moves))
-    agent._emit(events.message(events.AI_COMMENT, text))
+    _emit_deduped(agent, events.AI_COMMENT, text)
     agent._joseki_emit(data.get("jk2") or {})
     agent._set_busy(False)
     await agent._mood_llm_refine()
@@ -733,14 +748,14 @@ async def _finalize_just_moved(agent, data):
 async def _finalize_observe(agent, data):
     """提示发事件（短路时只归位 busy），然后解锁。"""
     if not data.get("short"):
-        agent._emit(events.message(events.AI_COMMENT, str(data.get("reply") or "")))
+        _emit_deduped(agent, events.AI_COMMENT, str(data.get("reply") or ""))
     agent._set_busy(False)
 
 
 async def _finalize_analyze(agent, data):
     """分析发事件 + 形势栏（短路时只归位 busy），然后解锁。"""
     if not data.get("short"):
-        agent._emit(events.message(events.AI, "📊 " + str(data.get("reply") or "")))
+        _emit_deduped(agent, events.AI, "📊 " + str(data.get("reply") or ""))
         info = data.get("info") or {}
         agent._emit(events.info(float(info.get("wr", 0.5)), float(info.get("score", 0.0))))
     agent._set_busy(False)
@@ -753,7 +768,7 @@ async def _finalize_chat(agent, data):
     if agent._llm_failed(reply):                # 云端失败：聊天退化为兜底台词
         reply = agent._fallback_line("chat")
     agent.st.chat_history.append({"role": "assistant", "content": reply})
-    agent._emit(events.message(events.AI, reply))
+    _emit_deduped(agent, events.AI, reply)
     await agent._mood_llm_refine()
 
 
@@ -761,14 +776,14 @@ async def _finalize_idle(agent, data):
     """闲置搭话收尾（不进 busy，与今天一致）。"""
     reply = str(data.get("reply") or "")
     agent.st.chat_history.append({"role": "assistant", "content": reply})
-    agent._emit(events.message(events.AI_IDLE, reply))
+    _emit_deduped(agent, events.AI_IDLE, reply)
 
 
 async def _finalize_summary(agent, data):
     """总结收尾：置终局标记 → 发话 → 真总结才写长期记忆 → 解锁。"""
     text = str(data.get("reply") or "")
     agent.st.finished = True
-    agent._emit(events.message(events.AI, "📋 对局总结\n" + text))
+    _emit_deduped(agent, events.AI, "📋 对局总结\n" + text)
     if not data.get("failed"):                  # 只写真总结：兜底台词不是总结，写进去会污染记忆
         await asyncio.to_thread(agent._remember_game, text,
                                 float(data.get("wr", 0.5)), float(data.get("score", 0.0)))

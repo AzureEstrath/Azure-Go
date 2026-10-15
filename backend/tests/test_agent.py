@@ -540,8 +540,10 @@ class GraphNodeExceptionTest(unittest.TestCase):
         self.assertIs(seq[-1], False)
         self.assertEqual(seq, [True, False])
 
-        # ③ 棋盘没被永久锁死：还原替身，随后照样能出话
+        # ③ 棋盘没被永久锁死：还原替身、换一句**不重复**的新台词（S28：与 Task 4 的 8 条窗口去重兼容——
+        #    StubLLM 恒定复读同一句本就该被拦下，那是设计行为、不是「锁死」），随后照样能出话
         del agent._pick_ai_move                 # 删掉实例上的替身，回到类方法
+        agent.llm.text = "异常之后我还在…"       # 换成窗口里没有的新台词，避免被判重复抑制
         before = len(bus.messages())
         asyncio.run(agent.hint())
         self.assertFalse(agent.busy)
@@ -565,4 +567,42 @@ class GraphNodeExceptionTest(unittest.TestCase):
         self.assertTrue(all(t != "" for t in texts))
         for e in bus.messages():
             self.assertNotIn("调用出错", str(e.get("text", "")))
+
+
+# —— 以下为计划 04 · Task 4 追加（既有断言一个字符都没改）——
+
+
+class DedupTest(unittest.TestCase):
+    def test_repeat_within_window_is_suppressed(self):
+        agent, _eng, llm, bus = _mk()
+        sent = []
+
+        async def run():
+            for _ in range(2):
+                bus.clear()
+                await agent.chat("你好")
+                sent.append([e["text"] for e in bus.messages(events.AI)])
+
+        llm.text = "我在的~"
+        asyncio.run(run())
+        self.assertEqual(len(sent[0]), 1)
+        self.assertEqual(len(sent[1]), 0)          # 隔一轮的原样复读被拦下
+
+    def test_move_announcement_not_deduped(self):
+        agent, _eng, llm, bus = _mk()
+        llm.text = "我在D16补一手。"
+
+        async def run():
+            await agent.player_move(3, 3)
+            first = len(bus.messages(events.AI_MOVE))
+            await agent.player_move(15, 15)
+            return first, len(bus.messages(events.AI_MOVE))
+
+        first, second = asyncio.run(run())
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 2)                # 落子宣告不受复读抑制
+
+    def test_window_is_eight(self):
+        from app.agent import AI_DEDUP_WINDOW
+        self.assertEqual(AI_DEDUP_WINDOW, 8)
 

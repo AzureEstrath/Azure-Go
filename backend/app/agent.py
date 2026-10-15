@@ -68,6 +68,11 @@ _MOVE_HINT_PATTERN = "[A-HJ-Ta-hj-t]\\s?\\d{1,2}|落子|落在|虚着|pass|着�
 _MOVE_TOKEN_PATTERN = r"(?<![A-Za-z0-9])[A-HJ-T]\d{1,2}(?!\d)"
 _PASS_WORD_PATTERN = r"pass|虚着|不落子|弃权"
 
+# AI 原话去重窗口（原在 ``Main.gd``：``AI_DEDUP_WINDOW`` / ``_recent_ai_texts``，本轮下沉到后端）。
+# 最近 N 条 AI 原话（不含 ``ai_move`` 落子宣告）里 ``strip()`` 后一字不差即判重复；前端保留既有判据，
+# 只兜「WS 重连后乱序」这一种后端看不到的情形。
+AI_DEDUP_WINDOW = 8
+
 # 闲置搭话兜底台词
 IDLE_LINES = [
     "唔…还在吗？我在这里等你哦。",
@@ -118,6 +123,7 @@ class AzureAgent:
         self._mood_ms = 0
         self._mood_desc = ""
         self._reveal_pending = False
+        self._recent_lines = []       # AI 原话去重窗口（最近 AI_DEDUP_WINDOW 条，跨回合存活，见 Main.gd 原判据）
         self._graph = None            # 回合状态图：首次用到时装配（build_graph 用闭包捕获 self）
 
         self._group_re = re.compile(_PAREN_GROUP_PATTERN)
@@ -162,6 +168,30 @@ class AzureAgent:
 
     def _emit(self, event):
         self.bus.publish(event)
+
+    # ================= AI 原话去重（8 条窗口，原在 Main.gd） =================
+
+    def _is_repeat(self, text) -> bool:
+        """最近 ``AI_DEDUP_WINDOW`` 条 AI 原话里是否已有 ``text.strip()`` 后**完全相等**的一句。
+
+        判据与前端 ``Main.gd`` 的 ``_recent_ai_texts`` 逐字一致（``strip()`` 后完全相等，不是包含）；
+        窗口里只有「非 ``ai_move``」的台词，空串一律不算重复。
+        """
+        norm = str(text or "").strip()
+        return norm != "" and norm in self._recent_lines
+
+    def _note_line(self, text):
+        """把一条 AI 原话记入去重窗口（超出上限丢最旧）。
+
+        **被抑制的那句也要入窗**（S27）：否则第二次、第三次相同的话会从中间漏出去一次，
+        与前端「每次 AI 文本都记进窗口」的行为不一致。
+        """
+        norm = str(text or "").strip()
+        if norm == "":
+            return
+        self._recent_lines.append(norm)
+        while len(self._recent_lines) > AI_DEDUP_WINDOW:
+            self._recent_lines.pop(0)
 
     # ================= 工具 =================
 

@@ -31,8 +31,8 @@ var _tts_model_edit: LineEdit
 var _tts_voice_edit: LineEdit
 var _tts_voice_opt: OptionButton
 var _pending_ai: Array[Dictionary] = []    # 待显示的 Azure 文字（FIFO；每项 {text, reveal, kind?}）
-const AI_DEDUP_WINDOW := 8                 # 防复读窗口：最近 N 条 AI 发言参与去重（不再只比对相邻一条）
-var _recent_ai_texts: Array[String] = []   # 最近说过的 AI 原话（含落子宣告）：一字不差的重复句直接抑制（防复读兜底）
+const AI_DEDUP_WINDOW := 8                 # 防复读窗口（兜底判据）：后端已按同样窗口去重，这里只兜 WS 重连后的乱序
+var _recent_ai_texts: Array[String] = []   # 最近说过的 AI 原话（含落子宣告）：只兜 WS 重连后乱序到达的重复句
 var _thinking_row: Control = null          # 「Azure 思考中……」占位气泡
 var _thinking_label: Label = null
 var _speech_hold := false                  # Azure 还有语音没播完：继续锁住棋盘
@@ -732,7 +732,7 @@ func _add_msg(kind: String, text: String) -> void:
 		var norm := text.strip_edges()
 		if kind != "ai_move" and _recent_ai_texts.has(norm):
 			print("[chat] 防复读（最近 %d 条内一字不差）已抑制：%s" % [_recent_ai_texts.size(), norm])
-			return                           # 防复读兜底：最近窗口内完全相同的一句不再重复显示/朗读（含隔了几条的原样复读）
+			return                           # 兜底判据：后端已去重，这里只兜 WS 重连后乱序到达的重复句（含隔了几条的原样复读）
 		_recent_ai_texts.append(norm)
 		while _recent_ai_texts.size() > AI_DEDUP_WINDOW:
 			_recent_ai_texts.pop_front()
