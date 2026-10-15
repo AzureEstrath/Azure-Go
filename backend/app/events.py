@@ -11,6 +11,7 @@
     joseki        ↔  joseki_event(payload)      定式高亮轨迹（kind/corner/points）
     tool          ↔  tool_event(payload)        她自己查资料（start/end，只给状态栏看）
     token         ↔  token_event(turn_id, delta) 流式增量（可选、默认关闭；最终内容以 message 为准）
+    speech        ↔  （无信号）                  一条台词对应的语音（音频 id 或系统语音指令）
     memory        ↔  （无信号）                  长期记忆的写入/召回元数据，前端只记一行日志
 
 事件统一为 dict，``type`` 字段走对应构造器；客户端按 type 分发。
@@ -22,6 +23,10 @@ message.kind 取值与前端 message 信号一致：
 
 ``tool`` 只描述「她自己查了一次资料」的进度（``phase`` = start/end），**不是台词**：
 前端只用它更新状态栏文案，工具返回的原始文本永远只回到模型手里。
+
+``speech`` 是**语音**（计划 05）：与对应的 ``message`` 一一配对（同 ``turn_id`` + 递增 ``seq``），
+``mode == "openai"`` 时按 ``id`` 去 ``GET /api/tts/audio/{id}`` 取音频，``mode == "system"`` 时
+用 ``text``（清洗后）交给 Windows 系统语音。**它不改 ``message`` 的形状**。
 
 ``memory`` 只描述一次长期记忆动作（``op`` = write/recall），同样是**元数据、不是台词**：
 前端不产生任何界面信号，只做轻量日志；记忆内容绝不进台词。
@@ -93,6 +98,33 @@ def token(turn_id, delta):
     （每次公开编排调用生成一次）。
     """
     return {"type": "token", "turn_id": str(turn_id), "delta": str(delta)}
+
+
+def speech(audio_id, mode, tone, pitch, turn_id, seq, text=""):
+    """一条台词的语音（计划 05）：与对应的 ``message`` 同 ``turn_id``、按 ``seq`` 递增一一配对。
+
+    ``mode`` 三态（与 :mod:`app.tts` 的返回值同源）：
+        ``openai`` —— 音频已合成并在缓存里，``id`` 可经 ``GET /api/tts/audio/{id}`` 取回；
+        ``system`` —— 合成不可用（未配置 / 超时 / 云端报错），``text`` 是清洗后可直接朗读的文本；
+        ``none``   —— **不发这个事件**（语音关闭 / 没有可念的内容），故构造器只管前两种。
+
+    ``tone`` 是 ``[[tone:sigh|cheer|proud]]`` 里剥出来的那一个语气标记（没有则为空串）；
+    ``pitch`` 是当前情绪区域的音高偏移（与 ``mood`` 事件同源），由前端叠加到播放音高上。
+
+    两条边界：**``message`` 的形状不受影响**（气泡仍整条由 ``message`` 收口，``turn_id`` 不进
+    ``message``）；``seq`` 只在**同一** ``turn_id`` 内从 1 单调递增，跨回合会重置——前端必须按
+    ``turn_id + seq`` 配对，不能只看 ``seq``。脏值不抛：``pitch`` / ``seq`` 非数字时退回 ``0``。
+    """
+    try:
+        p = float(pitch)
+    except (TypeError, ValueError):
+        p = 0.0
+    try:
+        s = int(seq)
+    except (TypeError, ValueError):
+        s = 0
+    return {"type": "speech", "id": str(audio_id), "mode": str(mode), "tone": str(tone),
+            "pitch": p, "turn_id": str(turn_id), "seq": s, "text": str(text)}
 
 
 def memory(op, tag, text, score=0.0):

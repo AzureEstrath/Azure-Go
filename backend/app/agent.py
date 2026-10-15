@@ -100,7 +100,8 @@ CHAT_FALLBACK_LINES = [
 
 class AzureAgent:
     def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False,
-                 tools_enabled=False, max_tool_calls=None, memory=None, stream_tokens=False):
+                 tools_enabled=False, max_tool_calls=None, memory=None, stream_tokens=False,
+                 tts=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -123,6 +124,12 @@ class AzureAgent:
         # 本轮唯一标识：**每次公开编排调用生成一次**（player_move 的三个阶段共用同一个），
         # 供 token（本任务）与 speech（计划 05）配对；它不进既有事件形状，只在新事件里带（S33）。
         self.turn_id = ""
+        # 本回合已发了几条 speech（T15）：同一 turn_id 内从 1 单调递增，由 `_new_turn()` 重置。
+        self._speech_seq = 0
+
+        # —— 云端语音（计划 05）：默认不接线（None）⇒ 行为与今天逐字一致（一条 speech 都不发）；
+        #    由 main.py 的 lifespan 注入 TTSClient（或测试注入假 TTS）——
+        self.tts = tts
 
         # —— 跨局长期记忆：默认不接线（None），由 main.py 的 lifespan 注入 MemoryService ——
         self.memory = memory
@@ -187,7 +194,23 @@ class AzureAgent:
     def _new_turn(self) -> str:
         """开启一次公开编排调用：生成新的 ``turn_id``（同一回合的多个阶段一路沿用，S33）。"""
         self.turn_id = uuid.uuid4().hex
+        self._speech_seq = 0                        # T15：seq 是**同一** turn_id 内从 1 起的单调序号
         return self.turn_id
+
+    def _next_speech_seq(self) -> int:
+        """取下一条 ``speech`` 事件的序号（T15：同一 ``turn_id`` 内从 1 起单调递增）。"""
+        self._speech_seq += 1
+        return self._speech_seq
+
+    def speech_pitch(self) -> float:
+        """当前情绪区域的音高偏移（T2：与 ``mood`` 事件同源；取不到时退回 ``0.0``）。
+
+        ``speech`` 事件的音高由 agent 侧填——``tts.py`` 那一层拿不到情绪（它的 ``pitch`` 恒为 0.0）。
+        """
+        try:
+            return float(self.mood.info(self.mood.region()).get("pitch", 0.0))
+        except Exception:                           # noqa: BLE001 —— 情绪数据脏了也不能让语音链断掉
+            return 0.0
 
     # ================= 事件 =================
 

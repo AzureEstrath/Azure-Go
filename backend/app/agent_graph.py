@@ -38,6 +38,12 @@
   最终台词干净，边界见该类的「保证边界」；去重闸门同样生效、整句复读一条 token 都不发），
   台词仍以 ``_finalize_*`` 里经 ``clean_reply`` + ``_emit_deduped`` 的完整 ``message`` 收口，
   且与「对整条原文调 ``content_of``」同构；关闭时一个 ``token`` 都不发，事件序列与没有这个功能时逐字一致；
+- 语音（计划 05）走 ``_emit_line``：先 ``message``、**紧随其后** ``await agent.tts.speak(text)`` 再发
+  ``speech``（``turn_id`` + 同一回合内从 1 递增的 ``seq``，由 ``agent._new_turn()`` 重置；``pitch`` 取
+  当前情绪区域）。三条不能回退的规则：``agent.tts is None``（未接线）时一条 ``speech`` 都不发、
+  行为与没有这个功能时逐字一致；``speech`` 与对应的 ``message`` **共用 ``_emit_deduped`` 这一个闸门**
+  （被去重抑制的台词连同它的 ``speech`` 一起不发）；``mode == "none"`` 不发。``ai_move`` 落子宣告
+  不走判重（直发），它的 ``speech`` 照样紧跟其后——前端仍在「这条语音开始播放」时 ``POST /api/reveal``；
 - ``build_graph(agent)`` 用闭包捕获 ``agent``，模块级不持有任何可变状态：同一个 ``agent`` 重建图
   是安全的，不同 ``agent`` 各有一张图。
 """
@@ -608,10 +614,11 @@ async def _speak_own_turn(agent, data, msgs):
     ai_gtp = str(mv.get("gtp") or "")
     ai_x = int(mv.get("x", -1))
     ai_y = int(mv.get("y", -1))
-    # 这条语音开始播放时，界面才把她的子放上棋盘（事件带坐标，客户端本地揭示）
-    agent._emit(events.message(events.AI_MOVE, think_msg, move={
+    # 这条语音开始播放时，界面才把她的子放上棋盘（事件带坐标，客户端本地揭示）；
+    # speech 紧跟在它后面发（T3/T2b：语音与气泡一一配对，前端仍在语音开始时 reveal）
+    await _emit_line(agent, events.AI_MOVE, think_msg, move={
         "x": ai_x, "y": ai_y, "gtp": ai_gtp, "pass": ai_gtp == "pass",
-    }))
+    })
 
     # 真正落子：先落到内部棋谱；棋盘可见的更新延后到语音开始时（reveal_move）
     if ai_gtp == "pass":
@@ -622,7 +629,7 @@ async def _speak_own_turn(agent, data, msgs):
         agent.st.add_move("W", ai_gtp)
     agent._reveal_pending = True
     if ai_gtp == "pass":
-        agent._emit(events.message(events.AI, "（Azure本手选择了虚着）"))
+        await _emit_line(agent, events.AI, "（Azure本手选择了虚着）")
 
 
 async def _speak_just_moved(agent, data, msgs):
@@ -774,18 +781,52 @@ async def _say(agent, msgs, max_tokens):
 
 # ================= ④ finalize：发事件、写 memory_log、归位 busy =================
 
-def _emit_deduped(agent, kind, text):
+async def _emit_speech(agent, text):
+    """把一条**刚发出去的**台词交给 TTS，并按需补发一条 ``speech`` 事件（与它相邻，T2b/T3）。
+
+    ``tts`` 未接线（``None``）时**什么都不做**——行为与没有这个功能时逐字一致（一条 ``speech`` 都不发）。
+    ``mode == "none"``（语音关闭 / 没有可念的内容）同样不发；``openai`` / ``system`` 都发。
+
+    TTS 出错**绝不影响这一回合**：``TTSClient.speak()`` 自己就不抛（失败一律降级 ``system``），
+    这里再兜一层只是为了「注入的假 TTS 抛了」也不至于把 ``busy`` 卡死。
+    """
+    tts = getattr(agent, "tts", None)
+    if tts is None:
+        return
+    try:
+        res = await tts.speak(text)
+    except Exception as e:                          # noqa: BLE001 —— 语音失败只丢语音，文字照常
+        print("[TTS] 合成异常（本条不发语音事件）：%s" % e)
+        return
+    res = res if isinstance(res, dict) else {}
+    mode = str(res.get("mode") or "none")
+    if mode == "none":
+        return
+    agent._emit(events.speech(
+        res.get("id") or "", mode, res.get("tone") or "",
+        agent.speech_pitch(), agent.turn_id, agent._next_speech_seq(), res.get("text") or "",
+    ))
+
+
+async def _emit_line(agent, kind, text, move=None):
+    """发一条对外台词：先 ``message``，**紧随其后**补 ``speech``（音画同步：前端按 turn_id+seq 配对）。"""
+    agent._emit(events.message(kind, text, move))
+    await _emit_speech(agent, text)
+
+
+async def _emit_deduped(agent, kind, text):
     """发一条**非落子宣告**的 ``message`` 事件：窗口内一字不差的原话不再推给前端。
 
     只做「发事件」这一道闸门（S25/S26）：调用方的 ``memory_log`` / ``chat_history`` 写入**照常**发生；
-    被抑制时**不发任何替代事件**；被抑制的那句照常入窗（S27，与前端 ``_recent_ai_texts`` 一致）。
+    被抑制时**不发任何替代事件**（**连同它的 ``speech`` 一起不发**，T3——否则玩家会听到一句屏幕上没有的话）；
+    被抑制的那句照常入窗（S27，与前端 ``_recent_ai_texts`` 一致）。
     ``ai_move`` 落子宣告不走这里（在 ``_speak_own_turn`` 里直发），永不受判重。
     """
     from .agent import AI_DEDUP_WINDOW        # 延迟导入：agent ↔ agent_graph 是模块级循环依赖
     if agent._is_repeat(text):
         print("[Agent] 原话去重（最近 %d 条内一字不差）已抑制：%s" % (AI_DEDUP_WINDOW, text))
     else:
-        agent._emit(events.message(kind, text))
+        await _emit_line(agent, kind, text)
     agent._note_line(text)
 
 
@@ -793,7 +834,7 @@ async def _finalize_after_player(agent, data):
     """点评入档并发给玩家（tag ``E``）。**不归位 busy**：本回合还有她自己的落子。"""
     text = str(data.get("reply") or "")
     agent.st.log_memory("E", text, len(agent.st.moves))
-    _emit_deduped(agent, events.AI_COMMENT, text)
+    await _emit_deduped(agent, events.AI_COMMENT, text)
 
 
 async def _finalize_own_turn(agent, data):
@@ -805,7 +846,7 @@ async def _finalize_just_moved(agent, data):
     """落子后感想入档（tag ``A``）、发事件、定式轨迹，然后归位 busy 与情绪小调用。"""
     text = str(data.get("reply") or "")
     agent.st.log_memory("A", text, len(agent.st.moves))
-    _emit_deduped(agent, events.AI_COMMENT, text)
+    await _emit_deduped(agent, events.AI_COMMENT, text)
     agent._joseki_emit(data.get("jk2") or {})
     agent._set_busy(False)
     await agent._mood_llm_refine()
@@ -815,14 +856,14 @@ async def _finalize_just_moved(agent, data):
 async def _finalize_observe(agent, data):
     """提示发事件（短路时只归位 busy），然后解锁。"""
     if not data.get("short"):
-        _emit_deduped(agent, events.AI_COMMENT, str(data.get("reply") or ""))
+        await _emit_deduped(agent, events.AI_COMMENT, str(data.get("reply") or ""))
     agent._set_busy(False)
 
 
 async def _finalize_analyze(agent, data):
     """分析发事件 + 形势栏（短路时只归位 busy），然后解锁。"""
     if not data.get("short"):
-        _emit_deduped(agent, events.AI, "📊 " + str(data.get("reply") or ""))
+        await _emit_deduped(agent, events.AI, "📊 " + str(data.get("reply") or ""))
         info = data.get("info") or {}
         agent._emit(events.info(float(info.get("wr", 0.5)), float(info.get("score", 0.0))))
     agent._set_busy(False)
@@ -835,7 +876,7 @@ async def _finalize_chat(agent, data):
     if agent._llm_failed(reply):                # 云端失败：聊天退化为兜底台词
         reply = agent._fallback_line("chat")
     agent.st.chat_history.append({"role": "assistant", "content": reply})
-    _emit_deduped(agent, events.AI, reply)
+    await _emit_deduped(agent, events.AI, reply)
     await agent._mood_llm_refine()
 
 
@@ -843,14 +884,14 @@ async def _finalize_idle(agent, data):
     """闲置搭话收尾（不进 busy，与今天一致）。"""
     reply = str(data.get("reply") or "")
     agent.st.chat_history.append({"role": "assistant", "content": reply})
-    _emit_deduped(agent, events.AI_IDLE, reply)
+    await _emit_deduped(agent, events.AI_IDLE, reply)
 
 
 async def _finalize_summary(agent, data):
     """总结收尾：置终局标记 → 发话 → 真总结才写长期记忆 → 解锁。"""
     text = str(data.get("reply") or "")
     agent.st.finished = True
-    _emit_deduped(agent, events.AI, "📋 对局总结\n" + text)
+    await _emit_deduped(agent, events.AI, "📋 对局总结\n" + text)
     if not data.get("failed"):                  # 只写真总结：兜底台词不是总结，写进去会污染记忆
         await asyncio.to_thread(agent._remember_game, text,
                                 float(data.get("wr", 0.5)), float(data.get("score", 0.0)))

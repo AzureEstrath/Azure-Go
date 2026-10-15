@@ -13,6 +13,8 @@
     POST /api/interaction {what}            玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话
     POST /api/mood/tick                     情绪心跳（向基线回落）
+    POST /api/tts/speak   {text}            试听/手动合成 → audio/wav（合成不出来 → 409）
+    GET  /api/tts/audio/{audio_id}          取一条已合成的音频 → audio/wav（未命中 → 404）
     POST /api/memory/query  {query, k?}     检索长期记忆（管理面；默认关闭时返回空列表）
     POST /api/memory/write  {tag?, text}    手动写一条长期记忆（关闭 / 空文本时被拒）
     GET  /api/memory/stats                  长期记忆体量（行数 / 归档数 / 向量数 / 库路径）
@@ -20,9 +22,11 @@
     GET  /api/state                         当前棋盘权威快照
     GET  /api/health                        引擎/LLM/长期记忆状态
 
-事件通道（WebSocket /ws）——后端把 9 类事件推给客户端，契约见 events.py：
-    message / state / info / busy / mood / joseki / tool / token / memory（连接建立时先发一次 hello 同步）。
+事件通道（WebSocket /ws）——后端把 10 类事件推给客户端，契约见 events.py：
+    message / state / info / busy / mood / joseki / tool / token / speech / memory（连接建立时先发一次 hello 同步）。
     `token` 是可选流式增量（`stream_tokens` 开启时才有，默认关闭；最终内容以 `message` 为准）。
+    `speech` 是每条台词的语音（`mode` 为 `openai` 时按 `id` 拉上面那条音频端点；`system` 时用 `text`，
+    交给 Windows 系统语音；语音关闭时根本不发），与对应 `message` 同 `turn_id`、`seq` 递增配对。
     `memory` 由记忆管理端点推送，是元数据（不是台词），前端只记日志。
 
 REST 应答统一返回 {"ok": bool, "state": <棋盘快照>}：命令是否被接受由 ok/busy 判断，
@@ -34,7 +38,7 @@ from contextlib import asynccontextmanager
 import asyncio
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from . import config as config_mod
 from . import coords, events, prompts
@@ -43,6 +47,7 @@ from .engine import KataGoEngine
 from .llm import LLMClient
 from .llm_chain import merge_extra_body
 from .memory_service import MemoryService
+from .tts import TTSClient
 
 
 def _int(v, d=-1):
@@ -53,11 +58,12 @@ def _int(v, d=-1):
         return d
 
 
-def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True, memory=None):
-    """构造应用；测试可注入 stub 引擎/LLM/agent/memory（autostart=False 跳过引擎启动）。
+def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=True, memory=None):
+    """构造应用；测试可注入 stub 引擎/LLM/agent/memory/tts（autostart=False 跳过引擎启动）。
 
     ``memory`` 显式传入时优先于 lifespan 构造的 ``MemoryService``（测试 seam）：
-    ``agent`` 分支也不再覆盖它。
+    ``agent`` 分支也不再覆盖它。``tts`` 同理——显式传入的假 TTS 优先；不传时 lifespan
+    构造 ``TTSClient(cfg)``，**两个分支**（自建 agent / 注入 agent）都把它挂到 agent 上（T16）。
     """
     cfg = cfg if cfg is not None else config_mod.AzureConfig.load()
 
@@ -67,6 +73,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True, memo
         # 长期记忆：显式注入优先；默认关闭时零开销（不建库、不调接口）
         mem = memory if memory is not None else MemoryService(cfg)
         app.state.memory = mem
+        # 云端语音：显式注入优先（测试用假 TTS）；默认关闭时 speak() 零请求
+        tts_client = tts if tts is not None else TTSClient(cfg)
+        app.state.tts = tts_client
         if agent is None:
             eng = engine if engine is not None else KataGoEngine(cfg.katago_url, cfg.katago_token, cfg.max_visits, cfg.katago_timeout_ms)
             cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key,
@@ -75,7 +84,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True, memo
             app.state.agent = AzureAgent(eng, cli, events.EventBus(), joseki_teach=cfg.joseki_teach,
                                          tools_enabled=cfg.tools_enabled, max_tool_calls=cfg.max_tool_calls,
                                          stream_tokens=cfg.stream_tokens,
-                                         memory=mem)
+                                         memory=mem, tts=tts_client)
             if autostart:
                 ok = await eng.start()
                 if not ok:
@@ -83,8 +92,10 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True, memo
         else:
             app.state.agent = agent
             app.state.agent.memory = mem         # 注入的 agent 也接上同一个实例（显式 memory= 优先）
+            app.state.agent.tts = tts_client     # 注入的 agent 同样接上（显式 tts= 优先）
         yield
         mem.close()                              # 退出时收尾（可重复调用）
+        await tts_client.close()                 # 语音客户端**无条件**关闭（autostart 为假时也要关）
         if autostart:
             await app.state.agent.katago.shutdown()
             await app.state.agent.llm.close()
@@ -222,6 +233,53 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True, memo
     async def mood_tick():
         a().tick_mood()
         return ok()
+
+    # ================= 云端语音（计划 05） =================
+    # 对局中的台词由 WS 的 `speech` 事件驱动（前端据 id 来拉音频）；这里两个端点是**试听/手动用**的。
+    # 任何合成失败都只回可读错误（409 / 404），绝不把端点打成 500、更不影响对局。
+
+    def tts_client():
+        """当前 TTS 客户端；未装配时为 ``None``（端点据此退化为可读错误）。"""
+        return getattr(app.state, "tts", None)
+
+    @app.post("/api/tts/speak")
+    async def tts_speak(body: dict):
+        """试听：``{text}`` → ``audio/wav``；合成不出音频（关闭 / 系统语音 / 空文本）→ 409。"""
+        c = tts_client()
+        raw = body.get("text")
+        text = raw.strip() if isinstance(raw, str) else ""
+        if c is None or text == "":
+            return JSONResponse({"ok": False, "error": "没有可朗读的文本"}, status_code=409)
+        try:
+            res = await c.speak(text)
+        except Exception as e:                  # noqa: BLE001 —— 合成异常只回可读错误
+            print("[TTS] 试听合成失败：%s" % e)
+            return JSONResponse({"ok": False, "error": "语音合成失败，请稍后再试"}, status_code=409)
+        res = res if isinstance(res, dict) else {}
+        if str(res.get("mode") or "none") != "openai":
+            return JSONResponse({"ok": False, "error": "当前语音方式不产生音频（请在设置里改用云端语音）"},
+                                status_code=409)
+        try:
+            blob = c.audio(str(res.get("id") or ""))
+        except Exception as e:                  # noqa: BLE001
+            print("[TTS] 试听取音频失败：%s" % e)
+            blob = None
+        if not blob:
+            return JSONResponse({"ok": False, "error": "音频已过期，请重试"}, status_code=409)
+        return Response(content=bytes(blob), media_type="audio/wav")
+
+    @app.get("/api/tts/audio/{audio_id}")
+    async def tts_audio(audio_id: str):
+        """取一条已合成的音频（``speech`` 事件 ``mode=="openai"`` 时带的 id）；未命中 → 404。"""
+        c = tts_client()
+        try:
+            blob = c.audio(audio_id) if c is not None else None
+        except Exception as e:                  # noqa: BLE001 —— 取不到就 404，绝不上抛
+            print("[TTS] 取音频失败：%s" % e)
+            blob = None
+        if not blob:
+            return JSONResponse({"ok": False, "error": "音频不存在或已过期"}, status_code=404)
+        return Response(content=bytes(blob), media_type="audio/wav")
 
     # ================= 长期记忆管理面 =================
     # 默认关闭（memory_enabled=false）时全部退化为可读的空结果：查询面可用、写入被拒。

@@ -361,5 +361,92 @@ class AssemblyTest(unittest.TestCase):
             self.assertEqual(app.state.agent.llm.chain.extra_body, merged)   # 链上也带着同一份
 
 
+class FakeTTS:
+    """假 TTS：不发网络请求，固定给 openai 模式。"""
+
+    def __init__(self, mode="openai"):
+        self.mode = mode
+        self.spoken = []
+
+    @property
+    def enabled(self):
+        return self.mode != "none"
+
+    async def speak(self, text):
+        self.spoken.append(text)
+        return {"id": "a%d" % len(self.spoken), "mode": self.mode, "text": "" if self.mode == "openai" else text,
+                "tone": "", "pitch": 0.0}
+
+    def audio(self, audio_id):
+        return b"RIFF" + b"\x00" * 40 if audio_id.startswith("a") else None
+
+    async def close(self):
+        pass
+
+
+class TtsApiTest(unittest.TestCase):
+    def test_speech_event_pairs_with_message(self):
+        """每条对外台词都必须有一条对应的 speech 事件（同 turn_id，seq 递增）。"""
+        app = create_app(engine=StubEngine(), llm=StubLLM(), tts=FakeTTS(), autostart=False)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws") as ws:
+                ws.receive_json()                                  # hello
+                client.post("/api/move", json={"x": 3, "y": 3})
+                seen = []
+                for _ in range(20):
+                    ev = ws.receive_json()
+                    seen.append(ev)
+                    if ev.get("type") == "busy" and ev.get("busy") is False:
+                        break
+        msgs = [e for e in seen if e.get("type") == "message"]
+        speech = [e for e in seen if e.get("type") == "speech"]
+        self.assertGreaterEqual(len(speech), len(msgs))
+        self.assertEqual([e["seq"] for e in speech], sorted(e["seq"] for e in speech))
+        self.assertEqual(len({e["turn_id"] for e in speech}), 1)
+
+    def test_speech_suppressed_when_disabled(self):
+        app = create_app(engine=StubEngine(), llm=StubLLM(), tts=FakeTTS(mode="none"), autostart=False)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws") as ws:
+                ws.receive_json()
+                client.post("/api/move", json={"x": 3, "y": 3})
+                seen = []
+                for _ in range(20):
+                    ev = ws.receive_json()
+                    seen.append(ev)
+                    if ev.get("type") == "busy" and ev.get("busy") is False:
+                        break
+        self.assertEqual([e for e in seen if e.get("type") == "speech"], [])
+        self.assertTrue([e for e in seen if e.get("type") == "message"])
+
+    def test_audio_endpoint_404_for_unknown(self):
+        with _client() as client:
+            self.assertEqual(client.get("/api/tts/audio/nope").status_code, 404)
+
+
+class TtsEndpointContractTest(unittest.TestCase):
+    """两个新端点的契约（T17）：合成不出来回可读 409，音频缺失回 404，**都不许 500**。"""
+
+    def test_speak_endpoint_409_without_audio(self):
+        """默认 cfg（tts_enabled=false）：试听拿不到音频 → 409 + 可读中文错误。"""
+        with _client() as client:
+            for body in ({}, {"text": ""}, {"text": "你好呀"}, {"text": 123}):
+                r = client.post("/api/tts/speak", json=body)
+                self.assertEqual(r.status_code, 409)
+                self.assertFalse(r.json()["ok"])
+                self.assertTrue(r.json()["error"])
+
+    def test_speak_and_audio_roundtrip(self):
+        """注入假 TTS：试听拿到 ``audio/wav``，按 ``speech`` 事件的 id 能取回同一条音频。"""
+        app = create_app(engine=StubEngine(), llm=StubLLM(), tts=FakeTTS(), autostart=False)
+        with TestClient(app) as client:
+            r = client.post("/api/tts/speak", json={"text": "你好呀"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.headers["content-type"], "audio/wav")
+            self.assertTrue(r.content.startswith(b"RIFF"))
+            self.assertEqual(client.get("/api/tts/audio/a1").status_code, 200)
+            self.assertEqual(client.get("/api/tts/audio/nope").status_code, 404)
+
+
 if __name__ == "__main__":
     unittest.main()
