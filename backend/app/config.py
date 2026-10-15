@@ -39,6 +39,17 @@ class AzureConfig:
         self.memory_top_k = 3               # 每次召回条数上限
         self.memory_max_inject_chars = 240  # 注入提示词的总字数上限（单条另截到 120 字）
         self.embed_timeout = 10.0           # 单次 embedding 超时（秒）；可收紧，memory_service 用它装配云端客户端
+        # —— 云端语音合成（后端合成 + 缓存；Task 2 起）：默认关闭、默认系统语音兜底 ——
+        self.tts_enabled = False            # 关闭时零开销：不发请求、不发 speech 事件，文字照常
+        self.tts_mode = "system"            # "openai"＝云端合成；"system"＝让前端用系统语音念
+        self.tts_base_url = ""              # OpenAI 兼容地址；openai 模式未配置时视为未启用
+        self.tts_model = "tts-1"
+        self.tts_api_key = ""               # 留空＝不带 Authorization（本机回环调试）
+        self.tts_voice = ""
+        self.tts_speed = 1.0
+        self.tts_volume = 1.0
+        self.tts_timeout_sec = 30           # 单次合成超时；超时整条降级为系统语音
+        self.tts_long_chunk = False         # 打开后单块字数上限放宽（templates 里该键已在）
         # —— 提示词自定义（留空则用内置 Azure 人设）——
         self.prompt_system = ""
         self.prompt_user_name = "Estarth"
@@ -105,6 +116,25 @@ class AzureConfig:
             self.embed_timeout = max(0.0, float(d.get("embed_timeout", self.embed_timeout)))
         except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把启动搞崩
             self.embed_timeout = 10.0
+        self.tts_enabled = bool(d.get("tts_enabled", self.tts_enabled))
+        self.tts_mode = str(d.get("tts_mode", self.tts_mode))
+        self.tts_base_url = str(d.get("tts_base_url", self.tts_base_url))
+        self.tts_model = str(d.get("tts_model", self.tts_model))
+        self.tts_api_key = str(d.get("tts_api_key", self.tts_api_key))
+        self.tts_voice = str(d.get("tts_voice", self.tts_voice))
+        try:
+            self.tts_speed = max(0.0, float(d.get("tts_speed", self.tts_speed)))
+        except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把后端启动搞崩
+            self.tts_speed = 1.0
+        try:
+            self.tts_volume = max(0.0, float(d.get("tts_volume", self.tts_volume)))
+        except (TypeError, ValueError):
+            self.tts_volume = 1.0
+        try:
+            self.tts_timeout_sec = max(1.0, float(d.get("tts_timeout_sec", self.tts_timeout_sec)))
+        except (TypeError, ValueError):
+            self.tts_timeout_sec = 30.0
+        self.tts_long_chunk = bool(d.get("tts_long_chunk", self.tts_long_chunk))
         self.prompt_system = str(d.get("prompt_system", self.prompt_system))
         self.prompt_user_name = str(d.get("prompt_user_name", self.prompt_user_name))
         pn = d.get("prompt_phase_notes")
