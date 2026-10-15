@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from app import events
 from app.llm import LLMClient
 from app.main import create_app
-from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM
+from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM, mk_agent
 
 
 def _client():
@@ -157,6 +157,173 @@ class MemoryHealthTest(unittest.TestCase):
                 self.assertEqual(client.get("/api/health").json()["memory_rows"], 1)
             # 退出时 close()：库已关，统计退回全 0（库文件仍在）
             self.assertEqual(app.state.memory.store.stats()["rows"], 0)
+
+
+class MemoryApiTest(unittest.TestCase):
+    """记忆管理 API：默认关闭时的端点形状（计划 03 Task 4 的钉死用例）。"""
+
+    def test_endpoints_shape_when_disabled(self):
+        with _client() as client:
+            r = client.post("/api/memory/query", json={"query": "x"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json(), {"ok": True, "items": []})
+            self.assertTrue(client.get("/api/memory/stats").json()["ok"])
+            self.assertEqual(client.post("/api/memory/forget", json={"all": True}).json()["removed"], 0)
+
+    def test_write_bad_body_no_500(self):
+        with _client() as client:
+            for body in ({}, {"text": 123}, {"text": ""}):
+                r = client.post("/api/memory/write", json=body)
+                self.assertEqual(r.status_code, 200)
+                self.assertFalse(r.json()["ok"])
+
+
+class MemoryApiEnabledTest(unittest.TestCase):
+    """启用长期记忆（临时库、不配 embedding → 关键词检索）：四个端点真正读写同一个库。"""
+
+    def _app(self, d):
+        from app.config import AzureConfig
+        cfg = AzureConfig()
+        cfg.memory_enabled = True
+        cfg.memory_db_path = os.path.join(d, "m.db")
+        return create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(), autostart=False)
+
+    def test_write_query_stats_forget_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            with TestClient(self._app(d)) as client:
+                r = client.post("/api/memory/write", json={"tag": "estarth", "text": "Estarth 喜欢点三三"})
+                self.assertEqual(r.status_code, 200)
+                self.assertTrue(r.json()["ok"])
+                self.assertIsInstance(r.json()["id"], int)
+
+                st = client.get("/api/memory/stats").json()
+                self.assertTrue(st["ok"])
+                self.assertEqual((st["rows"], st["games"], st["has_vectors"]), (1, 0, 0))
+                self.assertTrue(st["db"].endswith("m.db"))
+
+                q = client.post("/api/memory/query", json={"query": "点三三"}).json()
+                self.assertTrue(q["ok"])
+                self.assertEqual(len(q["items"]), 1)
+                item = q["items"][0]
+                self.assertEqual(set(item), {"id", "ts", "kind", "tag", "text", "score"})
+                self.assertEqual(item["text"], "Estarth 喜欢点三三")
+                self.assertEqual(item["tag"], "estarth")
+                self.assertEqual(item["kind"], "fact")
+
+                f = client.post("/api/memory/forget", json={"ids": [item["id"]]}).json()
+                self.assertEqual(f, {"ok": True, "removed": 1})
+                self.assertEqual(client.get("/api/memory/stats").json()["rows"], 0)
+
+    def test_duplicate_write_and_query_k(self):
+        with tempfile.TemporaryDirectory() as d:
+            with TestClient(self._app(d)) as client:
+                a1 = client.post("/api/memory/write", json={"tag": "t", "text": "布局喜欢点三三"}).json()
+                a2 = client.post("/api/memory/write", json={"tag": "t", "text": "布局喜欢点三三"}).json()
+                self.assertEqual(a1["id"], a2["id"])       # 同 tag + 同 text 不重复入库
+                client.post("/api/memory/write", json={"tag": "t", "text": "布局喜欢挂角"})
+                self.assertEqual(client.get("/api/memory/stats").json()["rows"], 2)
+
+                self.assertEqual(len(client.post("/api/memory/query", json={"query": "布局", "k": 1}).json()["items"]), 1)
+                self.assertEqual(len(client.post("/api/memory/query", json={"query": "布局"}).json()["items"]), 2)
+
+    def test_memory_event_on_write_and_recall(self):
+        """``memory`` 事件是元数据（op/tag/text/score），写与查各推一条；前端不产生任何信号。"""
+        with tempfile.TemporaryDirectory() as d:
+            with TestClient(self._app(d)) as client:
+                with client.websocket_connect("/ws") as ws:
+                    self.assertEqual(ws.receive_json()["type"], "hello")
+                    self.assertTrue(client.post("/api/memory/write",
+                                               json={"tag": "estarth", "text": "他喜欢点三三"}).json()["ok"])
+                    ev = ws.receive_json()
+                    self.assertEqual(set(ev), {"type", "op", "tag", "text", "score"})
+                    self.assertEqual((ev["type"], ev["op"]), ("memory", "write"))
+                    self.assertEqual(ev["tag"], "estarth")
+                    self.assertEqual(ev["text"], "他喜欢点三三")
+                    self.assertEqual(ev["score"], 0.0)
+
+                    client.post("/api/memory/query", json={"query": "点三三"})
+                    rec = ws.receive_json()
+                    self.assertEqual((rec["type"], rec["op"]), ("memory", "recall"))
+                    self.assertEqual(rec["text"], "他喜欢点三三")
+                    self.assertEqual(rec["score"], 0.0)     # 关键词降级：不给伪相似度
+
+
+class _BoomStore:
+    """坏库替身：所有方法都抛异常（模拟死库 / 库结构坏掉）。"""
+
+    def write(self, *a, **kw):
+        raise RuntimeError("库坏了")
+
+    def recall(self, *a, **kw):
+        raise RuntimeError("库坏了")
+
+    def stats(self):
+        raise RuntimeError("库坏了")
+
+    def forget(self, *a, **kw):
+        raise RuntimeError("库坏了")
+
+
+class _BoomMemory:
+    """长期记忆替身：服务面可用（available=True）但库全面故障。
+
+    ``close()`` 照常不抛——真实 ``MemoryService.close()`` 就是可重复调用且不上抛。
+    """
+
+    available = True
+
+    def __init__(self):
+        self.store = _BoomStore()
+
+    def recall_for(self, *a, **kw):
+        return ""
+
+    def close(self):
+        pass
+
+
+class MemoryApiDegradeTest(unittest.TestCase):
+    """关闭 / 库故障 / 注入 seam：端点一律降级为可读结果，显式 ``memory=`` 参数优先。"""
+
+    def test_disabled_shapes_are_complete(self):
+        """默认关闭：查询面可用（空结果）、写入被拒，四个端点都不 500。"""
+        with _client() as client:
+            self.assertEqual(client.get("/api/memory/stats").json(),
+                             {"ok": True, "rows": 0, "games": 0, "has_vectors": 0, "db": ""})
+            self.assertEqual(client.post("/api/memory/forget", json={}).json(), {"ok": True, "removed": 0})
+            self.assertEqual(client.post("/api/memory/write", json={"text": "写不进去"}).json(),
+                             {"ok": False, "id": None})
+            self.assertEqual(client.post("/api/memory/query", json={}).json(), {"ok": True, "items": []})
+
+    def test_broken_store_degrades_without_500(self):
+        app = create_app(engine=StubEngine(), llm=StubLLM(), autostart=False, memory=_BoomMemory())
+        with TestClient(app) as client:
+            r = client.post("/api/memory/query", json={"query": "x"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json(), {"ok": True, "items": []})
+            self.assertEqual(client.get("/api/memory/stats").json(),
+                             {"ok": True, "rows": 0, "games": 0, "has_vectors": 0, "db": ""})
+            self.assertEqual(client.post("/api/memory/forget", json={"all": True}).json(),
+                             {"ok": True, "removed": 0})
+            self.assertEqual(client.post("/api/memory/write", json={"text": "还是写不进去"}).json(),
+                             {"ok": False, "id": None})
+
+    def test_explicit_memory_takes_precedence(self):
+        """``memory=`` 显式参数优先：agent 分支不再覆盖它（测试 seam 必须诚实）。"""
+        agent, _eng, _llm, _bus = mk_agent()
+        fake = _BoomMemory()
+        app = create_app(agent=agent, autostart=False, memory=fake)
+        with TestClient(app):
+            self.assertIs(app.state.memory, fake)
+            self.assertIs(app.state.agent.memory, fake)
+
+    def test_injected_agent_gets_lifespan_memory_by_default(self):
+        """不传 ``memory=`` 时维持现状：注入的 agent 接上 lifespan 构造的实例（默认关闭）。"""
+        agent, _eng, _llm, _bus = mk_agent()
+        app = create_app(agent=agent, autostart=False)
+        with TestClient(app):
+            self.assertIs(app.state.agent.memory, app.state.memory)
+            self.assertFalse(app.state.agent.memory.available)
 
 
 class AssemblyTest(unittest.TestCase):

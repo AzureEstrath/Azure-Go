@@ -4,7 +4,8 @@ extends Node
 ##
 ## 对 Main.gd 暴露的信号与方法面（Main 的 agent.* 调用点只认这套契约）：
 ##   - 命令：REST POST（/api/move /api/hint /api/analyze /api/chat ... 见 docs）
-##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool；连上先收 hello 同步）
+##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool / memory；连上先收 hello 同步）
+##     memory 是长期记忆写入/召回的元数据：只记一行日志，不进台词、不产生任何信号
 ##
 ## 音画同步仍在客户端完成：`ai_move` 那条「落子宣告」的语音开始时，Main 调 reveal_move()，
 ## 这里 POST /api/reveal 让后端把已落到内部棋谱的那一手推给界面显示。
@@ -135,6 +136,10 @@ func _handle_packet(raw: String) -> void:
 			joseki_event.emit(_without_type(d))
 		"tool":
 			tool_event.emit(_without_type(d))
+		"memory":
+			# 长期记忆的写入 / 召回：元数据（不是台词）——只记一行日志，不产生任何界面信号
+			print("[NetClient] memory op=%s tag=%s score=%s text=%s" % [
+				str(d.get("op", "")), str(d.get("tag", "")), str(d.get("score", 0.0)), str(d.get("text", ""))])
 
 static func _dict(v) -> Dictionary:
 	return v if typeof(v) == TYPE_DICTIONARY else {}
