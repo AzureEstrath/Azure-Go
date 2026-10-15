@@ -1,6 +1,6 @@
 """LLM 调用：LangChain ``ChatOpenAI`` 的薄适配器（保留旧 ``chat()`` 契约）。
 
-链的装配（模型参数、扩展字段合并）全在 ``llm_chain.py``；本模块只负责四件事：
+链的装配（模型参数、扩展字段合并）全在 ``llm_chain.py``；本模块只负责四件事（都在 ``chat()`` 这条线上）：
 - 把 ``LLMClient`` 的参数映射成链（``extra_body`` 被外部改写时重建）；
 - 每次调用的输出上限（思考档位 1/2 各追加一段推理预算）：以线上键 ``max_tokens`` 顶层发出
   （按调用 ``bind(extra_body=...)`` 合并，用户配置打底、显式写死上限则让位）——``ChatOpenAI``
@@ -10,19 +10,40 @@
 
 推理段永不显示给玩家：台词一律经 ``llm_chain.content_of``（只取 ``content``）。
 
-对外接口：``chat(messages, max_tokens, no_think) -> str``（失败返回可读错误说明）；``chain``
-（``ChatOpenAI``）供 ``bind_tools`` / ``astream`` / ``with_structured_output`` 复用——它**没有**
-``chat()`` 的地址快拦（见 ``_url_ok``），直接用它发请求前必须自备同样的判断。
+对外接口：``chat(messages, max_tokens, no_think) -> str``（失败返回可读错误说明）；``mood_delta``
+（情绪增量，结构化输出，拿不到返回 ``None``）；``chain``（``ChatOpenAI``）供 ``bind_tools`` /
+``astream`` / ``with_structured_output`` 复用——它**没有** ``chat()`` 的地址快拦（见 ``_url_ok``），
+直接用它发请求前必须自备同样的判断。
 """
 
 from types import SimpleNamespace
 
 import openai
+from pydantic import BaseModel, Field
 
+from . import prompts
+from .emotion import DELTA_MAX
 from .llm_chain import FAIL_TEXT, build_chat_model, content_of
 
 REASON_BUDGET_MED = 160         # 思考档位 1（中等）：推理段的追加预算
 REASON_BUDGET_STRONG = 800      # 思考档位 2（强思考）：推理段的追加预算
+
+
+class MoodDelta(BaseModel):
+    """情绪增量（结构化输出的形状）：愉悦度 / 好奇度 / 唤醒度三项。
+
+    每项限定在 ``-0.40 ~ 0.40``（``EmotionModel.DELTA_MAX``）：单次情绪不许跳变。字段故意不加
+    pydantic 的 ``ge/le`` 约束——模型报超界时我们要的是「裁剪后照样用」，不是整次校验失败。
+    """
+
+    dv: float = Field(description="愉悦度增量，-0.40 ~ 0.40（负数=心情变差）")
+    dc: float = Field(description="好奇度增量，-0.40 ~ 0.40（负数=没兴致）")
+    da: float = Field(description="唤醒度增量，-0.40 ~ 0.40（负数=平静下来）")
+
+
+def _clamp_delta(x) -> float:
+    """裁剪到 ±``DELTA_MAX``：模型报多大都只许动这么多（与 ``EmotionModel.apply_delta`` 同界）。"""
+    return -DELTA_MAX if x < -DELTA_MAX else (DELTA_MAX if x > DELTA_MAX else float(x))
 
 
 def clean_content(text) -> str:
@@ -182,3 +203,31 @@ class LLMClient:
 
         text = content_of(ai)
         return text if text != "" else FAIL_TEXT
+
+    # ================= 情绪增量（结构化输出） =================
+
+    async def mood_delta(self, cur, region_name, desc):
+        """问一次「情绪变化」，要一份结构化增量：``[dv, dc, da]``；拿不到一律 ``None``。
+
+        调用方（``AzureAgent._mood_llm_refine``）是静默小调用：这里**绝不抛异常**，也不把失败
+        包装成台词——返回 ``None`` 只表示「这次没拿到」，由调用方回落到正则解析。
+
+        结构化走 ``method="function_calling"``：langchain-openai 1.x 的默认方法改发
+        ``response_format.json_schema``，部分 OpenAI 兼容服务不认，而工具调用是各家的公共能力；
+        ``tool_choice`` 会被强制成 ``MoodDelta``，所以提示词里那句 ``[[mood:…]]`` 的格式要求
+        不会真的被执行（当前值 / 区域 / 事件描述照旧通过它喂给模型）。
+        """
+        if not self._url_ok():                      # 未配置地址：一个请求都不许发（同 chat()）
+            return None
+        try:
+            structured = self._sync_chain().with_structured_output(MoodDelta, method="function_calling")
+            out = await structured.ainvoke([{
+                "role": "user",
+                "content": prompts.mood_delta_prompt(cur, region_name, desc),
+            }])
+            if out is None:                         # 服务端没按 schema 回（回成纯文本等）
+                return None
+            return [_clamp_delta(out.dv), _clamp_delta(out.dc), _clamp_delta(out.da)]
+        except Exception as e:                      # noqa: BLE001
+            print("[LLM] 情绪结构化输出失败：%s" % e)
+            return None

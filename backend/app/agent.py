@@ -250,8 +250,44 @@ class AzureAgent:
         self._mood_desc = EmotionModel.event_desc(what)
         self.sync_mood(False, True)
 
+    async def _mood_delta(self, cur, desc):
+        """情绪增量：优先结构化输出，拿不到才回落到正则解析（``None`` = 两条路都没拿到）。
+
+        结构化能力由 LLM 客户端提供（``LLMClient.mood_delta``）；只实现 ``chat()`` 的鸭子类型
+        客户端没有它，直接走正则——与 ``_think_hint`` 看 ``think_mode`` 是同一种写法。
+
+        失败一律静默（含异常、含形状不对的脏返回值）：情绪小调用绝不打扰主流程，也绝不把错误
+        文案变成她的台词。
+        """
+        region = self.mood.region_name()
+        fn = getattr(self.llm, "mood_delta", None)
+        if fn is not None:
+            try:
+                d = await fn(cur, region, desc)
+            except Exception as e:                  # noqa: BLE001
+                print("[Agent] 情绪结构化输出异常：%s" % e)
+                d = None
+            if isinstance(d, (list, tuple)) and len(d) == 3:   # 形状不对＝这次没拿到
+                return d
+        try:
+            text = await self.llm.chat([{
+                "role": "user",
+                "content": prompts.mood_delta_prompt(cur, region, desc),
+            }], MOOD_LLM_MAX_TOKENS, True)
+        except Exception as e:                      # noqa: BLE001
+            print("[Agent] 情绪小调用异常：%s" % e)
+            return None
+        if self._llm_failed(text):
+            return None
+        parsed = EmotionModel.parse_delta(text)
+        return parsed[1] if parsed[0] else None
+
     async def _mood_llm_refine(self):
-        """单独的「情绪变化」小调用：异步、限频、失败静默；绝不等它。"""
+        """单独的「情绪变化」小调用：异步、限频、失败静默；绝不等它。
+
+        优先结构化输出（模型直接给三维增量），拿不到才回落到正则解析（v2 行为不变）；两条路都
+        拿不到就静默收场，情绪只保留本地事件结算的结果。
+        """
         if self.llm is None or self._mood_desc == "" or self.busy:
             return
         now = int(time.monotonic() * 1000)
@@ -260,20 +296,9 @@ class AzureAgent:
         self._mood_ms = now
         desc = self._mood_desc
         self._mood_desc = ""
-        try:
-            text = await self.llm.chat([{
-                "role": "user",
-                "content": prompts.mood_delta_prompt((self.mood.v, self.mood.c, self.mood.a), self.mood.region_name(), desc),
-            }], MOOD_LLM_MAX_TOKENS, True)
-        except Exception as e:                      # 失败静默：情绪小调用绝不打扰主流程
-            print("[Agent] 情绪小调用异常：%s" % e)
+        d = await self._mood_delta((self.mood.v, self.mood.c, self.mood.a), desc)
+        if d is None:
             return
-        if self._llm_failed(text):
-            return
-        parsed = EmotionModel.parse_delta(text)
-        if not parsed[0]:
-            return
-        d = parsed[1]
         self.mood.apply_delta(d[0], d[1], d[2])
         self.sync_mood(False)
 
