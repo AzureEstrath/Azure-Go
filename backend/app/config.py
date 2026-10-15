@@ -22,6 +22,9 @@ class AzureConfig:
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
         self.llm_think_mode = 0
+        # —— 请求体扩展字段（透传给 OpenAI 兼容服务，如 top_k / reasoning_effort）——
+        self.llm_extra_body = {}            # 始终并入
+        self.llm_think_extra_body = {}      # 仅思考档位开启（think_mode > 0）时并入
         # —— 提示词自定义（留空则用内置 Azure 人设）——
         self.prompt_system = ""
         self.prompt_user_name = "Estarth"
@@ -68,6 +71,12 @@ class AzureConfig:
             self.llm_think_mode = max(0, min(2, int(d.get("llm_think_mode", self.llm_think_mode))))
         else:
             self.llm_think_mode = 2 if bool(d.get("llm_think_strong", False)) else 0   # 旧键（bool）迁移
+        eb = d.get("llm_extra_body")
+        if isinstance(eb, dict):
+            self.llm_extra_body = dict(eb)
+        tb = d.get("llm_think_extra_body")
+        if isinstance(tb, dict):
+            self.llm_think_extra_body = dict(tb)
         self.prompt_system = str(d.get("prompt_system", self.prompt_system))
         self.prompt_user_name = str(d.get("prompt_user_name", self.prompt_user_name))
         pn = d.get("prompt_phase_notes")

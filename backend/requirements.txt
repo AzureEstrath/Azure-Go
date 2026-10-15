@@ -2,3 +2,5 @@ fastapi>=0.110
 uvicorn>=0.27
 websockets>=12        # /ws 事件通道：裸 uvicorn 不含 WebSocket 实现，缺了会让升级请求返回 404
 httpx>=0.27
+langchain-core>=1.0     # LCEL / 消息类型 / ChatPromptTemplate
+langchain-openai>=1.0   # ChatOpenAI（云端 OpenAI 兼容服务）
