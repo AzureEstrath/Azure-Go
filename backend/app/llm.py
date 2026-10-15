@@ -2,14 +2,17 @@
 
 链的装配（模型参数、扩展字段合并）全在 ``llm_chain.py``；本模块只负责四件事：
 - 把 ``LLMClient`` 的参数映射成链（``extra_body`` 被外部改写时重建）；
-- 每次调用的 ``max_tokens`` 预算（思考档位 1/2 各追加一段推理预算）；
+- 每次调用的输出上限（思考档位 1/2 各追加一段推理预算）：以线上键 ``max_tokens`` 顶层发出
+  （按调用 ``bind(extra_body=...)`` 合并，用户配置打底、显式写死上限则让位）——``ChatOpenAI``
+  自己的 ``max_tokens`` 会被改名成 ``max_completion_tokens``，而 DeepSeek 等目标服务端认的是前者；
 - 把链抛出的异常映射成「调用出错：…」可读中文（绝不抛给上层）；
-- 服务端拒绝扩展字段（HTTP 400/422）时去掉扩展字段重试一次的安全网。
+- 服务端拒绝参数（HTTP 400/422）时去掉扩展字段与注入的上限重试一次的安全网。
 
 推理段永不显示给玩家：台词一律经 ``llm_chain.content_of``（只取 ``content``）。
 
-对外接口：``chat(messages, max_tokens, no_think) -> str``（失败返回可读错误说明）；
-``chain``（``ChatOpenAI``）供 ``bind_tools`` / ``astream`` / ``with_structured_output`` 复用。
+对外接口：``chat(messages, max_tokens, no_think) -> str``（失败返回可读错误说明）；``chain``
+（``ChatOpenAI``）供 ``bind_tools`` / ``astream`` / ``with_structured_output`` 复用——它**没有**
+``chat()`` 的地址快拦（见 ``_url_ok``），直接用它发请求前必须自备同样的判断。
 """
 
 from types import SimpleNamespace
@@ -53,6 +56,9 @@ class LLMClient:
         self._http = http_client                    # 同步路径（invoke）：langchain-openai 1.x 只认它
         self._http_async = http_async_client        # 异步路径（ainvoke）：只认它，测试注入假客户端用
         self._built_extra_body = None
+        # chain 只供 bind_tools / astream / with_structured_output 复用（Task 4/5）。一切真的发请求的
+        # 台词路径必须走 chat()：它会先过 _url_ok() 快拦，而未配置 llm_base_url 时 openai 客户端会
+        # 静默退回 api.openai.com，真连外网且单次卡几十秒。
         self.chain = None
         self._sync_chain()
 
@@ -102,16 +108,40 @@ class LLMClient:
             return max_tokens + REASON_BUDGET_MED
         return max_tokens
 
-    def _strip_on_reject(self, e) -> bool:
-        """服务端明确拒绝扩展字段（HTTP 400/422）时清空 ``extra_body``（只做一次）。
+    @staticmethod
+    def _pins_budget(body) -> bool:
+        """用户在 ``extra_body`` 里显式写死了输出上限：注入的预算必须让位（尊重配置）。"""
+        return "max_tokens" in body or "max_completion_tokens" in body
 
-        只有「确实带着扩展字段」的 400/422 才算数：连接失败等不许乱扣帽子。
+    def _extra_for(self, budget) -> dict:
+        """本次调用要绑定的扩展字段：用户配置打底，未被写死时补上输出上限。
+
+        输出上限走 ``max_tokens``（``bind`` 到请求体顶层）而不是 ``ainvoke(max_tokens=...)``：
+        后者会被 langchain-openai 改名成 ``max_completion_tokens``，目标服务端不认。
         """
-        if e.status_code not in (400, 422) or not self.extra_body or self._extra_body_unsupported:
+        if self._extra_body_unsupported:
+            return {}
+        body = dict(self.extra_body or {})
+        if not self._pins_budget(body):
+            body["max_tokens"] = budget
+        return body
+
+    async def _call(self, messages, budget):
+        """发一次请求：按调用把扩展字段与输出上限合并后 bind 到链上（不重建模型）。"""
+        return await self._sync_chain().bind(extra_body=self._extra_for(budget)).ainvoke(messages)
+
+    def _strip_on_reject(self, e) -> bool:
+        """服务端明确拒绝参数（HTTP 400/422）时去掉扩展字段与注入的输出上限，重试一次。
+
+        请求体里总有我们注入的 ``max_tokens``，所以 400/422 一律给一次「什么都不加」的机会
+        （有的服务端只认 ``max_completion_tokens``，会直接拒绝 ``max_tokens``）；连接失败、超时
+        这类传输层问题不算数，不许乱扣帽子。置位后永久不再加料。
+        """
+        if e.status_code not in (400, 422) or self._extra_body_unsupported:
             return False
         self._extra_body_unsupported = True
         self.extra_body = {}
-        print("[LLM] 服务端拒绝扩展字段（HTTP %d），本次去掉重试" % e.status_code)
+        print("[LLM] 服务端拒绝参数（HTTP %d），去掉扩展字段与输出上限重试" % e.status_code)
         return True
 
     def _reason_of(self, e) -> str:
@@ -136,13 +166,13 @@ class LLMClient:
             return "调用出错：未配置 LLM 地址（llm_base_url），请在 config.json 里填写"
         budget = self._budget(max_tokens, no_think)
         try:
-            ai = await self._sync_chain().ainvoke(messages, max_tokens=budget)
+            ai = await self._call(messages, budget)
         except openai.APIStatusError as e:
             print("[LLM] HTTP %d：%s" % (e.status_code, str(e)[:200]))
             if not self._strip_on_reject(e):
                 return "调用出错：" + self._reason_of(e)
             try:
-                ai = await self._sync_chain().ainvoke(messages, max_tokens=budget)
+                ai = await self._call(messages, budget)
             except Exception as e2:                 # noqa: BLE001
                 print("[LLM] 调用失败：%s" % e2)
                 return "调用出错：" + self._reason_of(e2)

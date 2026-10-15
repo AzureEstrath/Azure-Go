@@ -2,6 +2,9 @@
 
 langchain-openai 1.x 的异步路径（``ainvoke``）只认 ``http_async_client``：同步/异步两个假
 客户端（各挂一个 MockTransport）都必须注入，否则测试会真的去连 api.example.com。
+
+输出上限走线上键 ``max_tokens``（经 ``bind(extra_body=...)`` 顶层合并）：``ChatOpenAI``
+自己的 ``max_tokens`` 会被改名成 ``max_completion_tokens``，而目标服务端（DeepSeek 等）认的是前者。
 """
 
 import asyncio
@@ -66,8 +69,9 @@ class ChatTest(unittest.TestCase):
         c = _client(handler)
         out = asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100))
         self.assertEqual(out, "好")
-        # langchain-openai 1.x 把 max_tokens 改名为 max_completion_tokens（官方 API 的新名）
-        self.assertEqual(seen[0]["max_completion_tokens"], 100)
+        # 输出上限的线上键就是 max_tokens（不是 langchain-openai 默认改的 max_completion_tokens）
+        self.assertEqual(seen[0]["max_tokens"], 100)
+        self.assertNotIn("max_completion_tokens", seen[0])
 
     def test_reasoning_content_not_shown(self):
         def handler(req):
@@ -135,6 +139,62 @@ class ChatTest(unittest.TestCase):
         self.assertIn("top_k", seen[0])
         self.assertNotIn("top_k", seen[1])
 
+    def test_budget_binding_keeps_extra_body_keys(self):
+        """按调用 bind 时用户扩展字段不许被挤掉：两者都要在请求体里。"""
+        seen = []
+
+        def handler(req):
+            seen.append(json.loads(req.content.decode("utf-8")))
+            return httpx.Response(200, json=_reply("好"))
+
+        c = _client(handler, extra_body={"top_k": 40})
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100)), "好")
+        self.assertEqual(seen[0]["top_k"], 40)
+        self.assertEqual(seen[0]["max_tokens"], 100)
+
+    def test_explicit_max_tokens_wins(self):
+        """配置里写死了 max_tokens：注入的预算必须让位（尊重显式配置）。"""
+        seen = []
+
+        def handler(req):
+            seen.append(json.loads(req.content.decode("utf-8")))
+            return httpx.Response(200, json=_reply("好"))
+
+        c = _client(handler, extra_body={"max_tokens": 7})
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100)), "好")
+        self.assertEqual(seen[0]["max_tokens"], 7)
+
+    def test_explicit_max_completion_tokens_wins(self):
+        """配置里写死了 max_completion_tokens：连 max_tokens 都不许注入。"""
+        seen = []
+
+        def handler(req):
+            seen.append(json.loads(req.content.decode("utf-8")))
+            return httpx.Response(200, json=_reply("好"))
+
+        c = _client(handler, extra_body={"max_completion_tokens": 9})
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100)), "好")
+        self.assertEqual(seen[0]["max_completion_tokens"], 9)
+        self.assertNotIn("max_tokens", seen[0])
+
+    def test_400_on_max_tokens_recovers_without_budget(self):
+        """只认 max_completion_tokens 的服务端会 400 拒绝 max_tokens：去掉重试必须救回来。"""
+        seen = []
+
+        def handler(req):
+            body = json.loads(req.content.decode("utf-8"))
+            seen.append(body)
+            if "max_tokens" in body:
+                return httpx.Response(400, json={"error": {"message": "Unsupported parameter: max_tokens"}})
+            return httpx.Response(200, json=_reply("好"))
+
+        c = _client(handler)          # 用户没配扩展字段：注入的 max_tokens 就是唯一的「加料」
+        out = asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100))
+        self.assertEqual(out, "好")
+        self.assertEqual(seen[0]["max_tokens"], 100)
+        self.assertNotIn("max_tokens", seen[1])
+        self.assertTrue(c._extra_body_unsupported)
+
     def test_unconfigured_base_url_never_reaches_network(self):
         """未配置地址（config.json 可能留空）：必须立刻返回可读错误，不许真连外网。
 
@@ -159,7 +219,7 @@ class ChatTest(unittest.TestCase):
         c = _client(handler, think_mode=1)
         out = asyncio.run(c.chat([{"role": "user", "content": "hi"}], 32, True))
         self.assertEqual(out, "嗯")
-        self.assertEqual(seen[0]["max_completion_tokens"], 32)   # no_think：不加推理预算
+        self.assertEqual(seen[0]["max_tokens"], 32)   # no_think：不加推理预算
 
 
 class ChainTest(unittest.TestCase):
