@@ -143,6 +143,10 @@ class KataGoEngine:
 
         连接类错误与超时重试 **1 次**：重试在本次调用内部完成、只返回一个结果，
         不会让同一手被分析两次而把 ``pre_analysis`` 缓存写脏。
+
+        传输层失败（连接被拒 / 连接或读取错误）对应子进程时代的「管道断了」——那时进程确实已死，
+        故这里也置 ``_dead``；超时与 HTTP 状态响应（503 预热 / 401 / 500）都**不**置死
+        （旧实现里超时不杀进程），成功分析会把它清掉（见 ``_parse_reply``）。
         """
         self._seq += 1
         req = {
@@ -164,6 +168,8 @@ class KataGoEngine:
                 err = "KataGo 云服务响应超时（%d ms）" % self.timeout_ms
                 continue
             except httpx.TransportError as e:
+                # 传输层失败＝管道断了：置「死」标记（超时是它的子类，已在上一个分支拦下，不置死）
+                self._dead = True
                 err = "连不上 KataGo 云服务：%s（%s）" % (e, self.url)
                 continue
             except Exception as e:

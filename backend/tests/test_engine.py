@@ -20,6 +20,14 @@ def _engine(handler, **kw):
     return KataGoEngine(url="http://kg.test", client=client, ready_poll_sec=0.0, **kw)
 
 
+def _raise_connect(req):
+    raise httpx.ConnectError("boom", request=req)
+
+
+def _raise_read_timeout(req):
+    raise httpx.ReadTimeout("slow", request=req)
+
+
 class StartTest(unittest.TestCase):
     def test_start_ok_when_ready(self):
         async def run():
@@ -148,6 +156,108 @@ class AnalyzeTest(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual(seen["auth"], "Bearer s3cret")
+
+
+class RetryAndDeadTest(unittest.TestCase):
+    """Review Focus #5：重试次数必须钉死，且 ``_dead`` 的置位/自愈要成对验证。
+
+    连接类错误与超时**恰好重试 1 次**（共 2 次尝试）；HTTP 状态响应（503 预热 / 401 鉴权）
+    **不重试**（共 1 次）。``_dead`` 只在传输层失败（旧子进程时代的「管道断了」）时置位，
+    超时与状态响应都不置；一次成功分析把它清掉（云服务重启后能自愈）。
+    """
+
+    def _counting(self, behavior):
+        """包一层计数：只统计 ``/analyze`` 的调用次数，``/health`` 不计入。"""
+        calls = {"n": 0}
+
+        def handler(req):
+            if req.url.path == "/health":
+                return httpx.Response(200, json={"ok": True, "state": "ready"})
+            calls["n"] += 1
+            return behavior(req)
+
+        return handler, calls
+
+    def test_transport_error_retries_exactly_once(self):
+        handler, calls = self._counting(_raise_connect)
+
+        async def run():
+            eng = _engine(handler)
+            await eng.start()
+            return await eng.analyze([]), eng.is_dead(), calls["n"]
+
+        r, dead, n = asyncio.run(run())
+        self.assertIn("error", r)
+        self.assertEqual(n, 2)          # 首次 + 重试 1 次
+        self.assertTrue(dead)           # 传输层失败＝旧时代的「管道断了」：置 _dead
+
+    def test_timeout_retries_exactly_once_without_marking_dead(self):
+        handler, calls = self._counting(_raise_read_timeout)
+
+        async def run():
+            eng = _engine(handler, timeout_ms=50)
+            await eng.start()
+            return await eng.analyze([]), eng.is_dead(), calls["n"]
+
+        r, dead, n = asyncio.run(run())
+        self.assertIn("超时", r["error"])
+        self.assertEqual(n, 2)          # 超时也重试 1 次
+        self.assertFalse(dead)          # 但超时不置死（旧实现里超时不杀进程）
+
+    def test_503_does_not_retry(self):
+        handler, calls = self._counting(
+            lambda req: httpx.Response(503, json={"error": "正在加载"}))
+
+        async def run():
+            eng = _engine(handler)
+            await eng.start()
+            return await eng.analyze([]), eng.is_dead(), calls["n"]
+
+        r, dead, n = asyncio.run(run())
+        self.assertIn("正在加载", r["error"])
+        self.assertEqual(n, 1)          # 状态响应不重试
+        self.assertFalse(dead)          # 也不置死
+
+    def test_401_does_not_retry(self):
+        handler, calls = self._counting(
+            lambda req: httpx.Response(401, json={"error": "鉴权失败"}))
+
+        async def run():
+            eng = _engine(handler)
+            await eng.start()
+            return await eng.analyze([]), eng.is_dead(), calls["n"]
+
+        r, dead, n = asyncio.run(run())
+        self.assertIn("鉴权失败", r["error"])
+        self.assertEqual(n, 1)
+        self.assertFalse(dead)
+
+    def test_transport_failure_marks_dead_then_success_clears(self):
+        """自愈：传输失败置 ``_dead``，云服务恢复后一次成功分析把它清掉。"""
+        calls = {"n": 0}
+
+        def handler(req):
+            if req.url.path == "/health":
+                return httpx.Response(200, json={"ok": True, "state": "ready"})
+            calls["n"] += 1
+            if calls["n"] <= 2:         # 首次 + 重试都失败
+                raise httpx.ConnectError("boom", request=req)
+            return httpx.Response(200, json=ANALYSIS)
+
+        async def run():
+            eng = _engine(handler)
+            await eng.start()
+            first = await eng.analyze([])
+            dead_after_failure = eng.is_dead()
+            second = await eng.analyze([])
+            return first, dead_after_failure, second, eng.is_dead(), eng.last_error()
+
+        first, dead_after_failure, second, dead_after_success, err = asyncio.run(run())
+        self.assertIn("error", first)
+        self.assertTrue(dead_after_failure)
+        self.assertIn("rootInfo", second)
+        self.assertFalse(dead_after_success)
+        self.assertEqual(err, "")
 
 
 class MiscTest(unittest.TestCase):
