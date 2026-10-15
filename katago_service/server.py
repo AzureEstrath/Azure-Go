@@ -16,6 +16,7 @@
 import argparse
 import asyncio
 import hmac
+import ipaddress
 import os
 import time
 from contextlib import asynccontextmanager
@@ -293,8 +294,16 @@ def build_app(args) -> FastAPI:
 
 
 def _is_loopback(host: str) -> bool:
-    """是否只在本机可达的监听地址。"""
-    return host in ("127.0.0.1", "localhost", "::1")
+    """是否只在本机可达的监听地址。
+
+    用 ``ipaddress`` 解析而不是比对字面量：``127.0.0.2``、``[::1]`` 等回环变体也算回环，
+    免得误报「对外监听」；非 IP 的主机名（如 ``localhost``）回落到字面量判断。
+    """
+    h = (host or "").strip().strip("[]")        # IPv6 监听地址可能写作 [::1]
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return h.lower() == "localhost"
 
 
 if __name__ == "__main__":
@@ -306,10 +315,6 @@ if __name__ == "__main__":
     # 默认只监听回环（与 backend/app/main.py 一致）；跨机部署用 --host/KATAGO_HOST 对外监听
     print("[KataGo服务] 启动 http://%s:%d（analysis-threads=%d）"
           % (_host, _args.port, _args.analysis_threads))
-    if not _is_loopback(_host) and not _token:
-        # 静态文档里写了不算数：这里必须真喊一声，否则「对外监听 + 无 token」会悄无声息
-        print("[KataGo服务] 警告：正在对外监听（%s）且未配置 token，请务必配置 "
-              "KATAGO_SERVICE_TOKEN 或置于内网/TLS 反代之后" % _host)
     try:
         _app = build_app(_args)
     except ValueError as e:
@@ -318,4 +323,9 @@ if __name__ == "__main__":
         print("[KataGo服务] 请用 --katago-exe/--model/--config 或环境变量 "
               "KATAGO_EXE/KATAGO_MODEL/KATAGO_CONFIG 指定引擎")
         raise SystemExit(2)
+    if not _is_loopback(_host) and not _token:
+        # 静态文档里写了不算数：这里必须真喊一声，否则「对外监听 + 无 token」会悄无声息。
+        # 放在 build_app 成功之后：配置缺失时只报启动失败，不再先喊一句无关的暴露告警。
+        print("[KataGo服务] 警告：正在对外监听（%s）且未配置 token，请务必配置 "
+              "KATAGO_SERVICE_TOKEN 或置于内网/TLS 反代之后" % _host)
     uvicorn.run(_app, host=_host, port=_args.port)

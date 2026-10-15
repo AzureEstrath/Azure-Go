@@ -285,5 +285,17 @@ class CliCfgMappingTest(unittest.TestCase):
             self.assertEqual(server.resolve_host(server.parse_args(["--host", ""])), "127.0.0.1")
 
 
+class LoopbackTest(unittest.TestCase):
+    """P19-⑤ 守卫：回环判定用 ipaddress 解析，回环变体不得误报「对外监听」。"""
+
+    def test_loopback_variants_are_loopback(self):
+        for host in ("127.0.0.1", "127.0.0.2", "::1", "[::1]", "localhost", "LOCALHOST"):
+            self.assertTrue(server._is_loopback(host), host)
+
+    def test_non_loopback_is_not_loopback(self):
+        for host in ("0.0.0.0", "10.0.0.5", "192.168.1.10", "example.com", ""):
+            self.assertFalse(server._is_loopback(host), host)
+
+
 if __name__ == "__main__":
     unittest.main()
