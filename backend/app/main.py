@@ -73,6 +73,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True, memo
                                                          extra_body=merge_extra_body(cfg))
             app.state.agent = AzureAgent(eng, cli, events.EventBus(), joseki_teach=cfg.joseki_teach,
                                          tools_enabled=cfg.tools_enabled, max_tool_calls=cfg.max_tool_calls,
+                                         stream_tokens=cfg.stream_tokens,
                                          memory=mem)
             if autostart:
                 ok = await eng.start()

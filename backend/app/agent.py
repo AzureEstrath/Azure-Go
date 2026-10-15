@@ -11,6 +11,7 @@ import asyncio
 import random
 import re
 import time
+import uuid
 
 from langchain_core.messages import ToolMessage
 
@@ -22,7 +23,7 @@ from .agent_graph import (
 from .board import SIZE as BOARD_SIZE
 from .emotion import EmotionModel
 from .joseki import JosekiRecognizer
-from .llm_chain import content_of
+from .llm_chain import content_of, stream_delta_of
 from .state import GameState
 from .tools import TOOLS, failed as tool_failed
 
@@ -99,7 +100,7 @@ CHAT_FALLBACK_LINES = [
 
 class AzureAgent:
     def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False,
-                 tools_enabled=False, max_tool_calls=None, memory=None):
+                 tools_enabled=False, max_tool_calls=None, memory=None, stream_tokens=False):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -115,6 +116,13 @@ class AzureAgent:
         want = MAX_TOOL_CALLS if max_tool_calls is None else int(max_tool_calls)
         self.max_tool_calls = max(0, min(want, MAX_TOOL_CALLS))    # 配置只能收紧，不能突破硬上限
         self._chain = None
+
+        # —— 流式输出（可选、默认关闭）：关闭时一个 token 事件都不发，事件序列与没有这个功能时
+        #    逐字一致；开启后 speak 阶段逐块推 `token`，台词仍以完整 message 收口（S31/S32）——
+        self.stream_tokens = bool(stream_tokens)
+        # 本轮唯一标识：**每次公开编排调用生成一次**（player_move 的三个阶段共用同一个），
+        # 供 token（本任务）与 speech（计划 05）配对；它不进既有事件形状，只在新事件里带（S33）。
+        self.turn_id = ""
 
         # —— 跨局长期记忆：默认不接线（None），由 main.py 的 lifespan 注入 MemoryService ——
         self.memory = memory
@@ -159,10 +167,15 @@ class AzureAgent:
             "tool_calls": 0,
             "wants_tools": False,
             "move": None,
-            "turn_id": str(turn_id or ""),
+            "turn_id": str(turn_id or self.turn_id or ""),
             "data": dict(data or {}),
         }
         return await self.graph.ainvoke(state)
+
+    def _new_turn(self) -> str:
+        """开启一次公开编排调用：生成新的 ``turn_id``（同一回合的多个阶段一路沿用，S33）。"""
+        self.turn_id = uuid.uuid4().hex
+        return self.turn_id
 
     # ================= 事件 =================
 
@@ -408,6 +421,50 @@ class AzureAgent:
                 raise
             print("[Agent] 工具调用被服务端拒绝参数（HTTP %d），去掉扩展字段与输出上限重试一次" % e.status_code)
             return await bound.bind(extra_body={}).ainvoke(msgs)
+
+    # ================= 流式输出（可选、默认关闭） =================
+
+    def _bind_stream(self, src, max_tokens):
+        """给流式来源补上输出上限：与 ``_bind_tools`` 同一手法（``bind(extra_body=…)`` 是整体替换）。"""
+        if not hasattr(src, "bind"):
+            return src                              # 鸭子类型替身（测试）：不支持 bind，照原样用
+        if getattr(self.llm, "_extra_body_unsupported", False):
+            return src.bind(extra_body={})          # 服务端拒绝过扩展字段：什么都不加
+        body = dict(getattr(src, "extra_body", None) or {})
+        if "max_tokens" not in body and "max_completion_tokens" not in body:
+            body["max_tokens"] = max_tokens
+        return src.bind(extra_body=body)
+
+    def _stream_chunks(self, messages, max_tokens=300):
+        """本次出话的可流式来源：返回「逐块产出可见文本」的异步生成器；不可流式时返回 ``None``。
+
+        ``stream_tokens`` 关闭（默认）时**直接返回 None**——关闭态一个 ``token`` 事件都不会发，
+        事件序列与没有这个功能时逐字一致（S31③）。开启后优先用实时取到的 LangChain 链
+        （与 ``bind_tools`` 同一个来源）；鸭子类型替身只实现 ``astream`` 时用它自己。
+
+        与 ``LLMClient.chat`` 同一条安全网：地址没配（``_chain_ok`` 为假）时不发任何请求——
+        否则 openai 客户端会静默退回 api.openai.com 真连外网。输出上限按线上键 ``max_tokens``
+        绑进请求体（理由同 ``_bind_tools``：``ChatOpenAI`` 的 ``max_tokens`` 会被改名）。
+
+        每块都经 ``llm_chain.stream_delta_of`` 取文本：**只认回答的 content 通道**，推理段
+        （``reasoning_content`` / ``reasoning`` / think 段）永不进 delta；空块直接跳过（不发事件）。
+        """
+        if not self.stream_tokens or not self._chain_ok():
+            return None
+        src = self.chain
+        if src is None or not hasattr(src, "astream"):
+            src = self.llm if hasattr(self.llm, "astream") else None
+        if src is None:
+            return None
+        src = self._bind_stream(src, max_tokens)
+
+        async def gen():
+            async for chunk in src.astream(messages):
+                delta = stream_delta_of(chunk)
+                if delta != "":
+                    yield delta
+
+        return gen()
 
     async def _run_tool(self, by_name, name, args) -> str:
         """执行一个工具：发 ``tool`` start/end 事件，返回给模型的 ``ToolMessage`` 文本；绝不抛出。
@@ -691,6 +748,7 @@ class AzureAgent:
             self._emit(events.state(self.st.payload()))   # 让界面撤销乐观落子
             return
         self._set_busy(True)
+        self._new_turn()                            # 三阶段共用同一轮标识（S33）
         try:
             state = await self._turn(PHASE_AFTER_PLAYER, {"x": x, "y": y})
             state = await self._turn(PHASE_OWN_TURN, state.get("data"), state.get("turn_id"))
@@ -777,6 +835,7 @@ class AzureAgent:
         if self.busy:
             return
         self._set_busy(True)
+        self._new_turn()
         try:
             await self._turn(PHASE_OBSERVE)
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
@@ -793,6 +852,7 @@ class AzureAgent:
             self._emit(events.message(events.AI, "棋盘还空着呢~ 先落几手，我再帮你看看形势。"))
             return
         self._set_busy(True)
+        self._new_turn()
         try:
             await self._turn(PHASE_ANALYZE)
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
@@ -811,6 +871,7 @@ class AzureAgent:
         # 按聊天内容即时结算情绪（本地关键词分类）
         self._mood_event(self._chat_event(self.chat_emotion(text)), "，他说：「%s」" % text[:40].strip())
         self._set_busy(True)
+        self._new_turn()
         try:
             await self._turn(PHASE_CHAT, {"text": text})
         except Exception as e:                      # 意外抛出：按失败处理，别让棋盘锁死
@@ -822,6 +883,7 @@ class AzureAgent:
         """闲置搭话：Estarth 一段时间没动静时，Azure 主动说一句短话。"""
         if self.busy:
             return
+        self._new_turn()
         await self._turn(PHASE_IDLE)                 # 不进 busy：与今天一致（空闲搭话不锁棋盘）
 
     async def summarize(self, note=""):
@@ -832,6 +894,7 @@ class AzureAgent:
             self._emit(events.message(events.AI, "还没下过棋呢~"))
             return
         self._set_busy(True)
+        self._new_turn()
         try:
             await self._turn(PHASE_SUMMARY, {"note": note})
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死

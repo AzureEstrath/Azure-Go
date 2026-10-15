@@ -649,3 +649,222 @@ class DedupTest(unittest.TestCase):
         self.assertFalse(agent._is_repeat("我"))                # 只是子串 → 不判重
         self.assertFalse(agent._is_repeat("我不在的~"))          # 只差一个字 → 不判重
 
+
+# —— 以下为计划 04 · Task 5 追加（既有断言一个字符都没改）——
+
+
+class StreamTest(unittest.TestCase):
+    class StreamLLM(StubLLM):
+        async def astream(self, messages, max_tokens=300):
+            for piece in ["我", "在", "的~"]:
+                yield piece
+
+    def test_tokens_off_by_default(self):
+        agent, _eng, _llm, bus = _mk()
+        self.assertFalse(agent.stream_tokens)
+        asyncio.run(agent.chat("在吗"))
+        self.assertEqual(bus.of_type("token"), [])
+
+    def test_tokens_emitted_when_enabled(self):
+        agent, _eng, _llm, bus = _mk()
+        agent.llm = self.StreamLLM()
+        agent.stream_tokens = True
+        asyncio.run(agent.chat("在吗"))
+        deltas = [e["delta"] for e in bus.of_type("token")]
+        self.assertEqual("".join(deltas), "我在的~")
+        self.assertTrue(all(e["turn_id"] == bus.of_type("token")[0]["turn_id"] for e in bus.of_type("token")))
+
+
+# —— 以下为计划 04 · Task 5 评审 S31/S32/S33 的补充守卫（纯追加）——
+
+
+class _Chunk:
+    """流式 chunk 替身（DeepSeek-R1 形态：content 与推理段同块下发）。"""
+
+    def __init__(self, content="", reasoning=""):
+        self.content = content
+        self.additional_kwargs = {"reasoning_content": reasoning} if reasoning else {}
+        self.response_metadata = {"model_name": "stub"}
+
+
+class StreamGuardTest(unittest.TestCase):
+    """S31 推理段永不进 delta / 默认关闭零 token；S33 turn_id 每次公开调用一次；S32 去重闸门不绕过。"""
+
+    class ReasonLLM(StubLLM):
+        """带推理段的流式替身：最后一块 content 为空（推理段还在继续）。"""
+
+        async def astream(self, messages, max_tokens=300):
+            for piece in ["你", "好", "~"]:
+                yield _Chunk(piece, "内部推理段：我要不要理他")
+            yield _Chunk("", "内部推理段：我要不要理他")
+
+    class PrefixLLM(StubLLM):
+        """先吐一整句（与窗口里那句重合），再续上后半句：以它开头的**新话**不许被误截。"""
+
+        async def astream(self, messages, max_tokens=300):
+            for piece in ["我在的~", "，怎么啦？"]:
+                yield piece
+
+    class TurnLLM(StubLLM):
+        """每次调用换一句：`player_move` 三个阶段各自出话，便于核对 `turn_id` 是不是同一个。"""
+
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        async def astream(self, messages, max_tokens=300):
+            self.n += 1
+            for piece in ["第%d句" % self.n, "。"]:
+                yield piece
+
+    def test_reasoning_segment_never_leaks_into_delta(self):
+        """硬规则 3：delta 只能来自 content 通道——带 `reasoning_content` 的块一个字都不许漏出去。"""
+        agent, _eng, _llm, bus = _mk()
+        agent.llm = self.ReasonLLM()
+        agent.stream_tokens = True
+        asyncio.run(agent.chat("在吗"))
+
+        toks = bus.of_type("token")
+        self.assertEqual("".join(e["delta"] for e in toks), "你好~")
+        self.assertEqual(set(toks[0].keys()), {"type", "turn_id", "delta"})   # 新事件的自有形状
+        for e in toks:
+            self.assertNotIn("内部推理", str(e["delta"]))
+        texts = [str(m["text"]) for m in bus.messages(events.AI)]
+        self.assertEqual(texts, ["你好~"])                                    # message 仍是权威全文
+        self.assertNotIn("内部推理", "".join(texts))
+
+    def test_blank_content_chunk_emits_no_event(self):
+        """S31②：空 content 的块（推理段还在继续）不发事件——4 块只出 3 条增量。"""
+        agent, _eng, _llm, bus = _mk()
+        agent.llm = self.ReasonLLM()
+        agent.stream_tokens = True
+        asyncio.run(agent.chat("在吗"))
+        self.assertEqual(len(bus.of_type("token")), 3)
+
+    def test_tokens_off_by_default_even_with_streamable_llm(self):
+        """S31③：默认关闭时「能流式的模型」也一个 token 都不发，事件序列与普通模型逐字一致。"""
+        a1, _e1, _l1, b1 = _mk()
+        a1.llm = self.ReasonLLM()                # 模型侧能流式，但 stream_tokens 保持默认 false
+        a2, _e2, _l2, b2 = _mk()                 # 普通 StubLLM（没有 astream）
+        asyncio.run(a1.chat("在吗"))
+        asyncio.run(a2.chat("在吗"))
+
+        self.assertFalse(a1.stream_tokens)
+        self.assertEqual(b1.of_type("token"), [])
+        self.assertEqual(self._norm(b1.events), self._norm(b2.events))   # 类型 / 顺序 / 载荷全一致
+
+    @staticmethod
+    def _norm(events):
+        """事件序列骨架：情绪三维向基线回落按真实时间算（浮点末位会抖），浮点归一到 6 位再比。"""
+        def one(v):
+            if isinstance(v, float):
+                return round(v, 6)
+            if isinstance(v, dict):
+                return {k: one(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [one(x) for x in v]
+            return v
+        return [one(dict(e)) for e in events]
+
+    def test_turn_id_is_one_per_public_call(self):
+        """S33：`turn_id` 每次公开调用生成一次——`player_move` 的三阶段共用同一个。"""
+        agent, _eng, _llm, bus = _mk()
+        agent.llm = self.TurnLLM()
+        agent.stream_tokens = True
+        asyncio.run(agent.player_move(3, 3))
+
+        toks = bus.of_type("token")
+        self.assertTrue(toks, "三个阶段都该有流式增量")
+        self.assertTrue(agent.turn_id)
+        self.assertEqual({str(e["turn_id"]) for e in toks}, {agent.turn_id})   # 三阶段同一个
+        self.assertEqual("".join(e["delta"] for e in toks), "第1句。第2句。第3句。")
+        for m in bus.messages():                 # 既有 message 事件的形状一个字都没动
+            self.assertNotIn("turn_id", m)
+
+        # 硬规则 1 + 音画同步：流式开着也照旧——ai_move 带坐标，可见更新仍延后到 reveal_move()
+        moves = bus.messages(events.AI_MOVE)
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(set(moves[0]["move"].keys()), {"x", "y", "gtp", "pass"})
+        self.assertTrue(agent._reveal_pending)
+        before = len(bus.of_type("state"))
+        agent.reveal_move()
+        self.assertFalse(agent._reveal_pending)
+        self.assertEqual(len(bus.of_type("state")), before + 1)
+
+    def test_turn_id_changes_between_public_calls(self):
+        """每次公开调用都是新的一轮：`turn_id` 不得沿用上一轮（配 speech / token 用）。"""
+        agent, _eng, _llm, _bus = _mk()
+        asyncio.run(agent.chat("在吗"))
+        first = agent.turn_id
+        self.assertTrue(first)
+        asyncio.run(agent.hint())
+        self.assertTrue(agent.turn_id)
+        self.assertNotEqual(agent.turn_id, first)
+
+    def test_dedup_gate_applies_to_streaming_path(self):
+        """S32：流式路径同样过闸门——原样复读时 `message` 被拦，完整重复句也不出现在 token 流里。"""
+        agent, _eng, _llm, bus = _mk()
+        agent.llm = StreamTest.StreamLLM()       # 逐块吐「我」「在」「的~」
+        agent.stream_tokens = True
+        agent._note_line("我在的~")               # 最近 8 条窗口里已经有这句原话
+        asyncio.run(agent.chat("在吗"))
+
+        self.assertEqual(bus.messages(events.AI), [])              # 重复句不发 message
+        deltas = [str(e["delta"]) for e in bus.of_type("token")]
+        self.assertNotEqual("".join(deltas), "我在的~")             # 完整重复句不得出现在事件里
+
+    def test_new_sentence_starting_with_a_window_line_is_not_truncated(self):
+        """判据是「相等」不是「包含」：以窗口里那句开头的新话，流式下照样完整发出。"""
+        agent, _eng, _llm, bus = _mk()
+        agent.llm = self.PrefixLLM()
+        agent.stream_tokens = True
+        agent._note_line("我在的~")
+        asyncio.run(agent.chat("在吗"))
+
+        self.assertEqual("".join(str(e["delta"]) for e in bus.of_type("token")), "我在的~，怎么啦？")
+        self.assertEqual([str(m["text"]) for m in bus.messages(events.AI)], ["我在的~，怎么啦？"])
+
+
+class RealChainStreamTest(unittest.TestCase):
+    """真链路径（``ChatOpenAI.astream``）也走同一条流式通道：MockTransport 回 SSE，全程不触网。
+
+    其它用例用的是鸭子类型替身（对象上直接有 ``astream``）；这条走生产装配
+    （``LLMClient.chain`` → ``_bind_stream`` 的 ``bind(extra_body=…)`` → ``astream``），
+    顺带核对线上请求体仍是 ``stream: true`` + 我们注入的 ``max_tokens``。
+    """
+
+    def test_real_chain_streams_tokens_and_message_still_authoritative(self):
+        import json
+        import time
+        import httpx
+        from app.llm import LLMClient
+
+        seen = []
+
+        def handler(req):
+            seen.append(json.loads(req.content.decode("utf-8")))
+            chunks = [{"id": "x", "object": "chat.completion.chunk", "created": 0, "model": "stub",
+                       "choices": [{"index": 0, "delta": {"content": p}, "finish_reason": None}]}
+                      for p in ["你", "好", "~"]]
+            chunks.append({"id": "x", "object": "chat.completion.chunk", "created": 0, "model": "stub",
+                           "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+            body = "".join("data: %s\n\n" % json.dumps(c, ensure_ascii=False) for c in chunks) + "data: [DONE]\n\n"
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  content=body.encode("utf-8"))
+
+        llm = LLMClient("http://stub.local/v1", "stub-model", "k",
+                        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+                        http_async_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        bus = events.RecordingBus()
+        agent = AzureAgent(StubEngine(), llm, bus, stream_tokens=True)
+        agent._mood_ms = int(time.monotonic() * 1000)      # 情绪小调用限频：这轮跳过，只发这一次流式请求
+        asyncio.run(agent.chat("在吗"))
+
+        self.assertEqual(len(seen), 1)
+        self.assertIs(seen[0].get("stream"), True)                          # 走的真是流式
+        self.assertEqual(seen[0]["max_tokens"], 400)                        # 输出上限照旧注入
+        toks = bus.of_type("token")
+        self.assertEqual("".join(str(e["delta"]) for e in toks), "你好~")
+        self.assertTrue(all(str(e["turn_id"]) == agent.turn_id for e in toks))
+        self.assertEqual([str(m["text"]) for m in bus.messages(events.AI)], ["你好~"])   # 气泡以 message 为准
+

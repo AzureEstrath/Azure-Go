@@ -28,6 +28,8 @@ class AzureConfig:
         # —— 发言侧工具（她自己查盘/复算/查定式；只影响怎么说，不影响下哪里）——
         self.tools_enabled = False          # 默认关闭：行为与没有工具时完全一致
         self.max_tool_calls = 2             # 一次发言的工具次数上限（agent 侧还有硬上限）
+        # —— 流式输出（默认关闭）：开启后 speak 阶段逐块推 `token` 事件，最终仍以完整 message 收口 ——
+        self.stream_tokens = False
         # —— 长期记忆（跨局记得玩家；默认关闭，关闭时不建库、不调 embedding）——
         self.memory_enabled = False
         self.memory_db_path = ""            # 留空＝<backend>/data/memory.db（由 memory_service 决定）
@@ -91,6 +93,7 @@ class AzureConfig:
             self.llm_think_extra_body = dict(tb)
         self.tools_enabled = bool(d.get("tools_enabled", self.tools_enabled))
         self.max_tool_calls = max(0, int(d.get("max_tool_calls", self.max_tool_calls)))
+        self.stream_tokens = bool(d.get("stream_tokens", self.stream_tokens))
         self.memory_enabled = bool(d.get("memory_enabled", self.memory_enabled))
         self.memory_db_path = str(d.get("memory_db_path", self.memory_db_path))
         self.embed_base_url = str(d.get("embed_base_url", self.embed_base_url))

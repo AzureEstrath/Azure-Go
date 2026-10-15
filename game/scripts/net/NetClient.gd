@@ -4,7 +4,8 @@ extends Node
 ##
 ## 对 Main.gd 暴露的信号与方法面（Main 的 agent.* 调用点只认这套契约）：
 ##   - 命令：REST POST（/api/move /api/hint /api/analyze /api/chat ... 见 docs）
-##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool / memory；连上先收 hello 同步）
+##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool / token / memory；连上先收 hello 同步）
+##     token 是可选（默认关闭）的流式增量：只影响气泡的显示过程，最终内容仍以 message 为准
 ##     memory 是长期记忆写入/召回的元数据：只记一行日志，不进台词、不产生任何信号
 ##
 ## 音画同步仍在客户端完成：`ai_move` 那条「落子宣告」的语音开始时，Main 调 reveal_move()，
@@ -21,6 +22,9 @@ signal mood_changed(payload: Dictionary)
 signal joseki_event(payload: Dictionary)
 ## 她自己查资料（phase=start/end）：只给状态栏用，工具返回的原文永远不会走到这里
 signal tool_event(payload: Dictionary)
+## 流式增量（可选、默认关闭：后端 `stream_tokens` 开启时才会收到这个事件）
+## `turn_id` 标识同一轮发言，`delta` 是这一块新增的文字；最终内容一律以 `message` 为准
+signal token_event(turn_id: String, delta: String)
 ## 连接状态提示（Main 接到状态栏）
 signal net_status(text: String, bad: bool)
 
@@ -136,6 +140,9 @@ func _handle_packet(raw: String) -> void:
 			joseki_event.emit(_without_type(d))
 		"tool":
 			tool_event.emit(_without_type(d))
+		"token":
+			# 流式增量（可选、默认关闭）：只喂气泡的显示过程，最终以 message 收口
+			token_event.emit(str(d.get("turn_id", "")), str(d.get("delta", "")))
 		"memory":
 			# 长期记忆的写入 / 召回：元数据（不是台词）——只记一行日志，不产生任何界面信号
 			print("[NetClient] memory op=%s tag=%s score=%s text=%s" % [

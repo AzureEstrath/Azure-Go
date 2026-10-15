@@ -77,3 +77,16 @@ def content_of(ai_message) -> str:
     if _TAG_OPEN in out:                    # 思考段被截断（未闭合）
         return ""
     return out
+
+
+def stream_delta_of(chunk) -> str:
+    """流式 chunk → 本次增量文本（**推理段永不显示**，硬规则 3）。
+
+    纯字符串（鸭子类型替身直接吐文本块）原样返回；消息对象只取 ``content``——``AIMessageChunk``
+    继承 ``AIMessage``，与台词走同一条 ``content_of``（含 think 段剥离），
+    ``additional_kwargs.reasoning_content`` / ``reasoning`` / ``response_metadata`` 一概不读。
+    空内容返回空串，由调用方跳过（不发事件）。
+    """
+    if isinstance(chunk, str):
+        return chunk
+    return content_of(chunk)

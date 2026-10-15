@@ -32,6 +32,10 @@
   再追加历史与发话」，``just_moved`` / ``observe`` / ``analyze`` / ``summary`` 是发完事件之后），
   ``_set_busy`` 自带去重，多调一次不会产生多余的 ``busy`` 事件。
 - 台词一律经 ``agent.clean_reply()``（``_reply()`` 内部必经），推理段永不进台词；
+- speak 阶段还有一条**可选**（默认关闭，``agent.stream_tokens``）的流式通道：``_streamed_text``
+  逐块推 ``token`` 事件（delta 只来自回答的 content 通道、推理段永不外泄、去重闸门同样生效），
+  台词仍以 ``_finalize_*`` 里经 ``clean_reply`` + ``_emit_deduped`` 的完整 ``message`` 收口；
+  关闭时一个 ``token`` 都不发，事件序列与没有这个功能时逐字一致；
 - ``build_graph(agent)`` 用闭包捕获 ``agent``，模块级不持有任何可变状态：同一个 ``agent`` 重建图
   是安全的，不同 ``agent`` 各有一张图。
 """
@@ -573,7 +577,7 @@ def _tools_node(agent):
 async def _speak_after_player(agent, data, msgs):
     """玩家那手的点评（定式成型时换成讲解，不额外增加 LLM 调用）。"""
     jk = data.get("jk") or {}
-    player_eval = await agent._reply(msgs, 300)
+    player_eval = await _say(agent, msgs, 300)
     if str(jk.get("kind", "")) == "formed" and agent._llm_failed(player_eval):
         player_eval = prompts.joseki_fallback(str(jk["name"]), str(jk["key"]))
     elif agent._llm_failed(player_eval):        # 云端失败：点评退化为兜底台词
@@ -593,7 +597,7 @@ async def _speak_own_turn(agent, data, msgs):
         if agent.tools_enabled:
             think_msg = await agent._tool_loop(msgs, 80, "own_turn")
         else:
-            think_msg = await agent._reply(msgs, 80)
+            think_msg = await _say(agent, msgs, 80)
     if agent._llm_failed(think_msg):            # 云端失败：落子宣告退化为兜底台词（坐标照常揭示）
         think_msg = agent._fallback_line("game")
     data["think_msg"] = think_msg
@@ -622,7 +626,7 @@ async def _speak_own_turn(agent, data, msgs):
 async def _speak_just_moved(agent, data, msgs):
     """她落子后那句感想。"""
     jk2 = data.get("jk2") or {}
-    ai_eval = await agent._reply(msgs, 120)
+    ai_eval = await _say(agent, msgs, 120)
     if str(jk2.get("kind", "")) == "formed" and agent._llm_failed(ai_eval):
         ai_eval = prompts.joseki_fallback(str(jk2["name"]), str(jk2["key"]))
     elif agent._llm_failed(ai_eval):            # 云端失败：落子后那句退化为兜底台词
@@ -639,7 +643,7 @@ async def _speak_observe(agent, data, msgs):
         if agent.tools_enabled:                 # 工具只在这一处与落子宣告启用（短回合不背工具往返）
             msg = await agent._tool_loop(msgs, 300, "observe")
         else:
-            msg = await agent._reply(msgs, 300)
+            msg = await _say(agent, msgs, 300)
     if agent._llm_failed(msg):                  # 云端失败：提示退化为兜底台词
         msg = agent._fallback_line("game")
     data["reply"] = msg
@@ -649,7 +653,7 @@ async def _speak_analyze(agent, data, msgs):
     """分析台词。"""
     if data.get("short"):
         return
-    msg = await agent._reply(msgs, 350)
+    msg = await _say(agent, msgs, 350)
     if agent._llm_failed(msg):                  # 云端失败：分析退化为兜底台词（形势数据照常下发）
         msg = agent._fallback_line("game")
     data["reply"] = msg
@@ -657,12 +661,12 @@ async def _speak_analyze(agent, data, msgs):
 
 async def _speak_chat(agent, data, msgs):
     """聊天台词（消息构造失败时按空回复处理，由 finalize 的兜底顶上）。"""
-    data["reply"] = await agent._reply(msgs, 400) if msgs else ""
+    data["reply"] = await _say(agent, msgs, 400) if msgs else ""
 
 
 async def _speak_idle(agent, data, msgs):
     """闲置搭话台词。"""
-    reply = await agent._reply(msgs, 90)
+    reply = await _say(agent, msgs, 90)
     if agent._llm_failed(reply):
         reply = agent._idle_line()
     data["reply"] = reply
@@ -670,7 +674,7 @@ async def _speak_idle(agent, data, msgs):
 
 async def _speak_summary(agent, data, msgs):
     """总结台词。"""
-    text = await agent._reply(msgs, 600)
+    text = await _say(agent, msgs, 600)
     failed = agent._llm_failed(text)
     if failed:                                  # 云端失败：总结退化为兜底台词
         text = agent._fallback_line("chat")
@@ -703,6 +707,51 @@ def _speak_node(agent):
         return {"reply": str(data.get("reply") or ""), "data": data}
 
     return speak
+
+
+# ================= ③′ speak 的可选流式通道（默认关闭） =================
+
+async def _streamed_text(agent, msgs, max_tokens):
+    """speak 阶段的出话：``stream_tokens`` 开启且来源支持 ``astream`` 时逐块发 ``token``，返回完整台词。
+
+    返回 ``None`` 表示「这次不走流式」，调用方回落到 ``agent._reply``——默认关闭时走的永远是那条路，
+    事件序列与没有这个功能时逐字一致（S31③）。三条不可回退的约束：
+
+    - delta 只来自回答的 content 通道（``agent._stream_chunks`` 里按 ``content_of`` 取），
+      推理段（``reasoning_content`` / think 段）永不进事件、空块不发事件（硬规则 3）；
+    - 去重闸门对流式路径同样生效（S32）：累加到这里**刚好等于窗口里某句原话**的那一块先扣住不发，
+      整句确实是原样复读时收尾那块就留在手里（token 流里只剩一个真前缀），随后的 ``message`` 也照样
+      被 ``_emit_deduped`` 拦下；若后面还有内容把它续长（只是以那句开头的**新话**），再按序补发，
+      不会误截。判据仍是「相等」，不是「包含」。
+    - 流式本身失败（连接断开 / 服务端报错）**绝不影响这一回合**：返回 ``None`` 让调用方走非流式那条路，
+      台词必定完整（前端的气泡最终内容以 ``message`` 为准，会被整条替换）。
+    """
+    chunks = agent._stream_chunks(msgs, max_tokens)
+    if chunks is None:
+        return None
+    parts = []
+    emitted = 0
+    try:
+        async for delta in chunks:
+            parts.append(delta)
+            if agent._is_repeat(agent.clean_reply("".join(parts))):
+                continue                            # 这一句如果就此打住就是重复：先扣住，不再外发
+            for d in parts[emitted:]:               # 没被拦住：把扣住的块按序补发
+                agent._emit(events.token(agent.turn_id, d))
+            emitted = len(parts)
+    except Exception as e:                          # noqa: BLE001 —— 流式失败退回非流式，绝不抛出
+        print("[Agent] 流式输出失败（退回非流式）：%s" % e)
+        return None
+    text = "".join(parts)
+    if text == "":
+        return ""                                   # 空内容：交给调用方的兜底判据
+    return agent.clean_reply(text)
+
+
+async def _say(agent, msgs, max_tokens):
+    """speak 阶段的统一出话口：流式开着就走流式，否则与 Task 2/3/4 的 ``agent._reply`` 同一条路。"""
+    text = await _streamed_text(agent, msgs, max_tokens)
+    return await agent._reply(msgs, max_tokens) if text is None else text
 
 
 # ================= ④ finalize：发事件、写 memory_log、归位 busy =================

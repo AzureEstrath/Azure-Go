@@ -10,6 +10,7 @@
     mood          ↔  mood_changed(payload)      三维情绪区域（表情/语气词/音高）
     joseki        ↔  joseki_event(payload)      定式高亮轨迹（kind/corner/points）
     tool          ↔  tool_event(payload)        她自己查资料（start/end，只给状态栏看）
+    token         ↔  token_event(turn_id, delta) 流式增量（可选、默认关闭；最终内容以 message 为准）
     memory        ↔  （无信号）                  长期记忆的写入/召回元数据，前端只记一行日志
 
 事件统一为 dict，``type`` 字段走对应构造器；客户端按 type 分发。
@@ -76,6 +77,17 @@ def tool(phase, name, args=None, ok=True, ms=0):
     """
     return {"type": "tool", "phase": str(phase), "name": str(name),
             "args": dict(args or {}), "ok": bool(ok), "ms": int(ms)}
+
+
+def token(turn_id, delta):
+    """流式输出的一段增量（``stream_tokens`` 开启时才有；默认关闭时一个都不发）。
+
+    ``delta`` 只来自回答的 ``content`` 通道——推理段（``reasoning_content`` / think 段）永不进这里
+    （硬规则 3）；空内容的块不发事件。**它不是台词**：气泡的最终内容一律以随后的 ``message``
+    为准（去重闸门只对 ``message`` 生效），``turn_id`` 用来把同一轮发言的增量与 ``message``、
+    日后的 ``speech`` 配起来（每次公开编排调用生成一次）。
+    """
+    return {"type": "token", "turn_id": str(turn_id), "delta": str(delta)}
 
 
 def memory(op, tag, text, score=0.0):

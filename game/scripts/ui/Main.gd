@@ -33,6 +33,8 @@ var _tts_voice_opt: OptionButton
 var _pending_ai: Array[Dictionary] = []    # 待显示的 Azure 文字（FIFO；每项 {text, reveal, kind?}）
 const AI_DEDUP_WINDOW := 8                 # 防复读窗口（兜底判据）：后端已按同样窗口去重，这里只兜 WS 重连后的乱序
 var _recent_ai_texts: Array[String] = []   # 最近说过的 AI 原话（含落子宣告）：只兜 WS 重连后乱序到达的重复句
+var _stream_turn := ""                     # 当前流式气泡对应的 turn_id（后端 token 流式通道：可选、默认关闭）
+var _stream_label: Label = null            # 当前流式气泡：增量直接追加，最终由 message 全文收口
 var _thinking_row: Control = null          # 「Azure 思考中……」占位气泡
 var _thinking_label: Label = null
 var _speech_hold := false                  # Azure 还有语音没播完：继续锁住棋盘
@@ -743,6 +745,53 @@ func _add_msg(kind: String, text: String) -> void:
 		_queue_rush_seq = _msg_seq           # 玩家/系统消息：把当前积压的投递全部快进
 	_pump_msg_queue()
 
+## 流式增量（后端 `stream_tokens` 开启时才有；默认关闭时这个回调一次都不会被调用到）：
+## 增量直接追加到本轮的流式气泡；气泡的最终内容一律由随后的 `message` 收口（见 _add_msg_now）
+func _on_token_event(turn_id: String, delta: String) -> void:
+	if delta == "":
+		return
+	if _stream_label == null or not is_instance_valid(_stream_label) or turn_id != _stream_turn:
+		_stream_turn = turn_id                       # 新的一轮发言：另起一个流式气泡
+		_add_stream_bubble()
+	if _stream_label == null or not is_instance_valid(_stream_label):
+		return
+	_stream_label.text += delta
+	_scroll_to_bottom()
+
+## 建流式气泡：有「Azure 思考中……」占位就原地改成它，否则照 Azure 消息气泡的样子新建一个
+## （不做打字机：增量本来就是一块块到的，TYPING_SEC_PER_CHAR 只兜没有 token 的普通消息）
+func _add_stream_bubble() -> void:
+	if _thinking_label != null and is_instance_valid(_thinking_label):
+		_stream_label = _thinking_label
+		_thinking_label = null
+		_thinking_row = null
+		_stream_label.text = ""
+		return
+	var row := HBoxContainer.new()
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_theme_constant_override("separation", 0)
+	row.alignment = BoxContainer.ALIGNMENT_BEGIN
+	var bubble := PanelContainer.new()
+	bubble.add_theme_stylebox_override("panel", _style(BUBBLE_AI, 10, 10))
+	row.add_child(bubble)
+	var inner := VBoxContainer.new()
+	inner.add_theme_constant_override("separation", 2)
+	bubble.add_child(inner)
+	var who := Label.new()
+	who.text = "Azure"
+	who.add_theme_font_size_override("font_size", 10)
+	who.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
+	inner.add_child(who)
+	var lbl := Label.new()
+	lbl.text = ""
+	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	lbl.custom_minimum_size = Vector2(292, 0)
+	lbl.add_theme_color_override("font_color", Color(0.106, 0.337, 0.337))
+	inner.add_child(lbl)
+	_chat_box.add_child(row)
+	_stream_label = lbl
+	_scroll_to_bottom()
+
 ## 剥离回复开头的 [[tone:xxx]] 语气标记 → [tone, 干净文本]；未知标记照删但不播音（防标记泄漏给玩家）
 func _strip_tone(text: String) -> Array:
 	if _tone_re.get_pattern() == "":
@@ -872,6 +921,14 @@ func _release_batch(force_show: bool) -> void:
 		tts.speak(text, tts_kind)
 
 func _add_msg_now(kind: String, text: String) -> void:
+	# 流式收口（后端 stream_tokens 开启时才有）：文字已由 `token` 增量显示在同一气泡里，
+	# 最终内容以这条 message 为准——整条替换，不再另建气泡、也不再走打字机
+	if kind == "ai" and _stream_label != null and is_instance_valid(_stream_label):
+		_stream_label.text = text
+		_stream_label = null
+		_stream_turn = ""
+		_scroll_to_bottom()
+		return
 	# 「Azure 思考中……」占位：第一条真实 Azure 文字原地替换它（原地开始打字）
 	if kind == "ai" and _thinking_label != null:
 		var typing_lbl := _thinking_label
@@ -1338,6 +1395,7 @@ func _wire_agent() -> void:
 	agent.mood_changed.connect(_on_mood_changed)
 	agent.joseki_event.connect(_on_joseki_event)
 	agent.tool_event.connect(_on_tool_event)
+	agent.token_event.connect(_on_token_event)    # 可选（默认关闭）的流式增量：只影响气泡显示过程
 	var mood_timer := Timer.new()                 # 三维情绪向基线回落的心跳：2 秒一次，区域没变时零开销
 	mood_timer.wait_time = 2.0
 	mood_timer.autostart = true
