@@ -28,6 +28,14 @@ class AzureConfig:
         # —— 发言侧工具（她自己查盘/复算/查定式；只影响怎么说，不影响下哪里）——
         self.tools_enabled = False          # 默认关闭：行为与没有工具时完全一致
         self.max_tool_calls = 2             # 一次发言的工具次数上限（agent 侧还有硬上限）
+        # —— 长期记忆（跨局记得玩家；默认关闭，关闭时不建库、不调 embedding）——
+        self.memory_enabled = False
+        self.memory_db_path = ""            # 留空＝<backend>/data/memory.db（由 memory_service 决定）
+        self.embed_base_url = ""            # 云端 OpenAI 兼容 embedding 地址；三者任一为空则降级为关键词检索
+        self.embed_model = ""
+        self.embed_api_key = ""
+        self.memory_top_k = 3               # 每次召回条数上限
+        self.memory_max_inject_chars = 240  # 注入提示词的总字数上限（单条另截到 120 字）
         # —— 提示词自定义（留空则用内置 Azure 人设）——
         self.prompt_system = ""
         self.prompt_user_name = "Estarth"
@@ -82,6 +90,13 @@ class AzureConfig:
             self.llm_think_extra_body = dict(tb)
         self.tools_enabled = bool(d.get("tools_enabled", self.tools_enabled))
         self.max_tool_calls = max(0, int(d.get("max_tool_calls", self.max_tool_calls)))
+        self.memory_enabled = bool(d.get("memory_enabled", self.memory_enabled))
+        self.memory_db_path = str(d.get("memory_db_path", self.memory_db_path))
+        self.embed_base_url = str(d.get("embed_base_url", self.embed_base_url))
+        self.embed_model = str(d.get("embed_model", self.embed_model))
+        self.embed_api_key = str(d.get("embed_api_key", self.embed_api_key))
+        self.memory_top_k = max(0, int(d.get("memory_top_k", self.memory_top_k)))
+        self.memory_max_inject_chars = max(0, int(d.get("memory_max_inject_chars", self.memory_max_inject_chars)))
         self.prompt_system = str(d.get("prompt_system", self.prompt_system))
         self.prompt_user_name = str(d.get("prompt_user_name", self.prompt_user_name))
         pn = d.get("prompt_phase_notes")
