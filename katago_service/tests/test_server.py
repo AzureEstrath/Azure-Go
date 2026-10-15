@@ -226,9 +226,13 @@ class CliArgsTest(unittest.TestCase):
     def test_args_default_port(self):
         self.assertEqual(server.parse_args([]).port, 8100)
 
+    def test_args_default_analysis_threads(self):
+        self.assertEqual(server.parse_args([]).analysis_threads, 1)
+
     def test_args_default_host_is_loopback(self):
-        # 默认必须只回环：不带 token 的服务不能默认对外监听
-        self.assertEqual(server.parse_args([]).host, "127.0.0.1")
+        # --host 不传时由 resolve_host 兜底（flag → KATAGO_HOST → 回环），这里钉住最终值
+        with mock.patch.dict(os.environ, {"KATAGO_HOST": ""}):
+            self.assertEqual(server.resolve_host(server.parse_args([])), "127.0.0.1")
 
     def test_args_host_override(self):
         self.assertEqual(server.parse_args(["--host", "0.0.0.0"]).host, "0.0.0.0")
@@ -263,11 +267,20 @@ class CliCfgMappingTest(unittest.TestCase):
                          ("env-katago.exe", "env-model.bin", "env-analysis.cfg"))
         self.assertEqual(app.state.token, "env-token")
 
-    def test_host_falls_back_to_env_then_loopback(self):
-        """--host 留空时回落 KATAGO_HOST；连环境变量也没有才用回环。"""
+    def test_host_env_applies_without_flag(self):
+        """P16-F1 回归守卫：不配 --host 时 KATAGO_HOST 也必须生效。
+
+        ``--host`` 若带非空默认值，``args.host or KATAGO_HOST or DEFAULT_HOST`` 永远不会走到
+        环境变量，``KATAGO_HOST=0.0.0.0 python -m katago_service.server`` 会静默只绑回环，
+        README 里「set KATAGO_HOST=0.0.0.0 即可」的写法就成了错的。
+        """
         with mock.patch.dict(os.environ, {"KATAGO_HOST": "0.0.0.0"}):
-            self.assertEqual(server.resolve_host(server.parse_args(["--host", ""])), "0.0.0.0")
-            self.assertEqual(server.resolve_host(server.parse_args([])), "127.0.0.1")
+            self.assertEqual(server.resolve_host(server.parse_args([])), "0.0.0.0")
+
+    def test_host_flag_beats_env_then_loopback(self):
+        """优先级：--host → KATAGO_HOST → 回环；空字符串一律按「没传」处理（bat 的传参形态）。"""
+        with mock.patch.dict(os.environ, {"KATAGO_HOST": "0.0.0.0"}):
+            self.assertEqual(server.resolve_host(server.parse_args(["--host", "10.0.0.5"])), "10.0.0.5")
         with mock.patch.dict(os.environ, {"KATAGO_HOST": ""}):
             self.assertEqual(server.resolve_host(server.parse_args(["--host", ""])), "127.0.0.1")
 

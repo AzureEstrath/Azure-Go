@@ -246,8 +246,9 @@ def parse_args(argv=None):
         prog="python -m katago_service.server",
         description="KataGo 云服务：常驻 analysis 引擎，对外提供 /health 与 /analyze",
     )
-    parser.add_argument("--host", default=DEFAULT_HOST,
-                        help="监听地址（默认 %s 仅回环；跨机部署填 0.0.0.0 并由内网/TLS 反代暴露）"
+    parser.add_argument("--host", default=None,
+                        help="监听地址（缺省时取环境变量 KATAGO_HOST，仍为空则 %s 仅回环）；"
+                             "对外监听（如 0.0.0.0）时务必配置 token 并置于内网/TLS 反代之后"
                              % DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=8100, help="监听端口（默认 8100）")
     parser.add_argument("--token", default="", help="Bearer 令牌；留空＝不校验（仅限本机回环调试）")
@@ -260,12 +261,17 @@ def parse_args(argv=None):
 
 
 def resolve_host(args) -> str:
-    """监听地址：留空时回落到环境变量 ``KATAGO_HOST``，仍为空则只监听回环（安全默认）。
+    """监听地址：优先级 ``--host`` → 环境变量 ``KATAGO_HOST`` → 只监听回环（安全默认）。
 
-    服务是可独立部署的：后端在别的机器上时要 ``--host 0.0.0.0``（或 ``KATAGO_HOST``），
-    但默认值必须是回环——不带 token 的服务绝不能默认对外监听。
+    ``--host`` 的默认值必须是**空**，否则 ``args.host or ...`` 永远不会走到环境变量，
+    ``KATAGO_HOST=0.0.0.0 python -m katago_service.server`` 就会静默只绑回环（P16-F1）。
     """
     return args.host or os.environ.get("KATAGO_HOST", "") or DEFAULT_HOST
+
+
+def resolve_token(args) -> str:
+    """Bearer 令牌：优先级 ``--token`` → 环境变量 ``KATAGO_SERVICE_TOKEN`` → 空（不校验）。"""
+    return args.token or os.environ.get("KATAGO_SERVICE_TOKEN", "")
 
 
 def build_app(args) -> FastAPI:
@@ -283,8 +289,12 @@ def build_app(args) -> FastAPI:
         "config": args.config or os.environ.get("KATAGO_CONFIG", ""),
         "analysis_threads": args.analysis_threads,
     }
-    token = args.token or os.environ.get("KATAGO_SERVICE_TOKEN", "")
-    return create_app(token=token, cfg=cfg)
+    return create_app(token=resolve_token(args), cfg=cfg)
+
+
+def _is_loopback(host: str) -> bool:
+    """是否只在本机可达的监听地址。"""
+    return host in ("127.0.0.1", "localhost", "::1")
 
 
 if __name__ == "__main__":
@@ -292,7 +302,20 @@ if __name__ == "__main__":
 
     _args = parse_args()
     _host = resolve_host(_args)
-    # 默认只监听回环（与 backend/app/main.py 一致）；跨机部署用 --host 0.0.0.0 并由内网/TLS 反代暴露
+    _token = resolve_token(_args)
+    # 默认只监听回环（与 backend/app/main.py 一致）；跨机部署用 --host/KATAGO_HOST 对外监听
     print("[KataGo服务] 启动 http://%s:%d（analysis-threads=%d）"
           % (_host, _args.port, _args.analysis_threads))
-    uvicorn.run(build_app(_args), host=_host, port=_args.port)
+    if not _is_loopback(_host) and not _token:
+        # 静态文档里写了不算数：这里必须真喊一声，否则「对外监听 + 无 token」会悄无声息
+        print("[KataGo服务] 警告：正在对外监听（%s）且未配置 token，请务必配置 "
+              "KATAGO_SERVICE_TOKEN 或置于内网/TLS 反代之后" % _host)
+    try:
+        _app = build_app(_args)
+    except ValueError as e:
+        # 完全没给引擎配置：给可读中文提示而不是裸 traceback（路径给错但非空的情况会优雅降级为 dead/503）
+        print("[KataGo服务] 启动失败：%s" % e)
+        print("[KataGo服务] 请用 --katago-exe/--model/--config 或环境变量 "
+              "KATAGO_EXE/KATAGO_MODEL/KATAGO_CONFIG 指定引擎")
+        raise SystemExit(2)
+    uvicorn.run(_app, host=_host, port=_args.port)
