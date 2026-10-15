@@ -1,11 +1,12 @@
 extends SceneTree
 ## 配置读写自检（headless，无外部依赖）
 ## 覆盖计划 00 的 Review Focus：v2.x 旧配置不崩、废弃键不被写回；
-## 以及 C1 回归守卫：save() 不得抹掉后端在用的 katago_* 键。
+## 以及 C1 反向守卫（计划 01）：KataGo 改为独立云服务后，save() 必须清掉已无读取方的 katago_* 旧键。
 ## 全程只用临时文件，绝不读写仓库里的 game/config.json。
 ## 运行：godot --headless --path game --script res://tests/test_config.gd
 
 const TMP := "user://test_config_tmp.json"
+## 「后端自行拉起引擎」时代的旧键值（只需非默认、可辨识；save() 之后必须消失）
 const KATAGO_BIN := "D:/KataGo/bin/katago/katago.exe"
 const KATAGO_MODEL := "D:/KataGo/models/model-b18c384nbt.bin.gz"
 const KATAGO_CONFIG := "D:/KataGo/bin/katago/default_gtp.cfg"
@@ -58,8 +59,9 @@ func _run() -> void:
 		_check("废弃音色 %s → %s" % [dead, AzureConfig.TTS_VOICE_DEFAULT],
 			c2.tts_voice == AzureConfig.TTS_VOICE_DEFAULT)
 
-	# —— 3) save()：清旧键、留 katago_*（C1 回归守卫）与未知键、写回改动值 ——
+	# —— 3) save()：清旧键（含计划 01 起失效的 katago_*）与未知键、写回改动值 ——
 	var raw := {
+		# v2.x~v3.0.0 的「后端自行拉起引擎」旧键：KataGo 现在是独立云服务，这三个键必须被清掉
 		"katago_bin": KATAGO_BIN,
 		"katago_model": KATAGO_MODEL,
 		"katago_config": KATAGO_CONFIG,
@@ -75,9 +77,9 @@ func _run() -> void:
 	var out := _read_raw()
 	for k in DEAD_KEYS:
 		_check("save() 清除旧键 " + k, not out.has(k))
-	_check("save() 保留 katago_bin", out.get("katago_bin", "") == KATAGO_BIN)
-	_check("save() 保留 katago_model", out.get("katago_model", "") == KATAGO_MODEL)
-	_check("save() 保留 katago_config", out.get("katago_config", "") == KATAGO_CONFIG)
+	_check("save() 清除旧键 katago_bin", not out.has("katago_bin"))
+	_check("save() 清除旧键 katago_model", not out.has("katago_model"))
+	_check("save() 清除旧键 katago_config", not out.has("katago_config"))
 	_check("save() 保留未知键", out.get("future_unknown_key", "") == "保留我")
 	_check("save() 写回改动的 tts_api_key", out.get("tts_api_key", "") == "sk-changed")
 

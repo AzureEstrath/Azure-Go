@@ -114,10 +114,13 @@ func save() -> bool:
 		path = ProjectSettings.globalize_path(path)
 	var d := _raw.duplicate()
 	d["_说明"] = "云端模型（LLM / 语音 TTS）与远程后端服务的地址与参数。打包发布时把本文件放在与可执行文件同一目录即可覆盖。"
-	# katago_bin / katago_model / katago_config 不在这里删除：它们是**后端**在用的活配置
-	# （backend/app/config.py 读取并交给 KataGoEngine），且 game/config.json 就是后端的配置文件
-	# （backend/run_server.bat 通过 AZURE_CONFIG 指过来）。前端已无这些字段，既不读也不改，
-	# 只需随 _raw 原样保留，否则用户配好的非默认 KataGo 路径会在游戏存档时被抹掉。
+	# katago_bin / katago_model / katago_config 是「后端自行拉起 KataGo 进程」时代的旧键（v2.x~v3.0.0）：
+	# 计划 01 起 KataGo 由独立部署的云服务提供，后端只连 katago_url / katago_token / katago_timeout_ms，
+	# 这三个键已无任何读取方，随旧配置一起清理，免得用户存档里一直留着失效的引擎路径。
+	# （katago_url 等新键前端不读，作为未知键随 _raw 原样保留，不会被这里动到。）
+	d.erase("katago_bin")
+	d.erase("katago_model")
+	d.erase("katago_config")
 	d["max_visits"] = max_visits
 	d["joseki_teach"] = joseki_teach
 	d.erase("backend_mode")                       # 只剩「连后端」一条路径：旧配置里的 backend_mode 不再写回
