@@ -1643,13 +1643,10 @@ func _sync_speech_hold() -> void:
 	_speech_hold = false
 	_refresh_lock()
 
-## 她这一侧还没收尾：思考中，或还有语音在排队/播放/取回（棋盘处于锁定状态的两种来源）
+## 她这一侧还没收尾：回合还在跑 / 语音侧还没完（含「音频还在取」）/ 调用方那个闩还挂着。
+## 四个「她还在忙吗」谓词里最外层的那个（判据都在 SpeechPairing 里，便于门卫钉一致性）。
 func _azure_hold_active() -> bool:
-	if agent != null and agent.busy:
-		return true
-	if _speech_hold:
-		return true
-	return _speech_busy()
+	return pairing.hold_active(_pair_facts(), _speech_hold)
 
 func _set_idle_state(v: bool) -> void:
 	if board != null:

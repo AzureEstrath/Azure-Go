@@ -22,6 +22,15 @@ extends Node
 ##   `armed`      已进入显示队列（`_deliver_msg` 跑过）；`displayed` 文字已显示
 ##   `released`   已经「不等它了」（不再算「她在忙」，也就不会把棋盘锁死）
 ##   `wait_display` 「同步说话」开着时：文字等这条语音开播才显示
+##
+## **不变量（T25，最要紧的一条）**：任何**已登记、且未被本地作废**（非 `tomb`、未被 `forget_idle()`）
+## 的台词，**最终一定会被显示一次**——无论它的 `speech` 到没到、无论配对位是否过了 TTL、
+## 无论那一轮是否还 `busy`：
+##   · `speech` 到了 → 开播时（`display`）或判定无声时（`finish` + `display`）显示；
+##   · `speech` 没到 → 回合结束时 `release_stale()` 放出来；若那一轮一直 `busy` / 音频一直在途，
+##     TTL 到期时 `prune_expired()` **先显示再清出**；
+##   · 音频取不回 / 解析不了 → 调用方补 `speech_skipped` → 显示（`release_stale` 也会兜底）。
+## 只有两类记录**有意不显示**：`tomb`（本地丢弃）与 `forget_idle()` 作废的走神搭话。
 
 ## 该把这条台词的文字显示出来了（Main 收到后：`_add_msg_now` + 必要时 `_reveal_move()`）
 signal display_requested(text: String, reveal: bool)
@@ -156,16 +165,28 @@ func prune() -> void:
 	_pairs = kept
 
 ## 配对位保鲜：过了窗口还没配上的记录清出（腾出配对位，免得它吃掉后面那条台词的语音）。
+##
+## **不变量（T25）**：**清出之前，只要这条台词的文字还没显示过，就先把它显示出来**——绝不静默丢台词。
+## 于是只有两种记录可以直接清掉：已经显示过的，与本地作废的占位（`tomb`）；还没轮到 `_deliver_msg`
+## 的（未 `arm`）**留着不清**——它马上会被 `arm`，此刻清掉就等于丢字（那时 `_deliver_msg` 只在
+## `played` 时才显示，而这条永远不会有 `played`）。
 ## 返回被清出的台词（供调用方记一行日志）。
 func prune_expired() -> Array[String]:
 	var out: Array[String] = []
 	var now := now_ms()
 	var kept: Array[Dictionary] = []
 	for rec in _pairs:
-		if not bool(rec["got"]) and now - int(rec["t"]) > SPEECH_PAIR_TTL_MS:
-			out.append(str(rec["text"]))
+		if bool(rec["got"]) or now - int(rec["t"]) <= SPEECH_PAIR_TTL_MS:
+			kept.append(rec)
 			continue
-		kept.append(rec)
+		if bool(rec["tomb"]):
+			continue                                   # 占位没有文字：直接清掉
+		if not bool(rec["displayed"]):
+			if not bool(rec["armed"]):
+				kept.append(rec)                       # 还没轮到 _deliver_msg：留着，别丢它
+				continue
+			display(rec)                               # 先把文字放出来，再腾出配对位
+		out.append(str(rec["text"]))
 	_pairs = kept
 	return out
 
@@ -233,6 +254,12 @@ func audio_in_flight(env: Dictionary) -> bool:
 		if bool(rec["got"]) and not bool(rec["played"]):
 			return true
 	return false
+
+## 她这一侧还没收尾（棋盘该锁着）：回合还在跑 / 调用方的闩还挂着 / 语音侧还没完。
+## 这是第四个「她还在忙吗」谓词（`_pending_ai`→`has_pending` / `_tts_playing` / `audio_in_flight` / 这个）。
+## 与 `busy` 的分工：`busy` 只看语音侧（在播 + 表里还有没出结果的），这里再加上「回合」与「闩」。
+func hold_active(env: Dictionary, hold_latch := false) -> bool:
+	return bool(env.get("turn_active", false)) or hold_latch or busy(env)
 
 # —— 小访问器（免得调用方到处写字段名） ——
 

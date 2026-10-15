@@ -242,7 +242,7 @@ func _run() -> void:
 	# —— ⑥ 配对位 TTL + 「只有文字」标记保鲜期（假时钟推进） ——
 	var p6 := _new_pairing()
 	_reset()
-	var r6 := p6.register("壬", false, "")
+	var r6 := p6.register("壬", true, "")
 	p6.arm(r6, true)
 	_advance(SpeechPairing.SPEECH_PAIR_TTL_MS - 1000)
 	_check("⑥ 还没到窗口：配对位留着（继续等它的语音）", p6.prune_expired().is_empty() and p6.pair_count() == 1)
@@ -250,6 +250,20 @@ func _run() -> void:
 	var gone := p6.prune_expired()
 	_check("⑥ 过了窗口：等不到语音的配对位清出（免得吃掉后面那条的语音）",
 			gone == ["壬"] and p6.pair_count() == 0)
+	_check("⑥ TTL 过期**不静默丢台词**：文字先显示出来（含揭示）", _shown == ["壬"] and _reveals[0])
+	_check("⑥ 过期清出后四个谓词一起归位（棋盘不会被锁死）",
+			not p6.has_pending() and not p6.busy(_env()) and not p6.hold_active(_env(), false))
+	# 还没轮到 _deliver_msg（未 arm）的记录：不许被清掉，也不许提前显示
+	_reset()
+	var r6b := p6.register("癸", true, "")
+	_advance(SpeechPairing.SPEECH_PAIR_TTL_MS + 1000)
+	_check("⑥b 还没进显示队列的记录不会被清掉（清掉就等于丢字）",
+			p6.prune_expired().is_empty() and p6.pair_count() == 1 and _shown.is_empty())
+	p6.arm(r6b, true)
+	p6.release_stale(_env())                        # 回合结束，仍然等不到语音
+	_check("⑥b 它最终照样会被显示（不变量：已登记的台词一定会被显示）", _shown == ["癸"] and _reveals[0])
+	_check("⑥b 显示过的记录随后可以被清出（表不会一直涨）",
+			p6.prune_expired() == ["癸"] and p6.pair_count() == 0)
 	p6.mark_text_only()
 	_check("⑥b 标记先被非 ai 类型忽略（不被它们顺手吃掉）", not p6.take_text_only_mark("ai_comment"))
 	_check("⑥b kind==ai 时立刻取用有效", p6.take_text_only_mark("ai"))
@@ -277,6 +291,38 @@ func _run() -> void:
 	p7.forget_idle()
 	_check("⑦ 还没配对的走神搭话留成占位（吃掉它自己那条 speech）",
 			p7.is_tomb(idle2) and not p7.has_pending())
+
+	# —— ⑧ 四个「她还在忙吗」谓词一致 + `_azure_hold_active`（T26） ——
+	# 四个谓词：`_pending_ai`(→has_pending) / `_tts_playing` / `audio_in_flight` / `busy`(→hold_active)
+	var p8 := _new_pairing()
+	_reset()
+	var r8 := p8.register("子", false, "")
+	p8.arm(r8, true)
+	_check("⑧ 等语音时：has_pending 与 busy 一致（都算「她在忙」）", p8.has_pending() and p8.busy(_env()))
+	_check("⑧ 等语音时 hold_active 为真（棋盘锁着）", p8.hold_active(_env(), false))
+	_check("⑧ 这时音频其实还没到（audio_in_flight 只看在播/在取/已配对）",
+			not p8.audio_in_flight(_env()))
+	_check("⑧ 不变量：has_pending ⇒ busy（还有待显示文字就不可能「她不忙」）",
+			(not p8.has_pending()) or p8.busy(_env()))
+	p8.release_stale(_env())
+	_check("⑧ 释放后文字显示了、四个谓词一起归位（棋盘不可能被锁死）",
+			_shown == ["子"] and not p8.has_pending() and not p8.busy(_env())
+			and not p8.audio_in_flight(_env()) and not p8.hold_active(_env(), false))
+	_check("⑧ hold_active 的另两个来源也认（回合还在跑 / 闩还挂着）",
+			p8.hold_active(_env(true, false, false)) and p8.hold_active(_env(), true))
+	# 已配对、音频在取：busy 与 audio_in_flight 必须同时为真（用一台干净的状态机，免得旧记录干扰）
+	var p8b := _new_pairing()
+	_reset()
+	var r8b := p8b.register("子2", false, "")
+	p8b.arm(r8b, true)
+	_check("⑧b 已配对（音频在取）：busy 与 audio_in_flight 同时为真",
+			p8b.accept_speech("t8", 1).get("id") == r8b.get("id")
+			and p8b.busy(_env()) and p8b.audio_in_flight(_env()))
+	p8b.finish(r8b)
+	p8b.display(r8b)
+	_check("⑧b 出结果后三个语音谓词一起归位",
+			not p8b.busy(_env()) and not p8b.audio_in_flight(_env()) and not p8b.has_pending())
+	_check("⑧b 归位之后 hold_active 才能为假（否则棋盘锁死）", not p8b.hold_active(_env(), false))
 
 	if _fail == 0:
 		print("[pair] PASS：", _total, " 项断言全部通过")
