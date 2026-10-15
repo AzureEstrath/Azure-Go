@@ -42,5 +42,21 @@ class DelocalizedLLMTest(unittest.TestCase):
         self.assertIsNone(importlib.util.find_spec("app.services"))
 
 
+class CloudKatagoConfigTest(unittest.TestCase):
+    def test_katago_fields_replaced(self):
+        c = AzureConfig()
+        for gone in ("katago_bin", "katago_model", "katago_config"):
+            self.assertFalse(hasattr(c, gone), gone)
+        for now in ("katago_url", "katago_token", "katago_timeout_ms"):
+            self.assertTrue(hasattr(c, now), now)
+
+    def test_has_katago_follows_url(self):
+        c = AzureConfig()
+        c.katago_url = "http://127.0.0.1:8100"
+        self.assertTrue(c.has_katago())
+        c.katago_url = ""
+        self.assertFalse(c.has_katago())
+
+
 if __name__ == "__main__":
     unittest.main()

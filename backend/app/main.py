@@ -45,20 +45,20 @@ def _int(v, d=-1):
 
 
 def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
-    """构造应用；测试可注入 stub 引擎/LLM/agent（autostart=False 跳过子进程启动）。"""
+    """构造应用；测试可注入 stub 引擎/LLM/agent（autostart=False 跳过引擎启动）。"""
     cfg = cfg if cfg is not None else config_mod.AzureConfig.load()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         prompts.configure(cfg)
         if agent is None:
-            eng = engine if engine is not None else KataGoEngine(cfg.katago_bin, cfg.katago_model, cfg.katago_config, cfg.max_visits)
+            eng = engine if engine is not None else KataGoEngine(cfg.katago_url, cfg.katago_token, cfg.max_visits, cfg.katago_timeout_ms)
             cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key, think_mode=cfg.llm_think_mode)
             app.state.agent = AzureAgent(eng, cli, events.EventBus(), joseki_teach=cfg.joseki_teach)
             if autostart:
                 ok = await eng.start()
                 if not ok:
-                    print("[KataGo] 启动失败：" + eng.last_error())
+                    print("[KataGo] 云服务不可用：" + eng.last_error())
                 asyncio.create_task(cli.probe_models())
         else:
             app.state.agent = agent
@@ -83,6 +83,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
             "ok": True,
             "katago_dead": s.katago.is_dead(),
             "katago_error": s.katago.last_error(),
+            "katago_url": cfg.katago_url,
             "llm_url": s.llm.base_url,
         }
 
@@ -206,5 +207,5 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
-    print("Azure 后端启动...（KataGo 由本进程拉起，LLM 走云端）")
+    print("Azure 后端启动...（KataGo 走云服务，LLM 走云端）")
     uvicorn.run(app, host="127.0.0.1", port=8000)
