@@ -217,6 +217,40 @@ class ToolRouteRealTriggerTest(unittest.TestCase):
         self.assertFalse(agent.busy)
         self.assertIs([e["busy"] for e in bus.of_type("busy")][-1], False)
 
+    def test_oversubscribed_parallel_calls_all_get_a_tool_message(self):
+        """I1：第 2 轮并行要 2 个工具、只剩 1 个额度 ⇒ 超额调用不执行，但**必须补 ToolMessage**。
+
+        AIMessage 里每个 ``tool_call_id`` 都要有应答，否则紧接着的 ``tools → decide`` 那一轮模型往返
+        会被 OpenAI 兼容端点判成 400（AI 消息带 2 个 tool_call_id、却只有 1 条 ToolMessage）。
+        """
+        from langchain_core.messages import ToolMessage
+        from app.agent_graph import PHASE_OBSERVE
+        agent, _eng, _llm, bus = _mk()
+        agent.tools_enabled = True
+        agent.chain = _ScriptChain([
+            _Ai(tool_calls=[{"name": "board_query", "args": {}, "id": "c1"}]),
+            _Ai(tool_calls=[{"name": "board_query", "args": {}, "id": "c2"},
+                            {"name": "board_query", "args": {}, "id": "c3"}]),
+            _Ai(content="看完了，先稳一手。"),
+        ])
+
+        state = asyncio.run(agent._turn(PHASE_OBSERVE))
+
+        # c1、c2 执行到上限；c3 超额，不执行但仍补预算 ToolMessage
+        self.assertEqual(state["tool_calls"], agent.max_tool_calls)
+        want_ids = set()
+        have_ids = set()
+        for m in state["messages"]:
+            for tc in (getattr(m, "tool_calls", None) or []):
+                want_ids.add(str(tc.get("id", "")))
+            if isinstance(m, ToolMessage):
+                have_ids.add(str(m.tool_call_id))
+        self.assertEqual(want_ids, {"c1", "c2", "c3"})
+        self.assertTrue(want_ids.issubset(have_ids), "有 tool_call_id 没被应答：%s" % (want_ids - have_ids))
+        # 只有 2 个工具真被执行（超额那个不发 tool 事件）
+        starts = [e for e in bus.of_type("tool") if e["phase"] == "start"]
+        self.assertEqual(len(starts), agent.max_tool_calls)
+
 
 class ToolsDisabledPathTest(unittest.TestCase):
     """S20：`tools_enabled=False` 时工具**完全不上线路**（与 Task 2 逐字一致）。

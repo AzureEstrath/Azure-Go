@@ -407,6 +407,14 @@ class AzureAgent:
     async def _tool_loop(self, messages, max_tokens, phase="", tools=None) -> str:
         """受限 tool loop：模型可以在预算内先查资料，再落回一句自然语言。
 
+        **现状（计划 04 · Task 3 起）：工具轮的主实现已搬到状态图**——``agent_graph._decide_tool_round``
+        （每轮一次模型调用）＋ ``tools`` 节点（执行 + 回灌 ``ToolMessage``），由条件边
+        ``decide → tools → decide`` 驱动。本函数的早退判据与图的 ``_tool_round_ready`` 是同一条
+        （链不可用 / 地址未配 / 预算为 0 时直接 ``_reply``），所以工具开着时它**只在「链不可用」这一
+        降级路径**上被调用（此时它等价于 ``_reply``）；它的 ``for`` 循环体目前**只被
+        ``tests/test_tools.py`` 直接覆盖**（保留是为了不删既有守卫，且两条语义必须与图对齐——
+        尤其「超额工具的每个 ``tool_call_id`` 都要补一条预算 ``ToolMessage``」）。
+
         只在 ``hint()`` 与 ``_ai_turn()`` 的落子宣告两处启用（且 ``tools_enabled`` 为真）：
         聊天/闲置这类短回合不走 tool loop，免得白等工具往返的时延。
 

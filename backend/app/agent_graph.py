@@ -531,18 +531,27 @@ def _tools_node(agent):
     兜住，绝不抛异常）；本节点只做「执行 + 拼接」：每个工具结果作为一条 ``ToolMessage`` **追加进声明过的
     ``state["messages"]``**（覆盖 reducer + 手动拼接，不会丢消息），工具输出只回到模型手里、
     永不进台词。执行完回到 ``decide`` 再来一轮（条件边 ``tools → decide``）。
+
+    超额调用（预算已满）**不执行但必须补一条 ``TOOL_BUDGET_TEXT`` 的 ToolMessage**：这一轮的
+    AIMessage 里每个 ``tool_call_id`` 都要有应答，否则紧接着的 ``tools → decide`` 那一轮模型往返
+    会被 OpenAI 兼容端点判成 400（与 ``agent._tool_loop`` 的既有语义逐字对齐）。
     """
 
     async def tools_node(state: TurnState) -> TurnState:
+        from .agent import TOOL_BUDGET_TEXT        # 延迟导入：agent ↔ agent_graph 是模块级循环依赖
         data = dict(state.get("data") or {})
         messages = list(state.get("messages") or [])
         tool_calls = int(state.get("tool_calls") or 0)
         by_name = {t.name: t for t in TOOLS}
         for tc in list(data.get("pending_tool_calls") or []):
-            if tool_calls >= agent.max_tool_calls:      # 预算用尽：不再执行（条件边也到此为止）
-                continue
             name = str(tc.get("name", ""))
             args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+            if tool_calls >= agent.max_tool_calls:      # 预算用尽：不执行，但补预算提示（不得留未应答的 id）
+                messages = messages + [ToolMessage(
+                    TOOL_BUDGET_TEXT % agent.max_tool_calls,
+                    tool_call_id=str(tc.get("id", "")),
+                )]
+                continue
             tool_calls += 1
             messages = messages + [ToolMessage(
                 await agent._run_tool(by_name, name, args),
