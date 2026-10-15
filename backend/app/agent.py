@@ -18,7 +18,7 @@ from langchain_core.messages import ToolMessage
 from . import coords, events, prompt_chains, prompts
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
-    PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph,
+    PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, _emit_line,
 )
 from .board import SIZE as BOARD_SIZE
 from .emotion import EmotionModel
@@ -774,14 +774,20 @@ class AzureAgent:
 
         多阶段回合：依次跑 ``after_player → own_turn → just_moved`` 三个阶段的图（顺序见
         ``agent_graph.py``）。前置判定（已忙 / 非法手）留在公开契约里：非法手**不置 busy、不调引擎**，
-        只发一条可读提示 + 权威快照让界面撤销乐观落子。
+        只发一条可读提示 + 权威快照让界面撤销乐观落子。提示**也是台词**：走 ``_emit_line``（T20①），
+        开局一次 ``_new_turn()`` 给配对的 ``speech`` 一个干净的 ``turn_id`` / ``seq``。
+
+        这里把 ``state`` **放在提示之前**（与旧顺序相反，有意为之）：前端只在收到 WS 的 ``state``
+        时才 ``board.set_stones`` 重同步，而 ``_emit_line`` 里的合成要等（最快 1~3 秒、失败最坏
+        30 秒）——先推快照，界面才不会把这一手不成立的子留在棋盘上。
         """
         if self.busy:
             return
         legal = self.st.board.is_legal(x, y, "black")
         if not legal["ok"]:
-            self._emit(events.message(events.AI, "这手不成立：%s" % legal["err"]))
-            self._emit(events.state(self.st.payload()))   # 让界面撤销乐观落子
+            self._new_turn()                            # 这行提示自己就是一次对外发言（T20①）
+            self._emit(events.state(self.st.payload()))   # 先让界面撤销乐观落子（不等合成）
+            await _emit_line(self, events.AI, "这手不成立：%s" % legal["err"])
             return
         self._set_busy(True)
         self._new_turn()                            # 三阶段共用同一轮标识（S33）
@@ -876,7 +882,7 @@ class AzureAgent:
             await self._turn(PHASE_OBSERVE)
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
             print("[Agent] 提示异常：%s" % e)
-            self._emit(events.message(events.AI_COMMENT, self._fallback_line("game")))
+            await _emit_line(self, events.AI_COMMENT, self._fallback_line("game"))
         finally:
             self._set_busy(False)
 
@@ -885,7 +891,8 @@ class AzureAgent:
         if self.busy:
             return
         if not self.st.moves:
-            self._emit(events.message(events.AI, "棋盘还空着呢~ 先落几手，我再帮你看看形势。"))
+            self._new_turn()                        # 空盘提示也是对外台词（T20①）
+            await _emit_line(self, events.AI, "棋盘还空着呢~ 先落几手，我再帮你看看形势。")
             return
         self._set_busy(True)
         self._new_turn()
@@ -893,7 +900,7 @@ class AzureAgent:
             await self._turn(PHASE_ANALYZE)
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
             print("[Agent] 分析异常：%s" % e)
-            self._emit(events.message(events.AI, "📊 " + self._fallback_line("game")))
+            await _emit_line(self, events.AI, "📊 " + self._fallback_line("game"))
         finally:
             self._set_busy(False)
 
@@ -927,7 +934,8 @@ class AzureAgent:
         if self.busy:
             return
         if not self.st.moves:
-            self._emit(events.message(events.AI, "还没下过棋呢~"))
+            self._new_turn()                        # 空盘提示也是对外台词（T20①）
+            await _emit_line(self, events.AI, "还没下过棋呢~")
             return
         self._set_busy(True)
         self._new_turn()
@@ -935,10 +943,12 @@ class AzureAgent:
             await self._turn(PHASE_SUMMARY, {"note": note})
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
             print("[Agent] 总结异常：%s" % e)
-            self._emit(events.message(events.AI, "📋 对局总结\n" + self._fallback_line("chat")))
+            await _emit_line(self, events.AI, "📋 对局总结\n" + self._fallback_line("chat"))
         finally:
             self._set_busy(False)
 
+    # 注意（计划 05 · T20②）：下面四个**同步**方法里的短提示**故意保持纯文字**（不发 `speech`）——
+    # 它们是同步方法（S5 不许改成 async），补 `speech` 就得 `await`、还得动端点；Task 5 会在 README 写明。
     def undo(self, turn_index):
         """俗手回档：撤销该手及其后的 Azure 应手，回到该手之前。"""
         if self.busy:

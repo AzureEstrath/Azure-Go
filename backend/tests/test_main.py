@@ -448,5 +448,146 @@ class TtsEndpointContractTest(unittest.TestCase):
             self.assertEqual(client.get("/api/tts/audio/nope").status_code, 404)
 
 
+# ================= 计划 05 · Task 3 修复轮（T20）：异步路径的玩家可见台词也要带 speech =================
+# 这一组是 **agent 级**用例（直接看 bus 上的事件序列，不走 WS）：换引擎/换 TTS 注入最省事，
+# 也避开了 WS 读取的时序不确定性。放在本文件是因为本轮只许改 test_main.py（其余测试文件不动）。
+
+import asyncio
+
+
+class ErrEngine(StubEngine):
+    """引擎失败（云服务不可用）：``analyze`` 回 ``{"error": …}`` ⇒ prepare 的短路提示路径。"""
+
+    async def analyze(self, moves):
+        return {"error": "云服务不可用"}
+
+
+class BoomEngine(StubEngine):
+    """引擎直接抛（比「回 error」更凶的失败形态）⇒ 公开方法的 ``except`` 兜底路径。"""
+
+    async def analyze(self, moves):
+        raise RuntimeError("云服务断连")
+
+
+def _mk_tts_agent(engine=None, llm=None, tts=None):
+    """造一个 RecordingBus 的 agent（复用本文件的 stub），可注入引擎 / LLM / TTS。"""
+    from app.agent import AzureAgent
+    bus = events.RecordingBus()
+    return AzureAgent(engine or StubEngine(), llm or StubLLM(), bus, tts=tts), bus
+
+
+class TtsAsyncPathTest(unittest.TestCase):
+    """T20①：异步路径上的每条玩家可见台词，都必须紧跟一条同 ``turn_id`` 的 ``speech``。"""
+
+    def _assert_paired(self, agent, bus):
+        """有 ``message`` 就有紧随的 ``speech``（同 ``turn_id``、``seq`` 从 1 连续）。"""
+        evs = bus.events
+        msgs = [i for i, e in enumerate(evs) if e.get("type") == "message"]
+        sps = [e for e in evs if e.get("type") == "speech"]
+        self.assertTrue(msgs, "这条路径必须有玩家可见台词")
+        self.assertEqual(len(sps), len(msgs), "message 与 speech 必须一一配对：%s" % evs)
+        for i in msgs:
+            self.assertEqual(evs[i + 1]["type"], "speech", "speech 必须紧跟 message：%s" % evs[i])
+            self.assertEqual(evs[i + 1]["turn_id"], agent.turn_id)
+            self.assertNotIn("turn_id", evs[i])          # message 的形状不许变
+        self.assertEqual([e["seq"] for e in sps], list(range(1, len(msgs) + 1)))
+
+    def test_engine_failure_shortcut_gets_speech(self):
+        """引擎失败短路提示（``_prepare_observe``）也要发声。"""
+        agent, bus = _mk_tts_agent(engine=ErrEngine(), tts=FakeTTS())
+        asyncio.run(agent.hint())
+        self.assertIn("一时算不清", bus.messages()[0]["text"])
+        self._assert_paired(agent, bus)
+
+    def test_engine_failure_analyze_shortcut_gets_speech(self):
+        """引擎失败短路提示（``_prepare_analyze``）也要发声（先攒一手棋谱）。"""
+        agent, bus = _mk_tts_agent(engine=StubEngine(), tts=FakeTTS())
+
+        async def go(a):
+            await a.player_move(3, 3)
+            a.bus.clear()
+            a.katago = ErrEngine()
+            await a.analyze_position()
+
+        asyncio.run(go(agent))
+        self.assertIn("一时算不清", bus.messages()[0]["text"])
+        self._assert_paired(agent, bus)
+
+    def test_empty_board_hints_get_speech(self):
+        """空盘提示（``analyze_position`` / ``summarize`` 的早退分支）也要发声。"""
+        for name, args in (("analyze_position", ()), ("summarize", ("",))):
+            agent, bus = _mk_tts_agent(tts=FakeTTS())
+            with self.subTest(case=name):
+                asyncio.run(getattr(agent, name)(*args))
+                self._assert_paired(agent, bus)
+
+    def test_exception_fallbacks_get_speech(self):
+        """三个公开方法的异常兜底台词（引擎直接抛）也要发声。"""
+        for name, args in (("hint", ()), ("analyze_position", ()), ("summarize", ("",))):
+            agent, bus = _mk_tts_agent(tts=FakeTTS())
+
+            async def go(a, name=name, args=args):
+                await a.player_move(3, 3)               # 先用正常引擎攒一手棋谱
+                a.bus.clear()
+                a.katago = BoomEngine()                 # 再换成「直接抛」的引擎
+                await getattr(a, name)(*args)
+
+            with self.subTest(case=name):
+                asyncio.run(go(agent))
+                self._assert_paired(agent, bus)
+
+    def test_illegal_move_hint_gets_speech(self):
+        """非法手提示（``player_move`` 的早退分支）也要发声，且与提示同 ``turn_id``。"""
+        agent, bus = _mk_tts_agent(tts=FakeTTS())
+
+        async def go(a):
+            await a.player_move(3, 3)
+            a.bus.clear()
+            await a.player_move(3, 3)                   # 同一手再落一次 ⇒ 非法手提示
+
+        asyncio.run(go(agent))
+        self.assertTrue(bus.messages()[0]["text"].startswith("这手不成立"))
+        self._assert_paired(agent, bus)
+        types = [e["type"] for e in bus.events]
+        self.assertIn("state", types)
+        self.assertLess(types.index("state"), types.index("message"),
+                        "界面重同步不能被合成时长拖延（state 先于提示）")
+
+    def test_system_mode_speech_carries_text(self):
+        """T20③①：``mode == "system"`` 的 ``speech`` 必须带**非空** ``text``（前端据此走系统语音）。"""
+        agent, bus = _mk_tts_agent(tts=FakeTTS("system"))
+        asyncio.run(agent.hint())
+        sps = bus.of_type("speech")
+        self.assertTrue(sps)
+        self.assertEqual({e["mode"] for e in sps}, {"system"})
+        self.assertTrue(all(e["text"] for e in sps), "system 模式的 text 不得为空：%s" % sps)
+
+    def test_no_speech_when_tts_not_wired(self):
+        """T20③②：``tts is None``（未接线）⇒ 一条 ``speech`` 都不发，文字照常。"""
+        agent, bus = _mk_tts_agent(tts=None)
+        asyncio.run(agent.hint())
+        self.assertEqual(bus.of_type("speech"), [])
+        self.assertTrue(bus.messages())
+
+    def test_sync_short_hints_stay_text_only(self):
+        """T20②：``undo``（两条）/ ``reset_game`` / ``set_allow_pass`` 的短提示**故意保持纯文字**。
+
+        它们是同步方法：补 ``speech`` 就得 ``await``（S5 不许改签名）+ 改既有端点（T18），故本轮显式接受。
+        """
+        agent, bus = _mk_tts_agent(tts=FakeTTS())
+
+        async def go(a):
+            await a.player_move(3, 3)
+            a.bus.clear()
+            a.undo(0)                                    # 有效回档 → 「退回第 N 手」
+            a.undo(-1)                                   # 回档点不存在 → 「已经不存在了哦」
+            a.set_allow_pass(True)
+            a.reset_game()
+
+        asyncio.run(go(agent))
+        self.assertEqual(len(bus.messages()), 4)         # undo×2 / set_allow_pass / reset_game 各一条
+        self.assertEqual(bus.of_type("speech"), [], "同步方法的短提示不得发 speech（T20②）")
+
+
 if __name__ == "__main__":
     unittest.main()

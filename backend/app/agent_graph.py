@@ -259,12 +259,16 @@ async def _prepare_just_moved(agent, data):
 
 
 async def _prepare_observe(agent, data):
-    """提示：引擎分析 → 形势摘要 → 方向性提示词（引擎失败则短路）。"""
+    """提示：引擎分析 → 形势摘要 → 方向性提示词（引擎失败则短路）。
+
+    短路提示是**玩家可见台词**：走 ``_emit_line``（T20①）——它紧跟着一条 ``speech``，
+    与正常出话那条路同一个发射口（否则 Task 4 之后这行会「只显示、不发声」）。
+    """
     n = len(agent.st.moves)
     analysis = await agent.katago.analyze(agent.st.moves)
     if "error" in analysis:
         print("[KataGo] " + str(analysis["error"]))
-        agent._emit(events.message(events.AI, "嗯...我这边一时算不清，稍等再试吧~"))
+        await _emit_line(agent, events.AI, "嗯...我这边一时算不清，稍等再试吧~")
         data["short"] = True
         return
     agent.st.pre_analysis = {"n": n, "a": analysis}
@@ -280,12 +284,12 @@ async def _prepare_observe(agent, data):
 
 
 async def _prepare_analyze(agent, data):
-    """局面分析：引擎分析 → 白方视角解读提示词（引擎失败则短路）。"""
+    """局面分析：引擎分析 → 白方视角解读提示词（引擎失败则短路；短路提示走 ``_emit_line``，T20①）。"""
     n = len(agent.st.moves)
     analysis = await agent.katago.analyze(agent.st.moves)
     if "error" in analysis:
         print("[KataGo] " + str(analysis["error"]))
-        agent._emit(events.message(events.AI, "唔…我这边一时算不清，稍后再让我看看吧。"))
+        await _emit_line(agent, events.AI, "唔…我这边一时算不清，稍后再让我看看吧。")
         data["short"] = True
         return
     conv = prompts.to_black_perspective(analysis, n)

@@ -238,14 +238,17 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     # 对局中的台词由 WS 的 `speech` 事件驱动（前端据 id 来拉音频）；这里两个端点是**试听/手动用**的。
     # 任何合成失败都只回可读错误（409 / 404），绝不把端点打成 500、更不影响对局。
 
-    def tts_client():
-        """当前 TTS 客户端；未装配时为 ``None``（端点据此退化为可读错误）。"""
+    def tts_of():
+        """当前 TTS 客户端；未装配时为 ``None``（端点据此退化为可读错误）。
+
+        名字与 lifespan 里的局部变量 ``tts_client`` 区分开，避免两个作用域同名造成误读。
+        """
         return getattr(app.state, "tts", None)
 
     @app.post("/api/tts/speak")
     async def tts_speak(body: dict):
         """试听：``{text}`` → ``audio/wav``；合成不出音频（关闭 / 系统语音 / 空文本）→ 409。"""
-        c = tts_client()
+        c = tts_of()
         raw = body.get("text")
         text = raw.strip() if isinstance(raw, str) else ""
         if c is None or text == "":
@@ -271,7 +274,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     @app.get("/api/tts/audio/{audio_id}")
     async def tts_audio(audio_id: str):
         """取一条已合成的音频（``speech`` 事件 ``mode=="openai"`` 时带的 id）；未命中 → 404。"""
-        c = tts_client()
+        c = tts_of()
         try:
             blob = c.audio(audio_id) if c is not None else None
         except Exception as e:                  # noqa: BLE001 —— 取不到就 404，绝不上抛
