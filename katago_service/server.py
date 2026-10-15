@@ -29,6 +29,9 @@ STATE_WARMING = "warming"
 STATE_READY = "ready"
 STATE_DEAD = "dead"
 
+# 默认只监听回环：不带 token 的服务绝不能默认对外监听（跨机部署要显式 --host 0.0.0.0）
+DEFAULT_HOST = "127.0.0.1"
+
 # 服务侧引擎请求超时由 proc.REQ_TIMEOUT_MS 决定；这里不设第二套超时，
 # 避免两层超时互相掩盖（客户端超时与重试在 backend/app/engine.py）。
 
@@ -235,13 +238,17 @@ def create_app(proc=None, token="", cfg=None) -> FastAPI:
 def parse_args(argv=None):
     """解析命令行参数（``python -m katago_service.server``）。
 
-    引擎路径与令牌都可以省略：留空时回落到环境变量 ``KATAGO_EXE`` / ``KATAGO_MODEL`` /
-    ``KATAGO_CONFIG`` / ``KATAGO_SERVICE_TOKEN``（见 ``build_app``）。
+    监听地址、引擎路径与令牌都可以省略：留空时回落到环境变量 ``KATAGO_HOST`` /
+    ``KATAGO_EXE`` / ``KATAGO_MODEL`` / ``KATAGO_CONFIG`` / ``KATAGO_SERVICE_TOKEN``
+    （见 ``resolve_host`` 与 ``build_app``）。
     """
     parser = argparse.ArgumentParser(
         prog="python -m katago_service.server",
         description="KataGo 云服务：常驻 analysis 引擎，对外提供 /health 与 /analyze",
     )
+    parser.add_argument("--host", default=DEFAULT_HOST,
+                        help="监听地址（默认 %s 仅回环；跨机部署填 0.0.0.0 并由内网/TLS 反代暴露）"
+                             % DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=8100, help="监听端口（默认 8100）")
     parser.add_argument("--token", default="", help="Bearer 令牌；留空＝不校验（仅限本机回环调试）")
     parser.add_argument("--katago-exe", dest="katago_exe", default="", help="katago 可执行文件路径")
@@ -250,6 +257,15 @@ def parse_args(argv=None):
     parser.add_argument("--analysis-threads", dest="analysis_threads", type=int, default=1,
                         help="引擎分析线程数（默认 1）")
     return parser.parse_args(argv)
+
+
+def resolve_host(args) -> str:
+    """监听地址：留空时回落到环境变量 ``KATAGO_HOST``，仍为空则只监听回环（安全默认）。
+
+    服务是可独立部署的：后端在别的机器上时要 ``--host 0.0.0.0``（或 ``KATAGO_HOST``），
+    但默认值必须是回环——不带 token 的服务绝不能默认对外监听。
+    """
+    return args.host or os.environ.get("KATAGO_HOST", "") or DEFAULT_HOST
 
 
 def build_app(args) -> FastAPI:
@@ -275,7 +291,8 @@ if __name__ == "__main__":
     import uvicorn
 
     _args = parse_args()
-    # 只监听回环（与 backend/app/main.py 一致）：跨机部署时由内网/TLS 反代对外暴露
-    print("[KataGo服务] 启动 http://127.0.0.1:%d（analysis-threads=%d）"
-          % (_args.port, _args.analysis_threads))
-    uvicorn.run(build_app(_args), host="127.0.0.1", port=_args.port)
+    _host = resolve_host(_args)
+    # 默认只监听回环（与 backend/app/main.py 一致）；跨机部署用 --host 0.0.0.0 并由内网/TLS 反代暴露
+    print("[KataGo服务] 启动 http://%s:%d（analysis-threads=%d）"
+          % (_host, _args.port, _args.analysis_threads))
+    uvicorn.run(build_app(_args), host=_host, port=_args.port)

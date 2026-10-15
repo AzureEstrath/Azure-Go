@@ -226,6 +226,13 @@ class CliArgsTest(unittest.TestCase):
     def test_args_default_port(self):
         self.assertEqual(server.parse_args([]).port, 8100)
 
+    def test_args_default_host_is_loopback(self):
+        # 默认必须只回环：不带 token 的服务不能默认对外监听
+        self.assertEqual(server.parse_args([]).host, "127.0.0.1")
+
+    def test_args_host_override(self):
+        self.assertEqual(server.parse_args(["--host", "0.0.0.0"]).host, "0.0.0.0")
+
 
 class CliCfgMappingTest(unittest.TestCase):
     """P13 守卫：命令行参数必须落到 ``_build_proc`` 读的键上（exe/model/config/analysis_threads）。
@@ -255,6 +262,14 @@ class CliCfgMappingTest(unittest.TestCase):
         self.assertEqual((proc.exe, proc.model, proc.cfg),
                          ("env-katago.exe", "env-model.bin", "env-analysis.cfg"))
         self.assertEqual(app.state.token, "env-token")
+
+    def test_host_falls_back_to_env_then_loopback(self):
+        """--host 留空时回落 KATAGO_HOST；连环境变量也没有才用回环。"""
+        with mock.patch.dict(os.environ, {"KATAGO_HOST": "0.0.0.0"}):
+            self.assertEqual(server.resolve_host(server.parse_args(["--host", ""])), "0.0.0.0")
+            self.assertEqual(server.resolve_host(server.parse_args([])), "127.0.0.1")
+        with mock.patch.dict(os.environ, {"KATAGO_HOST": ""}):
+            self.assertEqual(server.resolve_host(server.parse_args(["--host", ""])), "127.0.0.1")
 
 
 if __name__ == "__main__":
