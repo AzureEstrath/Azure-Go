@@ -30,6 +30,8 @@ class RestTest(unittest.TestCase):
             r = client.get("/api/health")
             self.assertEqual(r.status_code, 200)
             self.assertTrue(r.json()["ok"])
+            self.assertEqual(set(r.json()),
+                             {"ok", "katago_dead", "katago_error", "katago_url", "llm_url"})
 
             self.assertEqual(client.get("/api/state").json()["move_count"], 0)
 

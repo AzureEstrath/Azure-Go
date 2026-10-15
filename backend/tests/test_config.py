@@ -57,6 +57,20 @@ class CloudKatagoConfigTest(unittest.TestCase):
         c.katago_url = ""
         self.assertFalse(c.has_katago())
 
+    def test_new_katago_keys_round_trip_through_load(self):
+        """新三键必须真的被 load()/_apply() 读进来（防「字段加了但没接线」的回归）。"""
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"katago_url": "http://kg.example:9100", "katago_token": "tok",
+                           "katago_timeout_ms": 5000}, f)
+            c = AzureConfig.load(p)
+        self.assertEqual(c.katago_url, "http://kg.example:9100")
+        self.assertEqual(c.katago_token, "tok")
+        self.assertEqual(c.katago_timeout_ms, 5000)
+        self.assertTrue(c.has_katago())
+
 
 if __name__ == "__main__":
     unittest.main()

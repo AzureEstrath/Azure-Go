@@ -75,5 +75,10 @@ class AzureConfig:
             self.prompt_phase_notes = dict(pn)
 
     def has_katago(self) -> bool:
-        """KataGo 云服务地址是否已配置（留空即视为未接入，引擎相关功能自行降级）。"""
+        """是否**显式配置**了 KataGo 服务地址（判据：``katago_url`` 非空）。
+
+        注意「留空」不等于「不接入」：引擎客户端会把空地址回退到 ``DEFAULT_URL``
+        （``http://127.0.0.1:8100``，见 ``engine.py``），装配处照样会构造它并 ``start()``。
+        所以本判据只回答「用户有没有写地址」，**不代表** KataGo 相关功能已关闭。
+        """
         return bool(self.katago_url)

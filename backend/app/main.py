@@ -83,6 +83,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, autostart=True):
             "ok": True,
             "katago_dead": s.katago.is_dead(),
             "katago_error": s.katago.last_error(),
+            # 报的是**配置值**：留空时客户端会回退到 DEFAULT_URL（http://127.0.0.1:8100），
+            # 故可能与引擎实例实际连的地址不同；这里不读引擎实例（测试注入的 stub 没有 .url）。
             "katago_url": cfg.katago_url,
             "llm_url": s.llm.base_url,
         }
