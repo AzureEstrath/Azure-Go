@@ -3,8 +3,12 @@
 与旧实现一致：行分隔 JSON 请求/响应，moves 必须是带颜色的配对 [["B","Q16"],["W","D4"]]；
 请求超时 30s、启动（首次响应）超时 180s、stderr 必须持续排空否则 KataGo 会卡死。
 
-与旧实现唯一的差别：``analyze`` 不再自己构造请求体，而是**原样转发**调用方给的 ``req``
-（rules / komi / boardXSize / boardYSize / includeOwnership 由后端决定），只补一个 ``id``。
+与旧实现的差别（对照旧文件 diff 时留意这三处）：
+1. ``analyze`` 不再自己构造请求体，而是**原样转发**调用方给的 ``req``
+   （rules / komi / boardXSize / boardYSize / includeOwnership 由后端决定），只补一个 ``id``；
+   请求体序列化失败只让这一次请求报错，不判引擎死亡。
+2. 分析线程数由构造参数 ``analysis_threads`` 决定（旧实现写死 ``-analysis-threads 1``）。
+3. ``shutdown`` 末尾多两行：置 ``_dead`` 并补 ``_last_error``，让关闭后的 ``state_name()`` 无歧义。
 """
 
 import asyncio
@@ -89,8 +93,9 @@ class KatagoProcess:
     def state_name(self) -> str:
         """服务层 /health 的三态：``warming`` / ``ready`` / ``dead``。
 
-        首次成功拿到引擎应答之前一律 ``warming``（含 OpenCL 首次调优），
-        之后 ``ready``；一旦失败或已关闭则 ``dead``。
+        ``warming`` ＝ 尚未成功完成过一次分析（含 OpenCL 首次调优；引擎回的错误应答不算成功），
+        ``ready`` ＝ 已经成功分析过至少一次；一旦失败或已关闭则 ``dead``。
+        注意预热失败不置 ``dead``（首次调优可能超出常规超时），靠之后任何一次成功分析翻成 ``ready``。
         """
         if self._dead:
             return "dead"
@@ -203,11 +208,17 @@ class KatagoProcess:
         rid = "r%d" % self._seq
         body = dict(req)                    # 原样转发调用方的请求体
         body["id"] = rid
+        try:
+            payload = (json.dumps(body) + "\n").encode("utf-8")
+        except Exception as e:
+            # 调用方请求体不可序列化是「这一次请求」的错，不能连累共享引擎：
+            # 既不置 _dead，也不 _reject_all（那会牵连其他在途请求）
+            return {"error": "请求体无法序列化：%s" % e}
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         self._pending[rid] = fut                     # 先登记再写，避免错过响应
         try:
-            self._proc.stdin.write((json.dumps(body) + "\n").encode("utf-8"))
+            self._proc.stdin.write(payload)
             await self._proc.stdin.drain()
         except Exception as e:
             self._pending.pop(rid, None)
@@ -226,7 +237,8 @@ class KatagoProcess:
         except asyncio.CancelledError:
             self._pending.pop(rid, None)
             raise
-        self._ever_replied = True
+        if not (isinstance(result, dict) and "error" in result):
+            self._ever_replied = True       # 只有成功应答才算「就绪」，引擎级错误应答不算
         return result
 
     async def warmup(self) -> None:

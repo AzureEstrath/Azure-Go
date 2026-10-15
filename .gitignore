@@ -31,6 +31,9 @@ shots/
 backend/data/
 backend/logs/
 
+# —— KataGo 服务运行产物（引擎日志）——
+katago_service/logs/
+
 # —— SDD 工作区（本地临时产物，不入库）——
 .superpowers/
 
