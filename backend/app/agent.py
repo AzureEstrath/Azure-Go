@@ -156,16 +156,17 @@ class AzureAgent:
         """系统消息：聊天 / 闲置搭话这类「context_block + 历史窗口」的路径用；带 with_context 的路径走 `_phase_messages`。"""
         return {"role": "system", "content": self._sys_content(LEN_NOTE if self.limit_len else "")}
 
-    def _sys_teach_msg(self):
-        """`_sys_msg` 的讲解版（教学长度约束）；教学点评的链路径改传 ``len_note=LEN_TEACH_NOTE``。"""
-        return {"role": "system", "content": self._sys_content(LEN_TEACH_NOTE if self.limit_len else "")}
-
-    def _phase_messages(self, phase, context, len_note="") -> list:
+    def _phase_messages(self, phase, context, len_note=None) -> list:
         """某阶段的完整消息（系统 + 上下文）：经 ``prompt_chains`` 的链构造。
+
+        ``len_note=None`` 表示「按本局设置推导」：``limit_len`` 开着就附上 ``LEN_NOTE``（短回复约束）——
+        与旧 ``_sys_msg()`` 的做法一致，调用点不必各自记得；定式讲解这类特例显式传入 ``LEN_TEACH_NOTE``。
 
         必须与旧 ``[_sys_msg(), _user_msg(context)]`` 逐字符一致——模型要看到的字与本次重构前
         完全相同，一个标点都不能变（tests/test_prompt_chains.py 逐字符锁定）。
         """
+        if len_note is None:
+            len_note = LEN_NOTE if self.limit_len else ""
         return prompt_chains.build_messages(
             phase, context=context, len_note=len_note,
             mood_name=self.mood.region_name(), think_hint=self._think_hint(),

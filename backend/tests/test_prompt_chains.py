@@ -106,6 +106,7 @@ class ByteIdentityTest(unittest.TestCase):
             prompt_system = ""
             prompt_phase_notes = {}
         prompts.configure(C())
+        self.addCleanup(_configure_prompts)          # 别把「小明」留给后面的用例
         ctx = prompts.with_context([], [], [], "P", "observe", False, "", None)
         msgs = prompt_chains.build_messages("observe", context=ctx)
         self.assertNotIn("Estarth", msgs[0]["content"])
@@ -153,7 +154,6 @@ class AgentSystemMessageTest(unittest.TestCase):
         agent, _eng, _llm, _bus = mk_agent()
         agent.limit_len = True
         self.assertTrue(agent._sys_msg()["content"].endswith(LEN_NOTE))
-        self.assertTrue(agent._sys_teach_msg()["content"].endswith(LEN_TEACH_NOTE))
 
     def test_think_hint_only_when_thinking(self):
         agent, _eng, llm, _bus = mk_agent()
@@ -244,6 +244,46 @@ class CallSiteRoutingTest(unittest.TestCase):
         self.assertEqual(kw["mood_name"], agent.mood.region_name())
         self.assertEqual(kw["len_note"], "")
         self.assertEqual(kw["think_hint"], "")
+
+    def test_limit_len_reaches_every_call_site(self):
+        """「短回复」开着时（game/config.json 的默认），每条系统消息都必须带 ``LEN_NOTE`` 后缀。
+
+        ``_phase_messages`` 的 ``len_note=None`` 会按 ``self.limit_len`` 推导，调用点忘了也不会丢；
+        覆盖五个 with_context 调用点：after_player / own_turn / just_moved / observe / analyze / summary。
+        """
+        flows = [
+            ("hint", lambda a: a.hint(), 1),
+            ("player_move", lambda a: a.player_move(3, 3), 3),          # 点评 + 落子用意 + 落子后那句
+            ("analyze", self._after_move(lambda a: a.analyze_position()), 4),   # 含前置那一手
+            ("summarize", self._after_move(lambda a: a.summarize("辛苦啦")), 4),
+        ]
+        for tag, flow, expected in flows:
+            agent, _eng, llm, _bus = mk_agent()
+            agent.limit_len = True
+            asyncio.run(flow(agent))
+            texts = [m["content"] for msgs, _mx, _nt in llm.calls for m in msgs if m["role"] == "system"]
+            self.assertEqual(len(texts), expected, "%s：系统消息条数不对（调用点漏了？）" % tag)
+            for t in texts:
+                self.assertTrue(t.endswith(LEN_NOTE), "%s：系统消息丢了 LEN_NOTE（短回复约束）" % tag)
+
+    def test_teach_branch_uses_teach_note(self):
+        """定式成型那一手用教学长度约束（``LEN_TEACH_NOTE``），其余调用点仍是 ``LEN_NOTE``。"""
+        formed = {"kind": "formed", "name": "星位夹击", "key": "要点一句", "corner": "左上",
+                  "points": [(15, 3)], "cat": "x"}
+
+        async def run():
+            agent, _eng, llm, _bus = mk_agent()
+            agent.limit_len = True
+            agent._joseki_check = lambda: dict(formed)      # 直接驱动成型分支，不必摆真定式
+            await agent.player_move(3, 3)
+            return agent, llm
+
+        _agent, llm = asyncio.run(run())
+        texts = [m["content"] for msgs, _mx, _nt in llm.calls for m in msgs if m["role"] == "system"]
+        self.assertEqual(len(texts), 3)
+        self.assertTrue(texts[0].endswith(LEN_TEACH_NOTE), "定式讲解那一手应带 LEN_TEACH_NOTE")
+        for t in texts[1:]:
+            self.assertTrue(t.endswith(LEN_NOTE), "其余调用点应带 LEN_NOTE")
 
 
 if __name__ == "__main__":
