@@ -30,31 +30,16 @@ var _tts_url_edit: LineEdit
 var _tts_model_edit: LineEdit
 var _tts_voice_edit: LineEdit
 var _tts_voice_opt: OptionButton
-var _pending_ai: Array[Dictionary] = []    # 待显示的 Azure 台词记录（FIFO；与 _speech_pairs 里是同一批对象）
 const AI_DEDUP_WINDOW := 8                 # 防复读窗口（兜底判据）：后端已按同样窗口去重，这里只兜 WS 重连后的乱序
 var _recent_ai_texts: Array[String] = []   # 最近说过的 AI 原话（含落子宣告）：只兜 WS 重连后乱序到达的重复句
 
 ## —— 语音配对（计划 05：合成归后端，前端只播放）——
-## 后端每发一条台词就紧随其后发一条 `speech`（message→speech 严格串行），本端按**到达顺序**一对一对起来：
-##   `_speech_pairs`  配对表：每条要由后端朗读的台词一条记录，还没出结果（播放 / 判定无声）的都在这儿
-##   `_speech_by_group` 分组号 → 记录：语音开播 / 被判无声时按分组号精确回查
-## 记录字段：{id, text, reveal, kind, tomb, got, group, played, displayed, wait_display}
-##   tomb=本地已丢弃的台词占位（走神作废 / 防复读）：只用来吃掉它自己那条 speech，避免错配到下一条
-##   got=已收到配对的 speech；played=语音已出结果；displayed=文字已显示；wait_display=同步说话：等这段语音开播
-var _speech_pairs: Array[Dictionary] = []
-var _speech_by_group := {}
-var _speech_id := 0
+## 配对表、TTL/保鲜期、「她在忙吗」的判定全部在 `SpeechPairing`（可测决策层）里；本文件只留胶水：
+##   · 取音频（HTTP）、调系统语音、显示气泡、`POST /api/reveal`（见 _on_pairing_display）
+##   · 外部事实（后端 busy / 音频是否在播 / 是否还有取音频请求在途）由 `_pair_facts()` 打包喂给它
+var pairing: SpeechPairing = null
 var _speech_fetch: Array[Dictionary] = []  # 待取音频的 FIFO（**串行**取：保证播放顺序 = speech 到达顺序）
 var _speech_fetch_busy := false
-var _last_speech_turn := ""                # 上一条 speech 的 turn_id / seq：同一回合内必须递增（乱序/重复兜底）
-var _last_speech_seq := 0
-## 本地发起的「只有文字、没有语音」的调用（后端的 undo×2 / reset_game / set_allow_pass 是**同步方法**，
-## 已裁决保持纯文字；见 backend/app/agent.py 的 T20②）。打过标记后，下一条 AI 台词**不登记配对记录**：
-## 直接显示文字、不占配对位——既不去等一条永远不会来的语音，也不会把它后面那条台词的语音吃掉。
-var _text_only_left := 0
-var _text_only_ms := 0
-const TEXT_ONLY_TTL_MS := 3000             # 标记的保鲜期：调用没落到（如后端那次被 busy 挡下）就自然失效
-const SPEECH_PAIR_TTL_MS := 45000          # 配对位保鲜：一条 speech 最晚也会在后端合成超时内发出（默认 30s）
 var _stream_turn := ""                     # 当前流式气泡对应的 turn_id（后端 token 流式通道：可选、默认关闭）
 var _stream_label: Label = null            # 当前流式气泡：增量直接追加，最终由 message 全文收口
 var _thinking_row: Control = null          # 「Azure 思考中……」占位气泡
@@ -132,6 +117,7 @@ func _ready() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
 	cfg = AzureConfig.load_config()
 	_apply_cli_overrides()
+	_build_pairing()                           # 语音配对状态机：只做决策，副作用回调回本文件
 	_font = _make_cjk_font()
 	_build_world()
 	_build_board()
@@ -157,6 +143,13 @@ func _apply_cli_overrides() -> void:
 		elif a.begins_with("--key="):
 			cfg.llm_api_key = a.substr("--key=".length())
 			cfg.cli_locked["llm_api_key"] = true
+
+## 语音配对状态机：纯决策（谁该显示、谁还在忙、什么该清出），副作用都由信号回到本文件
+func _build_pairing() -> void:
+	pairing = SpeechPairing.new()
+	add_child(pairing)
+	pairing.display_requested.connect(_on_pairing_display)
+	pairing.resolved.connect(_on_pairing_resolved)
 
 # ================= 世界与棋盘 =================
 
@@ -698,7 +691,7 @@ func _on_acc_toggled(on: bool, which: String) -> void:
 			if _batch_pending:
 				_batch_token += 1
 				_release_batch(true)
-			elif not _pending_ai.is_empty():
+			elif pairing.has_pending():
 				_flush_pending_ai()
 		"chunk":
 			cfg.tts_long_chunk = on
@@ -741,9 +734,9 @@ func _button(parent: Node, text: String, cb: Callable) -> Button:
 func _add_msg(kind: String, text: String) -> void:
 	var is_ai := kind.begins_with("ai")
 	var speak_kind := "idle" if kind == "ai_idle" else ""
-	var text_only := _take_text_only_mark() if is_ai else false
+	var text_only := pairing.take_text_only_mark(kind) if is_ai else false
 	if kind == "ai_idle" and _idle_muted:
-		_speech_register("", false, speak_kind, true)   # 本地作废：留个占位吃掉它自己那条 speech
+		_register_tomb(speak_kind)           # 本地作废：留个占位吃掉它自己那条 speech
 		return                               # 玩家已经回来继续下棋：这句走神搭话作废（不出声也不显示）
 	var tone := ""
 	if is_ai:
@@ -755,13 +748,13 @@ func _add_msg(kind: String, text: String) -> void:
 		var norm := text.strip_edges()
 		if kind != "ai_move" and _recent_ai_texts.has(norm):
 			print("[chat] 防复读（最近 %d 条内一字不差）已抑制：%s" % [_recent_ai_texts.size(), norm])
-			_speech_register("", false, speak_kind, true)   # 同上：后端这条会带 speech 来，得有人吃掉它
+			_register_tomb(speak_kind)       # 同上：后端这条会带 speech 来，得有人吃掉它
 			return                           # 兜底判据：后端已去重，这里只兜 WS 重连后乱序到达的重复句（含隔了几条的原样复读）
 		_recent_ai_texts.append(norm)
 		while _recent_ai_texts.size() > AI_DEDUP_WINDOW:
 			_recent_ai_texts.pop_front()
 	# 所有消息统一入队、单协程顺序投递：ai_comment 前由导演层加犹豫节拍，延迟期间顺序不乱
-	# 要由后端朗读的 AI 台词在这里就登记配对记录（到达顺序 = 与 speech 事件的配对顺序）；
+	# 要由后端朗读的 AI 台词在这里就登记配对记录（登记顺序 = 与 speech 事件的配对顺序）；
 	# `text_only`（本地问候 / 后端同步方法的纯文字提示）不登记——它没有语音，也就没什么可配的。
 	_msg_seq += 1
 	var rec := {}
@@ -862,7 +855,7 @@ func _director_hesitation(kind: String, waiting_behind: int, seq: int) -> float:
 		return 0.0                           # 这条后面还排着别的：别拖
 	if _audio_in_flight():
 		return 0.0                           # 她还在说上一句（或语音还在取）：不叠犹豫
-	if not _pending_ai.is_empty() or _batch_pending:
+	if pairing.has_pending() or _batch_pending:
 		return 0.0                           # 还有没显示/没播完的话：优先消化积压
 	if tts != null and tts.enabled and tts.is_slow_engine():
 		return randf_range(HESITATE_SLOW_MIN, HESITATE_SLOW_MAX)
@@ -882,8 +875,7 @@ func _deliver_msg(kind: String, text: String, tone: String, rec: Dictionary) -> 
 			if _batch_pending and _pending_batch_kind != tts_kind:
 				_batch_token += 1
 				_release_batch(true)         # 批次按类型分组：走神搭话不跟对局发言混进同一段语音
-			rec["wait_display"] = false
-			_pending_ai.append(rec)
+			pairing.arm(rec, false)
 			_batch_pending = true
 			_pending_batch_kind = tts_kind
 			_batch_token += 1
@@ -892,14 +884,10 @@ func _deliver_msg(kind: String, text: String, tone: String, rec: Dictionary) -> 
 		else:
 			# 逐句播报：语音由 speech 事件驱动（按到达顺序与这条配对）；
 			# 「同步说话」开着时轮到它开始播放才显示文字（见 _on_utterance_started）
-			rec["wait_display"] = cfg.tts_sync_speak
-			if cfg.tts_sync_speak:
-				_pending_ai.append(rec)
-				if bool(rec.get("played", false)):
-					_display_rec(rec)        # 语音先到先播过了：这一刻就把文字补上
-			else:
-				_display_rec(rec)            # 文字立即显示，语音随后（或正在）播
-		_release_stale_speeches()            # 后端这一轮已结束（如 undo/reset 只有文字）：别一直等语音
+			pairing.arm(rec, cfg.tts_sync_speak)
+			if not cfg.tts_sync_speak or pairing.played(rec):
+				pairing.display(rec)         # 文字立即显示 / 语音先到先播过了：这一刻就把文字补上
+		pairing.release_stale(_pair_facts())  # 后端这一轮已结束（如 undo/reset 只有文字）：别一直等语音
 		return
 	if is_ai:
 		_add_msg_now("ai", text)                 # 未启用语音：直接显示
@@ -911,7 +899,7 @@ func _deliver_msg(kind: String, text: String, tone: String, rec: Dictionary) -> 
 		if _batch_pending:
 			_batch_token += 1
 			_release_batch(true)
-	elif not _pending_ai.is_empty():
+	elif pairing.has_pending():
 		_flush_pending_ai()
 	_add_msg_now(kind, text)
 
@@ -934,7 +922,7 @@ func _release_batch(force_show: bool) -> void:
 		return
 	if cfg.tts_sync_speak and not force_show and not _tts_playing:
 		# 文字等这段连续语音开口时（_on_tts_speaking → _flush_pending_ai）与声音一起出现；
-		# 万一这段语音最后没到（后端只发了文字/音频取不回），_release_stale_speeches 会兜底放出来
+		# 万一这段语音最后没到（后端只发了文字/音频取不回），pairing.release_stale 会兜底放出来
 		return
 	_flush_pending_ai()                 # 已经在响了 / 需要保序：先显示文字
 
@@ -1059,10 +1047,7 @@ func _tick_typing(delta: float) -> void:
 
 ## 语音就绪（开始播放）时，把等待中的 Azure 文字一起显示出来
 func _flush_pending_ai() -> void:
-	if _pending_ai.is_empty():
-		return
-	for rec in _pending_ai.duplicate():
-		_display_rec(rec)
+	pairing.flush_pending()
 
 ## 显示「Azure 思考中……」占位气泡（等第一条真实 Azure 文字到来时原地替换）
 func _show_thinking() -> void:
@@ -1102,7 +1087,7 @@ func _clear_thinking() -> void:
 
 ## 句间合成空隙也要有「思考中…」：下一句正在合成、还没开始播时显示占位，并让省略号动起来
 func _update_thinking(now: int) -> void:
-	if _thinking_label == null and not _pending_ai.is_empty() and not _tts_playing:
+	if _thinking_label == null and pairing.has_pending() and not _tts_playing:
 		_show_thinking()                                 # 文字还没轮到显示、也没在播：她在憋下一句
 	if _thinking_label == null:
 		return
@@ -1115,7 +1100,7 @@ func _update_thinking(now: int) -> void:
 func _clear_thinking_if_idle() -> void:
 	if _thinking_label == null:
 		return
-	if not _pending_ai.is_empty() or _audio_in_flight() or (agent != null and agent.busy):
+	if pairing.has_pending() or _audio_in_flight() or (agent != null and agent.busy):
 		return
 	_clear_thinking()
 
@@ -1157,7 +1142,7 @@ func _render_bad_moves(list: Array) -> void:
 		btn.pressed.connect(func():
 			_allow_tts_fillers()
 			if agent != null and not agent.busy:
-				_mark_text_only()            # 回档提示只有文字（后端同步方法，T20②）
+				pairing.mark_text_only()     # 回档提示只有文字（后端同步方法，T20②）
 			agent.undo(idx))
 		_bad_box.add_child(btn)
 
@@ -1420,7 +1405,7 @@ func _wire_agent() -> void:
 func _on_net_status(text: String, bad: bool) -> void:
 	_set_status(text, bad)
 	if bad:
-		_release_stale_speeches(true)
+		pairing.release_stale(_pair_facts(), true)
 
 ## 语气词统一出口：同一情绪在 MOOD_KEEP_MS 内延续时只刷新计时、不再出声（治「一惊一乍、语气太多」）；
 ## 情绪变化或隔了很久才再次出现，才真正响一声。"" 是 no-op（平淡发言不代表情绪结束）。
@@ -1493,7 +1478,7 @@ func _on_tts_status(text: String) -> void:
 	if _tts_status != null:
 		_tts_status.text = text
 	_set_status("语音：" + text)          # 底部状态行始终可见，左侧栏收起时也能看到
-	if not _pending_ai.is_empty() and (text.contains("失败") or text.contains("无响应") or text.contains("无法")):
+	if pairing.has_pending() and (text.contains("失败") or text.contains("无响应") or text.contains("无法")):
 		_flush_pending_ai()              # 语音出错：文字不能丢，立即显示
 
 func _greet() -> void:
@@ -1501,7 +1486,7 @@ func _greet() -> void:
 	if tts != null and tts.play_welcome(cfg.prompt_user_name):
 		_add_msg_now("ai", greet)             # 预制欢迎语音已经开口：文字直接显示，零等待
 	else:
-		_mark_text_only()                     # 本地问候没有后端语音（预制欢迎语音缺失时）：文字直接显示
+		pairing.mark_text_only()              # 本地问候没有后端语音（预制欢迎语音缺失时）：文字直接显示
 		_add_msg("ai", greet)
 	_add_msg("system", "你执黑先行。左键落子，右键拖拽可旋转棋盘视角。")
 
@@ -1540,7 +1525,7 @@ func _on_busy_changed(busy: bool) -> void:
 	if busy:
 		_show_thinking()                   # 聊天栏先占位「Azure 思考中……」
 	else:
-		_release_stale_speeches()          # 回合结束：等不到语音的文字直接放出来（落子也照常揭示）
+		pairing.release_stale(_pair_facts())   # 回合结束：等不到语音的文字直接放出来（落子也照常揭示）
 		_speech_hold = _speech_busy()      # Azure 还有话没播完（含音频还在取）：继续锁住棋盘，等她说完
 		if not _speech_hold:
 			_reveal_move()                 # 兜底：语音不可用/未播时，也要把落子显示出来
@@ -1548,7 +1533,7 @@ func _on_busy_changed(busy: bool) -> void:
 	_clear_thinking_if_idle()
 
 func _on_allow_pass_toggled(pressed: bool) -> void:
-	_mark_text_only()                        # 这条提示只有文字（后端同步方法，T20②）
+	pairing.mark_text_only()                 # 这条提示只有文字（后端同步方法，T20②）
 	agent.set_allow_pass(pressed)
 
 ## 定式导学开关（右侧栏）：写回 config.json，并对当前对局立即生效
@@ -1583,12 +1568,6 @@ func _cancel_idle_speech() -> void:
 		_batch_pending = false
 		_pending_batch_kind = ""
 		_batch_token += 1                # 让还在路上的去抖计时器失效
-	var kept: Array[Dictionary] = []
-	for e in _pending_ai:
-		if str((e as Dictionary).get("kind", "")) == "idle":
-			continue                     # 还没轮到显示的走神搭话文字：直接丢
-		kept.append(e)
-	_pending_ai = kept
 	var kept_q: Array[Dictionary] = []
 	for e in _msg_queue:
 		if str((e as Dictionary).get("kind", "")) == "ai_idle":
@@ -1598,7 +1577,7 @@ func _cancel_idle_speech() -> void:
 	_queue_rush_seq = _msg_seq           # 其余积压快进（玩家刚动手，别让她慢慢来）
 	if tts != null:
 		tts.cancel_kind("idle")
-	_speech_forget_idle()                # 配对表里走神搭话的记录一并作废（含它自己那条 speech 的占位）
+	pairing.forget_idle()                # 配对表里走神搭话的文字一并作废（含它自己那条 speech 的占位）
 	_speech_hold = _speech_busy()
 	_refresh_lock()
 	_clear_thinking_if_idle()
@@ -1606,7 +1585,7 @@ func _cancel_idle_speech() -> void:
 func _ask_reset() -> void:
 	_ask_note("重新开始？当前棋局与俗手记录都会清空。", func(_note):
 		_allow_tts_fillers()
-		_mark_text_only()                    # 重来提示只有文字（后端同步方法，T20②）
+		pairing.mark_text_only()             # 重来提示只有文字（后端同步方法，T20②）
 		agent.reset_game())
 
 func _ask_end() -> void:
@@ -1649,7 +1628,9 @@ func _process(delta: float) -> void:
 		_next_talk_ms = now + randi_range(int(IDLE_TALK_MIN * 1000.0), int(IDLE_TALK_MAX * 1000.0))
 		_idle_muted = false                             # 新的一轮搭话：先解除「玩家已回来」的作废标记
 		agent.idle_remark()                             # 长时间没动静：主动问一句（后端 POST /api/idle）
-	_release_stale_speeches()                           # 回合结束后还等不到语音的文字别一直等
+	for text in pairing.prune_expired():                 # 等不到语音的配对位清出，别让它吃掉后面那条
+		print("[TTS] 等不到语音的台词已从配对表清出：%s" % text.substr(0, 20))
+	pairing.release_stale(_pair_facts())                # 回合结束后还等不到语音的文字别一直等
 	_sync_speech_hold()                                 # 语音侧锁的兜底对齐（音频 404/取不回时不会锁死棋盘）
 	_update_thinking(now)
 	_tick_typing(delta)                                 # 打字节奏推进（AI 消息逐字显示）
@@ -1695,40 +1676,44 @@ func _on_tts_speaking(v: bool) -> void:
 ## 每段语音开始播放：逐句模式下把与之配对的那条 Azure 文字显示出来（文字与声音成对）。
 ## 分组号就是配对记录里的 group：语音一开播就按它精确回查，一条台词只显示一次、乱序也不会错位。
 func _on_utterance_started(group: int) -> void:
-	var rec: Dictionary = _speech_by_group.get(group, {})
+	var rec: Dictionary = pairing.group_of(group)
 	if not rec.is_empty():
-		_finish_rec(rec)             # 这段语音有结果了：退出配对表（不再占着「在途」）
+		pairing.finish(rec)          # 这段语音有结果了：退出配对表（不再占着「在途」）
 	if cfg.tts_batch_speak:
 		return
-	if group <= 0:                   # group=0 是试听：不显示任何待播文字
+	if group <= 0:                   # 防御：试听的音频不登记配对，永远走不到「有待播文字」这一步
 		return
-	if rec.is_empty() or not bool(rec.get("wait_display", false)):
+	if rec.is_empty() or not pairing.wait_display(rec):
 		return                       # 没配对到台词 / 文字早已显示过
-	_display_rec(rec)                # 显示文字；`_reveal_move()` 就在这一刻（音画同步，语义未变）
+	pairing.display(rec)             # 显示文字；`_reveal_move()` 就在这一刻（音画同步，语义未变）
 
 ## 这条语音不会再响了（音频坏了 / 被 stop / 队列溢出丢弃）：文字/落子照常显示，只是这一句没有声音
 func _on_speech_skipped(group: int) -> void:
-	var rec: Dictionary = _speech_by_group.get(group, {})
+	var rec: Dictionary = pairing.group_of(group)
 	if not rec.is_empty():
-		_finish_rec(rec)
+		pairing.finish(rec)
 	if cfg.tts_batch_speak:
 		_flush_pending_ai()
 	elif not rec.is_empty():
-		_display_rec(rec)
+		pairing.display(rec)
 
 # ================= 语音配对与播放（计划 05：合成归后端，本端只取音频 + 播放） =================
 #
+# 配对状态机在 `SpeechPairing`（`game/scripts/services/SpeechPairing.gd`，纯决策 + 可注入时钟）；
+# 本文件只留胶水：登记时喂它一条记录、收到 speech 时让它配对、由它告诉我「该显示哪条文字」。
 # 后端的出话顺序是**严格串行**的：`message(A)` → 合成 A → `speech(A)` → `message(B)` → …（同步方法
 # 里那几条只有文字的短提示会让这个序列多出一个「没有 speech 的 message」）。于是：
 #   1) `_add_msg` 为每条要朗读的 AI 台词登记一条**配对记录**（登记顺序 = speech 到达顺序）；
-#   2) `_on_speech_event` 按到达顺序取**最早那条还没配上的**记录，并把 `turn_id`+`seq` 递增当校验；
+#   2) `_on_speech_event` 交给状态机：按到达顺序取**最早那条还没配上的**记录，并用 `turn_id`+`seq` 递增校验；
 #   3) 配对成功后取音频（GET /api/tts/audio/{id}）→ `tts.play_audio(bytes, seq)`，或直接
 #      `tts.speak_system(text, seq)`；
-#   4) `utterance_started(group)` 回来时按 group 精确回查这条记录：显示文字 + `_reveal_move()`。
-# 三条兜底（保证任何一步出问题都**不会把文字卡死**）：
+#   4) `utterance_started(group)` 回来时 `pairing.group_of(group)` 精确回查 → `pairing.display()`
+#      → `display_requested` 信号回到 `_on_pairing_display`：显示文字 + `_reveal_move()`。
+# 兜底（保证任何一步出问题都**不会把文字卡死**）：
 #   · 音频 404 / 解析不了 → TTSClient 或本端补 `speech_skipped` → 文字立即显示；
-#   · 回合结束（busy=false）还等不到 speech（后端那一轮已经发完了）→ `_release_stale_speeches` 直接显示；
-#   · WS 断开 → 在途 speech 已经丢了 → `_release_stale_speeches(true)` 全部放出来。
+#   · 回合结束（busy=false）还等不到 speech（后端那一轮已经发完了）→ `pairing.release_stale` 直接显示；
+#   · WS 断开 → 在途 speech 已经丢了 → `pairing.release_stale(..., true)` 全部放出来；
+#   · 音频「根本没来」（404）→ `_process` 里 `_sync_speech_hold` 每帧清一次锁，不会锁死棋盘。
 # 反过来，本地丢弃的台词（走神作废 / 防复读）会留一条 `tomb` 占位：**吃掉它自己那条 speech**，
 # 避免把下一条台词的语音错配到它身上（后端那条语音本来就发出来了）。
 
@@ -1743,42 +1728,25 @@ static func _api_error_text(code: int, body: PackedByteArray) -> String:
 		return str((d as Dictionary)["error"])
 	return "HTTP %d" % code
 
+## 交给配对状态机的「外部事实」：她这一轮是否还在跑 / 音频是否在播或排队 / 是否还有取音频请求在途
+func _pair_facts() -> Dictionary:
+	return {
+		"turn_active": agent != null and agent.busy,
+		"playing": tts != null and tts.is_speaking(),
+		"fetching": _speech_fetch_busy or not _speech_fetch.is_empty(),
+	}
+
 ## 登记一条「要由后端朗读的台词」的配对记录（登记顺序 = 与 speech 事件的配对顺序）。
 ## 语音关着时不登记（后端那时也不会发 speech，文字一律直接显示，与没有这个功能时逐字一致）。
 ## `tomb=true`：这条已在本地被丢弃（走神作废 / 防复读），只留个占位吃掉它自己那条 speech。
 func _speech_register(text: String, reveal: bool, kind: String, tomb := false) -> Dictionary:
 	if tts == null or not tts.enabled:
 		return {}
-	_speech_id += 1
-	var rec := {
-		"id": _speech_id, "text": text, "reveal": reveal, "kind": kind, "tomb": tomb,
-		"t": Time.get_ticks_msec(),
-		"got": false, "group": -1, "played": false, "displayed": false, "released": false,
-		"wait_display": false,
-	}
-	_speech_pairs.append(rec)
-	return rec
+	return pairing.register(text, reveal, kind, tomb)
 
-## 打过标记的下一条 AI 台词**不登记配对记录**（它没有语音，也就没什么可配的）
-func _take_text_only_mark() -> bool:
-	if _text_only_left <= 0:
-		return false
-	_text_only_left = 0                                  # 一次调用只对应一条提示
-	return Time.get_ticks_msec() - _text_only_ms <= TEXT_ONLY_TTL_MS
-
-## 本地要发起一条「只有文字」的调用（undo / reset_game / set_allow_pass）或本地台词（开场问候）时先打个标记
-func _mark_text_only() -> void:
-	if tts == null or not tts.enabled:
-		return
-	_text_only_left = 1
-	_text_only_ms = Time.get_ticks_msec()
-
-## 取下一条等着配对的记录：只认**还没收到 speech**的那一条，所以乱序/重发也不会错配到下一条
-func _take_pair() -> Dictionary:
-	for rec in _speech_pairs:
-		if not bool(rec.get("got", false)):
-			return rec
-	return {}
+## 本地丢弃的台词留个占位（吃掉它自己那条 speech）
+func _register_tomb(kind: String) -> void:
+	_speech_register("", false, kind, true)
 
 ## 收到后端一条语音指令（紧随对应 message 之后）：与待播台词配对 → 取音频 / 交系统语音。
 ## 语音关闭时**一条请求都不发**（后端也不会发 speech），文字照常显示的老路子不受影响。
@@ -1790,27 +1758,26 @@ func _on_speech_event(payload: Dictionary) -> void:
 		return                                   # none / 脏值：不出声，也不占用配对位
 	var turn := str(payload.get("turn_id", ""))
 	var seq := int(payload.get("seq", 0))
-	if turn == _last_speech_turn and seq <= _last_speech_seq:
-		print("[TTS] 重复/乱序的 speech 已丢弃：turn=%s seq=%d" % [turn, seq])
-		return                                   # 同一回合内 seq 必须递增：兜 WS 重连后的乱序/重发
-	_last_speech_turn = turn
-	_last_speech_seq = seq
-	var rec := _take_pair()
+	var rec := pairing.accept_speech(turn, seq)
 	if rec.is_empty():
-		print("[TTS] 收到没有对应台词的 speech（turn=%s seq=%d），已忽略" % [turn, seq])
-		return                                   # 没有等着它的台词：绝不凭空出声
-	rec["got"] = true
-	if bool(rec.get("tomb", false)):
-		_finish_rec(rec)                         # 本地已丢弃的台词：吃掉它自己那条语音，不出声
+		_report_speech_drop(turn, seq)
+		return                                   # 重复/乱序，或没有等着它的台词：绝不凭空出声
+	if pairing.is_tomb(rec):
+		pairing.finish(rec)                      # 本地已丢弃的台词：吃掉它自己那条语音，不出声
 		return
-	var kind := str(rec.get("kind", ""))
+	var kind := pairing.kind_of(rec)
 	if smode == "system":
-		var g := tts.speak_system(str(payload.get("text", "")), seq, kind)
-		rec["group"] = g
-		_speech_by_group[g] = rec
+		pairing.set_group(rec, tts.speak_system(str(payload.get("text", "")), seq, kind))
 		return
 	_speech_fetch.append({"id": str(payload.get("id", "")), "seq": seq, "rec": rec})
 	_pump_speech_fetch()
+
+## 配对没成功只记一行日志（判定在状态机里，日志留在这一层）
+func _report_speech_drop(turn: String, seq: int) -> void:
+	if pairing.last_drop_reason == "stale":
+		print("[TTS] 重复/乱序的 speech 已丢弃：turn=%s seq=%d" % [turn, seq])
+	else:
+		print("[TTS] 收到没有对应台词的 speech（turn=%s seq=%d），已忽略" % [turn, seq])
 
 ## 取音频（GET /api/tts/audio/{id}）。**串行**一次一条：保证 play_audio 的调用顺序 = speech 到达顺序，
 ## 否则两条语音同时取、谁先回来谁先播，音频就会和文字错位。
@@ -1828,11 +1795,9 @@ func _pump_speech_fetch() -> void:
 	agent.fetch_bytes("/api/tts/audio/%s" % str(job["id"]), HTTPClient.METHOD_GET, {},
 		func(ok: bool, code: int, body: PackedByteArray):
 			_speech_fetch_busy = false
-			if ok and not body.is_empty() and not bool(rec.get("played", false)):
+			if ok and not body.is_empty() and not pairing.played(rec):
 				# 取音频期间这条已经作废（走神搭话被取消等）就不再出声；`played` 为真说明它已经出过结果
-				var g := tts.play_audio(body, int(job["seq"]), str(rec.get("kind", "")))
-				rec["group"] = g
-				_speech_by_group[g] = rec
+				pairing.set_group(rec, tts.play_audio(body, int(job["seq"]), pairing.kind_of(rec)))
 			elif not ok:
 				_speech_audio_failed(rec, _api_error_text(code, body) if code > 0 else "后端不可达")
 			_pump_speech_fetch())
@@ -1841,125 +1806,32 @@ func _pump_speech_fetch() -> void:
 func _speech_audio_failed(rec: Dictionary, why: String) -> void:
 	print("[TTS] 取音频失败：%s" % why)
 	_on_tts_status("这段语音的音频取回失败（%s），改为只显示文字" % why)
-	_finish_rec(rec)
-	_display_rec(rec)
+	pairing.finish(rec)
+	pairing.display(rec)
 
-## 她这一侧还有语音的事没完（排队/播放/取音频/等配对）：棋盘锁、语气词让位、闲置判定都看它。
-## 「音频还在路上」也必须算——否则后端 busy 一结束就会在音频到达之前提前解锁棋盘。
-## 已经不再等语音的（tomb 占位 / 出过结果 / 已被 _release_stale_speeches 放掉的）不算：不能把棋盘锁死。
-func _speech_busy() -> bool:
-	if tts != null and tts.is_speaking():
-		return true
-	for rec in _speech_pairs:
-		if not bool(rec.get("tomb", false)) and not bool(rec.get("played", false)) \
-				and not bool(rec.get("released", false)):
-			return true
-	return false
+## 配对状态机说「这条台词的文字该出现了」：显示气泡 + 该揭示的落子在这一刻揭示（音画同步）
+func _on_pairing_display(text: String, reveal: bool) -> void:
+	_add_msg_now("ai", text)
+	if reveal:
+		_reveal_move()                 # 说到这手棋时，才把子放上棋盘
 
-## 音频侧还有活干（在播 / 排队 / 正在取）：这时不能把等待中的文字当「等不到语音」放出来
-func _audio_in_flight() -> bool:
-	if tts != null and tts.is_speaking():
-		return true
-	if _speech_fetch_busy or not _speech_fetch.is_empty():
-		return true
-	for rec in _speech_pairs:
-		if bool(rec.get("got", false)) and not bool(rec.get("played", false)):
-			return true
-	return false
-
-## 把这条台词显示出来。已经显示过 / 本地已丢弃的不重复显示；`reveal` 的那一手就在这一刻落上棋盘。
-func _display_rec(rec: Dictionary) -> bool:
-	if rec.is_empty() or bool(rec.get("displayed", false)) or bool(rec.get("tomb", false)):
-		return false
-	rec["displayed"] = true
-	_remove_pending_ai(int(rec.get("id", -1)))
-	_add_msg_now("ai", str(rec.get("text", "")))
-	if bool(rec.get("reveal", false)):
-		_reveal_move()                 # 音画同步：说到这手棋时，才把子放上棋盘
-	return true
-
-## 这条台词的语音有结论了（已开播 / 判定无声 / 被取消）：退出配对表，不再占着「在途」
-func _finish_rec(rec: Dictionary) -> void:
-	rec["played"] = true
-	if int(rec.get("group", -1)) > 0:
-		_speech_by_group.erase(int(rec["group"]))
-	_prune_pairs()
+## 配对状态机说「有条语音出结果了」：刷新棋盘锁与「思考中…」占位
+func _on_pairing_resolved() -> void:
 	_refresh_lock()
 	_clear_thinking_if_idle()
 
-## 把这条记录从「待显示」里摘掉（按内部 id 认，避免两条内容相同的记录互相顶掉）
-func _remove_pending_ai(rid: int) -> void:
-	if _pending_ai.is_empty():
-		return
-	var kept: Array[Dictionary] = []
-	for rec in _pending_ai:
-		if int(rec.get("id", -1)) != rid:
-			kept.append(rec)
-	_pending_ai = kept
+## 她这一侧还有语音的事没完（排队/播放/取音频/等配对）：棋盘锁、语气词让位、闲置判定都看它。
+## 「音频还在路上」也必须算——否则后端 busy 一结束就会在音频到达之前提前解锁棋盘。
+func _speech_busy() -> bool:
+	return pairing.busy(_pair_facts())
 
-## 收拾配对表：已出结果的移除（记录在 `_speech_pairs` 里按引用比较，这里按 played 标记过滤即可）
-func _prune_pairs() -> void:
-	var kept: Array[Dictionary] = []
-	for rec in _speech_pairs:
-		if bool(rec.get("played", false)):
-			continue
-		kept.append(rec)
-	_speech_pairs = kept
+## 音频侧还有活干（在播 / 排队 / 正在取）：这时不能把等待中的文字当「等不到语音」放出来。
+## 已作废的 / 已出结果的记录不算：否则后端一条 speech 都不发时棋盘会被锁死。
+func _audio_in_flight() -> bool:
+	return pairing.audio_in_flight(_pair_facts())
 
-## 配对位保鲜：一条 speech 最晚也会在后端的合成超时（默认 30s）内发出。等过了这个窗口还没配上的，
-## 说明这条台词压根不会有语音（后端语音关着 / 那次合成失败没发事件）——腾出配对位，
-## 免得它一直占着队首、把后面那条台词的语音吃掉。
-func _prune_expired_pairs() -> void:
-	if _speech_pairs.is_empty():
-		return
-	var now := Time.get_ticks_msec()
-	var kept: Array[Dictionary] = []
-	for rec in _speech_pairs:
-		if not bool(rec.get("got", false)) and now - int(rec.get("t", now)) > SPEECH_PAIR_TTL_MS:
-			print("[TTS] 等不到语音的台词已从配对表清出：%s" % str(rec.get("text", "")).substr(0, 20))
-			continue
-		kept.append(rec)
-	_speech_pairs = kept
-
-## 回合结束 / WS 断开后，等不到语音的文字不能一直等：直接显示（落子也照常揭示）。
-## 注意：**只放文字、不拆配对位**——那条语音可能还在后端合成，等它到了照样要占它自己的位置、照样要出声。
-## 放掉之后这条不再占着「她在忙」（`released`），否则后端一条 speech 都不发时棋盘会被锁死。
-## `force=true`（连接断了）：在途的 speech 已经丢了，连配对位一起清掉。
-func _release_stale_speeches(force := false) -> void:
-	if not force:
-		if agent != null and agent.busy:
-			return                        # 回合还在跑：她的语音还没发完
-		if _audio_in_flight():
-			return                        # 还有音频在播 / 排队 / 正在取：等它
-	for rec in _speech_pairs:
-		if bool(rec.get("got", false)) and not bool(rec.get("played", false)) and not force:
-			continue                      # 已经配对上了、音频在路上：还占着「在忙」
-		rec["released"] = true
-	for rec in _pending_ai.duplicate():
-		_display_rec(rec)
-	if force:
-		for rec in _speech_pairs.duplicate():
-			if not bool(rec.get("got", false)):
-				_finish_rec(rec)          # 连不上了：这条语音不会再来了
-	_prune_expired_pairs()
-
-## 作废配对表里的走神搭话：文字不再显示；已配对的交给 cancel_kind 停播，还没配对的留占位吃掉它自己的 speech
-func _speech_forget_idle() -> void:
-	var done: Array[Dictionary] = []
-	for rec in _speech_pairs:
-		if str(rec.get("kind", "")) != "idle":
-			continue
-		rec["displayed"] = true          # 这段文字不再显示（与 _pending_ai 里的是同一对象）
-		_remove_pending_ai(int(rec.get("id", -1)))
-		if not bool(rec.get("got", false)):
-			rec["tomb"] = true           # 还没配对：留着吃掉它自己那条 speech
-		elif not bool(rec.get("played", false)):
-			done.append(rec)
-	for rec in done:
-		_finish_rec(rec)
-	_prune_pairs()
-
-## 试听按钮：合成在后端 —— POST /api/tts/speak 取回音频再播；失败只在状态栏提示，不打扰对局
+## 试听按钮：合成在后端 —— POST /api/tts/speak 取回音频再播；失败只在状态栏提示，不打扰对局。
+## 有意**不看** `tts.enabled`：试听是用户显式点的（与 BASE 的 `preview()` 一致），关了朗读也该能试。
 func _preview_tts() -> void:
 	if agent == null:
 		_on_tts_status("试听失败（后端未连接）")
@@ -1970,7 +1842,9 @@ func _preview_tts() -> void:
 	var done := func(ok: bool, code: int, body: PackedByteArray):
 		if ok and not body.is_empty():
 			if tts != null:
-				tts.play_audio(body, 0)     # group=0：试听，不触发任何待播文字的显示
+				# `seq=0` 只是「没有回合序号」；TTSClient 照常分配一个非零分组号，
+				# 而且这音频没在配对表里登记，所以不会触发任何待播文字的显示
+				tts.play_audio(body, 0)
 			return
 		_on_tts_status("试听失败：%s" % (_api_error_text(code, body) if code > 0 else "后端不可达"))
 	agent.fetch_bytes("/api/tts/speak", HTTPClient.METHOD_POST, {"text": PREVIEW_TEXT},

@@ -13,7 +13,8 @@ extends Node
 
 signal status(text: String)
 signal speaking_changed(on: bool)      # 开始/结束朗读（化身说话时歪头用）
-signal utterance_started(group: int)   # 一条台词的语音开始播放（group=play_audio/speak_system 的返回值；0=试听）
+signal utterance_started(group: int)   # 一条台词的语音开始播放（group=play_audio/speak_system 的返回值，恒 ≥1；
+                                       # 试听的音频也会拿到分组号，但它没登记配对，不会有待播文字）
 signal speech_skipped(group: int)      # 这条语音不会再响（音频坏了 / 队列溢出 / 被停）：文字照常显示，只是没声音
 
 const QUEUE_MAX := 3
@@ -38,7 +39,7 @@ var _sapi_pid := -1          # 系统语音的子进程
 var _speaking := false
 var _cooldown := 0.0
 var _group_seq := 0          # 语音分组号：每次 play_audio/speak_system 自增（一条台词一个）
-var _play_group := 0         # 正在播的那条的分组号（0 = 试听/无分组）；停掉时用它补一条 speech_skipped
+var _play_group := 0         # 正在播的那条的分组号（0 = 没在播/无分组）；停掉时用它补一条 speech_skipped
 var _play_kind := ""         # 正在播放的声音类型（""=对局发言；"idle"=走神搭话，可被取消）
 
 var _player: AudioStreamPlayer = null
