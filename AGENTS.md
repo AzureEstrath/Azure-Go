@@ -25,7 +25,7 @@
 - 运行游戏：`Godot_v4.6.3-stable_win64.exe --path game`（工程按 Godot 4.6 配置）。
   - 本机若只有 4.7（`E:\Godot\Godot_v4.7.1-stable_win64_console.exe`），跑完务必 `git status` 检查，把 `game/project.godot` 的 `config/features`、`*.import`、`*.uid` 等任务意图之外的改动还原。
 - 启动后端：`backend\run_server.bat`（内部 `cd` 到 `backend\` 再 `python -m app.main`，监听 `127.0.0.1:8000`）；等价的手动命令是 `cd backend && python -m app.main`。
-- 启动 KataGo 云服务：`katago_service\run_server.bat`（脚本自己 `cd` 到**仓库根目录**再 `python -m katago_service.server`，**必须原样跑**；监听 `127.0.0.1:8100`）。等价的手动命令在仓库根目录执行：`python -m katago_service.server --port 8100 --katago-exe <exe> --model <bin> --config <cfg> [--analysis-threads N]`；参数留空由环境变量兜底：`KATAGO_HOST` / `KATAGO_SERVICE_TOKEN` / `KATAGO_EXE` / `KATAGO_MODEL` / `KATAGO_CONFIG`（直接执行与经 `run_server.bat` 都生效）。后端要连它（`katago_url`，默认 `http://127.0.0.1:8100`），服务没起时后端不崩、只报「云服务不可用」。
+- 启动 KataGo 云服务：`katago_service\run_server.bat`（脚本自己 `cd` 到**仓库根目录**再 `python -m katago_service.server`，**必须原样跑**；监听 `127.0.0.1:8100`）。等价的手动命令在仓库根目录执行：`python -m katago_service.server --port 8100 --katago-exe <exe> --model <bin> --config <cfg> [--analysis-threads N]`；参数留空由环境变量兜底：`KATAGO_HOST` / `KATAGO_SERVICE_TOKEN` / `KATAGO_EXE` / `KATAGO_MODEL` / `KATAGO_CONFIG`（直接执行与经 `run_server.bat` 都生效）。后端要连它（`katago_url`，默认 `http://127.0.0.1:8100`），服务没起时后端不崩、只报「云服务不可用」。注意启动顺序：先起服务并等 `/health` 的 `state` 变 `ready` 再起后端——后端在 lifespan 里会等它就绪（最长 180s）才绑端口，预热期启动的后端在就绪前不监听任何端口（看起来像没起来）。
 - 测试：
   - `cd backend && python -m unittest discover -s tests` —— 后端全量（标准库 `unittest`，不用 pytest；先 `pip install -r backend/requirements.txt`）。
   - `cd katago_service && python -m unittest discover -s tests` —— KataGo 云服务全量（同样 `unittest`，用假引擎，不依赖真实 KataGo 与公网）。
@@ -38,7 +38,7 @@
 - **仓库 clone 下来跑不起来是正常的**：`katago.exe`/`*.dll`、`model.bin`（这两类归 **KataGo 云服务部署侧**持有）、`Azure.vrm`、CosyVoice 权重都不入库（见 `.gitignore` 与 README「模型与资产」，走 GitHub Releases）。不要试图补齐、生成或提交这些大文件。
 - 配置读取顺序：**可执行文件同目录 `config.json` → `res://config.json`**；`game/config.json` 只是随包模板。游戏内设置面板会**写回** config.json，而 CLI `--llm/--model/--key/--backend-url` 被记进 `cli_locked`、只影响本次运行——改配置逻辑时别破坏这个区分。
 - 后端配置走环境变量 `AZURE_CONFIG`；未设置时 `backend/app/config.py` 的 `load` 依次找 `<当前工作目录>/config.json` → `backend/config.json`（`backend\run_server.bat` 会先把 `..\AzureGoGodot\config.json` 写进 `AZURE_CONFIG`，该文件不存在时才用 `..\game\config.json`）。`katago_*` 只存**服务地址 / 令牌 / 超时**，引擎路径的解析逻辑（`_resolve`）已随服务化删除，不要再加回来。
-- KataGo 服务的健康语义：`/api/health` 的 `katago_dead` 只反映**启动探活**（一次成功分析会清除它），`katago_error` 则**每次分析失败**都刷新——两者要成对读，「`katago_dead=false` + 新的 `katago_error`」＝中途掉线。
+- KataGo 服务的健康语义：`/api/health` 的 `katago_dead` 反映**引擎已经没了**——`start()` 探活失败、或分析时**传输层失败**（连接被拒 / 连接或读取错误）都置位，一次成功分析会清除它；**分析**超时与 HTTP 状态响应（503 预热 / 401 / 500）只刷新 `katago_error`、**不**置 `katago_dead`——两者要成对读。
 - 不要拿 `game/config.json` 当字段默认值来源：模板（随包样例：`max_visits=100`、`tts_enabled=true`、`tts_pitch=1.02`、`tts_volume=0.65`、`vrm_path` 用相对值）与 `AzureConfig.gd` 的代码默认值并不一致，这是既有且有意的。以 `AzureConfig.gd` 为准，字段清单看 README 第三节。
 - `vrm_path` 建议写**绝对路径**（相对路径要能被 Godot 解析到，否则形象加载失败）。
 - 场景引用带 `uid://`（`Main.tscn` 的 ext_resource），`*.gd.uid` 与 `*.import` 已入库：移动/重命名脚本或资源时同步更新它们，不要手写 uid。

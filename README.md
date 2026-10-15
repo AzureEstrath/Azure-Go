@@ -193,12 +193,14 @@ OpenAI 的音色，才能真正出声；服务**连不上**时会自动临时降
   - REST：`/api/move|hint|analyze|chat|summarize|undo|reset|config|reveal|interaction|idle|mood/tick`，
     以及 `GET /api/state`、`GET /api/health`。
   - WebSocket：`/ws` 推送 `hello / message / state / info / busy / mood / joseki`。
-  - `GET /api/health` 返回 `{ok, katago_dead, katago_error, katago_url, llm_url}`（字段现都表示「云服务」的
-    状态）。其中 `katago_dead` 与 `katago_error` 必须**成对读**：
-    - `katago_dead` 只反映**启动探活**的结论——它仅由引擎客户端的 `start()` 置位，一次**成功的分析会把它清掉**；
+  - `GET /api/health` 返回 `{ok, katago_dead, katago_error, katago_url, llm_url}`（字段都改为描述所连云服务：
+    地址 / 启动结论 / 最近错误）。其中 `katago_dead` 与 `katago_error` 必须**成对读**：
+    - `katago_dead` 表示**引擎已经没了**：`start()` 探活失败、或分析时发生**传输层失败**（连接被拒 / 连接或
+      读取错误，相当于旧子进程时代的「管道断了」）都会置位；一次**成功的分析会把它清掉**（云服务重启后可自愈）；
     - `katago_error` 则在**每次分析失败**时刷新（成功时清空）；
-    - 所以「`katago_dead=false` 但 `katago_error` 是新的非空值」＝ 服务是**中途掉线**（启动时好好的、跑着跑着没了），
-      而不是「启动就没起来」。运维自检以 `katago_error` 为准，`katago_dead` 只当启动结论看；
+    - **分析**时的超时与 HTTP 状态响应（503 预热 / 401 / 500）**只刷新 `katago_error`、不置 `katago_dead`**
+      ——服务还在、只是这一次没答好。所以「`katago_dead=false` + 新的非空 `katago_error`」＝服务**在线但这次
+      没答好**，「`katago_dead=true`」＝引擎（或到它的链路）真的没了。运维自检以 `katago_error` 为准；
     - `katago_url` 是后端当前连接的 KataGo 服务地址，便于确认连的是哪台（留空时客户端回退默认回环地址
       `http://127.0.0.1:8100`）。
 - **后端配置**：后端进程用环境变量 `AZURE_CONFIG` 指定 `config.json`；未设置时依次找 `<当前工作目录>\config.json`
@@ -227,6 +229,11 @@ KataGo 不再由后端进程拉起，而是**独立部署的云服务**（`katag
   ```
   参数留空则由环境变量兜底：`KATAGO_HOST` / `KATAGO_SERVICE_TOKEN` / `KATAGO_EXE` / `KATAGO_MODEL` /
   `KATAGO_CONFIG`（对**直接执行**与**经 `run_server.bat`** 两种方式都生效）。默认监听 `127.0.0.1:8100`。
+- **启动顺序（重要）**：先起 KataGo 服务，**轮询 `/health` 直到 `state == "ready"`**，再起后端。
+  服务启动即后台预热（加载模型 / OpenCL 首次调优可能要几十秒到几分钟），预热期间**不要**启动后端：
+  后端在 lifespan 里会等它就绪（最长 `ready_timeout_ms`＝180 秒）才绑端口，这段时间里 `/api/chat`、
+  `/api/state` 与 `/ws` 都不可达，游戏只会显示「未连接后端」——看起来像后端根本没起来，
+  其实它是在等 KataGo 预热（预热完成、后端绑上端口后会自动恢复）。
 - **自检**：`curl http://127.0.0.1:8100/health` → `{"ok": true, "state": "ready", "katago_error": "", ...}`。
   模型加载期间 `state` 是 `warming`（此时 `/analyze` 立刻回 503 可读错误，不会挂到客户端超时，也不会
   让游戏卡住）；引擎起不来则是 `dead`，`katago_error` 给出原因。日志在 `katago_service\logs\katago\`。

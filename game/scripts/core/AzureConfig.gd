@@ -113,7 +113,7 @@ func save() -> bool:
 	if path.begins_with("res://"):
 		path = ProjectSettings.globalize_path(path)
 	var d := _raw.duplicate()
-	d["_说明"] = "云端模型（LLM / 语音 TTS）与远程后端服务的地址与参数。打包发布时把本文件放在与可执行文件同一目录即可覆盖。"
+	d["_说明"] = "云端模型（LLM / 语音 TTS）与远程后端服务的地址与参数；KataGo 由独立部署的云服务提供（katago_url，部署见 README「KataGo 服务部署」）。打包发布时把本文件放在与可执行文件同一目录即可覆盖。"
 	# katago_bin / katago_model / katago_config 是「后端自行拉起 KataGo 进程」时代的旧键（v2.x~v3.0.0）：
 	# 计划 01 起 KataGo 由独立部署的云服务提供，后端只连 katago_url / katago_token / katago_timeout_ms，
 	# 这三个键已无任何读取方，随旧配置一起清理，免得用户存档里一直留着失效的引擎路径。
