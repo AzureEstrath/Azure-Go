@@ -1,9 +1,10 @@
 """KataGo 云服务的 HTTP 面：``GET /health`` 与 ``POST /analyze``。
 
-服务自己持有状态机（P10）：lifespan 先置 ``warming``，``start()`` + ``warmup()`` 结束后
-只要进程没死就置 ``ready``。**绝不能**把「就绪」寄托在 ``proc.state_name() == "ready"`` 上：
-引擎若对所有请求都回错误应答，``state_name()`` 会永远停在 ``warming``，
-按它判就绪就成了死锁（warming → /analyze 503 → 永无成功分析 → 永远 warming）。
+服务自己持有状态机（P10）：lifespan 先置 ``warming``，``start()`` 之后**立刻返回**并把
+``warmup()`` 放到后台任务（P12 —— uvicorn 要等 lifespan 结束才绑端口，预热若卡在 lifespan 里，
+整个预热窗口端口都不监听），预热结束再置 ``ready``/``dead``。**绝不能**把「就绪」寄托在
+``proc.state_name() == "ready"`` 上：引擎若对所有请求都回错误应答，``state_name()`` 会永远停在
+``warming``，按它判就绪就成了死锁（warming → /analyze 503 → 永无成功分析 → 永远 warming）。
 
 ``/analyze`` 的请求体与响应体都是 KataGo analysis 引擎原文，服务不做字段解释，
 只负责鉴权、串行化与「未就绪/已死」的可读报错（见 docs/plans/01-katago-cloud-service.md）。
@@ -99,15 +100,37 @@ def _build_proc(cfg) -> KatagoProcess:
     )
 
 
-async def _prepare(proc) -> None:
-    """启动 + 预热。缺方法就跳过（假引擎没有生命周期）。"""
-    start = getattr(proc, "start", None)
-    if callable(start):
-        if await start() is False:
-            return                      # 启动失败：状态由 is_dead() 判定
-    warm = getattr(proc, "warmup", None)
-    if callable(warm):
-        await warm()
+async def _warmup_then_ready(app: FastAPI, proc) -> None:
+    """后台预热，结束后落状态（P12）。
+
+    预热超时/报错但进程还活着，仍必须是 ``ready``（P10）：引擎确实起来了，
+    真实请求它会应答（首次分析走 ``proc`` 里的长超时档），不能因为预热失败就永久 503。
+    """
+    try:
+        warm = getattr(proc, "warmup", None)
+        if callable(warm):
+            await warm()
+    except asyncio.CancelledError:
+        raise                           # 关闭时被取消：状态交给 shutdown，不在这里改
+    except Exception as e:
+        # 预热失败本身不判死：下面按 is_dead() 决定（P10 —— 进程活着就仍是 ready）
+        print("[KataGo服务] 预热异常：%s" % e)
+    app.state.state = STATE_DEAD if _is_dead(proc) else STATE_READY
+
+
+async def _stop_warmup(app: FastAPI) -> None:
+    """关闭前收掉预热后台任务：不留孤儿任务，也不出现「Task was destroyed but it is pending」。"""
+    task = app.state.warm_task
+    app.state.warm_task = None
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print("[KataGo服务] 预热任务异常退出：%s" % e)
 
 
 async def _shutdown(proc) -> None:
@@ -126,13 +149,20 @@ async def _lifespan(app: FastAPI):
     proc = app.state.proc
     app.state.driven = _has_lifecycle(proc)
     if app.state.driven:
-        await _prepare(proc)
-        # P10：预热超时/报错但进程还活着，也必须是 ready —— 引擎确实起来了，
-        # 真实请求它会应答（首次分析走 proc 里的长超时档）。
-        app.state.state = STATE_DEAD if _is_dead(proc) else STATE_READY
+        start = getattr(proc, "start", None)
+        if callable(start):
+            await start()               # 很快：只拉起进程，不等它预热完
+        if _is_dead(proc):
+            app.state.state = STATE_DEAD
+        else:
+            # P12：预热放后台，lifespan 立刻返回。uvicorn 是 lifespan 结束后才绑端口的，
+            # 若在这里 await warmup()，整个预热窗口端口都不监听 —— 客户端只会拿到
+            # 连接被拒（连 /health 的 warming 都看不到），后端 180s 的就绪等待也没了意义。
+            app.state.warm_task = asyncio.create_task(_warmup_then_ready(app, proc))
     try:
         yield
     finally:
+        await _stop_warmup(app)
         await _shutdown(proc)
 
 
@@ -151,6 +181,7 @@ def create_app(proc=None, token="", cfg=None) -> FastAPI:
     app.state.token = token or ""
     app.state.state = STATE_WARMING
     app.state.driven = False
+    app.state.warm_task = None          # P12 的后台预热任务
     app.state.started_at = time.monotonic()
     # 单用户场景：同一引擎不做并发分析，靠锁串行化，避免引擎侧争抢
     app.state.lock = asyncio.Lock()

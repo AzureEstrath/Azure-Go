@@ -1,7 +1,10 @@
 """HTTP 面：健康态、鉴权、请求透传、未就绪语义（假引擎，不起真进程）。"""
 
+import asyncio
 import os
 import sys
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -31,6 +34,55 @@ class FakeProc:
     async def analyze(self, req):
         self.seen.append(dict(req))
         return dict(self.reply)
+
+
+class DrivenFake:
+    """有生命周期的假引擎：状态由服务自己的状态机决定（P12 的回归守卫用）。
+
+    gate 非 None 时 warmup 会阻塞到它被 set（让「预热中」这个窗口可观察）；
+    fail_warmup 模拟「预热超时/报错但进程还活着」（P10：仍须 ready）；
+    die_in_warmup 模拟「预热期间进程死掉」（须 dead）。
+    """
+
+    def __init__(self, gate=None, fail_warmup=False, die_in_warmup=False):
+        self.gate = gate
+        self.fail_warmup = fail_warmup
+        self.die_in_warmup = die_in_warmup
+        self.started = False
+        self.warmed = False
+        self.dead = False
+        self.closed = False
+        self.seen = []
+
+    async def start(self):
+        self.started = True
+        return True
+
+    async def warmup(self):
+        while self.gate is not None and not self.gate.is_set():
+            await asyncio.sleep(0.005)          # 让出事件循环：预热期间端口仍要能应答
+        self.warmed = True
+        if self.die_in_warmup:
+            self.dead = True
+            raise RuntimeError("预热时引擎崩了")
+        if self.fail_warmup:
+            raise TimeoutError("预热超时")
+
+    async def shutdown(self):
+        self.closed = True
+
+    def is_dead(self):
+        return self.dead
+
+    def last_error(self):
+        return "假错误" if self.dead else ""
+
+    def state_name(self):
+        return "dead" if self.dead else ("ready" if self.warmed else "warming")
+
+    async def analyze(self, req):
+        self.seen.append(dict(req))
+        return {"rootInfo": {"winrate": 0.5}, "moveInfos": []}
 
 
 def _client(proc, token=""):
@@ -95,6 +147,70 @@ class AuthTest(unittest.TestCase):
     def test_no_token_configured_allows_local(self):
         with _client(FakeProc()) as c:
             self.assertEqual(c.post("/analyze", json={"moves": []}).status_code, 200)
+
+
+class WarmingVisibilityTest(unittest.TestCase):
+    """Review Focus #1 的回归守卫：预热在后台跑，warming 期间端口必须可达（P12）。
+
+    预热若被卡回 lifespan 里（uvicorn 要等 lifespan 结束才绑端口），这里第一个
+    /health 就会拿到 ready 而不是 warming —— 即「预热窗口内客户端只能连接被拒」。
+    """
+
+    def test_port_answers_while_warming(self):
+        gate = threading.Event()
+        # 兜底闹钟：万一预热被卡回 lifespan（回归），测试也要能收尾并给出断言失败，而不是永久挂住
+        watchdog = threading.Timer(5.0, gate.set)
+        watchdog.start()
+        try:
+            proc = DrivenFake(gate=gate)
+            with _client(proc) as c:
+                body = c.get("/health").json()               # 预热中端口可达＝本裁决的全部意义
+                self.assertTrue(proc.started)                # start() 已跑完，预热留在后台
+                self.assertEqual(body["state"], "warming")
+                self.assertFalse(body["ok"])
+                r = c.post("/analyze", json={"moves": []})   # 不得悬挂到客户端超时
+                self.assertEqual(r.status_code, 503)
+                self.assertIn("预热", r.json()["error"])
+                gate.set()                                   # 预热完成
+                self.assertTrue(self._wait_state(c, "ready"))
+                self.assertEqual(c.post("/analyze", json={"moves": []}).status_code, 200)
+        finally:
+            watchdog.cancel()
+
+    def test_warmup_failure_on_live_process_ends_ready(self):
+        """P10：预热超时/报错但进程还活着 → ready（引擎会应答真实请求）。"""
+        with _client(DrivenFake(fail_warmup=True)) as c:
+            self.assertTrue(self._wait_state(c, "ready"))
+            self.assertEqual(c.post("/analyze", json={"moves": []}).status_code, 200)
+
+    def test_process_dead_after_warmup_ends_dead(self):
+        with _client(DrivenFake(die_in_warmup=True)) as c:
+            self.assertTrue(self._wait_state(c, "dead"))
+            body = c.get("/health").json()
+            self.assertFalse(body["ok"])
+            self.assertIn("假错误", body["katago_error"])
+            self.assertEqual(c.post("/analyze", json={"moves": []}).status_code, 503)
+
+    def test_shutdown_cancels_warmup_task(self):
+        """关闭时预热任务必须被取消并等待：不留孤儿任务、不打「Task was destroyed」噪音。"""
+        gate = threading.Event()
+        watchdog = threading.Timer(5.0, gate.set)   # 同上：回归时给出断言失败而不是永久挂住
+        watchdog.start()
+        try:
+            proc = DrivenFake(gate=gate)
+            with _client(proc) as c:
+                self.assertEqual(c.get("/health").json()["state"], "warming")
+            self.assertFalse(proc.warmed)       # 预热没跑完，说明是被取消的
+            self.assertTrue(proc.closed)        # 引擎关闭发生在取消之后
+        finally:
+            watchdog.cancel()
+
+    def _wait_state(self, c, want, tries=300):
+        for _ in range(tries):
+            if c.get("/health").json()["state"] == want:
+                return True
+            time.sleep(0.01)
+        return False
 
 
 if __name__ == "__main__":
