@@ -94,6 +94,8 @@ var _lbl_wr: Label
 var _lbl_score: Label
 var _lbl_status: Label
 var _status_before_tool := ""                  # 她查资料前状态栏的原文案（end 时恢复）
+var _status_before_tool_bad := false           # 原文案的错误色标记（end 时一并恢复，别把红字洗成灰字）
+var _status_bad := false                       # 状态栏当前是不是错误色（_set_status 记录，上面那行取用）
 var _tool_active := false                      # 工具进度是否在跑（start/end 成对，避免重复记原文案）
 var _chk_pass: CheckBox
 var _chk_joseki: CheckBox
@@ -1086,6 +1088,7 @@ func _render_bad_moves(list: Array) -> void:
 		_bad_box.add_child(btn)
 
 func _set_status(text: String, bad := false) -> void:
+	_status_bad = bad
 	_lbl_status.text = text
 	_lbl_status.add_theme_color_override("font_color",
 		Color(0.8, 0.2, 0.2) if bad else Color(0.45, 0.45, 0.45))
@@ -1386,18 +1389,19 @@ func _on_joseki_event(payload: Dictionary) -> void:
 		return
 	board.highlight_points(pts, str(payload.get("kind", "formed")))
 
-## 她自己查资料（发言侧工具）：只在状态栏提示一句，end 时恢复原文案。
+## 她自己查资料（发言侧工具）：只在状态栏提示一句，end 时恢复原文案（连错误色一起恢复）。
 ## 工具返回的原始盘面/JSON 永远不会显示给玩家——她的台词仍由后端生成的对话事件送达。
 func _on_tool_event(payload: Dictionary) -> void:
 	if _lbl_status == null:
 		return
 	if str(payload.get("phase", "")) == "start":
 		if not _tool_active:
-			_status_before_tool = _lbl_status.text     # 记下原状态，工具返回后恢复
+			_status_before_tool = _lbl_status.text          # 记下原状态（文案 + 是不是错误色），工具返回后原样恢复
+			_status_before_tool_bad = _status_bad
 			_tool_active = true
 		_set_status("她正在查资料…")
 	elif _tool_active:
-		_set_status(_status_before_tool)
+		_set_status(_status_before_tool, _status_before_tool_bad)
 		_tool_active = false
 
 ## 左键点在 Azure 头部附近摸摸头：开心 + 微微脸红 + 一句轻快的语气词（情绪模型同步静默加成）
@@ -1460,6 +1464,8 @@ func _on_info_changed(wr: float, sc: float) -> void:
 	_lbl_score.text = "目差: %+.1f" % sc
 
 func _on_busy_changed(busy: bool) -> void:
+	if not busy:
+		_tool_active = false               # 回合结束：某个 start 的 end 万一没到，别让它卡住下一次 start
 	if avatar != null:
 		avatar.set_thinking(busy)          # 思考中回到中性表情，空闲时恢复常态微笑
 	if busy:

@@ -294,8 +294,8 @@ KataGo 引擎与权重遵循其上游许可。
 - **后端 LLM 调用改走 LangChain**：新增 `backend\app\llm_chain.py`（`ChatOpenAI` 的唯一装配点）与
   `backend\app\prompt_chains.py`（七阶段提示的 `ChatPromptTemplate` 链）；`llm.py` 退化为薄适配器
   （对外 `chat()` 契约不变，台词仍必经 `clean_reply()` 与去 think 段的 `content_of()`）。依赖锁定
-  `langchain-core>=1.0` / `langchain-openai>=1.0`（`backend\requirements.txt`）；旧的本地地址预检与
-  `probe_models` 探测随之删除。
+  `langchain-core>=1.0,<2.0` / `langchain-openai>=1.0,<2.0`（要求 1.0 及以上、限定在 1.x——测过的
+  就是装到的；`backend\requirements.txt`）；旧的本地地址预检与 `probe_models` 探测随之删除。
 - **可配置的请求体扩展字段**：新增 `llm_extra_body`（始终并入）与 `llm_think_extra_body`（仅思考档位开启时并入），
   透传服务商专有参数（`top_k` / `reasoning_effort` 等）；输出上限按线上键 `max_tokens` 发送，服务商拒绝
   （HTTP 400/422）时自动去掉扩展字段重试一次。**推理段永不显示给玩家**：只取 `AIMessage.content`，
