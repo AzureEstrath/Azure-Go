@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -211,6 +212,49 @@ class WarmingVisibilityTest(unittest.TestCase):
                 return True
             time.sleep(0.01)
         return False
+
+
+class CliArgsTest(unittest.TestCase):
+    def test_args_parse(self):
+        args = server.parse_args(["--port", "8101", "--token", "t",
+                                  "--katago-exe", "k.exe", "--model", "m.bin", "--config", "c.cfg",
+                                  "--analysis-threads", "4"])
+        self.assertEqual(args.port, 8101)
+        self.assertEqual(args.token, "t")
+        self.assertEqual(args.analysis_threads, 4)
+
+    def test_args_default_port(self):
+        self.assertEqual(server.parse_args([]).port, 8100)
+
+
+class CliCfgMappingTest(unittest.TestCase):
+    """P13 守卫：命令行参数必须落到 ``_build_proc`` 读的键上（exe/model/config/analysis_threads）。
+
+    参数名是 ``--katago-exe``（dest 为 ``katago_exe``），引擎读的键却是 ``exe``；
+    把 argparse 的 namespace 直接当 cfg 传进 ``create_app`` 会在启动时抛
+    ``ValueError: create_app 的 cfg 缺少引擎路径：exe``。下面两条就是那个坑的回归守卫。
+    """
+
+    def test_args_mapping_feeds_create_app(self):
+        args = server.parse_args(["--katago-exe", "k.exe", "--model", "m.bin",
+                                  "--config", "c.cfg", "--analysis-threads", "3"])
+        app = server.build_app(args)            # 只构造引擎，不 start：路径无需真实存在
+        proc = app.state.proc
+        self.assertEqual((proc.exe, proc.model, proc.cfg), ("k.exe", "m.bin", "c.cfg"))
+        self.assertEqual(proc.analysis_threads, 3)
+
+    def test_empty_flags_fall_back_to_env(self):
+        """run_server.bat 把（可能为空的）环境变量当参数传进来，空值必须回落到环境变量。"""
+        env = {"KATAGO_EXE": "env-katago.exe", "KATAGO_MODEL": "env-model.bin",
+               "KATAGO_CONFIG": "env-analysis.cfg", "KATAGO_SERVICE_TOKEN": "env-token"}
+        with mock.patch.dict(os.environ, env):
+            args = server.parse_args(["--katago-exe", "", "--model", "",
+                                      "--config", "", "--token", ""])
+            app = server.build_app(args)
+        proc = app.state.proc
+        self.assertEqual((proc.exe, proc.model, proc.cfg),
+                         ("env-katago.exe", "env-model.bin", "env-analysis.cfg"))
+        self.assertEqual(app.state.token, "env-token")
 
 
 if __name__ == "__main__":

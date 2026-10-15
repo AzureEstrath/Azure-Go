@@ -8,10 +8,15 @@
 
 ``/analyze`` 的请求体与响应体都是 KataGo analysis 引擎原文，服务不做字段解释，
 只负责鉴权、串行化与「未就绪/已死」的可读报错（见 docs/plans/01-katago-cloud-service.md）。
+
+入口：``python -m katago_service.server --port 8100 ...``（必须在**仓库根目录**执行，
+``katago_service`` 是包，父目录得在 sys.path 上；``run_server.bat`` 已处理）。
 """
 
+import argparse
 import asyncio
 import hmac
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -225,3 +230,52 @@ def create_app(proc=None, token="", cfg=None) -> FastAPI:
         return JSONResponse(content=result)
 
     return app
+
+
+def parse_args(argv=None):
+    """解析命令行参数（``python -m katago_service.server``）。
+
+    引擎路径与令牌都可以省略：留空时回落到环境变量 ``KATAGO_EXE`` / ``KATAGO_MODEL`` /
+    ``KATAGO_CONFIG`` / ``KATAGO_SERVICE_TOKEN``（见 ``build_app``）。
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m katago_service.server",
+        description="KataGo 云服务：常驻 analysis 引擎，对外提供 /health 与 /analyze",
+    )
+    parser.add_argument("--port", type=int, default=8100, help="监听端口（默认 8100）")
+    parser.add_argument("--token", default="", help="Bearer 令牌；留空＝不校验（仅限本机回环调试）")
+    parser.add_argument("--katago-exe", dest="katago_exe", default="", help="katago 可执行文件路径")
+    parser.add_argument("--model", default="", help="KataGo 模型文件路径")
+    parser.add_argument("--config", default="", help="KataGo analysis 配置文件路径")
+    parser.add_argument("--analysis-threads", dest="analysis_threads", type=int, default=1,
+                        help="引擎分析线程数（默认 1）")
+    return parser.parse_args(argv)
+
+
+def build_app(args) -> FastAPI:
+    """按命令行参数（含环境变量兜底）装配服务应用。
+
+    参数名与 ``_build_proc`` 读的键名并不一致（``--katago-exe`` 的 dest 是 ``katago_exe``，
+    引擎读的键却是 ``exe``），所以这里**显式映射**——直接把 argparse 的 namespace 当 cfg
+    传进 ``create_app`` 会在启动时抛「cfg 缺少引擎路径：exe」。
+
+    空字符串一律按「没传」处理：``run_server.bat`` 会把可能为空的环境变量直接当参数传进来。
+    """
+    cfg = {
+        "exe": args.katago_exe or os.environ.get("KATAGO_EXE", ""),
+        "model": args.model or os.environ.get("KATAGO_MODEL", ""),
+        "config": args.config or os.environ.get("KATAGO_CONFIG", ""),
+        "analysis_threads": args.analysis_threads,
+    }
+    token = args.token or os.environ.get("KATAGO_SERVICE_TOKEN", "")
+    return create_app(token=token, cfg=cfg)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    _args = parse_args()
+    # 只监听回环（与 backend/app/main.py 一致）：跨机部署时由内网/TLS 反代对外暴露
+    print("[KataGo服务] 启动 http://127.0.0.1:%d（analysis-threads=%d）"
+          % (_args.port, _args.analysis_threads))
+    uvicorn.run(build_app(_args), host="127.0.0.1", port=_args.port)
