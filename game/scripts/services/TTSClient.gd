@@ -1,33 +1,32 @@
 class_name TTSClient
 extends Node
-## TTS 客户端：请求 OpenAI 兼容的语音服务（`/v1/audio/speech`），只做「文本 → 音频字节 → 播放」；
-## 合成在服务端完成，本进程只负责排队、预取与播放，不再拉起任何本地服务。
+## 语音**播放器**（计划 05）：合成、切句、清洗全在后端，前端只按 `speech` 指令出声。
+##
+## 两个入口（都由 Main 接到 `speech` 事件后调用，各带回该条语音的 `seq`）：
+##   `play_audio(bytes, seq)`  —— 播放 `GET /api/tts/audio/{id}` 取回的音频（WAV/MP3）
+##   `speak_system(text, seq)` —— 让 Windows 系统语音念后端给的**清洗过的**文本（合成不可用时的降级指令）
+## 两者都返回**分组号 group**：一条台词的语音只发一次 `utterance_started(group)`（`seq` 用于配对校验与日志）。
+##
+## 这里**不再**做：文本清洗、按句分块、任何合成请求、本地服务探测、自动降级
+## （降级现在由后端直接发 `mode="system"` 的 `speech` 指令表达）。
+## 音画同步仍在 Main：`ai_move` 那条语音开始播放（`utterance_started`）时它才去 `POST /api/reveal`。
 
 signal status(text: String)
-signal auto_fallback(kind: String)     # 语音服务连不上时临时降级（不写配置）
 signal speaking_changed(on: bool)      # 开始/结束朗读（化身说话时歪头用）
-signal utterance_started(group: int)   # 一条消息的音频开始播放（group=speak() 的分组号；0=试听）
-signal speech_skipped(group: int)      # 跳过朗读（队列溢出或被取消）：文字照常显示，只是没有声音
+signal utterance_started(group: int)   # 一条台词的语音开始播放（group=play_audio/speak_system 的返回值；0=试听）
+signal speech_skipped(group: int)      # 这条语音不会再响（音频坏了 / 队列溢出 / 被停）：文字照常显示，只是没声音
 
 const QUEUE_MAX := 3
-const FAIL_COOLDOWN := 6.0
-const MAX_CHARS := 300
+const FAIL_COOLDOWN := 6.0             # 系统语音起不来之后缓一缓，别每帧重试
 const FILLER_FORCE_GAP_MS := 4000      # 任意两个语气词之间的最小间隔（force 也不能贴脸连播，防多路叠着响）
 const FILLER_THINK_GAP_MS := 1500      # 上一声是「思考声」时：情绪声可以更快接上（情绪优先）
-const FILLER_DIR := "res://assets/voice"   # 预制情绪语气词：填补合成等待的空白
+const FILLER_DIR := "res://assets/voice"   # 预制情绪语气词：填补等语音的空白
 const FILLER_COOLDOWN_MS := 9000           # 自动插话的最小间隔（避免一直「嗯……」）
 const THINK_FILLER_PER_TURN := 1           # 每次玩家互动后 think 语气词上限（一回合最多「嗯……」一次，别反复）
-var slow_chunk_chars := 100          # 慢引擎单次请求的字数上限（右侧栏「长句合并」开关：关=100/开=160）
-const HTTP_TIMEOUT_FAST := 60.0      # 轻量引擎（melo）/ 系统语音：很快就回
-const HTTP_TIMEOUT_SLOW := 240.0     # CosyVoice 系列 CPU 很慢：给足时间，别像以前那样 60 秒就被丢弃
-## 讲话时要丢掉的装饰：emoji、箭头/符号、半角假名颜文字等
-const _DROP_RE := "[\\x{1F000}-\\x{1FAFF}\\x{2190}-\\x{2BFF}\\x{FE00}-\\x{FE0F}\\x{2600}-\\x{27BF}\\x{FF61}-\\x{FF9F}\\x{30FB}\\x{FF65}\\x{2000}-\\x{200F}\\x{0370}-\\x{03FF}]"
 
-## 朗读方式：system=Windows 系统语音（零配置可用）；openai=OpenAI 兼容服务（云端 /v1/audio/speech）
+## 朗读方式：只是**本地镜像**（用户在下拉框选的意图），用来判断「要不要缩短导演层犹豫节拍」；
+## 真正走哪条路由后端按其配置决定（`speech` 事件里的 `mode`）。
 var mode := "openai"
-var base_url := "https://api.openai.com/v1"
-var model := "tts-1"
-var api_key := ""            # 云端 OpenAI 兼容 TTS：非空则发送 Authorization: Bearer <key>
 var voice := "中文女"
 var speed := 1.0
 var pitch := 1.0              # 播放层音调：直接改播放速率（会略带动语速）
@@ -36,33 +35,16 @@ var volume := 1.0
 var enabled := false
 
 var _sapi_pid := -1          # 系统语音的子进程
-var _last_url := ""
 var _speaking := false
-var _prefer_mode := ""       # 临时降级前的引擎模式（语音服务恢复后自动切回）
-var _recover_at := 0         # 下次探测服务可用性的时刻（ms）
-var _probing := false        # 在途请求是否为「恢复探测」
-var _http_busy := false      # Godot 的 HTTPRequest 同时只能有一个请求，单独跟踪避免 ERR_BUSY
-var _http_since := 0
-
-var _http: HTTPRequest = null
-var _player: AudioStreamPlayer = null
-var _busy := false
 var _cooldown := 0.0
-var _base_ready := false
-var _next_stream: AudioStream = null   # 边播边合成的下一句（预取），消除句间空白/卡住
-var _queue: Array[Dictionary] = []     # 朗读队列：{text, group, start, kind}；group 保证「一条消息一次 utterance_started」
-var _group_seq := 0                    # 消息分组号（每次 speak() 自增）
-var _req_group := 0                    # 在途合成请求属于哪一组
-var _req_start := false                # 在途请求是否为该组的第一块
-var _req_kind := ""                    # 在途请求的类型（""=对局发言；"idle"=走神搭话，可被取消）
-var _req_text := ""                    # 在途请求的文本（连接失败时回队重试用，不再丢句）
-var _next_group := 0                   # 预取流所属分组
-var _next_start := false
-var _next_kind := ""                   # 预取流的类型
-var _play_kind := ""                   # 正在播放的声音类型
-var _drop_result := false              # 在途请求的结果已作废（取消走神搭话）：到达时直接丢弃
-var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think / pat）
-var allow_fillers := true              # 是否允许自动插语气词：只在对局互动中允许，闲置搭话/开场问候不插（Main 控制）
+var _group_seq := 0          # 语音分组号：每次 play_audio/speak_system 自增（一条台词一个）
+var _play_group := 0         # 正在播的那条的分组号（0 = 试听/无分组）；停掉时用它补一条 speech_skipped
+var _play_kind := ""         # 正在播放的声音类型（""=对局发言；"idle"=走神搭话，可被取消）
+
+var _player: AudioStreamPlayer = null
+var _queue: Array[Dictionary] = []      # 朗读队列：{stream|text, group, seq, start, kind, system}
+var fillers: Dictionary = {}            # kind → Array[AudioStream]（surprise / happy / puzzle / think / pat）
+var allow_fillers := true               # 是否允许自动插语气词：只在对局互动中允许，闲置搭话/开场问候不插（Main 控制）
 var _filler_player: AudioStreamPlayer = null
 var _filler_last_ms := 0               # 上次插语气词的时刻（冷却用）
 var _filler_last_kind := ""            # 上次语气词的类型（情绪声可优先接在「思考声」后、并可打断它）
@@ -70,10 +52,6 @@ var _filler_last_idx := {}             # kind → 上次播的序号（避免同
 var think_filler_budget := 0           # 本回合剩余可自动插的 think 语气词次数（Main 在玩家互动时重置）
 
 func _ready() -> void:
-	_http = HTTPRequest.new()
-	_http.timeout = 60.0
-	add_child(_http)
-	_http.request_completed.connect(_on_done)
 	_player = AudioStreamPlayer.new()
 	add_child(_player)
 	_player.finished.connect(_on_spoken)
@@ -118,8 +96,8 @@ func play_filler(kind: String, force := false) -> void:
 		return
 	if not force and kind == "think" and think_filler_budget <= 0:
 		return                                       # 本回合的 think 语气词额度用完了（「让我看看…有一次就行」）
-	if _speaking or _next_stream != null:
-		return                                       # 她正在正式朗读：语气词一律让位
+	if is_speaking():
+		return                                       # 她正在正式朗读（或还有语音排着）：语气词一律让位
 	var now := Time.get_ticks_msec()
 	var can_cut_think := force and _filler_player.playing and _filler_last_kind == "think"
 	if _filler_player.playing and not can_cut_think:
@@ -152,8 +130,8 @@ func begin_filler_turn() -> void:
 func set_mood_pitch(p: float) -> void:
 	mood_pitch = clampf(p, -0.15, 0.15)
 
-## 播放预制欢迎语音（assets/voice/welcome_<名字>.wav）：开场问候零等待，不必等引擎合成。
-## 有对应文件才播并返回 true（调用方据此把文字直接显示）；否则返回 false，走普通语音流程。
+## 播放预制欢迎语音（assets/voice/welcome_<名字>.wav）：开场问候零等待，不必等合成。
+## 有对应文件才播并返回 true（调用方据此把文字直接显示）；否则返回 false，走普通流程。
 func play_welcome(name: String) -> bool:
 	if not enabled or _player == null:
 		return false
@@ -162,7 +140,7 @@ func play_welcome(name: String) -> bool:
 		return false
 	var res := FILLER_DIR.path_join("welcome_%s.wav" % key)
 	if not ResourceLoader.exists(res):
-		push_warning("[TTS] 预制欢迎语音缺失：%s（退回普通合成）" % res)
+		push_warning("[TTS] 预制欢迎语音缺失：%s（退回普通流程）" % res)
 		return false
 	var st := load(res)
 	if not (st is AudioStream):
@@ -173,111 +151,77 @@ func play_welcome(name: String) -> bool:
 	print("[TTS] 播放预制欢迎语音：%s" % res)
 	return true
 
-## 一句话播完：无缝接上预取的下一句；没有预取时才算整段读完
-func _on_spoken() -> void:
-	if _next_stream != null:
-		var s := _next_stream
-		var g := _next_group
-		var st := _next_start
-		var k := _next_kind
-		_next_stream = null
-		_next_kind = ""
-		_play_stream(s, g, st, k)                   # 下一句已合成好：立刻接着读，不留空白
-		_pump()                                     # 顺便继续预取再下一句
-		return
-	_play_kind = ""
-	_set_speaking(false)
-	status.emit("朗读完成")
-	_pump()
+# ================= 外部入口（由 Main 的 _on_speech_event 调用） =================
 
-## 退出时别把正在朗读的系统语音进程留成孤儿
-func _exit_tree() -> void:
-	if _sapi_pid > 0:
-		OS.kill(_sapi_pid)          # 无条件杀，is_process_running 有时已追不到子进程
-	_sapi_pid = -1
-
-func _process(delta: float) -> void:
-	if _http_busy and Time.get_ticks_msec() - _http_since > int((_http.timeout + 20.0) * 1000.0):
-		if _http != null:
-			_http.cancel_request()               # 卡死保护：超过请求超时阈值 20 秒仍未回包就取消
-		_http_busy = false
-		_busy = false
-		_cooldown = FAIL_COOLDOWN
-		_set_speaking(false)
-		status.emit("TTS 服务超时，已取消本次朗读")
-	if _cooldown > 0.0:
-		_cooldown -= delta
-		if _cooldown <= 0.0 and not _queue.is_empty():
-			_pump()                              # 冷却结束后继续读队列里剩下的句子
-	elif mode == "system" and _sapi_pid > 0 and not OS.is_process_running(_sapi_pid):
-		_sapi_pid = -1
-		_on_spoken()                             # 系统语音：本句读完，接着读下一句
-	if _prefer_mode != "" and not _http_busy and not _busy and Time.get_ticks_msec() >= _recover_at:
-		_probe_service()                         # 临时降级中：定期探测语音服务是否恢复
-	# 合成等待超过 1.6 秒又没在出声：插一句预制语气词，别让等待显得像卡住
-	if _http_busy and not _speaking and _next_stream == null and Time.get_ticks_msec() - _http_since > 1600:
-		play_filler("think")
-
-## 用户手动改了设置：取消「自动切回」状态
-func clear_fallback() -> void:
-	_prefer_mode = ""
-
-## 探测语音服务是否就绪；就绪则从系统语音兜底切回原引擎
-func _probe_service() -> void:
-	# OpenAI 兼容服务（含云端）：探标准 /models；只要服务在线就会有 HTTP 响应
-	var url := base_url.strip_edges().rstrip("/") + "/models"
-	_http.timeout = 4.0
-	_probing = true
-	_http_busy = true
-	_http_since = Time.get_ticks_msec()
-	if _http.request(url) != OK:
-		_probing = false
-		_http_busy = false
-		_recover_at = Time.get_ticks_msec() + 15000
-
-## 排队朗读一句（Azure 的话）。正在朗读时最多再排 3 句，避免越说越滞后。
-## kind 标记消息类型（""=对局发言；"idle"=走神搭话）：走神搭话可在玩家回来后整类取消（cancel_kind）
-func speak(text: String, kind := "") -> int:
-	if not enabled:
-		return 0
-	var t := clean_for_speech(text)
-	if t == "":
-		return 0
+## 播放一段后端取回的音频。`seq` 是这条语音在它所属回合内的序号（配对校验 / 日志用）。
+## 解析不了（既不是可用的 WAV 也不是 MP3）时**不静默卡住**：按「这条语音不会再响」处理——
+## 补发 `speech_skipped(group)` 让调用方把文字照常显示，并在状态栏给一条可读提示。
+## `kind` 沿用既有语义（""=对局发言；"idle"=走神搭话），让 `cancel_kind("idle")` 仍能整类作废。
+func play_audio(bytes: PackedByteArray, seq: int, kind := "") -> int:
 	_group_seq += 1
 	var g := _group_seq
-	_enqueue(t, g, kind)
+	var stream := _make_stream(bytes)
+	if stream == null:
+		print("[TTS] 音频无法解析：%d 字节（seq=%d）" % [bytes.size(), seq])
+		status.emit("这段语音的音频无法解析（%d 字节），改为只显示文字" % bytes.size())
+		speech_skipped.emit.call_deferred(g)
+		return g
+	_queue.append({"stream": stream, "group": g, "seq": seq, "start": true,
+			"kind": kind, "system": false})
+	_enforce_cap()
 	_pump()
 	return g
 
-## 是否还在忙（合成中/排队中/正在播放）。「同步说话」用它判断文字该等语音，还是直接显示。
-func is_speaking() -> bool:
-	return _speaking or _busy or _http_busy or _next_stream != null or not _queue.is_empty()
+## 交给 Windows 系统语音朗读一段（后端给的是清洗后的文本，这里**不再做任何清洗**）。
+## 文本为空 / PowerShell 起不来时同样补 `speech_skipped`，让文字照常显示。
+func speak_system(text: String, seq: int, kind := "") -> int:
+	_group_seq += 1
+	var g := _group_seq
+	if text.strip_edges() == "":
+		status.emit("这条语音没有可念的文本，改为只显示文字")
+		speech_skipped.emit.call_deferred(g)
+		return g
+	_queue.append({"text": text, "group": g, "seq": seq, "start": true,
+			"kind": kind, "system": true})
+	_enforce_cap()
+	_pump()
+	return g
 
+## 队列上限（沿用既有口径：系统语音最紧，慢引擎多留一块）——说话不能越排越滞后。
+func _queue_cap() -> int:
+	return QUEUE_MAX if mode == "system" else (4 if is_slow_engine() else 3)
+
+## 队列满了丢**最旧**的：丢的那条不会再响，补发 speech_skipped 让它的文字照常显示。
+func _enforce_cap() -> void:
+	var cap := _queue_cap()
+	while _queue.size() > cap:
+		var old: Dictionary = _queue.pop_front()
+		if bool(old.get("start", false)):
+			speech_skipped.emit.call_deferred(int(old["group"]))
+
+## 是否还有语音没播完（播放中 / 排着队）。「同步说话」与棋盘锁用它判断她是不是还在说。
+## 注意：合成在途（后端正在合成、音频还没到前端）不在这个口径里 —— Main 另行统计配对表。
+func is_speaking() -> bool:
+	return _speaking or not _queue.is_empty()
+
+## 停掉所有朗读（文字不会跟着消失：排着队的首块 + 正在播的那条都补发 speech_skipped）
 func stop() -> void:
-	# 被停掉的消息只是没有声音，文字不能跟着消失：补发 speech_skipped 让调用方照常显示
 	for it in _queue:
 		if bool(it.get("start", false)):
 			speech_skipped.emit.call_deferred(int(it["group"]))
 	_queue.clear()
-	_next_stream = null
-	_next_kind = ""
+	if _play_group > 0:                      # 正在播的那条被停掉了：调用方据此收账（文字照常显示）
+		speech_skipped.emit.call_deferred(_play_group)
+		_play_group = 0
 	if _player != null and _player.playing:
 		_player.stop()
-	if _http_busy and _http != null:
-		_http.cancel_request()          # 取消在途请求，否则下一次 request 会报 Busy
-	_http_busy = false
 	if _sapi_pid > 0:
 		OS.kill(_sapi_pid)
 	_sapi_pid = -1
-	_busy = false
-	_req_kind = ""
 	_play_kind = ""
-	_drop_result = false
 	_set_speaking(false)
 
-## 取消某一类（如 "idle"=走神搭话）尚未说完的语音：清队列、弃预取、停当前播放、丢弃在途合成结果。
-## 在途 HTTP 请求不强行 cancel_request（服务端推理串行、无法真打断，取消反而有回调竞态），
-## 只打「结果作废」标记，等它回来时丢弃并继续后面的队列。返回是否取消到了东西。
+## 取消某一类（如 "idle"=走神搭话）尚未说完的语音：清队列、停当前播放。返回是否取消到了东西。
 func cancel_kind(kind: String) -> bool:
 	if kind == "":
 		return false
@@ -289,16 +233,8 @@ func cancel_kind(kind: String) -> bool:
 		else:
 			kept.append(it)
 	_queue = kept
-	if _next_stream != null and _next_kind == kind:   # 预取的那一段也属于被取消的消息
-		_next_stream = null
-		_next_kind = ""
-		_next_start = false
-		hit = true
-	if _http_busy and _req_kind == kind:              # 正在合成的就是它：结果回来时直接丢
-		_drop_result = true
-		hit = true
 	if _play_kind == kind:                            # 正在播：停掉（stop() 不触发 finished，手动收尾）
-		if mode == "system" and _sapi_pid > 0:
+		if _sapi_pid > 0:
 			OS.kill(_sapi_pid)
 			_sapi_pid = -1
 		if _player != null and _player.playing:
@@ -310,90 +246,9 @@ func cancel_kind(kind: String) -> bool:
 		_pump()                                       # 若队列里还有别的（玩家互动的新回复），立刻接着来
 	return hit
 
-## 试听（忽略队列与开关，直接读一句）
-func preview(text: String) -> void:
-	var t := clean_for_speech(text)
-	if t == "":
-		t = "嗯~ 我是 Azure，很高兴见到你。"
-	stop()
-	_queue.push_front({"text": t, "group": 0, "start": true, "kind": ""})   # group=0：试听，不触发文字显示
-	_pump(true)
-
-## 文本 → 适合朗读的句子：去装饰/表情/括号标题，合并空白，限长
-func clean_for_speech(text: String) -> String:
-	var re := RegEx.new()
-	var s := text.replace("**", "").replace("📊", "").replace("📋", "")
-	if re.compile(_DROP_RE) == OK:
-		s = re.sub(s, "", true)
-	s = s.replace("【", "，").replace("】", "，")
-	s = s.replace("()", "").replace("（）", "")          # 颜文字被清空后剩下的空括号
-	s = " ".join(s.split("\n", false))
-	while s.contains("  "):
-		s = s.replace("  ", " ")
-	s = s.strip_edges()
-	if s.length() > MAX_CHARS:
-		s = s.substr(0, MAX_CHARS) + "…"
-	return s
-
-## 长句拆成小句；短句整体保留（避免把「嗯」这种碎成单句）
-static func _split_sentences(text: String) -> Array[String]:
-	var out: Array[String] = []
-	if text.length() <= 18:
-		out.append(text)
-		return out
-	var cur := ""
-	for i in text.length():
-		var ch := text[i]
-		cur += ch
-		if ch in ["。", "！", "？", "；", "…", "!", "?", ";", ".", "\n"]:
-			var s := cur.strip_edges()
-			if s != "":
-				out.append(s)
-			cur = ""
-	var tail := cur.strip_edges()
-	if tail != "":
-		out.append(tail)
-	# 纯标点的碎片（如「...」被拆出来的「.」）并回前一句，别当成独立句子发出去
-	var merged: Array[String] = []
-	for p in out:
-		if _has_word(p):
-			merged.append(p)
-		elif not merged.is_empty():
-			merged[merged.size() - 1] += p
-	if merged.is_empty():
-		merged.append(text)
-	return merged
-
-## 这段文本里是否含有「实字」（非标点/空白）；纯标点碎片不值得单独送去合成
-static func _has_word(s: String) -> bool:
-	for i in s.length():
-		var c := s[i]
-		if not (c in ["。", "！", "？", "；", "…", "!", "?", ";", ".", "\n", "，", ",", "、", "~", " "]):
-			return true
-	return false
-
-## 慢引擎分块：按整句合并，每块不超过 slow_chunk_chars 字。
-## 关键：不把一句话从标点中间切开——短消息会合成「一整块」，一次请求就连续读完整句。
-func _chunk_for_slow(text: String) -> Array[String]:
-	var sents := _split_sentences(text)
-	var out: Array[String] = []
-	var cur := ""
-	for s in sents:
-		if cur == "":
-			cur = s
-		elif cur.length() + s.length() <= slow_chunk_chars:
-			cur += s
-		else:
-			out.append(cur)
-			cur = s
-	if cur != "":
-		out.append(cur)
-	if out.is_empty():
-		out.append(text)
-	return out
-
 ## 是否为慢速神经网络引擎（自建 CosyVoice 的克隆/预设音色；melo 与系统语音不算）。
-## 导演层也用它判断犹豫节拍时长：慢引擎缩短犹豫，避免雪上加霜。
+## 合成已归后端，这里只剩「按音色估计引擎快慢」这一条纯函数语义：
+## 导演层用它判断犹豫节拍时长（慢引擎缩短犹豫，避免雪上加霜）。
 func is_slow_engine() -> bool:
 	if mode == "system":
 		return false
@@ -410,85 +265,59 @@ func _set_speaking(v: bool) -> void:
 	_speaking = v
 	speaking_changed.emit(v)
 
-## 分块并入朗读队列（speak 的入队实现）。慢引擎按「整句」合并成较大的块；
-## 队列满了丢最旧的——丢的若是某条消息的首块，说明这条再也不会开口，补发 speech_skipped
-## 让它的文字照常显示，并把该消息剩余的分块一并清掉（避免无文字配半截语音）。
-func _enqueue(text: String, group: int, kind: String) -> void:
-	var pieces: Array[String] = []
-	if is_slow_engine():
-		pieces = _chunk_for_slow(text)
-	else:
-		pieces.append(text)
-	var cap := QUEUE_MAX if mode == "system" else (4 if is_slow_engine() else 3)
-	if pieces.size() > cap:                          # 太长的消息只念前几句
-		pieces.resize(cap)
-	while _queue.size() > cap - pieces.size():
-		var old: Dictionary = _queue.pop_front()
-		if bool(old.get("start", false)):
-			var g := int(old["group"])
-			var kept: Array[Dictionary] = []
-			for it in _queue:
-				if int(it.get("group", -1)) != g:
-					kept.append(it)
-			_queue = kept
-			speech_skipped.emit.call_deferred(g)
-	for i in pieces.size():
-		# 同一条消息的所有分块共用一个 group；只有第一块标记 start=true
-		_queue.append({"text": pieces[i], "group": group, "start": i == 0, "kind": kind})
+## 一句话播完：接着读队列里的下一句
+func _on_spoken() -> void:
+	_play_kind = ""
+	_play_group = 0
+	_set_speaking(false)
+	status.emit("朗读完成")
+	_pump()
 
-func _pump(force := false) -> void:
-	if _busy or _http_busy or _queue.is_empty():
+## 退出时别把正在朗读的系统语音进程留成孤儿
+func _exit_tree() -> void:
+	if _sapi_pid > 0:
+		OS.kill(_sapi_pid)          # 无条件杀，is_process_running 有时已追不到子进程
+	_sapi_pid = -1
+
+func _process(delta: float) -> void:
+	if _cooldown > 0.0:
+		_cooldown -= delta
+		if _cooldown <= 0.0 and not _queue.is_empty():
+			_pump()                              # 冷却结束后继续读队列里剩下的
+	elif _sapi_pid > 0 and not OS.is_process_running(_sapi_pid):
+		_sapi_pid = -1
+		_on_spoken()                             # 系统语音：本句读完，接着读下一句
+
+## 出队一条并开播（播放中 / 队列空 / 冷却中都不动）
+func _pump() -> void:
+	if _speaking or _queue.is_empty() or _cooldown > 0.0:
 		return
-	if not force and (not enabled or _cooldown > 0.0):
-		return
-	if mode == "system":
-		if _sapi_pid > 0 and OS.is_process_running(_sapi_pid):
-			return                               # 上一句还在读
-		var item0: Dictionary = _queue.pop_front()
-		_speak_system(str(item0["text"]), int(item0["group"]), bool(item0["start"]), str(item0.get("kind", "")))
-		return
-	if _next_stream != null:
-		return                                   # 已预取下一句：等它播完再合成，避免堆积
-	_ensure_base()
-	_http.timeout = HTTP_TIMEOUT_SLOW if is_slow_engine() else HTTP_TIMEOUT_FAST
 	var item: Dictionary = _queue.pop_front()
-	var text := str(item["text"])
-	_req_group = int(item["group"])
-	_req_start = bool(item["start"])
-	_req_kind = str(item.get("kind", ""))
-	_req_text = text                             # 记录在途文本：连接失败可回队重试，不再丢句
-	_busy = true
-	# OpenAI 兼容 /v1/audio/speech
-	var headers := _with_auth(PackedStringArray(["Content-Type: application/json"]))
-	var payload := JSON.stringify({
-		"model": model, "input": text, "voice": voice,
-		"speed": speed, "response_format": "mp3",
-	})
-	_last_url = _endpoint()
-	_http_busy = true
-	_http_since = Time.get_ticks_msec()
-	var err := _http.request(_last_url, headers, HTTPClient.METHOD_POST, payload)
-	if err != OK:
-		_busy = false
-		_http_busy = false
-		_cooldown = FAIL_COOLDOWN
-		print("[TTS] 请求无法发出：%s  URL=%s" % [error_string(err), _last_url])
-		status.emit("TTS 请求发送失败（%s）：%s" % [error_string(err), _last_url])
-	elif is_slow_engine():
-		# 慢引擎（自建 CosyVoice）：让用户知道正在合成、大概要等多久，消除「文字出了但没声音」的割裂感
-		status.emit("Azure 正在开口…（本句合成中，约 %d 秒）" % int(ceil(text.length() * 1.2)))
+	if bool(item.get("system", false)):
+		_speak_system(str(item.get("text", "")), int(item["group"]),
+				bool(item.get("start", true)), str(item.get("kind", "")))
+		return
+	_play_stream(item["stream"], int(item["group"]), bool(item.get("start", true)),
+			str(item.get("kind", "")))
 
-func _endpoint() -> String:
-	return base_url.rstrip("/") + "/audio/speech"
+## 播放一段音频（统一入口：音量/音调/状态）
+func _play_stream(stream: AudioStream, group: int, start: bool, kind := "") -> void:
+	if _filler_player != null and _filler_player.playing:
+		_filler_player.stop()            # 正式朗读开始：语气词让位
+	_player.stream = stream
+	_player.volume_db = linear_to_db(clampf(volume, 0.01, 2.0))
+	_player.pitch_scale = clampf(pitch + mood_pitch, 0.5, 2.0)
+	_player.play()
+	_play_kind = kind
+	_play_group = group if start else 0
+	_set_speaking(true)
+	if start:
+		# 延到本帧末再报「这条开始播了」：调用方（Main）先把分组号记进配对表
+		utterance_started.emit.call_deferred(group)
+	status.emit("正在朗读…")
 
-## 云端 OpenAI 兼容 TTS：填了 api_key 就带 Bearer（留空则不发送）
-func _with_auth(h: PackedStringArray) -> PackedStringArray:
-	var key := api_key.strip_edges()
-	if key != "":
-		h.append("Authorization: Bearer " + key)
-	return h
-
-## Windows 系统语音（零配置兜底）：用 PowerShell 调 SAPI 朗读，子进程异步跑
+## Windows 系统语音（零配置兜底）：用 PowerShell 调 SAPI 朗读，子进程异步跑。
+## 文本由后端清洗好传来，这里**不再清洗**（语气标记在后端就剥干净了）。
 func _speak_system(text: String, group: int, start: bool, kind := "") -> void:
 	var s := text.replace("'", "''").replace("\"", "")
 	var rate := int(round(clampf((speed - 1.0) * 5.0, -8.0, 8.0)))
@@ -513,102 +342,16 @@ func _speak_system(text: String, group: int, start: bool, kind := "") -> void:
 		_sapi_pid = -1
 		_cooldown = FAIL_COOLDOWN                # 失败后缓一缓，避免每帧重试
 		_set_speaking(false)
-		status.emit("系统语音不可用（无法启动 PowerShell）")
+		status.emit("系统语音不可用（无法启动 PowerShell），这条改为只显示文字")
+		if start:
+			speech_skipped.emit.call_deferred(group)
 	else:
 		_play_kind = kind
+		_play_group = group if start else 0
 		_set_speaking(true)
 		if start:
-			utterance_started.emit.call_deferred(group)   # 延到本帧末：调用方先把待显示文字入队
+			utterance_started.emit.call_deferred(group)   # 延到本帧末：调用方先把这条的分组号记好
 		status.emit("正在朗读…（系统语音）")
-
-## Godot 只把 localhost 解析为 IPv6，自建服务多监听 IPv4，统一改写成 127.0.0.1
-func _ensure_base() -> void:
-	if _base_ready:
-		return
-	_base_ready = true
-	if base_url.contains("://localhost"):
-		base_url = base_url.replace("://localhost", "://127.0.0.1")
-
-func _on_done(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
-	_busy = false
-	_http_busy = false
-	if _probing:                                     # 恢复探测的结果
-		_probing = false
-		# 服务在线即视为恢复：200 最佳；云端 TTS 的 /models 可能返回 401/404，只要 <500 就说明链路已通
-		var back := result == HTTPRequest.RESULT_SUCCESS and code > 0 and code < 500
-		if back and _prefer_mode != "":
-			mode = _prefer_mode
-			_prefer_mode = ""
-			status.emit("语音服务已恢复，自动切回「%s」朗读" % mode)
-			_pump()
-		else:
-			_recover_at = Time.get_ticks_msec() + 15000
-		return
-	if _drop_result:                                 # 这次合成的内容（如走神搭话）已被取消：结果直接丢
-		_drop_result = false
-		_pump()
-		return
-	if result != HTTPRequest.RESULT_SUCCESS or code != 200:
-		var conn_failed := result == HTTPRequest.RESULT_CANT_CONNECT or result == HTTPRequest.RESULT_CONNECTION_ERROR \
-			or result == HTTPRequest.RESULT_CANT_RESOLVE
-		if conn_failed and mode != "system":
-			# 出队的这句先放回队首（原来会静默丢弃）
-			_queue.push_front({"text": _req_text, "group": _req_group, "start": _req_start, "kind": _req_kind})
-			# 服务连不上：临时改走系统语音，保证「有声音」，但不写回配置
-			_cooldown = 0.0
-			_prefer_mode = mode                       # 记住原引擎，服务就绪后自动切回
-			_recover_at = Time.get_ticks_msec() + 8000
-			mode = "system"
-			auto_fallback.emit("system")
-			_pump()
-			return
-		_cooldown = FAIL_COOLDOWN
-		_set_speaking(false)
-		var head := body.slice(0, mini(body.size(), 160)).get_string_from_utf8().replace("\n", " ").strip_edges()
-		var why := ""
-		if result == HTTPRequest.RESULT_TIMEOUT:
-			why = "合成超过 %d 秒仍未完成" % int(_http.timeout)
-		elif result != HTTPRequest.RESULT_SUCCESS:
-			why = error_string(result)
-		else:
-			why = "HTTP %d" % code
-		var msg := "TTS 无响应（%s）" % why
-		if head != "":
-			msg += " · " + head
-		print("[TTS] %s  URL=%s" % [msg, _last_url])
-		status.emit(msg)
-		_pump()
-		return
-	var stream := _make_stream(body)
-	if stream == null:
-		var sig := body.slice(0, mini(body.size(), 12))
-		print("[TTS] 音频无法解析：%d 字节，头部=%s  URL=%s" % [body.size(), sig, _last_url])
-		status.emit("TTS 返回的音频无法解析（%d 字节）" % body.size())
-		_pump()
-		return
-	if _player.playing:                              # 上一句还在播：先缓存，播完无缝接上
-		_next_stream = stream
-		_next_group = _req_group
-		_next_start = _req_start
-		_next_kind = _req_kind
-		_pump()                                      # 继续预取再下一句
-		return
-	_play_stream(stream, _req_group, _req_start, _req_kind)
-	_pump()                                          # 边播边合成下一句，消除句间停顿
-
-## 播放一段音频（统一入口：音量/音调/状态）
-func _play_stream(stream: AudioStream, group: int, start: bool, kind := "") -> void:
-	if _filler_player != null and _filler_player.playing:
-		_filler_player.stop()            # 正式朗读开始：语气词让位
-	_player.stream = stream
-	_player.volume_db = linear_to_db(clampf(volume, 0.01, 2.0))
-	_player.pitch_scale = clampf(pitch + mood_pitch, 0.5, 2.0)
-	_player.play()
-	_play_kind = kind
-	_set_speaking(true)
-	if start:
-		utterance_started.emit(group)
-	status.emit("正在朗读…")
 
 ## mp3（默认）或 16bit PCM wav（服务端可配）
 func _make_stream(b: PackedByteArray) -> AudioStream:

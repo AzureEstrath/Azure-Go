@@ -4,8 +4,10 @@ extends Node
 ##
 ## 对 Main.gd 暴露的信号与方法面（Main 的 agent.* 调用点只认这套契约）：
 ##   - 命令：REST POST（/api/move /api/hint /api/analyze /api/chat ... 见 docs）
-##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool / token / memory；连上先收 hello 同步）
+##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool / token / speech / memory；连上先收 hello 同步）
 ##     token 是可选（默认关闭）的流式增量：只影响气泡的显示过程，最终内容仍以 message 为准
+##     speech 是每条台词的**语音指令**（`mode=openai` 时按 id 去 GET /api/tts/audio/{id} 取音频；
+##     `mode=system` 时按 text 交给系统语音）——合成全在后端，前端只取音频 + 播放
 ##     memory 是长期记忆写入/召回的元数据：只记一行日志，不进台词、不产生任何信号
 ##
 ## 音画同步仍在客户端完成：`ai_move` 那条「落子宣告」的语音开始时，Main 调 reveal_move()，
@@ -25,6 +27,10 @@ signal tool_event(payload: Dictionary)
 ## 流式增量（可选、默认关闭：后端 `stream_tokens` 开启时才会收到这个事件）
 ## `turn_id` 标识同一轮发言，`delta` 是这一块新增的文字；最终内容一律以 `message` 为准
 signal token_event(turn_id: String, delta: String)
+## 云端语音指令（计划 05）：紧随对应的 `message` 之后到达，`turn_id`+`seq` 标识它与哪条台词配对。
+## `mode=openai` 时用 `id` 去 GET /api/tts/audio/{id} 取音频；`mode=system` 时用 `text` 交系统语音。
+## 合成全在后端，前端不再自行合成——这里只把原样 payload 转给 Main。
+signal speech_event(payload: Dictionary)
 ## 连接状态提示（Main 接到状态栏）
 signal net_status(text: String, bad: bool)
 
@@ -143,6 +149,10 @@ func _handle_packet(raw: String) -> void:
 		"token":
 			# 流式增量（可选、默认关闭）：只喂气泡的显示过程，最终以 message 收口
 			token_event.emit(str(d.get("turn_id", "")), str(d.get("delta", "")))
+		"speech":
+			# 这条台词的语音指令（合成在后端）：Main 据此取音频 / 调系统语音，并把它与
+			# 待显示的那条台词配起来（turn_id + seq）
+			speech_event.emit(_without_type(d))
 		"memory":
 			# 长期记忆的写入 / 召回：元数据（不是台词）——只记一行日志，不产生任何界面信号
 			print("[NetClient] memory op=%s tag=%s score=%s text=%s" % [
@@ -219,3 +229,24 @@ func _post(path: String, body: Dictionary = {}) -> void:
 			["Content-Type: application/json"], HTTPClient.METHOD_POST, JSON.stringify(body))
 	if err != OK:
 		req.queue_free()
+
+## 取一次响应体（GET 音频 / POST 试听合成）。与 _post 的「发完不管」不同，这里把结果交给回调：
+## `callback(ok: bool, code: int, body: PackedByteArray)`，只有 HTTP 2xx 才算 ok。
+## 连请求都发不出去（err != OK）时**立即**回调失败，不让调用方干等超时；节点用完自释放。
+## `timeout` 用秒（默认 POST_TIMEOUT）：试听要等后端合成，调用方可放宽。
+func fetch_bytes(path: String, method: int, body: Dictionary, callback: Callable,
+		timeout := POST_TIMEOUT) -> void:
+	var req := HTTPRequest.new()
+	req.timeout = timeout
+	add_child(req)
+	var payload := JSON.stringify(body) if method != HTTPClient.METHOD_GET else ""
+	req.request_completed.connect(func(result: int, code: int, _headers: PackedStringArray, data: PackedByteArray):
+		req.queue_free()
+		if callback.is_valid():
+			callback.call(result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300, code, data))
+	var err := req.request(_strip_slash(base_url) + path,
+			["Content-Type: application/json"], method, payload)
+	if err != OK:
+		req.queue_free()
+		if callback.is_valid():
+			callback.call(false, 0, PackedByteArray())
