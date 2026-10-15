@@ -2,6 +2,7 @@
 
 import math
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -82,6 +83,53 @@ class StoreTest(unittest.TestCase):
         self.assertIsInstance(store.write("还是能存进去", tag="t"), int)
         self.assertEqual(len(store.recall("存进去", k=1)), 1)
         store.close()
+
+    def test_mixed_db_keeps_vectorless_rows_recallable(self):
+        """向量行不得压掉关键词召回：没向量的行（写入时 embedding 失败 / 旧库遗留）也要找得到。"""
+        calls = {"fail": False}
+
+        def flaky(text):
+            """写入这一条时 embedding 恰好失败（返回 None）——该行没向量，其余照常。"""
+            if calls["fail"]:
+                return None
+            return fake_embed(text)
+
+        store = MemoryStore(os.path.join(self.dir.name, "mixed.db"), embed_fn=flaky)
+        try:
+            calls["fail"] = True
+            old_id = store.write("他喜欢乙乙乙的开局", tag="t")
+            calls["fail"] = False
+            new_id = store.write("布局喜欢点三三", tag="t2")
+            self.assertEqual(store.stats()["has_vectors"], 1)     # 旧行确实没向量
+
+            hits = store.recall("乙乙乙", k=3)                    # 向量命中不足 k 条 → 关键词补齐
+            ids = [h["id"] for h in hits]
+            self.assertIn(old_id, ids, "无向量的行照样关键词可达")
+            self.assertIn(new_id, ids, "有向量的行也在（向量优先）")
+            self.assertEqual([h["score"] for h in hits if h["id"] == old_id], [0.0])
+        finally:
+            store.close()
+
+    def test_legacy_db_is_migrated_in_place(self):
+        """旧库只有 ``memories(id, text)``：补表补列后写入 / 召回 / 统计 / 归档都得能用。"""
+        path = os.path.join(self.dir.name, "legacy.db")
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT)")
+        conn.execute("INSERT INTO memories(text) VALUES('旧库里的一句话：喜欢点三三')")
+        conn.commit()
+        conn.close()
+
+        store = MemoryStore(path, embed_fn=None)          # 关键词模式：旧行没有向量也能召回
+        try:
+            self.assertEqual((store.stats()["rows"], store.stats()["games"]), (1, 0))
+            hits = store.recall("点三三", k=3)
+            self.assertEqual([h["text"] for h in hits], ["旧库里的一句话：喜欢点三三"])
+            self.assertIsInstance(store.write("新写的一条", tag="t"), int)
+            self.assertEqual(store.stats()["rows"], 2)
+            self.assertIsInstance(store.save_game([["B", "Q16"]], "B+2.5", "布局平稳"), int)
+            self.assertEqual(store.stats()["games"], 1)
+        finally:
+            store.close()
 
 
 class MathTest(unittest.TestCase):

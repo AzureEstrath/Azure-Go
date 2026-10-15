@@ -74,5 +74,58 @@ class MemoryServiceTest(unittest.TestCase):
                                                       embed_model="emb", embed_api_key="k")))
 
 
+class EmbedTimeoutTest(unittest.TestCase):
+    """单次 embedding 超时按 ``embed_timeout`` 装配（默认 10 秒，运维可收紧）。"""
+
+    def _cfg(self, **kw):
+        class C:
+            embed_base_url = "https://e.example.com/v1"
+            embed_model = "emb"
+            embed_api_key = "k"
+            embed_timeout = 2.5
+        c = C()
+        for k, v in kw.items():
+            setattr(c, k, v)
+        return c
+
+    def _build(self, cfg):
+        from unittest import mock
+        from app import memory_service
+        seen = {}
+
+        class FakeEmbeddings:
+            def __init__(self, **kw):
+                seen.update(kw)
+
+            def embed_query(self, text):
+                return [0.0]
+
+        with mock.patch.object(memory_service, "OpenAIEmbeddings", FakeEmbeddings):
+            fn = memory_service.build_embed_fn(cfg)
+        return fn, seen
+
+    def test_configured_timeout_reaches_client(self):
+        fn, seen = self._build(self._cfg())
+        self.assertIsNotNone(fn)
+        self.assertEqual(seen["timeout"], 2.5)
+
+    def test_missing_or_bad_timeout_falls_back_to_default(self):
+        from app.memory_service import EMBED_TIMEOUT_SEC
+
+        class Legacy:                        # 旧配置对象（没有这个字段）
+            embed_base_url = "https://e.example.com/v1"
+            embed_model = "emb"
+            embed_api_key = "k"
+
+        cases = (("缺字段", Legacy()),
+                 ("0", self._cfg(embed_timeout=0)),
+                 ("负数", self._cfg(embed_timeout=-1)),
+                 ("脏值", self._cfg(embed_timeout="abc")))
+        for label, cfg in cases:
+            fn, seen = self._build(cfg)
+            self.assertIsNotNone(fn, label)
+            self.assertEqual(seen["timeout"], EMBED_TIMEOUT_SEC, label)
+
+
 if __name__ == "__main__":
     unittest.main()

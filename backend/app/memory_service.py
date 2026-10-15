@@ -21,7 +21,16 @@ from .memory import MemoryStore, inject_text
 DEFAULT_DB_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "memory.db")
 
-EMBED_TIMEOUT_SEC = 10.0        # 单次 embedding 超时（与工具层单次调用上限一致）
+EMBED_TIMEOUT_SEC = 10.0        # 单次 embedding 超时（与工具层单次调用上限一致）；配置 embed_timeout 可收紧
+
+
+def _embed_timeout(cfg) -> float:
+    """单次 embedding 超时：按 ``embed_timeout`` 收紧；缺字段 / 非正数 / 脏值退回 ``EMBED_TIMEOUT_SEC``。"""
+    try:
+        t = float(getattr(cfg, "embed_timeout", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return EMBED_TIMEOUT_SEC
+    return t if t > 0.0 else EMBED_TIMEOUT_SEC
 
 
 def build_embed_fn(cfg):
@@ -30,9 +39,9 @@ def build_embed_fn(cfg):
     返回 ``embed_fn(text) -> list[float]``，即 ``MemoryStore`` 的注入点；装配失败（地址非法等）
     也返回 ``None``：宁可降级成关键词检索，也不让记忆功能把服务拖垮。
 
-    两个刻意的参数：``max_retries=0`` 不让 SDK 重试拖住出话（与 ``llm_chain`` 同一理由）；
-    ``check_embedding_ctx_length=False`` 原样发文本、不猜 tokenizer——``embed_model`` 可能是
-    任意 OpenAI 兼容模型名，tiktoken 认不出来。
+    三个刻意的参数：``max_retries=0`` 不让 SDK 重试拖住出话（与 ``llm_chain`` 同一理由）；
+    ``timeout`` 取 ``embed_timeout``（默认 10 秒，可收紧）；``check_embedding_ctx_length=False``
+    原样发文本、不猜 tokenizer——``embed_model`` 可能是任意 OpenAI 兼容模型名，tiktoken 认不出来。
     """
     url = str(getattr(cfg, "embed_base_url", "") or "").strip()
     model = str(getattr(cfg, "embed_model", "") or "").strip()
@@ -44,7 +53,7 @@ def build_embed_fn(cfg):
             model=model,
             base_url=url,
             api_key=key,
-            timeout=EMBED_TIMEOUT_SEC,
+            timeout=_embed_timeout(cfg),
             max_retries=0,
             check_embedding_ctx_length=False,
         )

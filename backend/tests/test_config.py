@@ -72,5 +72,27 @@ class CloudKatagoConfigTest(unittest.TestCase):
         self.assertTrue(c.has_katago())
 
 
+class MemoryConfigTest(unittest.TestCase):
+    """长期记忆配置面：embedding 超时可收紧（默认 10 秒）。"""
+
+    def test_embed_timeout_default_and_round_trip(self):
+        self.assertEqual(AzureConfig().embed_timeout, 10.0)
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"embed_timeout": 2.5}, f)
+            self.assertEqual(AzureConfig.load(p).embed_timeout, 2.5)
+
+    def test_embed_timeout_bad_value_falls_back(self):
+        """脏值退回默认：不因一个旋钮把后端启动搞崩。"""
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"embed_timeout": "abc"}, f)
+            self.assertEqual(AzureConfig.load(p).embed_timeout, 10.0)
+
+
 if __name__ == "__main__":
     unittest.main()

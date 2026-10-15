@@ -36,6 +36,7 @@ class AzureConfig:
         self.embed_api_key = ""
         self.memory_top_k = 3               # 每次召回条数上限
         self.memory_max_inject_chars = 240  # 注入提示词的总字数上限（单条另截到 120 字）
+        self.embed_timeout = 10.0           # 单次 embedding 超时（秒）；可收紧，memory_service 用它装配云端客户端
         # —— 提示词自定义（留空则用内置 Azure 人设）——
         self.prompt_system = ""
         self.prompt_user_name = "Estarth"
@@ -97,6 +98,10 @@ class AzureConfig:
         self.embed_api_key = str(d.get("embed_api_key", self.embed_api_key))
         self.memory_top_k = max(0, int(d.get("memory_top_k", self.memory_top_k)))
         self.memory_max_inject_chars = max(0, int(d.get("memory_max_inject_chars", self.memory_max_inject_chars)))
+        try:
+            self.embed_timeout = max(0.0, float(d.get("embed_timeout", self.embed_timeout)))
+        except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把启动搞崩
+            self.embed_timeout = 10.0
         self.prompt_system = str(d.get("prompt_system", self.prompt_system))
         self.prompt_user_name = str(d.get("prompt_user_name", self.prompt_user_name))
         pn = d.get("prompt_phase_notes")

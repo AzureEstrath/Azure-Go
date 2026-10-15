@@ -6,8 +6,10 @@
 设计取舍：
 - **只用标准库**（``sqlite3`` + ``json``）：向量以 JSON 文本存库，余弦在 Python 里算，
   不引入 numpy / chroma / faiss——记忆规模上限 2000 条，这点计算量不值得加依赖。
-- **检索两级**：配了 ``embed_fn`` 就按余弦相似度排序；没配、或云端 embedding 报错
-  （401 / 超时）时降级为关键词匹配（score 固定 0.0，不伪造相似度）。
+- **检索两级**：配了 ``embed_fn`` 就按余弦相似度排序；**向量命中不足 ``k`` 条时，余量用关键词
+  从尚未命中的行里补齐**（混合库：写入时 embedding 失败或旧库遗留的无向量行，不会被有向量的
+  行压掉）；没配 ``embed_fn``、或云端 embedding 报错（401 / 超时）时整段降级为关键词匹配
+  （score 固定 0.0，不伪造相似度）。
 - **一切故障都不影响对局**：DB 打不开 / 不可写、embedding 抛异常都只打日志，
   写失败返回 ``None``、检索返回 ``[]``，绝不把异常抛回编排层。
 - **写入有硬上限**：单条 ``MAX_TEXT_LEN`` 字、同 tag + 同 text 去重、
@@ -295,7 +297,9 @@ class MemoryStore:
         """召回最相关的 ``k`` 条记忆，按 score 降序；任何故障返回 ``[]``。
 
         返回 ``[{"id","ts","kind","tag","text","score"}]``：有向量时 score 是余弦相似度，
-        降级到关键词时固定 0.0。
+        关键词命中固定 0.0。两级检索：向量先按余弦排序；**不足 ``k`` 条时**再用关键词从
+        尚未命中的行里补齐——混合库里没向量的行（写入时 embedding 失败 / 旧库遗留）
+        不会被有向量的行压掉。
         """
         q = str(query or "").strip()
         k = max(0, int(k or 0))
@@ -326,9 +330,12 @@ class MemoryStore:
             except Exception as e:          # noqa: BLE001 —— 检索绝不把异常抛回编排层
                 print("[Memory] 向量检索失败（已忽略）：%s" % e)
                 hits = []
-        if not hits:                        # 没向量 / 没命中：退关键词（score 固定 0.0）
+        if len(hits) < k:                   # 没向量 / 命中不够 k 条：余量退关键词补齐
+            seen = {int(h["id"]) for h in hits}
             terms = _keywords(q)
             for row in rows:                # rows 已按时间倒序：关键词命中给最新的
+                if int(row["id"]) in seen:  # 向量已命中的不重复计入
+                    continue
                 if any(t in str(row["text"]).lower() for t in terms):
                     hits.append(dict(row, score=0.0))
                     if len(hits) >= k:
