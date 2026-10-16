@@ -1,8 +1,7 @@
-"""对局编排（对应 ``AzureAgent.gd``）。
+"""对局编排（后端权威：对局、聊天、闲置搭话、情绪与定式都在这一层）。
 
-职责与 Godot 版逐行一致：玩家落子 → Azure 点评 → Azure 思考并落子；提示/分析/聊天/闲置/窥屏/总结/悔棋。
-差别只有一处：Godot 里 Agent 直接 emit signal 给界面，这里改为把事件交给 EventBus
-（事件契约见 ``events.py``），由 WS 推给客户端。
+职责：玩家落子 → Azure 点评 → Azure 思考并落子；提示/分析/聊天/闲置/总结/悔棋。
+结果不直接返回给界面，而是交给 EventBus（事件契约见 ``events.py``），由 WS 推给客户端。
 
 音画同步：``ai_move`` 事件带 ``move`` 坐标，客户端等她「落子宣告」的语音开始播放时本地揭示棋子；
 后端把这一手**已落到内部棋谱**、可见更新延后（``reveal_move()`` 供需要 round-trip 的客户端调用）。
@@ -13,11 +12,15 @@ import random
 import re
 import time
 
-from . import coords, events, prompts
+from langchain_core.messages import ToolMessage
+
+from . import coords, events, prompt_chains, prompts
 from .board import SIZE as BOARD_SIZE
 from .emotion import EmotionModel
 from .joseki import JosekiRecognizer
+from .llm_chain import content_of
 from .state import GameState
+from .tools import TOOLS, failed as tool_failed
 
 # LLM「情绪变化」小调用：限频 + 忙时跳过，保护主对话的响应速度与 KV 前缀缓存
 MOOD_LLM_GAP_MS = 15000
@@ -34,6 +37,20 @@ LEN_TEACH_NOTE = ("\n\n【本次额外要求 · 优先遵守】\n"
                   "- 这是定式讲解：把名称与要点讲清楚，2~3 句即可，别长篇大论\n"
                   "- 不复述局面、不客套，直接开讲就好")
 
+# —— 发言侧工具（她自己决定要不要查资料；只影响怎么说，不影响下哪里）——
+# 工具总次数硬上限：一次发言最多两次，防止「一直查、不回答」
+MAX_TOOL_CALLS = 2
+# 单工具超时（秒）：超时即返回超时文本，不阻塞回合
+TOOL_TIMEOUT_SEC = 10
+# 一次 tool loop 的模型往返硬上限：工具预算之外，还允许若干轮「别再调工具、直接回答」的催促；
+# 到顶就按现有内容收尾（拿不到正文时由调用方的兜底台词顶上），绝不允许无限往返
+MAX_TOOL_ROUNDS = 12
+# 参数里带棋谱的工具：模型没给棋谱时由后端注入当前局面
+MOVE_TOOLS = ("katago_analyze", "board_query")
+# 预算用尽 / 工具超时后给模型的追加指令（作为 ToolMessage 内容，不是台词）
+TOOL_BUDGET_TEXT = "工具调用次数已达上限（%d 次），这次不再执行；请不要再调用任何工具，直接用自然语言回答。"
+TOOL_TIMEOUT_TEXT = "工具执行超时（%d 秒），这次没取到结果；别再重试同一个工具，直接回答。"
+
 # 括号里带「着棋点位」的舞台提示不需要显示，例如（白棋落在 C4）/（第7手 Q16）/（C4）
 _PAREN_GROUP_PATTERN = "[（(][^（()）\\n]{0,40}[）)]"
 _MOVE_HINT_PATTERN = "[A-HJ-Ta-hj-t]\\s?\\d{1,2}|落子|落在|虚着|pass|着子|第\\s?\\d+\\s?手"
@@ -46,9 +63,25 @@ IDLE_LINES = [
     "要不要聊聊天？我有点无聊了~",
 ]
 
+# LLM 不可用（断网 / 401 / 429 / 超时 / 根本没配地址）时的兜底台词：
+# 「棋局类」用于点评、提示、分析、落子宣告；「闲聊类」用于聊天与总结。
+# 口吻与 IDLE_LINES 一致；多备几句随机挑，配合客户端的防复读窗口。
+GAME_FALLBACK_LINES = [
+    "唔…我脑子有点转不过来，这一手先不细说了。",
+    "嗯…这盘棋我一时看不透，先接着下吧。",
+    "唔…刚才那手我还没想明白，等会儿再跟你说。",
+    "嗯…思路有点断了，先陪你摆着，一会儿再讲。",
+]
+CHAT_FALLBACK_LINES = [
+    "唔…我脑子有点转不过来，这次就先说到这儿好不好？",
+    "嗯…我现在有点迷糊，回头再好好陪你聊。",
+    "唔…思路断了，等会儿再慢慢跟你说。",
+]
+
 
 class AzureAgent:
-    def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False):
+    def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False,
+                 tools_enabled=False, max_tool_calls=None, memory=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -58,6 +91,15 @@ class AzureAgent:
         self.joseki_teach = joseki_teach
         self.limit_len = limit_len
         self.busy = False
+
+        # —— 发言侧工具：默认关闭，行为与没有工具时完全一致 ——
+        self.tools_enabled = bool(tools_enabled)
+        want = MAX_TOOL_CALLS if max_tool_calls is None else int(max_tool_calls)
+        self.max_tool_calls = max(0, min(want, MAX_TOOL_CALLS))    # 配置只能收紧，不能突破硬上限
+        self._chain = None
+
+        # —— 跨局长期记忆：默认不接线（None），由 main.py 的 lifespan 注入 MemoryService ——
+        self.memory = memory
 
         self._mood_region = -1
         self._mood_ms = 0
@@ -85,9 +127,19 @@ class AzureAgent:
 
     @staticmethod
     def _llm_failed(t) -> bool:
-        """LLM 调用失败的统一判据（与闲置/窥屏的兜底判据一致）。"""
+        """LLM 调用失败的统一判据（与闲置搭话的兜底判据一致）。"""
         t = (t or "").strip()
         return t == "" or t.startswith("调用出错") or "脑子有点转不过来" in t
+
+    @staticmethod
+    def _fallback_line(kind="game") -> str:
+        """LLM 不可用时露给玩家的兜底台词（kind：``game`` 棋局类 / ``chat`` 闲聊类）。
+
+        云端失败在 ``LLMClient`` 里表现为「调用出错：…」文案（断网 / 401 / 429 / 超时），
+        也可能意外抛出；两种情况下都必须换成这句玩家能读的话，绝不把错误文案当成她的台词。
+        """
+        lines = CHAT_FALLBACK_LINES if kind == "chat" else GAME_FALLBACK_LINES
+        return str(lines[random.randrange(len(lines))])
 
     def _update_katago_brief(self, analysis, num_moves):
         """把 KataGo 形势数据整理成一段文字，存进 st.last_katago，供 Azure 上下文使用。"""
@@ -111,17 +163,42 @@ class AzureAgent:
             s += " 实地估算：Estarth（黑）约 %.0f 目，Azure（白）约 %.0f 目（按逐点归属估算，仅供参考）。" % (b, w)
         self.st.last_katago = s
 
-    def _sys_content(self, len_note) -> str:
-        s = prompts._t(prompts.system_prompt()) + prompts.mood_note(self.mood.region_name())
+    def _think_hint(self) -> str:
+        """思考风格半句：只在思考档开启时注入（判据与旧 ``_sys_content`` 一致）。"""
         if self.llm is not None and getattr(self.llm, "think_mode", 0) > 0:
-            s += "\n\n【思考风格 · 随心情微调】" + self.mood.think_hint()
-        return s + len_note
+            return self.mood.think_hint()
+        return ""
+
+    def _sys_content(self, len_note) -> str:
+        """系统消息文本：经 ``prompt_chains`` 的模板链构造（人设 + 心情 + 思考风格 + 长度约束）。
+
+        系统消息与阶段无关——阶段提示只在「无 context」的回退路径里补进系统消息，这里既没有
+        context 也没有 prompt，固定按首个阶段取链，产出与旧实现逐字符一致（test_prompt_chains 锁定）。
+        """
+        return prompt_chains.build_messages(
+            prompt_chains.PHASES[0], len_note=len_note,
+            mood_name=self.mood.region_name(), think_hint=self._think_hint(),
+        )[0]["content"]
 
     def _sys_msg(self):
+        """系统消息：聊天 / 闲置搭话这类「context_block + 历史窗口」的路径用；带 with_context 的路径走 `_phase_messages`。"""
         return {"role": "system", "content": self._sys_content(LEN_NOTE if self.limit_len else "")}
 
-    def _sys_teach_msg(self):
-        return {"role": "system", "content": self._sys_content(LEN_TEACH_NOTE if self.limit_len else "")}
+    def _phase_messages(self, phase, context, len_note=None) -> list:
+        """某阶段的完整消息（系统 + 上下文）：经 ``prompt_chains`` 的链构造。
+
+        ``len_note=None`` 表示「按本局设置推导」：``limit_len`` 开着就附上 ``LEN_NOTE``（短回复约束）——
+        与旧 ``_sys_msg()`` 的做法一致，调用点不必各自记得；定式讲解这类特例显式传入 ``LEN_TEACH_NOTE``。
+
+        必须与旧 ``[_sys_msg(), _user_msg(context)]`` 逐字符一致——模型要看到的字与本次重构前
+        完全相同，一个标点都不能变（tests/test_prompt_chains.py 逐字符锁定）。
+        """
+        if len_note is None:
+            len_note = LEN_NOTE if self.limit_len else ""
+        return prompt_chains.build_messages(
+            phase, context=context, len_note=len_note,
+            mood_name=self.mood.region_name(), think_hint=self._think_hint(),
+        )
 
     @staticmethod
     def _user_msg(content):
@@ -133,6 +210,9 @@ class AzureAgent:
         return out
 
     def _set_busy(self, v):
+        """设置忙碌状态；值没变就不推事件（嵌套的编排外壳会各自兜一次归位）。"""
+        if self.busy == v:
+            return
         self.busy = v
         self._emit(events.busy(v))
 
@@ -151,8 +231,194 @@ class AzureAgent:
         return out if out != "" else text
 
     async def _reply(self, messages, max_tokens=300) -> str:
-        """所有对外展示的 LLM 回复统一过一遍清洗。"""
-        return self.clean_reply(await self.llm.chat(messages, max_tokens))
+        """所有对外展示的 LLM 回复统一过一遍清洗。
+
+        云端失败时 ``LLMClient.chat`` 返回「调用出错：…」文案（不抛异常）；这里再兜住
+        「真抛出来」的情况（返回空串），由调用方的兜底台词顶上——她该下的棋、该念的
+        落子宣告都不会因此丢掉。
+        """
+        try:
+            return self.clean_reply(await self.llm.chat(messages, max_tokens))
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] LLM 调用异常：%s" % e)
+            return ""
+
+    # ================= 发言侧工具（她自己查资料） =================
+
+    @property
+    def chain(self):
+        """LangChain 链：默认实时取 ``llm.chain``。
+
+        ``LLMClient`` 在扩展字段被服务端拒绝后会**重建**链实例，抱住旧引用会一直带着被拒的字段，
+        所以这里每次现取；测试可直接赋值替换（赋值即固定，不再回看 ``llm.chain``）。
+        """
+        if self._chain is not None:
+            return self._chain
+        return getattr(self.llm, "chain", None)
+
+    @chain.setter
+    def chain(self, v):
+        self._chain = v
+
+    def _chain_ok(self) -> bool:
+        """直连链的前置检查（``LLMClient.chat`` 里 ``_url_ok`` 的同一判据）。
+
+        未配置 ``llm_base_url`` 时 openai 客户端会静默退回 api.openai.com：真连外网、单次卡几十秒，
+        所以工具路径也必须先拦（链自己没这个预检）。没接 LLM（测试注入链）时无从查起，按可用处理。
+        """
+        if self.llm is None:
+            return True
+        u = str(getattr(self.llm, "base_url", "") or "").strip().lower()
+        return u.startswith("http://") or u.startswith("https://")
+
+    def _tool_args(self, name, args) -> dict:
+        """补齐工具参数：引擎与当前棋谱由后端注入，模型不必（也不该）自己编。"""
+        out = dict(args or {})
+        if name == "katago_analyze":
+            out["engine"] = self.katago
+        if name in MOVE_TOOLS and not out.get("moves"):
+            out["moves"] = [list(m) for m in self.st.moves]
+        return out
+
+    def _bind_tools(self, pool, max_tokens) -> tuple:
+        """给链绑上工具与本次输出上限，返回 ``(可调用的链, ainvoke 的调用参数)``。
+
+        上限走 ``extra_body`` 的线上键 ``max_tokens``（与 ``LLMClient.chat`` 同一理由：
+        ``ainvoke(max_tokens=…)`` 会被 langchain-openai 改名成 ``max_completion_tokens``，
+        目标服务端不认）；``bind(extra_body=…)`` 是整体替换，所以先并入链自带的扩展字段。
+        没有 ``bind`` 的鸭子类型链（测试替身）只能退回 ``ainvoke`` 参数。
+
+        服务端拒绝过扩展字段（``llm._extra_body_unsupported``）时什么都不加：与
+        ``LLMClient._extra_for`` 同一判据——不加料，工具路径才不会每次调用都白挨一次 400 再重试。
+        """
+        bound = self.chain.bind_tools(list(pool))
+        if not hasattr(bound, "bind"):
+            return bound, {"max_tokens": max_tokens}
+        if getattr(self.llm, "_extra_body_unsupported", False):
+            return bound.bind(extra_body={}), {}
+        body = dict(getattr(self.chain, "extra_body", None) or {})
+        if "max_tokens" not in body and "max_completion_tokens" not in body:
+            body["max_tokens"] = max_tokens
+        return bound.bind(extra_body=body), {}
+
+    async def _chain_invoke(self, bound, msgs, kwargs):
+        """发一次工具链请求；服务端拒绝参数（HTTP 400/422）时去掉扩展字段与输出上限重试一次。
+
+        与 ``LLMClient.chat`` 同一安全网：有的 OpenAI 兼容服务遇到未知字段直接 400，
+        工具路径不能因此把本来能说话的回合变成兜底台词。
+        """
+        try:
+            return await bound.ainvoke(msgs, **kwargs)
+        except Exception as e:                  # noqa: BLE001
+            if getattr(e, "status_code", None) not in (400, 422):
+                raise
+            print("[Agent] 工具调用被服务端拒绝参数（HTTP %d），去掉扩展字段与输出上限重试一次" % e.status_code)
+            return await bound.bind(extra_body={}).ainvoke(msgs)
+
+    async def _run_tool(self, by_name, name, args) -> str:
+        """执行一个工具：发 ``tool`` start/end 事件，返回给模型的 ``ToolMessage`` 文本；绝不抛出。
+
+        ``ok`` 的判据只有两个：工具自己给出的失败文本（``tools.FAIL_PREFIX``）、超时。
+        ``args`` 传的是**模型给的那份**——注入的引擎对象不可序列化，也不该推给客户端。
+        """
+        self._emit(events.tool("start", name, args))
+        t0 = time.monotonic()
+        if name not in by_name:
+            text = "没有这个工具（%s），可用的只有：%s。" % (name, "、".join(sorted(by_name)))
+            ok = False
+        else:
+            try:
+                text = str(await asyncio.wait_for(
+                    by_name[name].ainvoke(self._tool_args(name, args)), TOOL_TIMEOUT_SEC))
+                ok = not tool_failed(text)
+            except asyncio.TimeoutError:
+                text = TOOL_TIMEOUT_TEXT % TOOL_TIMEOUT_SEC
+                ok = False
+            except Exception as e:              # noqa: BLE001
+                text = "工具执行失败（%s），这次先不参考它，直接回答。" % e
+                ok = False
+        self._emit(events.tool("end", name, args, ok, int((time.monotonic() - t0) * 1000)))
+        return text
+
+    async def _tool_loop(self, messages, max_tokens, phase="", tools=None) -> str:
+        """受限 tool loop：模型可以在预算内先查资料，再落回一句自然语言。
+
+        只在 ``hint()`` 与 ``_ai_turn()`` 的落子宣告两处启用（且 ``tools_enabled`` 为真）：
+        聊天/闲置这类短回合不走 tool loop，免得白等工具往返的时延。
+
+        硬规则：
+        - 工具次数上限 ``self.max_tool_calls``（默认 ``MAX_TOOL_CALLS``），单工具超时 ``TOOL_TIMEOUT_SEC``；
+          预算用尽后不再执行工具，只追加「别再调工具、直接回答」的指令催它收尾；
+        - 工具与链的任何失败都不许抛出：失败变成可读 ``ToolMessage``，链抛错则返回空串，
+          由调用方的兜底台词顶上（与 ``_reply`` 同一降级）；
+        - 玩家看到的永远是模型重写的自然语言（``clean_reply`` 必经），工具输出只回到模型手里；
+        - 链不可用（没接 LLM / 未配置地址）或预算为 0 时退回 ``_reply``：与不开工具完全同一条路。
+        """
+        pool = list(TOOLS if tools is None else tools)
+        by_name = {t.name: t for t in pool}
+        if self.chain is None or not self._chain_ok() or self.max_tool_calls <= 0:
+            return await self._reply(messages, max_tokens)
+        bound, kwargs = self._bind_tools(pool, max_tokens)
+        msgs = list(messages)
+        used = 0
+        ai = None
+        for _ in range(MAX_TOOL_ROUNDS):
+            try:
+                ai = await self._chain_invoke(bound, msgs, kwargs)
+            except Exception as e:              # noqa: BLE001
+                print("[Agent] tool loop 调用异常（%s）：%s" % (phase, e))
+                return ""
+            calls = list(getattr(ai, "tool_calls", None) or [])
+            if not calls:                       # 没有工具请求：这就是她要说的话
+                return self.clean_reply(content_of(ai))
+            msgs.append(ai)
+            for tc in calls:
+                name = str(tc.get("name", ""))
+                args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                if used >= self.max_tool_calls:  # 预算用尽：不再执行，催它直接回答（不存在的工具同样占预算）
+                    msgs.append(ToolMessage(TOOL_BUDGET_TEXT % self.max_tool_calls,
+                                            tool_call_id=str(tc.get("id", ""))))
+                    continue
+                used += 1
+                msgs.append(ToolMessage(await self._run_tool(by_name, name, args),
+                                        tool_call_id=str(tc.get("id", ""))))
+        print("[Agent] tool loop 到达往返上限（%d 次，%s）：按现有内容收尾" % (MAX_TOOL_ROUNDS, phase))
+        return self.clean_reply(content_of(ai)) if ai is not None else ""
+
+    # ================= 长期记忆（跨局） =================
+
+    def _long_term(self, query) -> str:
+        """召回跨局长期记忆的注入文本；未接线 / 未启用 / 任何故障一律返回空串。
+
+        默认不接线（``memory is None``）或 ``available == False`` 时不注入——
+        关闭长期记忆时的提示词与没有这个功能时逐字符一致。召回在出话路径上，
+        这里再兜一层异常保护，绝不让记忆把这一回合的 ``busy`` 卡住。
+
+        本方法是**同步**的：调用点必须 ``await asyncio.to_thread(self._long_term, …)``——
+        慢 embedding（最长 ``embed_timeout`` 秒）绝不能冻住事件循环（心跳与落子宣告都在这条循环上）。
+        """
+        mem = self.memory
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return ""
+        try:
+            return str(mem.recall_for(str(query or "")) or "")
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 长期记忆召回异常（已忽略）：%s" % e)
+            return ""
+
+    def _remember_game(self, summary, black_wr, score):
+        """把这一局的总结写进长期记忆（``result`` 渲染成一行）；失败只打日志，不影响对局。
+
+        同 ``_long_term``：同步实现，调用点走 ``asyncio.to_thread``（写库 + embedding 都在里面）。
+        """
+        mem = self.memory
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return
+        try:
+            result = "黑方（Estarth）胜率 %s，目差 %s" % (self._pct(black_wr), "%+.1f" % score)
+            mem.remember_game(list(self.st.moves), result, str(summary or ""))
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 长期记忆写入异常（已忽略）：%s" % e)
 
     # ================= 三维情绪 =================
 
@@ -189,8 +455,44 @@ class AzureAgent:
         self._mood_desc = EmotionModel.event_desc(what)
         self.sync_mood(False, True)
 
+    async def _mood_delta(self, cur, desc):
+        """情绪增量：优先结构化输出，拿不到才回落到正则解析（``None`` = 两条路都没拿到）。
+
+        结构化能力由 LLM 客户端提供（``LLMClient.mood_delta``）；只实现 ``chat()`` 的鸭子类型
+        客户端没有它，直接走正则——与 ``_think_hint`` 看 ``think_mode`` 是同一种写法。
+
+        失败一律静默（含异常、含形状不对的脏返回值）：情绪小调用绝不打扰主流程，也绝不把错误
+        文案变成她的台词。
+        """
+        region = self.mood.region_name()
+        fn = getattr(self.llm, "mood_delta", None)
+        if fn is not None:
+            try:
+                d = await fn(cur, region, desc)
+            except Exception as e:                  # noqa: BLE001
+                print("[Agent] 情绪结构化输出异常：%s" % e)
+                d = None
+            if isinstance(d, (list, tuple)) and len(d) == 3:   # 形状不对＝这次没拿到
+                return d
+        try:
+            text = await self.llm.chat([{
+                "role": "user",
+                "content": prompts.mood_delta_prompt(cur, region, desc),
+            }], MOOD_LLM_MAX_TOKENS, True)
+        except Exception as e:                      # noqa: BLE001
+            print("[Agent] 情绪小调用异常：%s" % e)
+            return None
+        if self._llm_failed(text):
+            return None
+        parsed = EmotionModel.parse_delta(text)
+        return parsed[1] if parsed[0] else None
+
     async def _mood_llm_refine(self):
-        """单独的「情绪变化」小调用：异步、限频、失败静默；绝不等它。"""
+        """单独的「情绪变化」小调用：异步、限频、失败静默；绝不等它。
+
+        优先结构化输出（模型直接给三维增量），拿不到才回落到正则解析（v2 行为不变）；两条路都
+        拿不到就静默收场，情绪只保留本地事件结算的结果。
+        """
         if self.llm is None or self._mood_desc == "" or self.busy:
             return
         now = int(time.monotonic() * 1000)
@@ -199,16 +501,9 @@ class AzureAgent:
         self._mood_ms = now
         desc = self._mood_desc
         self._mood_desc = ""
-        text = await self.llm.chat([{
-            "role": "user",
-            "content": prompts.mood_delta_prompt((self.mood.v, self.mood.c, self.mood.a), self.mood.region_name(), desc),
-        }], MOOD_LLM_MAX_TOKENS, True)
-        if self._llm_failed(text):
+        d = await self._mood_delta((self.mood.v, self.mood.c, self.mood.a), desc)
+        if d is None:
             return
-        parsed = EmotionModel.parse_delta(text)
-        if not parsed[0]:
-            return
-        d = parsed[1]
         self.mood.apply_delta(d[0], d[1], d[2])
         self.sync_mood(False)
 
@@ -288,178 +583,202 @@ class AzureAgent:
             self._emit(events.state(self.st.payload()))   # 让界面撤销乐观落子
             return
         self._set_busy(True)
-        gtp = coords.xy_to_gtp(x, y)
-        n = len(self.st.moves)
+        try:
+            gtp = coords.xy_to_gtp(x, y)
+            n = len(self.st.moves)
 
-        # ① 玩家落子前局面：缓存复用，否则现算（黑方视角，用于给这一手排名）
-        analysis = {}
-        if self.st.pre_analysis is not None and int(self.st.pre_analysis["n"]) == n:
-            analysis = self.st.pre_analysis["a"]
-        else:
-            analysis = await self.katago.analyze(self.st.moves)
-            if "error" in analysis:
-                print("[KataGo] " + str(analysis["error"]))
-                analysis = {}
+            # ① 玩家落子前局面：缓存复用，否则现算（黑方视角，用于给这一手排名）
+            analysis = {}
+            if self.st.pre_analysis is not None and int(self.st.pre_analysis["n"]) == n:
+                analysis = self.st.pre_analysis["a"]
             else:
-                self.st.pre_analysis = {"n": n, "a": analysis}
-        winrate_before = 0.5
-        move_infos = []
-        if analysis:
-            winrate_before = float((analysis.get("rootInfo") or {}).get("winrate", 0.5))
-            move_infos = analysis.get("moveInfos", [])
-        player_rank = -1
-        for i in range(min(len(move_infos), 5)):
-            if str(move_infos[i].get("move", "")) == gtp:
-                player_rank = i
-                break
-
-        # ② 玩家落子后局面（轮到白方）：用于选择 Azure 的应手
-        after = await self.katago.analyze(self._moves_with("B", gtp))
-        after_infos = []
-        after_black_wr = 0.5
-        after_black_score = 0.0
-        if "error" in after:
-            print("[KataGo] " + str(after["error"]))
-        else:
-            after_infos = after.get("moveInfos", [])
-            conv = prompts.to_black_perspective(after, n + 1)
-            after_black_wr = float(conv[0])
-            after_black_score = float(conv[1])
-            self._update_katago_brief(after, n + 1)       # 当前棋面的引擎形势，供 Azure 上下文
-
-        # ③ 提交玩家落子（先存快照，供俗手回档）
-        self.st.snapshots.append(self.st.make_snapshot())
-        self.st.board.play(x, y, "black")
-        self.st.add_move("B", gtp)
-        turn_index = len(self.st.snapshots) - 1
-
-        # ④ 俗手判定：不在我算的前5，或胜率明显下滑
-        drop = winrate_before - after_black_wr
-        if player_rank < 0 or drop > 0.10:
-            reason = "不在我算的前5候选" if player_rank < 0 else "胜率下滑%d%%" % int(round(drop * 100.0))
-            self.st.record_bad_move(turn_index, gtp, reason)
-        self._emit(events.state(self.st.payload()))
-
-        # ④″ 定式识别（纯本地计算、零引擎调用）
-        jk = self._joseki_check()
-        if jk:
-            self._joseki_emit(jk)
-
-        # ④′ 情绪反应：按这一手的好坏结算三维情绪（即时反馈不等 LLM）
-        ev = "player_ok"
-        if str(jk.get("kind", "")) == "formed" or player_rank == 0:
-            ev = "player_good"
-        elif player_rank < 0 or drop > 0.10:
-            ev = "player_bad"
-        elif player_rank >= 3:
-            ev = "player_off"
-        self._mood_event(ev)
-
-        # ⑤ Azure 点评这一手（定式成型时换成讲解，不额外增加 LLM 调用）
-        eval_prompt = ""
-        eval_sys = self._sys_msg()
-        if str(jk.get("kind", "")) == "formed":
-            eval_prompt = prompts.joseki_teach_prompt(str(jk["name"]), str(jk["key"]), str(jk["corner"]))
-            eval_sys = self._sys_teach_msg()
-        else:
-            if player_rank == 0:
-                eval_prompt = "Estarth下了 %s，这是我算的最优手！胜率%s。轻描淡写夸一下，1-2句。" % (gtp, self._pct(winrate_before))
-            elif 0 < player_rank < 3:
-                eval_prompt = "Estarth下了 %s，Top%d，胜率%s。肯定一下，1-2句。" % (gtp, player_rank + 1, self._pct(winrate_before))
-            elif player_rank >= 0:
-                eval_prompt = "Estarth下了 %s，不在前5。委婉指出，给点鼓励，1-2句。" % gtp
-            else:
-                eval_prompt = "Estarth下了 %s，没进我算的前5。慵懒表示不太理解，1-2句。" % gtp
-            eval_prompt += " 用你自己的口吻评，1句就好，别像解说员那样说「黑方/白棋」；先结合【当前棋面】确认这手落在哪、周围有没有子再说；不要提你自己接下来打算下哪里，不要复述胜率数值；开头和收尾都换一种新的说法，别复读你最近用过的口头禅。"
-            # 防复读：上一手点评的原话拿出来明确避开
-            prev_eval = ""
-            for i in range(len(self.st.memory_log) - 1, -1, -1):
-                if str(self.st.memory_log[i].get("tag", "")) == "E":
-                    prev_eval = str(self.st.memory_log[i].get("text", ""))
+                analysis = await self.katago.analyze(self.st.moves)
+                if "error" in analysis:
+                    print("[KataGo] " + str(analysis["error"]))
+                    analysis = {}
+                else:
+                    self.st.pre_analysis = {"n": n, "a": analysis}
+            winrate_before = 0.5
+            move_infos = []
+            if analysis:
+                winrate_before = float((analysis.get("rootInfo") or {}).get("winrate", 0.5))
+                move_infos = analysis.get("moveInfos", [])
+            player_rank = -1
+            for i in range(min(len(move_infos), 5)):
+                if str(move_infos[i].get("move", "")) == gtp:
+                    player_rank = i
                     break
-            if prev_eval != "":
-                angles = ["这手的方向/意图", "厚薄与轻重", "形状好不好", "和附近棋子的呼应", "对以后势力的影响", "和刚才几手的联系"]
-                eval_prompt += " 你上一手点评的原话是「%s」：这次不要复用里面出现过的形容词和句式，也别用同样的夸奖方式；从%s这个角度换个说法，还是一句话。" % (prev_eval, angles[random.randrange(len(angles))])
-            # 定式偏离：在常规点评后轻轻提一句常规形状
-            if str(jk.get("kind", "")) == "deviated":
-                want = jk.get("expect", (-1, -1))
-                if want[0] >= 0:
-                    eval_prompt += " " + prompts.joseki_hint_clause(str(jk["name"]), coords.xy_to_gtp(want[0], want[1]))
-        player_eval = await self._reply([
-            eval_sys,
-            self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, eval_prompt, "after_player", False, self.st.last_katago, self.st.board)),
-        ], 300)
-        if str(jk.get("kind", "")) == "formed" and self._llm_failed(player_eval):
-            player_eval = prompts.joseki_fallback(str(jk["name"]), str(jk["key"]))
-        self.st.log_memory("E", player_eval, len(self.st.moves))
-        self._emit(events.message(events.AI_COMMENT, player_eval))
 
-        # ⑥ Azure 思考并落子（把刚才那手点评一并传给她）
-        await self._ai_turn(after_infos, after_black_wr, after_black_score, player_eval)
-        self._set_busy(False)
-        await self._mood_llm_refine()
+            # ② 玩家落子后局面（轮到白方）：用于选择 Azure 的应手
+            after = await self.katago.analyze(self._moves_with("B", gtp))
+            after_infos = []
+            after_black_wr = 0.5
+            after_black_score = 0.0
+            if "error" in after:
+                print("[KataGo] " + str(after["error"]))
+            else:
+                after_infos = after.get("moveInfos", [])
+                conv = prompts.to_black_perspective(after, n + 1)
+                after_black_wr = float(conv[0])
+                after_black_score = float(conv[1])
+                self._update_katago_brief(after, n + 1)       # 当前棋面的引擎形势，供 Azure 上下文
+
+            # ③ 提交玩家落子（先存快照，供俗手回档）
+            self.st.snapshots.append(self.st.make_snapshot())
+            self.st.board.play(x, y, "black")
+            self.st.add_move("B", gtp)
+            turn_index = len(self.st.snapshots) - 1
+
+            # ④ 俗手判定：不在我算的前5，或胜率明显下滑
+            drop = winrate_before - after_black_wr
+            if player_rank < 0 or drop > 0.10:
+                reason = "不在我算的前5候选" if player_rank < 0 else "胜率下滑%d%%" % int(round(drop * 100.0))
+                self.st.record_bad_move(turn_index, gtp, reason)
+            self._emit(events.state(self.st.payload()))
+
+            # ④″ 定式识别（纯本地计算、零引擎调用）
+            jk = self._joseki_check()
+            if jk:
+                self._joseki_emit(jk)
+
+            # ④′ 情绪反应：按这一手的好坏结算三维情绪（即时反馈不等 LLM）
+            ev = "player_ok"
+            if str(jk.get("kind", "")) == "formed" or player_rank == 0:
+                ev = "player_good"
+            elif player_rank < 0 or drop > 0.10:
+                ev = "player_bad"
+            elif player_rank >= 3:
+                ev = "player_off"
+            self._mood_event(ev)
+
+            # ⑤ Azure 点评这一手（定式成型时换成讲解，不额外增加 LLM 调用）
+            eval_prompt = ""
+            eval_note = LEN_NOTE if self.limit_len else ""
+            if str(jk.get("kind", "")) == "formed":
+                eval_prompt = prompts.joseki_teach_prompt(str(jk["name"]), str(jk["key"]), str(jk["corner"]))
+                eval_note = LEN_TEACH_NOTE if self.limit_len else ""
+            else:
+                if player_rank == 0:
+                    eval_prompt = "Estarth下了 %s，这是我算的最优手！胜率%s。轻描淡写夸一下，1-2句。" % (gtp, self._pct(winrate_before))
+                elif 0 < player_rank < 3:
+                    eval_prompt = "Estarth下了 %s，Top%d，胜率%s。肯定一下，1-2句。" % (gtp, player_rank + 1, self._pct(winrate_before))
+                elif player_rank >= 0:
+                    eval_prompt = "Estarth下了 %s，不在前5。委婉指出，给点鼓励，1-2句。" % gtp
+                else:
+                    eval_prompt = "Estarth下了 %s，没进我算的前5。慵懒表示不太理解，1-2句。" % gtp
+                eval_prompt += " 用你自己的口吻评，1句就好，别像解说员那样说「黑方/白棋」；先结合【当前棋面】确认这手落在哪、周围有没有子再说；不要提你自己接下来打算下哪里，不要复述胜率数值；开头和收尾都换一种新的说法，别复读你最近用过的口头禅。"
+                # 防复读：上一手点评的原话拿出来明确避开
+                prev_eval = ""
+                for i in range(len(self.st.memory_log) - 1, -1, -1):
+                    if str(self.st.memory_log[i].get("tag", "")) == "E":
+                        prev_eval = str(self.st.memory_log[i].get("text", ""))
+                        break
+                if prev_eval != "":
+                    angles = ["这手的方向/意图", "厚薄与轻重", "形状好不好", "和附近棋子的呼应", "对以后势力的影响", "和刚才几手的联系"]
+                    eval_prompt += " 你上一手点评的原话是「%s」：这次不要复用里面出现过的形容词和句式，也别用同样的夸奖方式；从%s这个角度换个说法，还是一句话。" % (prev_eval, angles[random.randrange(len(angles))])
+                # 定式偏离：在常规点评后轻轻提一句常规形状
+                if str(jk.get("kind", "")) == "deviated":
+                    want = jk.get("expect", (-1, -1))
+                    if want[0] >= 0:
+                        eval_prompt += " " + prompts.joseki_hint_clause(str(jk["name"]), coords.xy_to_gtp(want[0], want[1]))
+            player_eval = await self._reply(self._phase_messages(
+                "after_player",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, eval_prompt, "after_player", False, self.st.last_katago, self.st.board),
+                len_note=eval_note,
+            ), 300)
+            if str(jk.get("kind", "")) == "formed" and self._llm_failed(player_eval):
+                player_eval = prompts.joseki_fallback(str(jk["name"]), str(jk["key"]))
+            elif self._llm_failed(player_eval):     # 云端失败：点评退化为兜底台词
+                player_eval = self._fallback_line("game")
+            self.st.log_memory("E", player_eval, len(self.st.moves))
+            self._emit(events.message(events.AI_COMMENT, player_eval))
+
+            # ⑥ Azure 思考并落子（把刚才那手点评一并传给她）
+            await self._ai_turn(after_infos, after_black_wr, after_black_score, player_eval)
+            await self._mood_llm_refine()
+        except Exception as e:                      # 编排意外抛出（LLM/引擎）：不得让 busy 永久为真
+            print("[Agent] 落子编排异常：%s" % e)
+        finally:
+            self._set_busy(False)
 
     async def _ai_turn(self, after_infos, fallback_wr, fallback_score, player_eval=""):
-        pick = self._pick_ai_move(after_infos)
-        ai_gtp, ai_x, ai_y = pick[0], pick[1], pick[2]
+        try:
+            pick = self._pick_ai_move(after_infos)
+            ai_gtp, ai_x, ai_y = pick[0], pick[1], pick[2]
 
-        # 用意：落子前说明「我准备下在哪、想做什么」
-        think_hint = "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
-        think_prompt = "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过Estarth那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。换一个全新的说法，别总用「嗯~」「唔」开头，句式也别和刚才那条点评一样。" % think_hint
-        await asyncio.sleep(0.35)
-        think_msg = await self._reply([
-            self._sys_msg(),
-            self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, think_prompt, "own_turn", False, self.st.last_katago, self.st.board)),
-        ], 80)
-        # 这条语音开始播放时，界面才把她的子放上棋盘（事件带坐标，客户端本地揭示）
-        self._emit(events.message(events.AI_MOVE, think_msg, move={
-            "x": ai_x, "y": ai_y, "gtp": ai_gtp, "pass": ai_gtp == "pass",
-        }))
+            # 跨局长期记忆：本回合一次召回（查询＝最近一手 + 阶段），
+            # 下面「用意」与「落子后感想」两段话共用，不做两次 embedding 往返；
+            # 走 to_thread：慢 embedding 不得冻住事件循环（心情心跳与落子宣告都在这条循环上）
+            last_gtp = str(self.st.moves[-1][1]) if self.st.moves else "（空盘）"
+            lt = await asyncio.to_thread(self._long_term, "最近一手 %s，阶段 own_turn" % last_gtp)
 
-        # 真正落子：先落到内部棋谱；棋盘可见的更新延后到语音开始时（reveal_move）
-        if ai_gtp == "pass":
-            self.st.board.pass_move()
-            self.st.add_move("W", "pass")
-        else:
-            self.st.board.play(ai_x, ai_y, "white")
-            self.st.add_move("W", ai_gtp)
-        self._reveal_pending = True
-        if ai_gtp == "pass":
-            self._emit(events.message(events.AI, "（Azure本手选择了虚着）"))
+            # 用意：落子前说明「我准备下在哪、想做什么」
+            think_hint = "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
+            think_prompt = "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过Estarth那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。换一个全新的说法，别总用「嗯~」「唔」开头，句式也别和刚才那条点评一样。" % think_hint
+            await asyncio.sleep(0.35)
+            think_msgs = self._phase_messages(
+                "own_turn",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, think_prompt, "own_turn", False, self.st.last_katago, self.st.board, lt),
+            )
+            if self.tools_enabled:                  # 工具只在这一处与提示启用；落点照旧由 _pick_ai_move 决定
+                think_msg = await self._tool_loop(think_msgs, 80, "own_turn")
+            else:
+                think_msg = await self._reply(think_msgs, 80)
+            if self._llm_failed(think_msg):         # 云端失败：落子宣告退化为兜底台词（坐标照常揭示）
+                think_msg = self._fallback_line("game")
+            # 这条语音开始播放时，界面才把她的子放上棋盘（事件带坐标，客户端本地揭示）
+            self._emit(events.message(events.AI_MOVE, think_msg, move={
+                "x": ai_x, "y": ai_y, "gtp": ai_gtp, "pass": ai_gtp == "pass",
+            }))
 
-        jk2 = self._joseki_check()
+            # 真正落子：先落到内部棋谱；棋盘可见的更新延后到语音开始时（reveal_move）
+            if ai_gtp == "pass":
+                self.st.board.pass_move()
+                self.st.add_move("W", "pass")
+            else:
+                self.st.board.play(ai_x, ai_y, "white")
+                self.st.add_move("W", ai_gtp)
+            self._reveal_pending = True
+            if ai_gtp == "pass":
+                self._emit(events.message(events.AI, "（Azure本手选择了虚着）"))
 
-        # ⑦ 先算「Azure 落子后局面」（轮到黑方）→ 供信息栏与下面「局势」的上下文使用
-        post = await self.katago.analyze(self.st.moves)
-        wr = fallback_wr
-        sc = fallback_score
-        if "error" in post:
-            print("[KataGo] " + str(post["error"]))
-        else:
-            ri = post.get("rootInfo") or {}
-            wr = float(ri.get("winrate", 0.5))
-            sc = float(ri.get("scoreLead", 0.0))
-            self._update_katago_brief(post, len(self.st.moves))
-            # 这份「她落子后」的分析即下一手玩家落子前的局面：缓存复用
-            self.st.pre_analysis = {"n": len(self.st.moves), "a": post}
-        self._emit(events.info(wr, sc))
+            jk2 = self._joseki_check()
 
-        if str(jk2.get("kind", "")) == "formed":
-            ai_eval_prompt = prompts.joseki_short_prompt(str(jk2["name"]), str(jk2["key"]), ai_gtp)
-        elif ai_gtp == "pass":
-            ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (player_eval, think_msg)
-        else:
-            ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (ai_gtp, player_eval, think_msg)
-        ai_eval = await self._reply([
-            self._sys_msg(),
-            self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, ai_eval_prompt, "just_moved", False, self.st.last_katago, self.st.board)),
-        ], 120)
-        if str(jk2.get("kind", "")) == "formed" and self._llm_failed(ai_eval):
-            ai_eval = prompts.joseki_fallback(str(jk2["name"]), str(jk2["key"]))
-        self.st.log_memory("A", ai_eval, len(self.st.moves))
-        self._emit(events.message(events.AI_COMMENT, ai_eval))
-        self._joseki_emit(jk2)
-        # 不在这里 emit state：落子的可见更新由 reveal_move() 在她这段语音开始时触发
+            # ⑦ 先算「Azure 落子后局面」（轮到黑方）→ 供信息栏与下面「局势」的上下文使用
+            post = await self.katago.analyze(self.st.moves)
+            wr = fallback_wr
+            sc = fallback_score
+            if "error" in post:
+                print("[KataGo] " + str(post["error"]))
+            else:
+                ri = post.get("rootInfo") or {}
+                wr = float(ri.get("winrate", 0.5))
+                sc = float(ri.get("scoreLead", 0.0))
+                self._update_katago_brief(post, len(self.st.moves))
+                # 这份「她落子后」的分析即下一手玩家落子前的局面：缓存复用
+                self.st.pre_analysis = {"n": len(self.st.moves), "a": post}
+            self._emit(events.info(wr, sc))
+
+            if str(jk2.get("kind", "")) == "formed":
+                ai_eval_prompt = prompts.joseki_short_prompt(str(jk2["name"]), str(jk2["key"]), ai_gtp)
+            elif ai_gtp == "pass":
+                ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (player_eval, think_msg)
+            else:
+                ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (ai_gtp, player_eval, think_msg)
+            ai_eval = await self._reply(self._phase_messages(
+                "just_moved",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, ai_eval_prompt, "just_moved", False, self.st.last_katago, self.st.board, lt),
+            ), 120)
+            if str(jk2.get("kind", "")) == "formed" and self._llm_failed(ai_eval):
+                ai_eval = prompts.joseki_fallback(str(jk2["name"]), str(jk2["key"]))
+            elif self._llm_failed(ai_eval):         # 云端失败：落子后那句退化为兜底台词
+                ai_eval = self._fallback_line("game")
+            self.st.log_memory("A", ai_eval, len(self.st.moves))
+            self._emit(events.message(events.AI_COMMENT, ai_eval))
+            self._joseki_emit(jk2)
+            # 不在这里 emit state：落子的可见更新由 reveal_move() 在她这段语音开始时触发
+        finally:
+            self._set_busy(False)       # 编排外壳：异常也要让棋盘解锁
 
     def _pick_ai_move(self, move_infos) -> list:
         """按引擎候选顺序取第一个在当前棋盘合法的点；不允许虚着时绝不虚着。"""
@@ -503,24 +822,34 @@ class AzureAgent:
         if self.busy:
             return
         self._set_busy(True)
-        n = len(self.st.moves)
-        analysis = await self.katago.analyze(self.st.moves)
-        if "error" in analysis:
-            print("[KataGo] " + str(analysis["error"]))
-            self._emit(events.message(events.AI, "嗯...我这边一时算不清，稍等再试吧~"))
+        try:
+            n = len(self.st.moves)
+            analysis = await self.katago.analyze(self.st.moves)
+            if "error" in analysis:
+                print("[KataGo] " + str(analysis["error"]))
+                self._emit(events.message(events.AI, "嗯...我这边一时算不清，稍等再试吧~"))
+                return
+            self.st.pre_analysis = {"n": n, "a": analysis}
+            tops = [str(m.get("move", "")) for m in (analysis.get("moveInfos", []) or [])[:3]]
+            self._update_katago_brief(analysis, n)
+            prompt = "当前局面：%s。我算到的好点：%s。Estarth还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）；换个说法开场，别重复你上一次提示的句式和口头禅。" % (
+                prompts.board_summary(self.st.move_seq), self._py_list(tops))
+            msgs = self._phase_messages(
+                "observe",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "observe", False, self.st.last_katago, self.st.board),
+            )
+            if self.tools_enabled:                  # 工具只在这一处与落子宣告启用（短回合不背工具往返）
+                msg = await self._tool_loop(msgs, 300, "observe")
+            else:
+                msg = await self._reply(msgs, 300)
+            if self._llm_failed(msg):               # 云端失败：提示退化为兜底台词
+                msg = self._fallback_line("game")
+            self._emit(events.message(events.AI_COMMENT, msg))
+        except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
+            print("[Agent] 提示异常：%s" % e)
+            self._emit(events.message(events.AI_COMMENT, self._fallback_line("game")))
+        finally:
             self._set_busy(False)
-            return
-        self.st.pre_analysis = {"n": n, "a": analysis}
-        tops = [str(m.get("move", "")) for m in (analysis.get("moveInfos", []) or [])[:3]]
-        self._update_katago_brief(analysis, n)
-        prompt = "当前局面：%s。我算到的好点：%s。Estarth还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）；换个说法开场，别重复你上一次提示的句式和口头禅。" % (
-            prompts.board_summary(self.st.move_seq), self._py_list(tops))
-        msg = await self._reply([
-            self._sys_msg(),
-            self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "observe", False, self.st.last_katago, self.st.board)),
-        ], 300)
-        self._emit(events.message(events.AI_COMMENT, msg))
-        self._set_busy(False)
 
     async def analyze_position(self):
         """局面分析：以 Azure（执白）的视角解读局势。"""
@@ -530,29 +859,35 @@ class AzureAgent:
             self._emit(events.message(events.AI, "棋盘还空着呢~ 先落几手，我再帮你看看形势。"))
             return
         self._set_busy(True)
-        n = len(self.st.moves)
-        analysis = await self.katago.analyze(self.st.moves)
-        if "error" in analysis:
-            print("[KataGo] " + str(analysis["error"]))
-            self._emit(events.message(events.AI, "唔…我这边一时算不清，稍后再让我看看吧。"))
+        try:
+            n = len(self.st.moves)
+            analysis = await self.katago.analyze(self.st.moves)
+            if "error" in analysis:
+                print("[KataGo] " + str(analysis["error"]))
+                self._emit(events.message(events.AI, "唔…我这边一时算不清，稍后再让我看看吧。"))
+                return
+            conv = prompts.to_black_perspective(analysis, n)
+            black_wr = float(conv[0])
+            score_black = float(conv[1])
+            azure_wr = 1.0 - black_wr
+            tops = [str(m.get("move", "")) for m in (analysis.get("moveInfos", []) or [])[:5]]
+            self._update_katago_brief(analysis, n)
+            lead = "你略占上风" if azure_wr > 0.5 else ("局面胶着" if azure_wr > 0.45 else "Estarth领先")
+            prompt = "当前局面：%s，共%d手。你（Azure，执白）算出的判断：白方胜率约%s（%s），目差%s（正数是你领先）。你在考虑的几个点：%s。请用你自己的视角（我/你，别说「黑方/白棋」）分析当前局势3-4句：局面走向、关键处或薄弱处，可以点醒Estarth；语气慵懒但专业，先结合【当前棋面】核对再说，别提到盘上没有的子。" % (
+                prompts.board_summary(self.st.move_seq), n, self._pct(azure_wr), lead, "%+.1f" % (-score_black), self._py_list(tops))
+            msg = await self._reply(self._phase_messages(
+                "analyze",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "analyze", False, self.st.last_katago, self.st.board),
+            ), 350)
+            if self._llm_failed(msg):               # 云端失败：分析退化为兜底台词（形势数据照常下发）
+                msg = self._fallback_line("game")
+            self._emit(events.message(events.AI, "📊 " + msg))
+            self._emit(events.info(black_wr, score_black))
+        except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
+            print("[Agent] 分析异常：%s" % e)
+            self._emit(events.message(events.AI, "📊 " + self._fallback_line("game")))
+        finally:
             self._set_busy(False)
-            return
-        conv = prompts.to_black_perspective(analysis, n)
-        black_wr = float(conv[0])
-        score_black = float(conv[1])
-        azure_wr = 1.0 - black_wr
-        tops = [str(m.get("move", "")) for m in (analysis.get("moveInfos", []) or [])[:5]]
-        self._update_katago_brief(analysis, n)
-        lead = "你略占上风" if azure_wr > 0.5 else ("局面胶着" if azure_wr > 0.45 else "Estarth领先")
-        prompt = "当前局面：%s，共%d手。你（Azure，执白）算出的判断：白方胜率约%s（%s），目差%s（正数是你领先）。你在考虑的几个点：%s。请用你自己的视角（我/你，别说「黑方/白棋」）分析当前局势3-4句：局面走向、关键处或薄弱处，可以点醒Estarth；语气慵懒但专业，先结合【当前棋面】核对再说，别提到盘上没有的子。" % (
-            prompts.board_summary(self.st.move_seq), n, self._pct(azure_wr), lead, "%+.1f" % (-score_black), self._py_list(tops))
-        msg = await self._reply([
-            self._sys_msg(),
-            self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "analyze", False, self.st.last_katago, self.st.board)),
-        ], 350)
-        self._emit(events.message(events.AI, "📊 " + msg))
-        self._emit(events.info(black_wr, score_black))
-        self._set_busy(False)
 
     async def chat(self, text):
         """自由聊天。"""
@@ -564,20 +899,29 @@ class AzureAgent:
         # 按聊天内容即时结算情绪（本地关键词分类）
         self._mood_event(self._chat_event(self.chat_emotion(text)), "，他说：「%s」" % text[:40].strip())
         self._set_busy(True)
-        msgs = [
-            self._sys_msg(),
-            self._user_msg(prompts.context_block(self.st.moves, self.st.memory_log, self.st.chat_history, "chat", True, self.st.last_katago, self.st.board)),
-        ]
-        hist = self.st.chat_history
-        upto = len(hist) - 1            # 最后一条是刚追加的这句，下面单独发，避免重复
-        for sp in prompts.chat_windows(hist[:upto]):
-            for i in range(int(sp[0]), int(sp[1]) + 1):
-                msgs.append(hist[i])
-        msgs.append({"role": "user", "content": text})
-        reply = await self._reply(msgs, 400)
+        reply = ""
+        try:
+            lt = await asyncio.to_thread(self._long_term, text)     # 慢 embedding 不得冻住事件循环
+            msgs = [
+                self._sys_msg(),
+                self._user_msg(prompts.context_block(self.st.moves, self.st.memory_log, self.st.chat_history, "chat", True, self.st.last_katago, self.st.board,
+                                                     long_term=lt)),
+            ]
+            hist = self.st.chat_history
+            upto = len(hist) - 1            # 最后一条是刚追加的这句，下面单独发，避免重复
+            for sp in prompts.chat_windows(hist[:upto]):
+                for i in range(int(sp[0]), int(sp[1]) + 1):
+                    msgs.append(hist[i])
+            msgs.append({"role": "user", "content": text})
+            reply = await self._reply(msgs, 400)
+        except Exception as e:                      # 意外抛出：按失败处理，别让棋盘锁死
+            print("[Agent] 聊天异常：%s" % e)
+        finally:
+            self._set_busy(False)
+        if self._llm_failed(reply):                 # 云端失败：聊天退化为兜底台词
+            reply = self._fallback_line("chat")
         self.st.chat_history.append({"role": "assistant", "content": reply})
         self._emit(events.message(events.AI, reply))
-        self._set_busy(False)
         await self._mood_llm_refine()
 
     async def idle_remark(self):
@@ -596,36 +940,6 @@ class AzureAgent:
         self.st.chat_history.append({"role": "assistant", "content": reply})
         self._emit(events.message(events.AI_IDLE, reply))
 
-    async def peer_remark(self, info):
-        """窥屏搭话：长时间无操作时偷看一眼屏幕，切去了别的窗口就结合看到的内容说一句。"""
-        if self.busy:
-            return
-        self._mood_event("peek")
-        title = str(info.get("fg_title", "")).strip()
-        vlm = str(info.get("vlm", "")).strip()
-        ocr = str(info.get("ocr", "")).strip()
-        if len(ocr) > 220:
-            ocr = ocr[:220] + "…"
-        seen = ""
-        if vlm != "":
-            seen += "屏幕画面：%s\n" % vlm
-        if ocr != "":
-            seen += "屏幕文字（OCR）：%s\n" % ocr
-        if seen == "":
-            seen = "（没能看清具体内容）\n"
-        prompt = ("Estarth 很久没碰棋盘了。你悄悄瞥了一眼他的屏幕——他现在开着的窗口是「%s」，%s"
-                  + "用你自己的口吻主动对他说一句很短的话（30字以内）：自然地带出你看到了什么（他在看什么、忙什么），"
-                  + "好奇、有点小情绪，但别像监视器一样复述细节、也别责备他；如果他只是在看别的页面，就顺着内容搭话。1句，慵懒亲切。") % (title if title != "" else "未知窗口", seen)
-        reply = await self._reply([
-            self._sys_msg(),
-            self._user_msg(prompts.context_block(self.st.moves, self.st.memory_log, self.st.chat_history, "chat", True, self.st.last_katago, self.st.board)),
-            {"role": "user", "content": prompt},
-        ], 120)
-        if self._llm_failed(reply):
-            reply = "唔…跑去忙别的啦？我还在这儿等你哦。"
-        self.st.chat_history.append({"role": "assistant", "content": reply})
-        self._emit(events.message(events.AI_IDLE, reply))
-
     async def summarize(self, note=""):
         """对局总结。"""
         if self.busy:
@@ -634,29 +948,39 @@ class AzureAgent:
             self._emit(events.message(events.AI, "还没下过棋呢~"))
             return
         self._set_busy(True)
-        n = len(self.st.moves)
-        final_wr = 0.5
-        final_score = 0.0
-        analysis = await self.katago.analyze(self.st.moves)
-        if "error" in analysis:
-            print("[KataGo] " + str(analysis["error"]))
-        else:
-            conv = prompts.to_black_perspective(analysis, n)
-            final_wr = float(conv[0])
-            final_score = float(conv[1])
-        self._update_katago_brief(analysis, n)
-        # 终局情绪：她赢下（黑方胜率 < 0.5）平和地开心，输了则有点低落
-        self._mood_event("summary_win" if final_wr < 0.5 else "summary_lose")
-        seq = " → ".join(str(s) for s in self.st.move_seq)
-        prompt = "对局结束，共%d手。\n序列：%s\n最终黑胜率：%s，目差：%s\nEstarth备注：%s\n\n写总结：1.对局回顾 2.给Estarth的改进建议 2-3条 3.你的心情\n用Azure口吻，150-250字，慵懒真诚。" % (
-            n, seq, self._pct(final_wr), "%+.1f" % final_score, note)
-        text = await self._reply([
-            self._sys_msg(),
-            self._user_msg(prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "summary", False, self.st.last_katago, self.st.board)),
-        ], 600)
-        self.st.finished = True
-        self._emit(events.message(events.AI, "📋 对局总结\n" + text))
-        self._set_busy(False)
+        try:
+            n = len(self.st.moves)
+            final_wr = 0.5
+            final_score = 0.0
+            analysis = await self.katago.analyze(self.st.moves)
+            if "error" in analysis:
+                print("[KataGo] " + str(analysis["error"]))
+            else:
+                conv = prompts.to_black_perspective(analysis, n)
+                final_wr = float(conv[0])
+                final_score = float(conv[1])
+            self._update_katago_brief(analysis, n)
+            # 终局情绪：她赢下（黑方胜率 < 0.5）平和地开心，输了则有点低落
+            self._mood_event("summary_win" if final_wr < 0.5 else "summary_lose")
+            seq = " → ".join(str(s) for s in self.st.move_seq)
+            prompt = "对局结束，共%d手。\n序列：%s\n最终黑胜率：%s，目差：%s\nEstarth备注：%s\n\n写总结：1.对局回顾 2.给Estarth的改进建议 2-3条 3.你的心情\n用Azure口吻，150-250字，慵懒真诚。" % (
+                n, seq, self._pct(final_wr), "%+.1f" % final_score, note)
+            text = await self._reply(self._phase_messages(
+                "summary",
+                prompts.with_context(self.st.moves, self.st.memory_log, self.st.chat_history, prompt, "summary", False, self.st.last_katago, self.st.board),
+            ), 600)
+            failed = self._llm_failed(text)
+            if failed:                              # 云端失败：总结退化为兜底台词
+                text = self._fallback_line("chat")
+            self.st.finished = True
+            self._emit(events.message(events.AI, "📋 对局总结\n" + text))
+            if not failed:                          # 只写真总结：兜底台词不是总结，写进去会污染记忆
+                await asyncio.to_thread(self._remember_game, text, final_wr, final_score)
+        except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
+            print("[Agent] 总结异常：%s" % e)
+            self._emit(events.message(events.AI, "📋 对局总结\n" + self._fallback_line("chat")))
+        finally:
+            self._set_busy(False)
 
     def undo(self, turn_index):
         """俗手回档：撤销该手及其后的 Azure 应手，回到该手之前。"""

@@ -2,6 +2,9 @@
 
 逐字逐函数移植自 AzureGoGodot/scripts/ai/AzurePrompts.gd。
 提示词内容一字不改，与 Godot 客户端保持完全一致。
+
+例外：``long_term_note`` 与 ``context_block`` / ``with_context`` 的 ``long_term`` 参数
+是后端长期记忆新增的，Godot 版没有；``long_term`` 为空串时输出仍与 Godot 版逐字符一致。
 """
 
 from . import coords
@@ -300,8 +303,27 @@ def board_map(board, num_moves):
     return "X = Estarth(黑)   O = Azure(白)   · = 空点\n%s\n%s\n%s，%s。" % ("\n".join(lines), occ, done, whose)
 
 
-def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, katago="", board=None):
-    """board：调用方已有的现成棋盘，给了就直接用。"""
+def long_term_note(text):
+    """跨局长期记忆的注入段：只作参考、不许照抄、不是当前盘面。
+
+    ``text`` 为空串时返回空串——``context_block`` 据此保证「没开长期记忆时输出逐字符不变」。
+    """
+    t = str(text or "").strip()
+    if t == "":
+        return ""
+    return ("\n\n【长期记忆 · 跨局的旧印象，不是当前盘面，仅供参考】\n%s\n"
+        + "上面这些是以前的对局与聊天里留下的印象，说的是「这个人过去的习惯」，不是眼前这盘棋："
+        + "别把它当成【当前棋面】或【最近的对话】，别照抄上面的句子，也别在回复里提起这段记忆本身；"
+        + "只在与眼前盘面不冲突时自然参考，拿不准就按眼前这盘棋来。") % t
+
+
+def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, katago="", board=None,
+                  long_term=""):
+    """board：调用方已有的现成棋盘，给了就直接用。
+
+    long_term：跨局长期记忆的召回文本，插在「【最近的对话】」之后、铁律段之前；
+    空串＝不注入，此时输出与没有这个参数时逐字符一致。
+    """
     hist = chat_history
     if skip_last_chat and len(hist) > 0:
         hist = hist[:len(hist) - 1]      # 聊天阶段：当前这句不在摘录里重复
@@ -310,6 +332,7 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
         + "\n\n【对局全貌 · 请始终记住】\n%s\n整盘手数：%s\n最近过程：\n%s"
         + "\n【落子评定存档（E=Estarth黑 / A=Azure白）· 只作回忆参考，别照抄、别改写里面的句子】\n%s"
         + "\n【最近的对话】\n%s"
+        + "%s"                                   # 长期记忆段（空串时不留痕）
         + "\n（铁律 · 先核对再开口：\n"
         + "1) 只要这句话与棋局有关，动笔前先看【当前棋面】：要提到某片区域/某个点「有子、没子、模样、实地、厚薄」时，必须能在上面的「现有棋子」里找到依据；那里没有的子一律不许提，拿不准就只说方向、不点具体子，绝不凭印象编。凡说「左/右/上/下」必须先按坐标核对：字母是列（A→T 从左到右）、数字是行（19→1 从上到下）；两子字母相同只能说「上下」、数字相同才算「左右」；核对不上就别说方位词，改说「这一带」。\n"
         + "2) 与棋局有关的每一句都要扣住「最近一手」和当前盘面，接着此刻的形势、以及你上一句的感受往下说；用「我 / 你」的第一人称视角，别像解说员那样说「黑方 / 白棋」，也别复述、别自说自话。\n"
@@ -322,13 +345,16 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
         game_narrative(moves),
         memory_brief(memory_log),
         chat_brief(hist),
+        long_term_note(long_term),
     )
     return _t(block)
 
 
-def with_context(moves, memory_log, chat_history, prompt, phase, skip_last_chat=False, katago="", board=None):
-    """在原提示词前附上对局全貌与回忆（原提示词本身不改动）。"""
-    return _t(context_block(moves, memory_log, chat_history, phase, skip_last_chat, katago, board) + "\n\n【现在】\n" + prompt)
+def with_context(moves, memory_log, chat_history, prompt, phase, skip_last_chat=False, katago="", board=None,
+                 long_term=""):
+    """在原提示词前附上对局全貌与回忆（原提示词本身不改动）；``long_term`` 原样转给 ``context_block``。"""
+    return _t(context_block(moves, memory_log, chat_history, phase, skip_last_chat, katago, board, long_term)
+              + "\n\n【现在】\n" + prompt)
 
 
 def board_summary(move_seq, last_n=6):

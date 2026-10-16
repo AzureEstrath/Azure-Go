@@ -1,33 +1,42 @@
 """后端配置（对应 ``AzureConfig.gd`` 中与后端相关的字段）。
 
-前后端分离后，config.json 仍只有一份：客户端只读它需要的（渲染/TTS/VLM/VRM 等），
+前后端分离后，config.json 仍只有一份：客户端只读它需要的（渲染 / 语音 TTS / VRM 等），
 后端只读引擎与 LLM、提示词自定义部分。这里只保留后端需要的字段，避免两边职责重叠。
 
-相对路径解析顺序与 Godot 版一致：可执行文件目录 → 项目目录 → D:/KataGo。
+KataGo 由独立的云服务提供（见 ``katago_service/``）：这里只存服务地址、鉴权 token 与超时，
+不再解析引擎可执行文件 / 模型 / 配置的路径。
 """
 
 import json
 import os
 
-_DEFAULT_DIRS = [os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "D:/KataGo"]
-
 
 class AzureConfig:
     def __init__(self):
-        self.katago_bin = r"D:\KataGo\bin\katago\katago.exe"
-        self.katago_model = r"D:\KataGo\models\model-b18c384nbt.bin.gz"
-        self.katago_config = r"D:\KataGo\bin\katago\default_gtp.cfg"
+        self.katago_url = "http://127.0.0.1:8100"   # KataGo 云服务地址（与 katago_service 默认端口一致）
+        self.katago_token = ""                      # Bearer token；留空＝不鉴权（本机回环调试）
+        self.katago_timeout_ms = 30000              # 单次 /analyze 超时
         self.max_visits = 500
         self.joseki_teach = True
-        self.llm_base_url = "http://localhost:8080/v1"
-        self.llm_model = "qwen3.5"
+        self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
+        self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
         self.llm_think_mode = 0
-        # —— 本地 LLM 服务（llama-server，由后端拉起与看护）——
-        self.llm_auto_start = True
-        self.llm_port = 8080
-        self.llm_exe = ""
-        self.llm_model_path = ""
+        # —— 请求体扩展字段（透传给 OpenAI 兼容服务，如 top_k / reasoning_effort）——
+        self.llm_extra_body = {}            # 始终并入
+        self.llm_think_extra_body = {}      # 仅思考档位开启（think_mode > 0）时并入
+        # —— 发言侧工具（她自己查盘/复算/查定式；只影响怎么说，不影响下哪里）——
+        self.tools_enabled = False          # 默认关闭：行为与没有工具时完全一致
+        self.max_tool_calls = 2             # 一次发言的工具次数上限（agent 侧还有硬上限）
+        # —— 长期记忆（跨局记得玩家；默认关闭，关闭时不建库、不调 embedding）——
+        self.memory_enabled = False
+        self.memory_db_path = ""            # 留空＝<backend>/data/memory.db（由 memory_service 决定）
+        self.embed_base_url = ""            # 云端 OpenAI 兼容 embedding 地址；三者任一为空则降级为关键词检索
+        self.embed_model = ""
+        self.embed_api_key = ""
+        self.memory_top_k = 3               # 每次召回条数上限
+        self.memory_max_inject_chars = 240  # 注入提示词的总字数上限（单条另截到 120 字）
+        self.embed_timeout = 10.0           # 单次 embedding 超时（秒）；可收紧，memory_service 用它装配云端客户端
         # —— 提示词自定义（留空则用内置 Azure 人设）——
         self.prompt_system = ""
         self.prompt_user_name = "Estarth"
@@ -59,13 +68,12 @@ class AzureConfig:
                 c._path = path
                 c._raw = d
                 c._apply(d)
-        c._resolve_paths(os.path.dirname(os.path.abspath(path)) if path else "")
         return c
 
     def _apply(self, d):
-        self.katago_bin = str(d.get("katago_bin", self.katago_bin))
-        self.katago_model = str(d.get("katago_model", self.katago_model))
-        self.katago_config = str(d.get("katago_config", self.katago_config))
+        self.katago_url = str(d.get("katago_url", self.katago_url))
+        self.katago_token = str(d.get("katago_token", self.katago_token))
+        self.katago_timeout_ms = int(d.get("katago_timeout_ms", self.katago_timeout_ms))
         self.max_visits = int(d.get("max_visits", self.max_visits))
         self.joseki_teach = bool(d.get("joseki_teach", self.joseki_teach))
         self.llm_base_url = str(d.get("llm_base_url", self.llm_base_url))
@@ -75,36 +83,36 @@ class AzureConfig:
             self.llm_think_mode = max(0, min(2, int(d.get("llm_think_mode", self.llm_think_mode))))
         else:
             self.llm_think_mode = 2 if bool(d.get("llm_think_strong", False)) else 0   # 旧键（bool）迁移
-        self.llm_auto_start = bool(d.get("llm_auto_start", self.llm_auto_start))
-        self.llm_port = int(d.get("llm_port", self.llm_port))
-        self.llm_exe = str(d.get("llm_exe", self.llm_exe))
-        self.llm_model_path = str(d.get("llm_model_path", self.llm_model_path))
+        eb = d.get("llm_extra_body")
+        if isinstance(eb, dict):
+            self.llm_extra_body = dict(eb)
+        tb = d.get("llm_think_extra_body")
+        if isinstance(tb, dict):
+            self.llm_think_extra_body = dict(tb)
+        self.tools_enabled = bool(d.get("tools_enabled", self.tools_enabled))
+        self.max_tool_calls = max(0, int(d.get("max_tool_calls", self.max_tool_calls)))
+        self.memory_enabled = bool(d.get("memory_enabled", self.memory_enabled))
+        self.memory_db_path = str(d.get("memory_db_path", self.memory_db_path))
+        self.embed_base_url = str(d.get("embed_base_url", self.embed_base_url))
+        self.embed_model = str(d.get("embed_model", self.embed_model))
+        self.embed_api_key = str(d.get("embed_api_key", self.embed_api_key))
+        self.memory_top_k = max(0, int(d.get("memory_top_k", self.memory_top_k)))
+        self.memory_max_inject_chars = max(0, int(d.get("memory_max_inject_chars", self.memory_max_inject_chars)))
+        try:
+            self.embed_timeout = max(0.0, float(d.get("embed_timeout", self.embed_timeout)))
+        except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把启动搞崩
+            self.embed_timeout = 10.0
         self.prompt_system = str(d.get("prompt_system", self.prompt_system))
         self.prompt_user_name = str(d.get("prompt_user_name", self.prompt_user_name))
         pn = d.get("prompt_phase_notes")
         if isinstance(pn, dict):
             self.prompt_phase_notes = dict(pn)
 
-    def _resolve_paths(self, exe_dir):
-        if exe_dir:
-            self.katago_bin = _resolve(self.katago_bin, exe_dir)
-            self.katago_model = _resolve(self.katago_model, exe_dir)
-            self.katago_config = _resolve(self.katago_config, exe_dir)
-        if self.llm_exe:
-            self.llm_exe = _resolve(self.llm_exe, exe_dir)
-        if self.llm_model_path:
-            self.llm_model_path = _resolve(self.llm_model_path, exe_dir)
+    def has_katago(self) -> bool:
+        """是否**显式配置**了 KataGo 服务地址（判据：``katago_url`` 非空）。
 
-    def has_paths(self) -> bool:
-        """KataGo 三件套是否用户显式配置过（都指向存在的文件）。"""
-        return all(os.path.isfile(p) for p in (self.katago_bin, self.katago_model, self.katago_config))
-
-
-def _resolve(p, exe_dir):
-    if os.path.isabs(p):
-        return p
-    for base in ([exe_dir] if exe_dir else []) + _DEFAULT_DIRS:
-        cand = os.path.join(base, p)
-        if os.path.isfile(cand):
-            return cand
-    return os.path.join(exe_dir, p) if exe_dir else p
+        注意「留空」不等于「不接入」：引擎客户端会把空地址回退到 ``DEFAULT_URL``
+        （``http://127.0.0.1:8100``，见 ``engine.py``），装配处照样会构造它并 ``start()``。
+        所以本判据只回答「用户有没有写地址」，**不代表** KataGo 相关功能已关闭。
+        """
+        return bool(self.katago_url)

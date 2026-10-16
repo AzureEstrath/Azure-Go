@@ -1,0 +1,3 @@
+fastapi>=0.110
+uvicorn>=0.27
+httpx>=0.27            # 仅测试用：fastapi.testclient 依赖它；服务本身不发起任何外部请求

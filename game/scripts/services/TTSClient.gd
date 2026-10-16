@@ -1,17 +1,15 @@
 class_name TTSClient
 extends Node
-## 本地 TTS 客户端：请求本机自建的语音服务（OpenAI 兼容 /v1/audio/speech，推荐 CosyVoice 3），
-## 只做「文本 → 音频字节 → 播放」。模型推理在本地服务进程里跑（可用 GPU），游戏侧几乎零开销；
-## 全程 localhost，不联网。
+## TTS 客户端：请求 OpenAI 兼容的语音服务（`/v1/audio/speech`），只做「文本 → 音频字节 → 播放」；
+## 合成在服务端完成，本进程只负责排队、预取与播放，不再拉起任何本地服务。
 
 signal status(text: String)
-signal auto_fallback(kind: String)     # 本地服务连不上时临时降级（不写配置）
+signal auto_fallback(kind: String)     # 语音服务连不上时临时降级（不写配置）
 signal speaking_changed(on: bool)      # 开始/结束朗读（化身说话时歪头用）
 signal utterance_started(group: int)   # 一条消息的音频开始播放（group=speak() 的分组号；0=试听）
-signal speech_skipped(group: int)      # 跳过朗读（服务加载中）：文字照常显示，只是没有声音
+signal speech_skipped(group: int)      # 跳过朗读（队列溢出或被取消）：文字照常显示，只是没有声音
 
 const QUEUE_MAX := 3
-const LOADING_HOLD_MAX := 6             # 语音服务加载期间最多暂存多少条待读消息（超出丢最旧的并放行其文字）
 const FAIL_COOLDOWN := 6.0
 const MAX_CHARS := 300
 const FILLER_FORCE_GAP_MS := 4000      # 任意两个语气词之间的最小间隔（force 也不能贴脸连播，防多路叠着响）
@@ -25,13 +23,12 @@ const HTTP_TIMEOUT_SLOW := 240.0     # CosyVoice 系列 CPU 很慢：给足时�
 ## 讲话时要丢掉的装饰：emoji、箭头/符号、半角假名颜文字等
 const _DROP_RE := "[\\x{1F000}-\\x{1FAFF}\\x{2190}-\\x{2BFF}\\x{FE00}-\\x{FE0F}\\x{2600}-\\x{27BF}\\x{FF61}-\\x{FF9F}\\x{30FB}\\x{FF65}\\x{2000}-\\x{200F}\\x{0370}-\\x{03FF}]"
 
-## 朗读方式：system=Windows 系统语音（零配置可用）；openai=CosyVoice 等服务(OpenAI 兼容)；
-## cosyvoice=CosyVoice 官方 fastapi（/inference_sft 表单接口）
-var mode := "system"
-var base_url := "http://127.0.0.1:9880/v1"
-var model := "cosyvoice3"
+## 朗读方式：system=Windows 系统语音（零配置可用）；openai=OpenAI 兼容服务（云端 /v1/audio/speech）
+var mode := "openai"
+var base_url := "https://api.openai.com/v1"
+var model := "tts-1"
 var api_key := ""            # 云端 OpenAI 兼容 TTS：非空则发送 Authorization: Bearer <key>
-var voice := "azure"
+var voice := "中文女"
 var speed := 1.0
 var pitch := 1.0              # 播放层音调：直接改播放速率（会略带动语速）
 var mood_pitch := 0.0         # 情绪区域的瞬时音高偏移（叠加在 pitch 上、不写回配置；±0.1 以内）
@@ -41,7 +38,7 @@ var enabled := false
 var _sapi_pid := -1          # 系统语音的子进程
 var _last_url := ""
 var _speaking := false
-var _prefer_mode := ""       # 临时降级前的引擎模式（本地服务就绪后自动切回）
+var _prefer_mode := ""       # 临时降级前的引擎模式（语音服务恢复后自动切回）
 var _recover_at := 0         # 下次探测服务可用性的时刻（ms）
 var _probing := false        # 在途请求是否为「恢复探测」
 var _http_busy := false      # Godot 的 HTTPRequest 同时只能有一个请求，单独跟踪避免 ERR_BUSY
@@ -54,7 +51,6 @@ var _cooldown := 0.0
 var _base_ready := false
 var _next_stream: AudioStream = null   # 边播边合成的下一句（预取），消除句间空白/卡住
 var _queue: Array[Dictionary] = []     # 朗读队列：{text, group, start, kind}；group 保证「一条消息一次 utterance_started」
-var _loading_hold: Array[Dictionary] = []   # 服务加载期暂存的整条消息：就绪后按序补读（不再跳过朗读）
 var _group_seq := 0                    # 消息分组号（每次 speak() 自增）
 var _req_group := 0                    # 在途合成请求属于哪一组
 var _req_start := false                # 在途请求是否为该组的第一块
@@ -65,8 +61,6 @@ var _next_start := false
 var _next_kind := ""                   # 预取流的类型
 var _play_kind := ""                   # 正在播放的声音类型
 var _drop_result := false              # 在途请求的结果已作废（取消走神搭话）：到达时直接丢弃
-var fast_voices := {}                  # 服务端标记为轻量的音色 id（sherpa/melo）：不需要按句拆分
-var service_loading := false           # Main 置位：本地语音服务正在加载模型（加载期不出声、也不降级系统语音）
 var fillers: Dictionary = {}           # kind → Array[AudioStream]（surprise / happy / puzzle / think / pat）
 var allow_fillers := true              # 是否允许自动插语气词：只在对局互动中允许，闲置搭话/开场问候不插（Main 控制）
 var _filler_player: AudioStreamPlayer = null
@@ -98,7 +92,7 @@ const FILLER_FILES := {
 	"sigh": ["filler_sigh_1.wav", "filler_sigh_2.wav"],          # 叹气/可惜：唉……、哎呀
 	"cheer": ["filler_cheer_1.wav", "filler_cheer_2.wav"],       # 惊叹/赞叹：哇！、好哎~
 	"proud": ["filler_proud_1.wav", "filler_proud_2.wav"],       # 小得意/撒娇：哼哼~、诶嘿
-	"hmph": ["filler_hmph_1.wav", "filler_hmph_2.wav"],          # 生气/得意的哼：窥屏发言前专用
+	"hmph": ["filler_hmph_1.wav", "filler_hmph_2.wav"],          # 生气/得意的哼：情绪区域爆发时用
 }
 
 ## 载入预制语气词：res://assets/voice/ 下按清单加载
@@ -157,18 +151,6 @@ func begin_filler_turn() -> void:
 ## 三维情绪区域 → 音高微调（由 Main 在 mood_changed 时下发；只影响本句听感，不改用户配置）
 func set_mood_pitch(p: float) -> void:
 	mood_pitch = clampf(p, -0.15, 0.15)
-
-## Main 在语音服务健康检查结束（就绪或超时）后调用：解除「加载中」闸门并立刻开始朗读
-func notify_service_ready() -> void:
-	service_loading = false
-	_cooldown = 0.0
-	# 加载期间排队的整条消息：现在按序补读（文字端仍按「同步说话」规则跟着语音开口才出现）
-	if not _loading_hold.is_empty():
-		var held := _loading_hold
-		_loading_hold = []
-		for it in held:
-			_enqueue(str(it["text"]), int(it["group"]), str(it.get("kind", "")))
-	_pump()
 
 ## 播放预制欢迎语音（assets/voice/welcome_<名字>.wav）：开场问候零等待，不必等引擎合成。
 ## 有对应文件才播并返回 true（调用方据此把文字直接显示）；否则返回 false，走普通语音流程。
@@ -231,7 +213,7 @@ func _process(delta: float) -> void:
 		_sapi_pid = -1
 		_on_spoken()                             # 系统语音：本句读完，接着读下一句
 	if _prefer_mode != "" and not _http_busy and not _busy and Time.get_ticks_msec() >= _recover_at:
-		_probe_service()                         # 临时降级中：定期看看本地服务好了没
+		_probe_service()                         # 临时降级中：定期探测语音服务是否恢复
 	# 合成等待超过 1.6 秒又没在出声：插一句预制语气词，别让等待显得像卡住
 	if _http_busy and not _speaking and _next_stream == null and Time.get_ticks_msec() - _http_since > 1600:
 		play_filler("think")
@@ -240,20 +222,10 @@ func _process(delta: float) -> void:
 func clear_fallback() -> void:
 	_prefer_mode = ""
 
-## 探测本地服务是否就绪；就绪则从系统语音兜底切回原引擎
+## 探测语音服务是否就绪；就绪则从系统语音兜底切回原引擎
 func _probe_service() -> void:
-	var prefer := _prefer_mode if _prefer_mode != "" else mode
-	var url := ""
-	if prefer == "cosyvoice":
-		var b := base_url.rstrip("/")
-		if b.ends_with("/v1"):
-			b = b.substr(0, b.length() - 3)
-		url = b + "/health"
-	else:
-		# OpenAI 兼容服务（含云端）：探标准 /models；只要服务在线就会有 HTTP 响应
-		url = base_url.strip_edges().rstrip("/") + "/models"
-	if url.contains("://localhost"):
-		url = url.replace("://localhost", "://127.0.0.1")
+	# OpenAI 兼容服务（含云端）：探标准 /models；只要服务在线就会有 HTTP 响应
+	var url := base_url.strip_edges().rstrip("/") + "/models"
 	_http.timeout = 4.0
 	_probing = true
 	_http_busy = true
@@ -271,17 +243,6 @@ func speak(text: String, kind := "") -> int:
 	var t := clean_for_speech(text)
 	if t == "":
 		return 0
-	if service_loading and mode != "system":
-		# 本地服务正在加载模型：本条先排队等它就绪再读（绝不降级系统语音——用户会突然听到 Windows 音色）。
-		# 这里不发 speech_skipped：调用方的文字会一直等到这条真正开口才显示（同步说话模式）
-		_group_seq += 1
-		var lg := _group_seq
-		_loading_hold.append({"text": t, "group": lg, "kind": kind})
-		while _loading_hold.size() > LOADING_HOLD_MAX:
-			var old: Dictionary = _loading_hold.pop_front()   # 排太久了：丢最旧的一条，放行它的文字
-			speech_skipped.emit.call_deferred(int(old["group"]))
-		status.emit("语音服务加载中：本条已排队，就绪后自动朗读")
-		return lg
 	_group_seq += 1
 	var g := _group_seq
 	_enqueue(t, g, kind)
@@ -289,7 +250,6 @@ func speak(text: String, kind := "") -> int:
 	return g
 
 ## 是否还在忙（合成中/排队中/正在播放）。「同步说话」用它判断文字该等语音，还是直接显示。
-## 注意：加载期暂存的 _loading_hold 不算「在说」——棋盘锁与落子揭示不该被它拖住
 func is_speaking() -> bool:
 	return _speaking or _busy or _http_busy or _next_stream != null or not _queue.is_empty()
 
@@ -298,10 +258,7 @@ func stop() -> void:
 	for it in _queue:
 		if bool(it.get("start", false)):
 			speech_skipped.emit.call_deferred(int(it["group"]))
-	for it2 in _loading_hold:
-		speech_skipped.emit.call_deferred(int(it2["group"]))
 	_queue.clear()
-	_loading_hold.clear()
 	_next_stream = null
 	_next_kind = ""
 	if _player != null and _player.playing:
@@ -332,13 +289,6 @@ func cancel_kind(kind: String) -> bool:
 		else:
 			kept.append(it)
 	_queue = kept
-	var kept_hold: Array[Dictionary] = []
-	for it in _loading_hold:
-		if str(it.get("kind", "")) == kind:
-			hit = true                                # 还没轮到补读的走神搭话：直接丢掉（文字也不显示）
-		else:
-			kept_hold.append(it)
-	_loading_hold = kept_hold
 	if _next_stream != null and _next_kind == kind:   # 预取的那一段也属于被取消的消息
 		_next_stream = null
 		_next_kind = ""
@@ -442,7 +392,7 @@ func _chunk_for_slow(text: String) -> Array[String]:
 		out.append(text)
 	return out
 
-## 是否为慢速神经网络引擎（CosyVoice 克隆/预设；melo 与系统语音不算）。
+## 是否为慢速神经网络引擎（自建 CosyVoice 的克隆/预设音色；melo 与系统语音不算）。
 ## 导演层也用它判断犹豫节拍时长：慢引擎缩短犹豫，避免雪上加霜。
 func is_slow_engine() -> bool:
 	if mode == "system":
@@ -450,8 +400,6 @@ func is_slow_engine() -> bool:
 	var v := voice.strip_edges().to_lower()
 	if v.ends_with("-fast"):
 		return false                       # 快速克隆版（melo + 音色转换）很快
-	if fast_voices.get(v, false):
-		return false                       # 服务端标记为轻量（engine=sherpa，如小雅/少女音）：不必拆句
 	return v != "melo" and v != "sherpa" and v != "zh_en" and not v.begins_with("melo")
 
 # ================= 内部 =================
@@ -462,7 +410,7 @@ func _set_speaking(v: bool) -> void:
 	_speaking = v
 	speaking_changed.emit(v)
 
-## 分块并入朗读队列（speak 与加载期补读共用）。慢引擎按「整句」合并成较大的块；
+## 分块并入朗读队列（speak 的入队实现）。慢引擎按「整句」合并成较大的块；
 ## 队列满了丢最旧的——丢的若是某条消息的首块，说明这条再也不会开口，补发 speech_skipped
 ## 让它的文字照常显示，并把该消息剩余的分块一并清掉（避免无文字配半截语音）。
 func _enqueue(text: String, group: int, kind: String) -> void:
@@ -493,8 +441,6 @@ func _pump(force := false) -> void:
 		return
 	if not force and (not enabled or _cooldown > 0.0):
 		return
-	if service_loading and mode != "system":
-		return                                   # 本地服务正在加载：本轮不请求（notify_service_ready 后恢复）
 	if mode == "system":
 		if _sapi_pid > 0 and OS.is_process_running(_sapi_pid):
 			return                               # 上一句还在读
@@ -512,17 +458,12 @@ func _pump(force := false) -> void:
 	_req_kind = str(item.get("kind", ""))
 	_req_text = text                             # 记录在途文本：连接失败可回队重试，不再丢句
 	_busy = true
-	var headers: PackedStringArray
-	var payload := ""
-	if mode == "cosyvoice":                      # CosyVoice 官方 fastapi：表单接口
-		headers = _with_auth(PackedStringArray(["Content-Type: application/x-www-form-urlencoded"]))
-		payload = "tts_text=%s&spk_id=%s" % [text.uri_encode(), voice.uri_encode()]
-	else:                                        # OpenAI 兼容 /v1/audio/speech
-		headers = _with_auth(PackedStringArray(["Content-Type: application/json"]))
-		payload = JSON.stringify({
-			"model": model, "input": text, "voice": voice,
-			"speed": speed, "response_format": "mp3",
-		})
+	# OpenAI 兼容 /v1/audio/speech
+	var headers := _with_auth(PackedStringArray(["Content-Type: application/json"]))
+	var payload := JSON.stringify({
+		"model": model, "input": text, "voice": voice,
+		"speed": speed, "response_format": "mp3",
+	})
 	_last_url = _endpoint()
 	_http_busy = true
 	_http_since = Time.get_ticks_msec()
@@ -534,14 +475,13 @@ func _pump(force := false) -> void:
 		print("[TTS] 请求无法发出：%s  URL=%s" % [error_string(err), _last_url])
 		status.emit("TTS 请求发送失败（%s）：%s" % [error_string(err), _last_url])
 	elif is_slow_engine():
-		# 慢引擎（CosyVoice）：让用户知道在合成、大概要等多久，消除「文字出了但没声音」的割裂感
+		# 慢引擎（自建 CosyVoice）：让用户知道正在合成、大概要等多久，消除「文字出了但没声音」的割裂感
 		status.emit("Azure 正在开口…（本句合成中，约 %d 秒）" % int(ceil(text.length() * 1.2)))
 
 func _endpoint() -> String:
-	var b := base_url.rstrip("/")
-	return b + ("/inference_sft" if mode == "cosyvoice" else "/audio/speech")
+	return base_url.rstrip("/") + "/audio/speech"
 
-## 本地服务无需鉴权；填了 api_key（云端 OpenAI 兼容 TTS）则带 Bearer
+## 云端 OpenAI 兼容 TTS：填了 api_key 就带 Bearer（留空则不发送）
 func _with_auth(h: PackedStringArray) -> PackedStringArray:
 	var key := api_key.strip_edges()
 	if key != "":
@@ -581,7 +521,7 @@ func _speak_system(text: String, group: int, start: bool, kind := "") -> void:
 			utterance_started.emit.call_deferred(group)   # 延到本帧末：调用方先把待显示文字入队
 		status.emit("正在朗读…（系统语音）")
 
-## Godot 只把 localhost 解析为 IPv6，本地服务多监听 IPv4，统一改写成 127.0.0.1
+## Godot 只把 localhost 解析为 IPv6，自建服务多监听 IPv4，统一改写成 127.0.0.1
 func _ensure_base() -> void:
 	if _base_ready:
 		return
@@ -614,18 +554,13 @@ func _on_done(result: int, code: int, _headers: PackedStringArray, body: PackedB
 		if conn_failed and mode != "system":
 			# 出队的这句先放回队首（原来会静默丢弃）
 			_queue.push_front({"text": _req_text, "group": _req_group, "start": _req_start, "kind": _req_kind})
-			if service_loading:
-				# 服务还在加载模型：绝不降级系统语音（否则会突然冒出 Windows 音色），等它就绪
-				status.emit("语音服务正在加载模型，本条等它就绪后再读")
-				_cooldown = 2.0
-			else:
-				# 本地服务没启动：临时改走系统语音，保证「有声音」，但不写回配置
-				_cooldown = 0.0
-				_prefer_mode = mode                       # 记住原引擎，服务就绪后自动切回
-				_recover_at = Time.get_ticks_msec() + 8000
-				mode = "system"
-				auto_fallback.emit("system")
-				_pump()
+			# 服务连不上：临时改走系统语音，保证「有声音」，但不写回配置
+			_cooldown = 0.0
+			_prefer_mode = mode                       # 记住原引擎，服务就绪后自动切回
+			_recover_at = Time.get_ticks_msec() + 8000
+			mode = "system"
+			auto_fallback.emit("system")
+			_pump()
 			return
 		_cooldown = FAIL_COOLDOWN
 		_set_speaking(false)

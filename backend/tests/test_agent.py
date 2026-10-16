@@ -7,55 +7,15 @@
 import asyncio
 import os
 import sys
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import events
 from app.agent import AzureAgent
-
-
-class StubEngine:
-    """固定返回的假引擎：候选点覆盖常见位置，便于断言确定性的应手。"""
-
-    CAND = ["Q16", "D4", "Q4", "D16", "K10", "C3", "R14", "F16", "J3", "O16", "C16", "R4"]
-
-    def __init__(self):
-        self.calls = []
-        self.dead = False
-
-    async def analyze(self, moves):
-        self.calls.append([list(m) for m in moves])
-        return {
-            "rootInfo": {"winrate": 0.5, "scoreLead": 0.0},
-            "moveInfos": [{"move": m, "visits": 1} for m in self.CAND],
-            "ownership": [0.0] * 361,
-        }
-
-    def is_dead(self):
-        return self.dead
-
-    def last_error(self):
-        return ""
-
-
-class StubLLM:
-    def __init__(self, text="嗯~ 这一步我看着挺顺。"):
-        self.think_mode = 0
-        self.text = text
-        self.calls = []
-        self.base_url = "http://localhost:8080/v1"
-
-    async def chat(self, messages, max_tokens=300, no_think=False):
-        self.calls.append((list(messages), max_tokens, no_think))
-        return self.text
-
-
-def _mk():
-    eng = StubEngine()
-    llm = StubLLM()
-    bus = events.RecordingBus()
-    return AzureAgent(eng, llm, bus), eng, llm, bus
+from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM
+from helpers import mk_agent as _mk
 
 
 class FlowTest(unittest.TestCase):
@@ -156,6 +116,21 @@ class FlowTest(unittest.TestCase):
             [c for c in eng.calls if c == cached_pos], [cached_pos],
             "第二手不应重算已缓存的「落子前局面」",
         )
+
+    def test_peek_removed(self):
+        agent, _eng, _llm, _bus = _mk()
+        self.assertFalse(hasattr(agent, "peer_remark"))
+
+    def test_idle_remark_still_works(self):
+        """删掉窥屏后，闲置主动搭话必须照常（Review Focus 第四条）。"""
+
+        async def run():
+            agent, _eng, _llm, bus = _mk()
+            await agent.idle_remark()
+            return bus
+
+        bus = asyncio.run(run())
+        self.assertEqual(len(bus.messages(events.AI_IDLE)), 1)
 
 
 class ControlTest(unittest.TestCase):
@@ -267,6 +242,264 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(agent.st.board.at(x, y), "")
         self.assertTrue(agent.st.board.is_legal(x, y, "white")["ok"])
         self.assertEqual((x, y), (9, 9))          # 空盘：就近中心
+
+
+class FailSafeTest(unittest.TestCase):
+    """云端 LLM 失败 / 未配置时：busy 必须归位，健康面必须可用。"""
+
+    # —— 断言工具 ——
+
+    def _run(self, llm, flow):
+        """用失败的云端 LLM 跑一条流程，返回 (agent, bus)。"""
+        async def run():
+            agent, _eng, _llm, bus = _mk()
+            agent.llm = llm
+            await flow(agent)
+            return agent, bus
+
+        return asyncio.run(run())
+
+    def _run_after_move(self, llm, flow):
+        """先正常下一手铺出局面，再换成失败的云端 LLM 跑目标流程（bus 已清空）。"""
+        async def run():
+            agent, _eng, _llm, bus = _mk()
+            await agent.player_move(3, 3)
+            agent.llm = llm
+            bus.clear()
+            await flow(agent)
+            return agent, bus
+
+        return asyncio.run(run())
+
+    def _assert_no_error_text_and_unlocked(self, tag, agent, bus):
+        """玩家可见文本里不许出现「调用出错」，且 busy 必须归位（否则棋盘永久锁死）。"""
+        for e in bus.messages():
+            self.assertNotIn("调用出错", str(e.get("text", "")), "%s：错误文案漏给了玩家" % tag)
+        self.assertFalse(agent.busy, "%s：busy 没归位" % tag)
+        self.assertFalse(bus.of_type("busy")[-1]["busy"], "%s：最后一个 busy 事件应为 False" % tag)
+
+    def _assert_says_something(self, tag, bus, kind):
+        """该流程必须有一句非空的兜底台词顶上来。"""
+        texts = [str(e.get("text", "")).strip() for e in bus.messages(kind)]
+        self.assertTrue(texts, "%s：应有一句兜底台词" % tag)
+        self.assertTrue(all(t != "" for t in texts), "%s：兜底台词不能为空" % tag)
+
+    def test_busy_released_when_llm_raises(self):
+        agent, eng, _llm, bus = _mk()
+        agent.llm = BoomLLM()
+
+        async def run():
+            await agent.player_move(3, 3)
+
+        asyncio.run(run())
+        self.assertFalse(agent.busy)
+        self.assertFalse(bus.of_type("busy")[-1]["busy"])
+
+    def test_move_degrades_cleanly(self):
+        """点评 / 落子宣告退化为兜底台词；她的应手照常（Review Focus #2/#3）。"""
+        for llm in (ErrLLM(), BoomLLM()):
+            tag = type(llm).__name__
+            agent, bus = self._run(llm, lambda a: a.player_move(3, 3))
+            self._assert_no_error_text_and_unlocked(tag, agent, bus)
+            self._assert_says_something(tag, bus, events.AI_COMMENT)     # 点评有兜底
+            self.assertTrue(bus.messages(events.AI_MOVE), tag + "：落子宣告必须照常")
+            self.assertEqual(len(agent.st.moves), 2, tag + "：她该下的一手不能丢")
+            payload = agent.st.payload()
+            self.assertEqual(len(payload["stones"]), payload["move_count"], tag + "：棋盘状态必须自洽")
+
+    def test_hint_degrades_cleanly(self):
+        for llm in (ErrLLM(), BoomLLM()):
+            tag = type(llm).__name__
+            agent, bus = self._run(llm, lambda a: a.hint())
+            self._assert_no_error_text_and_unlocked(tag, agent, bus)
+            self._assert_says_something(tag, bus, events.AI_COMMENT)
+
+    def test_analyze_degrades_cleanly(self):
+        for llm in (ErrLLM(), BoomLLM()):
+            tag = type(llm).__name__
+            agent, bus = self._run_after_move(llm, lambda a: a.analyze_position())
+            self._assert_no_error_text_and_unlocked(tag, agent, bus)
+            self._assert_says_something(tag, bus, events.AI)
+
+    def test_chat_degrades_cleanly(self):
+        for llm in (ErrLLM(), BoomLLM()):
+            tag = type(llm).__name__
+            agent, bus = self._run(llm, lambda a: a.chat("你好呀~"))
+            self._assert_no_error_text_and_unlocked(tag, agent, bus)
+            self._assert_says_something(tag, bus, events.AI)
+            # 兜底台词要进聊天历史，下一轮上下文才自洽
+            self.assertEqual(agent.st.chat_history[-1]["role"], "assistant", tag)
+
+    def test_summarize_degrades_cleanly(self):
+        for llm in (ErrLLM(), BoomLLM()):
+            tag = type(llm).__name__
+            agent, bus = self._run_after_move(llm, lambda a: a.summarize("辛苦啦"))
+            self._assert_no_error_text_and_unlocked(tag, agent, bus)
+            texts = [str(e.get("text", "")) for e in bus.messages(events.AI)]
+            self.assertTrue(any(t.startswith("📋 对局总结") for t in texts), tag)
+            self._assert_says_something(tag, bus, events.AI)
+
+
+class FakeMemory:
+    def __init__(self, text=""):
+        self.text = text
+        self.games = []
+
+    @property
+    def available(self):
+        return True
+
+    def recall_for(self, query, k=None):
+        return self.text
+
+    def remember_game(self, moves, result, summary):
+        self.games.append((len(moves), result, summary))
+
+
+class MemoryWiringTest(unittest.TestCase):
+    def test_constructor_accepts_memory(self):
+        """构造参数接口：main.py 的 lifespan 用 ``memory=`` 注入。"""
+        mem = FakeMemory()
+        agent = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus(), memory=mem)
+        self.assertIs(agent.memory, mem)
+
+    def test_no_memory_keeps_long_term_empty(self):
+        agent, _eng, llm, _bus = _mk()
+        agent.memory = None
+
+        async def run():
+            await agent.player_move(3, 3)
+
+        asyncio.run(run())
+        for msgs, _mt, _nt in llm.calls:
+            for m in msgs:
+                if m["role"] == "user":
+                    self.assertNotIn("长期记忆", m["content"])
+
+    def test_memory_text_reaches_prompts(self):
+        agent, _eng, _llm, _bus = _mk()
+        agent.memory = FakeMemory("Estarth 喜欢点三三")
+
+        async def run():
+            await agent.chat("你好")
+
+        asyncio.run(run())
+        # 真实断言：至少一条 user 消息里带上了召回文本
+        sent = [m["content"] for c in agent.llm.calls for m in c[0] if m["role"] == "user"]
+        self.assertTrue(any("Estarth 喜欢点三三" in s for s in sent))
+
+    def test_memory_text_reaches_ai_turn_context(self):
+        """她这一回合（_ai_turn）也要带召回文本——这条走 with_context 的透传路径。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent.memory = FakeMemory("Estarth 喜欢点三三")
+
+        async def run():
+            await agent.player_move(3, 3)
+
+        asyncio.run(run())
+        sent = [m["content"] for c in agent.llm.calls for m in c[0] if m["role"] == "user"]
+        self.assertTrue(any("Estarth 喜欢点三三" in s for s in sent))
+
+    def test_summary_writes_long_term_memory(self):
+        agent, _eng, _llm, _bus = _mk()
+        mem = FakeMemory()
+        agent.memory = mem
+
+        async def run():
+            await agent.player_move(3, 3)
+            await agent.summarize("测试备注")
+
+        asyncio.run(run())
+        self.assertEqual(len(mem.games), 1)
+        self.assertGreater(mem.games[0][0], 0)
+
+    def test_summary_fallback_is_not_stored(self):
+        """云端失败时的兜底台词不算总结：不得写进长期记忆（记忆污染）。"""
+        agent, _eng, _llm, _bus = _mk()
+        mem = FakeMemory()
+        agent.memory = mem
+        agent.llm = ErrLLM()
+
+        async def run():
+            await agent.player_move(3, 3)
+            await agent.summarize("辛苦啦")
+
+        asyncio.run(run())
+        self.assertEqual(len(mem.games), 0)
+
+
+class ThreadProbeMemory:
+    """记录召回 / 写入在哪个线程被调用：记忆调用必须走工作线程，不得阻塞事件循环。"""
+
+    def __init__(self):
+        self.threads = []
+        self.games = []
+
+    @property
+    def available(self):
+        return True
+
+    def recall_for(self, query, k=None):
+        self.threads.append(threading.current_thread())
+        return ""
+
+    def remember_game(self, moves, result, summary):
+        self.threads.append(threading.current_thread())
+        self.games.append((len(moves), result, summary))
+
+
+class MemoryOffLoopTest(unittest.TestCase):
+    """记忆调用必须走 ``asyncio.to_thread``：慢 embedding 不得冻住整个事件循环（I2）。"""
+
+    def test_memory_calls_run_off_the_event_loop(self):
+        agent, _eng, _llm, _bus = _mk()
+        mem = ThreadProbeMemory()
+        agent.memory = mem
+        seen = {}
+
+        async def run():
+            seen["loop"] = threading.current_thread()
+            await agent.player_move(3, 3)       # _ai_turn 里的召回
+            await agent.chat("你好")            # chat 里的召回
+            await agent.summarize("备注")       # summarize 里的写入
+
+        asyncio.run(run())
+        self.assertGreaterEqual(len(mem.threads), 3)
+        for t in mem.threads:
+            self.assertIsNot(t, seen["loop"], "记忆调用不得跑在事件循环线程上")
+
+
+class BoomMemory:
+    """召回与写入都抛异常的替身：记忆故障只该打日志，绝不能让这一回合卡死。"""
+
+    @property
+    def available(self):
+        return True
+
+    def recall_for(self, query, k=None):
+        raise RuntimeError("云端 embedding 401")
+
+    def remember_game(self, moves, result, summary):
+        raise RuntimeError("库坏了")
+
+
+class MemoryFailureTest(unittest.TestCase):
+    """记忆故障（I2 的守卫路径）：回合照常走完、``busy`` 归位、台词照常发出。"""
+
+    def test_raising_memory_keeps_turns_alive(self):
+        agent, _eng, _llm, bus = _mk()
+        agent.memory = BoomMemory()
+
+        async def run():
+            await agent.player_move(3, 3)
+            await agent.chat("你好")
+            await agent.summarize("备注")
+
+        asyncio.run(run())
+        self.assertFalse(agent.busy)                                        # busy 必须归位
+        self.assertTrue(bus.messages(events.AI_MOVE))                       # 落子宣告照常
+        texts = [str(e.get("text", "")) for e in bus.messages(events.AI)]
+        self.assertTrue(any(t.startswith("📋 对局总结") for t in texts))     # 总结照常发出
 
 
 if __name__ == "__main__":
