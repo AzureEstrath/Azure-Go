@@ -393,6 +393,48 @@ func _run() -> void:
 	_check("⑩ 取回时才发现已作废 ⇒ 什么都不做（不播也不显示）",
 			p10.resolve_fetch(r10c, false, 0) == "done" and _shown.is_empty())
 
+	# —— ⑪ 回合已结束的台词**不等语音**：她上一句的音频还在播时也不能把回复扣在「思考中」里 ——
+	# 触发链（用户报告的现象）：玩家在她朗读时发聊天 ⇒ 这条回复的 `speech` 排在上一句音频之后，
+	# 原来的 `arm(rec, cfg.tts_sync_speak)` 让文字傻等它 ⇒ `release_stale()` 又因「音频在途」拒放
+	# ⇒ 回复一直不显示、「Azure 思考中……」占位一直挂着；玩家**再发一条消息**时
+	# `Main._deliver_msg` 会先放积压，回复这才冒出来（看起来「上一条要等下一次发送」）。
+	var p11 := _new_pairing()
+	_reset()
+	var r11 := p11.register("聊天回复", false, "ai")
+	var wait11 := p11.should_wait_voice(true, _env(false, true, false), false)   # 回合已结束 + 音频在播
+	_check("⑪ 回合已结束时不等语音（她上一句还在播也不等）", not wait11)
+	p11.arm(r11, wait11)
+	if not wait11:                                                       # Main._deliver_msg 的同一步
+		p11.display(r11)
+	_check("⑪ 文字当场显示、不留待显示残留（不会挂在「思考中」占位里）",
+			_shown == ["聊天回复"] and not p11.has_pending())
+	_check("⑪ 回合还没结束时照样等语音（对局中的同步说话不变）",
+			p11.should_wait_voice(true, _env(true, true, false), false))
+	_check("⑪ 「同步说话」关掉时一律不等", not p11.should_wait_voice(false, _env(true, false, false), false))
+	_check("⑪ 落子宣告（reveal）任何情况下都等：音画同步的硬规则不许被绕过",
+			p11.should_wait_voice(true, _env(false, true, false), true))
+	# ⑪c 不许插队：前面还有台词在等它自己的语音时，这条也得按顺序等（聊天栏顺序不乱）
+	_reset()
+	var r11b := p11.register("还在等语音的上一句", false, "ai")
+	p11.arm(r11b, true)
+	_check("⑪c 前面有欠账时按顺序等（不抢到它前面去）",
+			p11.should_wait_voice(true, _env(false, true, false), false))
+	p11.finish(r11b)
+	p11.display(r11b)                                                    # 玩家消息一进来就会这样先放积压
+	_check("⑪c 积压放掉之后就不再等（回复仍然即时）",
+			not p11.should_wait_voice(true, _env(false, true, false), false))
+	# ⑪d 回合**中**的台词：她的语音马上要开口，等它一起出现——老行为不许回退
+	var p11d := _new_pairing()
+	_reset()
+	var r11d := p11d.register("落子宣告", true, "ai_move")
+	p11d.arm(r11d, p11d.should_wait_voice(true, _env(true, false, false), true))
+	p11d.release_stale(_env(false, true, false))                         # 回合结束但音频还在途
+	_check("⑪d 回合中的台词：语音在途时不提前放（reveal 时机不变）",
+			_shown.is_empty() and p11d.has_pending())
+	p11d.finish(r11d)
+	p11d.display(r11d)
+	_check("⑪d 语音开播后照常显示（等到了，含揭示）", _shown == ["落子宣告"] and _reveals[0])
+
 	if _fail == 0:
 		print("[pair] PASS：", _total, " 项断言全部通过")
 	else:

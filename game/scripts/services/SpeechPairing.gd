@@ -127,6 +127,26 @@ func arm(rec: Dictionary, wait_display: bool) -> void:
 	rec["armed"] = true
 	rec["wait_display"] = wait_display
 
+## 这条台词的文字该不该**等它自己的语音开播**（「同步说话」的判据；`Main._deliver_msg` 用它定 `arm()` 的
+## `wait_display`，`_on_utterance_started` 再据此决定「要不要在这一刻显示」）。
+##
+## 三种情况**等**：
+##   · **她这一轮还没结束**（`turn_active`）：这一轮她的话是一串连着的朗读，文字配着声音一起出现才自然；
+##   · **这条要揭示棋子**（`reveal`，即 `ai_move` 落子宣告）：音画同步的硬规则——她的子必须在**这手宣告的
+##     语音开始播放**时才揭示（`Main._reveal_move` → `POST /api/reveal`），所以文字也得等那一刻，不能提前；
+##   · **前面还有没显示的台词**（`has_pending()`）：那时它自己的语音正排着队，现在放它就会抢到那条前面，
+##     聊天栏的顺序会乱（`Main._deliver_msg` 对玩家消息的「先放积压」正是为了保序）。
+##
+## 其余（回合已经结束、不用揭示棋子、前面也没有欠账的台词：聊天 / 闲置搭话 / 非法手提示）**一律不等**：她上一句的
+## 音频可能还排在队列里没播完，等它就会把这条回复一直扣在「Azure 思考中……」占位里——玩家**再发一条消息**时
+## `Main._deliver_msg` 会先放积压，回复这才冒出来，看起来就是「上一条回复要等下一次发送才显示」。README
+## 「同步说话」一栏写的「聊天与闲置搭话接近即时、前端会立刻放字」就是这条规则——它原来只靠
+## `release_stale()` 在「音频没在途」时碰巧成立，音频一在途（她还在念上一句）就失效了。
+func should_wait_voice(sync_enabled: bool, env: Dictionary, reveal := false) -> bool:
+	if not bool(sync_enabled):
+		return false
+	return bool(reveal) or bool(env.get("turn_active", false)) or has_pending()
+
 ## 现在就把这条文字显示出来（已经显示过 / 占位记录不重复显示）：真的显示了才发 `display_requested`
 func display(rec: Dictionary) -> bool:
 	if rec.is_empty() or bool(rec["displayed"]) or bool(rec["tomb"]):

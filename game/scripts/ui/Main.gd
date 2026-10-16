@@ -884,10 +884,14 @@ func _deliver_msg(kind: String, text: String, tone: String, rec: Dictionary) -> 
 			var token := _batch_token
 			get_tree().create_timer(BATCH_WINDOW).timeout.connect(func(): _flush_batch(token))
 		else:
-			# 逐句播报：语音由 speech 事件驱动（按到达顺序与这条配对）；
-			# 「同步说话」开着时轮到它开始播放才显示文字（见 _on_utterance_started）
-			pairing.arm(rec, cfg.tts_sync_speak)
-			if not cfg.tts_sync_speak or pairing.played(rec):
+			# 逐句播报：语音由 speech 事件驱动（按到达顺序与这条配对）。
+			# 「同步说话」只在**她这一轮还没结束**（或这条要揭示棋子）时让文字等语音——
+			# 见 `should_wait_voice`：回合已经结束的台词（聊天 / 闲置搭话 / 非法手提示）当场显示，
+			# 她上一句的音频还在播时也不能扣着（否则回复会一直挂在「Azure 思考中……」里，
+			# 等到玩家再发一条才放出来）。
+			var wait_voice: bool = pairing.should_wait_voice(cfg.tts_sync_speak, _pair_facts(), reveal)
+			pairing.arm(rec, wait_voice)
+			if not wait_voice or pairing.played(rec):
 				pairing.display(rec)         # 文字立即显示 / 语音先到先播过了：这一刻就把文字补上
 		pairing.release_stale(_pair_facts())  # 后端这一轮已结束（如 undo/reset 只有文字）：别一直等语音
 		return
@@ -924,7 +928,9 @@ func _release_batch(force_show: bool) -> void:
 		return
 	if cfg.tts_sync_speak and not force_show and not _tts_playing:
 		# 文字等这段连续语音开口时（_on_tts_speaking → _flush_pending_ai）与声音一起出现；
-		# 万一这段语音最后没到（后端只发了文字/音频取不回），pairing.release_stale 会兜底放出来
+		# 万一这段语音最后没到（后端只发了文字/音频取不回），pairing.release_stale 会兜底放出来。
+		# （逐句模式的同类判断在 `should_wait_voice`；整段模式这里本来就要求「已经在响了」才等，
+		#  所以聊天这类「回合已结束」的回复不会像逐句模式那样被扣住。）
 		return
 	_flush_pending_ai()                 # 已经在响了 / 需要保序：先显示文字
 
