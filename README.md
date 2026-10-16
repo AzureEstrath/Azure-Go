@@ -25,6 +25,7 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 
 ## 目录
 
+- [分支说明](#分支说明)
 - [一、仓库结构](#一仓库结构)
 - [二、快速开始](#二快速开始)
 - [三、`config.json` 字段](#三configjson-字段)
@@ -35,6 +36,19 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 - [八、许可](#八许可)
 - [九、更新](#九更新)
 - [十、致谢](#十致谢)
+
+---
+
+## 分支说明
+
+本仓库以 **发展主版本** 为主线，另保留一条 **历史分支** 完整承载旧版：
+
+| 分支 | 定位 | 内容概要 | 链接 |
+| --- | --- | --- | --- |
+| **`main`** | 发展主版本（当前主线，v3.x） | 前后端分离：`game\` 只负责渲染、输入与语音播放，`backend\` 统一编排对局与模型调用，`katago_service\` 独立部署提供 KataGo；支持 LangChain 提示链、发言侧工具与长期记忆。 | [查看 main](https://github.com/AzureEstrath/Azure-Go) |
+| **`legacy`** | 历史分支（发展副版本，v1.0–v2.0.1） | 旧版完整存档：本机运行 KataGo 与本地模型、三维情感模型（valence / curiosity / arousal）、前后端分离 v2.0.1，以及 `peek\` 窥屏脚本等。 | [查看 legacy](https://github.com/AzureEstrath/Azure-Go/tree/legacy) |
+
+> `legacy` 为旧版的历史存档，后续功能开发集中在 `main`。
 
 ---
 
