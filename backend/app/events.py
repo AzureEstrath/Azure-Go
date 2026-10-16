@@ -1,6 +1,6 @@
-"""客户端事件契约与事件总线（对应 AzureAgent.gd 的 6 个 signal）。
+"""客户端事件契约与事件总线（对应前端 `NetClient.gd` 的 7 个 signal）。
 
-AzureAgent.gd 通过 6 个 signal 把结果推给界面；分离后改为「后端发事件 → WS 推给客户端」。
+前端的 7 个 signal 由后端事件驱动；分离后是「后端发事件 → WS 推给客户端」。
 本模块把契约集中在一处，避免各处 magic string：
 
     message       ↔  message(kind, text)        对话/点评/落子宣告（kind 见下）
@@ -9,20 +9,28 @@ AzureAgent.gd 通过 6 个 signal 把结果推给界面；分离后改为「后�
     busy          ↔  busy_changed(busy)
     mood          ↔  mood_changed(payload)      三维情绪区域（表情/语气词/音高）
     joseki        ↔  joseki_event(payload)      定式高亮轨迹（kind/corner/points）
+    tool          ↔  tool_event(payload)        她自己查资料（start/end，只给状态栏看）
+    memory        ↔  （无信号）                  长期记忆的写入/召回元数据，前端只记一行日志
 
 事件统一为 dict，``type`` 字段走对应构造器；客户端按 type 分发。
-message.kind 取值与 AzureAgent 的 message.emit 完全一致：
+message.kind 取值与前端 message 信号一致：
     ai / ai_comment / ai_move / ai_idle / user / system
 
 ``ai_move`` 额外带 ``move`` 字段（{x, y, gtp, pass}）；客户端在落子宣告语音开始时
-``POST /api/reveal`` 让后端把这一手推到棋盘（round-trip，与本地模式「语音开始才 reveal」语义一致）。
+``POST /api/reveal`` 让后端把这一手推到棋盘（round-trip：语音开始才揭示那一手）。
+
+``tool`` 只描述「她自己查了一次资料」的进度（``phase`` = start/end），**不是台词**：
+前端只用它更新状态栏文案，工具返回的原始文本永远只回到模型手里。
+
+``memory`` 只描述一次长期记忆动作（``op`` = write/recall），同样是**元数据、不是台词**：
+前端不产生任何界面信号，只做轻量日志；记忆内容绝不进台词。
 """
 
 # —— message.kind ——
 AI = "ai"                    # 一般台词（提示/分析/总结/虚着说明等）
 AI_COMMENT = "ai_comment"    # 重要点评（导演层据此加犹豫节拍）
 AI_MOVE = "ai_move"          # 落子宣告（带坐标；语音开始时揭示）
-AI_IDLE = "ai_idle"          # 闲置/窥屏搭话（玩家一回来可整句作废）
+AI_IDLE = "ai_idle"          # 闲置搭话（玩家一回来可整句作废）
 USER = "user"
 SYSTEM = "system"
 
@@ -58,6 +66,29 @@ def joseki(payload):
     e = {"type": "joseki"}
     e.update(payload)
     return e
+
+
+def tool(phase, name, args=None, ok=True, ms=0):
+    """工具执行进度（只给状态栏用，不是台词）：start 在调用前、end 在返回后。
+
+    ``args`` 只带模型自己给的那份参数（注入的引擎对象不可序列化，也不该外泄）；
+    ``ok``/``ms`` 只在 ``end`` 上有意义，``start`` 固定 ``True``/``0``。
+    """
+    return {"type": "tool", "phase": str(phase), "name": str(name),
+            "args": dict(args or {}), "ok": bool(ok), "ms": int(ms)}
+
+
+def memory(op, tag, text, score=0.0):
+    """长期记忆的写入 / 召回（**元数据、不是台词**，前端只记一行日志）。
+
+    ``op`` 取 ``write`` / ``recall``；``score`` 只在召回时有意义（关键词降级固定 0.0）。
+    ``score`` 不是数字时按 0.0 处理——这个构造器不该因为脏值把端点打成 500。
+    """
+    try:
+        sc = float(score)
+    except (TypeError, ValueError):
+        sc = 0.0
+    return {"type": "memory", "op": str(op), "tag": str(tag), "text": str(text), "score": sc}
 
 
 def hello(payload, mood_payload, busy):

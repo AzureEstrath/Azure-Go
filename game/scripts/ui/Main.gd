@@ -12,10 +12,7 @@ const BUBBLE_SYS := Color(1.0, 0.953, 0.804)
 signal setup_confirmed
 
 var cfg: AzureConfig
-var katago: KataGoEngine
-var llm: LLMClient
-## 对局编排入口：本地模式为 AzureAgent（同进程编排），remote 模式为 NetClient（后端服务进程）。
-## 两者的信号与方法面完全一致，故此处不写死类型（按 cfg.backend_mode 动态选择）。
+## 对局编排入口：NetClient（编排与 KataGo/LLM 都在后端服务进程）。不写死类型，与信号接线解耦。
 var agent
 var board: Board3D
 var ambience: Ambience
@@ -42,7 +39,6 @@ var _speech_hold := false                  # Azure 还有语音没播完：继�
 var _pending_batch := ""                   # 攒起来的连续 Azure 文本：合并成「一整段」一次合成
 var _pending_batch_kind := ""              # 这批文本的类型（""=对局发言；"idle"=走神搭话，可整批作废）
 var _batch_token := 0                      # 去抖令牌：又来新消息就自增，让旧计时器失效
-var _tts_pid := -1                         # 本游戏拉起的语音服务进程（用于开关切换后重启）
 var _tts_playing := false                  # 当前是否真有音频在播（区别于「排队中/合成中」）
 var _think_dots := 0                       # 「思考中…」省略号动效点数（1~3 循环）
 var _think_last_ms := 0                    # 上次刷新省略号的时刻
@@ -65,7 +61,6 @@ var _typing_full := ""                     # 这条消息的完整文本
 var _typing_shown := 0.0                   # 已显示字数（浮点累计）
 var _typing_cps := 0.0                     # 当前打字速度（字/秒）
 var _typing_queue: Array[Dictionary] = []  # 排队等待打字的 {label,text}（单活跃顺序播放，防抢跑）
-var _peek_hmph := false                    # 窥屏发言前先「哼」一声（_tick_peek 设，搭话投递时消费）
 var _tone_re := RegEx.new()                # [[tone:xxx]] 语气标记（首次使用时编译）
 var _mood := ""                            # 当前情绪基调：同一情绪延续时只刷新计时、不再出声（治「语气太多」）
 var _mood_ms := 0                          # 最近一次情绪刷新的时刻
@@ -75,38 +70,16 @@ const MOOD_KEEP_MS := 30000                # 同一情绪 30 秒内视为延续�
 const BATCH_WINDOW := 0.35
 
 var _last_activity_ms := 0                 # 最近一次「玩家有操作」的时刻（闲置计时）
-var _last_player_activity_ms := 0          # 同上的「真实玩家操作」时钟：只有玩家自己动鼠标/键盘才刷新（窥屏门槛用，不被 Azure 自己说话重置）
 var _idle := false
 var _idle_muted := false                   # 玩家已回来（落子/说话）：在途与排队的走神搭话全部作废
 var _next_talk_ms := 0                     # 下一次闲置搭话的时刻
 var _last_move_count := 0                  # 用于识别 Azure 刚落的那颗子
 
-## 长时间闲置窥屏（本地 PaddleOCR + Qwen2.5-VL，独立 python 进程一跑一停）
-const PEEK_COOLDOWN_MS := 60000            # 两次窥屏至少隔 1 分钟（搭话本身也要间隔 45 秒起，不会刷屏）
-const PEEK_TIMEOUT_MS := 240000            # 窥屏进程超时：放弃，退回普通搭话
-var _peek_busy := false
-var _peek_started_ms := 0
-var _peek_last_ms := 0
-var _peek_ctx_activity := 0                # 发起窥屏时的「玩家活动时刻」：对不上说明玩家已回来，结果作废
-var _peek_out := ""                        # 窥屏结果 json 路径
-var _peek_exe := ""                        # 跑窥屏的 python（需装好 paddleocr / llama-cpp-python）
-var _peek_script := ""                     # azure_peek.py 路径
-var _peek_probed := false
-var _peek_ok := false
-var _peek_pid := -1                        # 正在跑的窥屏进程（退出时清掉，别留孤儿）
-var _vlm_starter := ""                     # start_vlm_server.py 路径（拉起 GPU 常驻 VLM 服务）
-var _llm_starter := ""                     # start_llm_server.py 路径（启动时一并拉起本地 LLM 服务）
-var _llm_py := ""                          # 用来跑启动器的 python（启动器只用标准库，任意 python 皆可）
+## 音色候选（静态列表）：云端服务商各有音色名，这里只给常见几种；右侧输入框可手填任意音色 id
+const VOICE_PRESETS := ["alloy", "echo", "fable", "nova", "onyx", "shimmer",
+	"中文女", "粤语女", "英文女"]
 
-## 本地语音服务目录：优先「可执行文件同级的 cosyvoice\」（分享版），否则回退 D:/KataGo/cosyvoice（开发机）。
-## 用 VBS 以「隐藏窗口的 python.exe」拉起：pythonw 加载 CosyVoice 时会静默崩溃。
-var _tts_dir := "D:/KataGo/cosyvoice"
-const TTS_PORT := 9880
-## 音色只保留能听的女声（用户反馈男声/韩语均不可用）；melo 是轻量引擎
-const COSYVOICE_PRESETS := ["中文女", "粤语女", "英文女"]
-const CLONE_VOICE := "azure"               # CosyVoice 克隆音色（最像，但 CPU 上慢）
-const CLONE_FAST := "azure-fast"           # 快速版：melo 合成 + OpenVoice 音色转换
-## 闲置互动：玩家长时间无操作 → 看向玩家 + 歪头 + 偶尔主动搭话
+## 闲置互动：玩家长时间无操作 → 看向玩家 + 歪头 + 偶尔主动搭话（搭话走后端 POST /api/idle）
 const IDLE_SEC := 12.0
 const IDLE_TALK_FIRST := 18.0
 const IDLE_TALK_MIN := 45.0
@@ -120,6 +93,10 @@ var _lbl_moves: Label
 var _lbl_wr: Label
 var _lbl_score: Label
 var _lbl_status: Label
+var _status_before_tool := ""                  # 她查资料前状态栏的原文案（end 时恢复）
+var _status_before_tool_bad := false           # 原文案的错误色标记（end 时一并恢复，别把红字洗成灰字）
+var _status_bad := false                       # 状态栏当前是不是错误色（_set_status 记录，上面那行取用）
+var _tool_active := false                      # 工具进度是否在跑（start/end 成对，避免重复记原文案）
 var _chk_pass: CheckBox
 var _chk_joseki: CheckBox
 var _bad_box: HBoxContainer
@@ -129,10 +106,7 @@ var _shot_path := ""
 
 func _ready() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
-	_last_player_activity_ms = _last_activity_ms
-	_peek_last_ms = -PEEK_COOLDOWN_MS          # 允许开局后第一次长闲置就窥屏
 	cfg = AzureConfig.load_config()
-	_tts_dir = _find_tts_dir()
 	_apply_cli_overrides()
 	_font = _make_cjk_font()
 	_build_world()
@@ -143,24 +117,13 @@ func _ready() -> void:
 	_greet()
 	_handle_cli()
 
-## 语音服务目录：优先可执行文件同级的 cosyvoice\，否则回退开发机路径
-func _find_tts_dir() -> String:
-	var exe_dir := OS.get_executable_path().get_base_dir()
-	for c in [exe_dir.path_join("cosyvoice"), "D:/KataGo/cosyvoice"]:
-		if FileAccess.file_exists(c.path_join("azure_tts_server.py")):
-			return c
-	return exe_dir.path_join("cosyvoice")
-
 ## 命令行覆盖：--llm=http://host:port/v1  --model=模型名  --key=云端API Key（均不写回配置）
-## 另有架构开关：--backend=local|remote 与 --backend-url=http://host:port
+## 另有 --backend-url=http://host:port 指定后端服务地址
 func _apply_cli_overrides() -> void:
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--backend-url="):
 			cfg.backend_url = a.substr("--backend-url=".length())
 			cfg.cli_locked["backend_url"] = true
-		elif a.begins_with("--backend="):
-			cfg.backend_mode = a.substr("--backend=".length())
-			cfg.cli_locked["backend_mode"] = true
 		elif a.begins_with("--llm="):
 			cfg.llm_base_url = a.substr("--llm=".length())
 			cfg.cli_locked["llm_base_url"] = true
@@ -315,15 +278,11 @@ func _build_right_panel(root: Control) -> void:
 	_style_check(_chk_joseki, "定式导学")
 	info.add_child(_chk_joseki)
 
-	# 加速开关（bf16 / 短参考需重启语音服务；短回复、同步说话、整段合成、长句合并立即生效）
+	# 语音开关（短回复、同步说话、整段合成、长句合并，均立即生效）
 	var acc := GridContainer.new()
 	acc.columns = 2
 	acc.add_theme_constant_override("h_separation", 12)
 	vb.add_child(acc)
-	_acc_check(acc, "bf16 加速", cfg.tts_bf16, "bf16",
-		"把 CosyVoice 的 LLM 权重降到 bfloat16：约快 20~28%，个别词可能读错（需重启语音服务）")
-	_acc_check(acc, "短参考", cfg.tts_short_prompt, "short",
-		"用 ~2.7s 短参考替代 6.3s：实测总耗时基本不变，语速会变慢、音色略变（需重启语音服务）")
 	_acc_check(acc, "短回复", cfg.tts_limit_len, "len",
 		"限制 Azure 每次只说 1~2 句：语音等待时间随字数下降（立即生效）")
 	_acc_check(acc, "同步说话", cfg.tts_sync_speak, "sync",
@@ -386,7 +345,7 @@ func _build_right_panel(root: Control) -> void:
 	_lbl_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(_lbl_status)
 
-## 左侧（与右侧等宽）：本地语音朗读设置
+## 左侧（与右侧等宽）：语音朗读设置
 func _build_left_panel(root: Control) -> void:
 	var panel := PanelContainer.new()
 	_left_panel = panel
@@ -409,12 +368,12 @@ func _build_left_panel(root: Control) -> void:
 	var hv := VBoxContainer.new()
 	head.add_child(hv)
 	var t1 := Label.new()
-	t1.text = "🔊 语音（本地 TTS）"
+	t1.text = "🔊 语音朗读"
 	t1.add_theme_font_size_override("font_size", 16)
 	t1.add_theme_color_override("font_color", Color.WHITE)
 	hv.add_child(t1)
 	var t2 := Label.new()
-	t2.text = "本机自建 CosyVoice 3 等服务 · 全程 localhost · 侧栏收起后依然朗读"
+	t2.text = "云端 OpenAI 兼容语音服务 / Windows 系统语音 · 侧栏收起后依然朗读"
 	t2.add_theme_font_size_override("font_size", 11)
 	t2.add_theme_color_override("font_color", Color(1, 1, 1, 0.85))
 	t2.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -430,16 +389,15 @@ func _build_left_panel(root: Control) -> void:
 	var opt := OptionButton.new()
 	opt.fit_to_longest_item = false                  # 不让长选项文字撑宽面板（保证左右侧栏等宽）
 	opt.add_item("系统语音", 0)
-	opt.add_item("CosyVoice 表单接口", 1)
-	opt.add_item("CosyVoice OpenAI 接口", 2)
-	opt.selected = maxi(0, ["system", "openai", "cosyvoice"].find(cfg.tts_mode))
+	opt.add_item("CosyVoice OpenAI 接口", 1)
+	opt.selected = maxi(0, ["system", "openai"].find(cfg.tts_mode))
 	opt.item_selected.connect(_on_tts_mode)
 	vb.add_child(opt)
 
-	vb.add_child(_field_label("服务地址（上面第 2/3 项才需要）"))
+	vb.add_child(_field_label("服务地址（上面第 2 项才需要）"))
 	var le_url := LineEdit.new()
 	le_url.text = cfg.tts_base_url
-	le_url.tooltip_text = "例如 http://127.0.0.1:9880/v1"
+	le_url.tooltip_text = "云端 OpenAI 兼容语音服务地址，例如 https://api.openai.com/v1（自建服务填它的地址）"
 	le_url.text_submitted.connect(func(_t): _apply_tts_fields())
 	le_url.focus_exited.connect(_apply_tts_fields)
 	vb.add_child(le_url)
@@ -461,7 +419,7 @@ func _build_left_panel(root: Control) -> void:
 	col2.add_child(_field_label("音色（可下拉选）"))
 	_tts_voice_opt = OptionButton.new()
 	_tts_voice_opt.fit_to_longest_item = false       # 同上：避免被最长音色名撑宽
-	_fill_voice_items([])
+	_fill_voice_items()
 	col2.add_child(_tts_voice_opt)
 	_tts_voice_opt.item_selected.connect(_on_voice_selected)
 
@@ -469,20 +427,15 @@ func _build_left_panel(root: Control) -> void:
 	vrow.add_theme_constant_override("separation", 6)
 	vb.add_child(vrow)
 	var b_refresh := Button.new()
-	b_refresh.text = "刷新音色列表"
+	b_refresh.text = "重填音色候选"
+	b_refresh.tooltip_text = "音色候选是本地静态列表，点一下按当前配置重填下拉框；具体音色 id 也可在右侧手填"
 	b_refresh.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	b_refresh.pressed.connect(_refresh_voices)
 	vrow.add_child(b_refresh)
 	_tts_voice_edit = LineEdit.new()             # 也可手动输入音色 id
 	_tts_voice_edit.text = cfg.tts_voice
-	_tts_voice_edit.tooltip_text = "手动输入音色 id（如 melo / 中文女）"
+	_tts_voice_edit.tooltip_text = "手动输入音色 id（服务商不同，音色名也不同）"
 	vrow.add_child(_tts_voice_edit)
-
-	var chk_auto := CheckBox.new()
-	chk_auto.button_pressed = cfg.tts_auto_start
-	chk_auto.toggled.connect(func(v): cfg.tts_auto_start = v; cfg.save())
-	_style_check(chk_auto, "启动游戏时自动拉起语音服务")
-	vb.add_child(chk_auto)
 
 	vb.add_child(_field_label("语速"))
 	var sp := HSlider.new()
@@ -543,9 +496,9 @@ func _build_left_panel(root: Control) -> void:
 	vb.add_child(_tts_status)
 
 	var tip := Label.new()
-	tip.text = "本机已部署本地语音（都在 D:\\KataGo\\cosyvoice）：\n" \
-		+ "· 音色：azure-fast（你的克隆音色·快速版，推荐）/ azure（CosyVoice 原版，较慢）/ melo / 中文女 / 粤语女 / 英文女\n" \
-		+ "· 换引擎音色后需重启语音服务；零配置兜底：上面第 1 项「Windows 系统语音」"
+	tip.text = "语音由云端 OpenAI 兼容服务合成（第 2 项），也可用手填音色 id；\n" \
+		+ "· 零配置兜底：上面第 1 项「Windows 系统语音」直接用本机 SAPI，不联网\n" \
+		+ "· 服务不可达时自动临时改用系统语音，只影响本次运行、不改配置"
 	tip.add_theme_font_size_override("font_size", 10)
 	tip.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
 	tip.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -638,11 +591,11 @@ func _on_tts_enabled(v: bool) -> void:
 		tts.enabled = v
 		if not v:
 			tts.stop()
-	_tts_status.text = ("已开启朗读 · 本地服务 %s" % cfg.tts_base_url) if v else "未开启朗读"
+	_tts_status.text = ("已开启朗读 · 语音服务 %s" % cfg.tts_base_url) if v else "未开启朗读"
 	cfg.save()
 
 func _on_tts_mode(i: int) -> void:
-	var m: String = ["system", "openai", "cosyvoice"][clampi(i, 0, 2)]
+	var m: String = ["system", "openai"][clampi(i, 0, 1)]
 	if m == cfg.tts_mode:
 		return                       # 程序化赋值也可能触发该信号：值没变就不写配置
 	cfg.tts_mode = m
@@ -669,8 +622,8 @@ func _apply_tts_fields() -> void:
 	cfg.save()
 	_tts_status.text = "语音设置已保存"
 
-## 音色下拉：只保留能听的女声（melo / 中文女 / 粤语女 / 英文女）；服务端返回的男声与克隆音色统一过滤
-func _fill_voice_items(from_server: Array) -> void:
+## 音色下拉：云端服务商各有音色名，这里只填静态候选；具体 id 也可在右侧输入框手填（不再向语音服务探测）
+func _fill_voice_items() -> void:
 	if _tts_voice_opt == null:
 		return
 	if _is_removed_voice(cfg.tts_voice):                # 旧配置里的男声/克隆音色 → 迁到中文女
@@ -680,44 +633,18 @@ func _fill_voice_items(from_server: Array) -> void:
 		if tts != null:
 			tts.voice = cfg.tts_voice
 		cfg.save()
-	var items: Array = [
-		[CLONE_FAST, "Azure 快速版"],
-		[CLONE_VOICE, "Azure 克隆（最像）"],
-		["melo", "MeloTTS"],
-	]
-	for p in COSYVOICE_PRESETS:
-		items.append([p, "%s（预设）" % p])
-	for v in from_server:
-		if typeof(v) != TYPE_DICTIONARY:
-			continue
-		var vid := str((v as Dictionary).get("id", ""))
-		var eng := str((v as Dictionary).get("engine", ""))
-		if eng == "sherpa" and tts != null:
-			tts.fast_voices[vid] = true          # 轻量音色：客户端不必按句拆分/给超长超时
-		# 允许：melo、克隆音色、预设女声，以及服务端注册的所有轻量女声（engine=sherpa，如少女/元气音色）
-		var allowed := vid == "melo" or vid == CLONE_VOICE or vid.ends_with("-fast") \
-			or COSYVOICE_PRESETS.has(vid) or eng == "sherpa"
-		if not allowed:
-			continue                                    # 不再展示男声 / 旧克隆音色
-		var dup := false
-		for it in items:
-			if str(it[0]) == vid:
-				dup = true
-				break
-		if not dup:
-			items.append([vid, str((v as Dictionary).get("label", vid))])
 	_tts_voice_opt.clear()
-	for it in items:
-		_tts_voice_opt.add_item(str(it[1]))
-		_tts_voice_opt.set_item_metadata(_tts_voice_opt.item_count - 1, str(it[0]))
+	for v in VOICE_PRESETS:
+		_tts_voice_opt.add_item(v)
+		_tts_voice_opt.set_item_metadata(_tts_voice_opt.item_count - 1, v)
 	for i in _tts_voice_opt.item_count:
 		if str(_tts_voice_opt.get_item_metadata(i)) == cfg.tts_voice:
 			_tts_voice_opt.select(i)
 			break
 
-## 已移除的音色（男声 / 韩语女 / 旧克隆音色）；azure 是新的克隆音色，保留
+## 已移除的音色（男声 / 韩语女 / 旧克隆音色）：清单以 AzureConfig.LEGACY_TTS_VOICES 为准，不再各存一份
 static func _is_removed_voice(v: String) -> bool:
-	return v in ["中文男", "日语男", "英文男", "韩语女", "azure-soft", "azure-brisk", "azure-calm"]
+	return v in AzureConfig.LEGACY_TTS_VOICES
 
 func _on_voice_selected(i: int) -> void:
 	var vid := str(_tts_voice_opt.get_item_metadata(i))
@@ -729,136 +656,16 @@ func _on_voice_selected(i: int) -> void:
 		tts.voice = vid
 		tts.stop()
 	cfg.save()
-	_tts_status.text = "音色已切换：%s（换引擎音色时需重启语音服务）" % vid
+	_tts_status.text = "音色已切换：%s" % vid
 
-## 从服务端 /voices 拉取音色清单
+## 「重填音色候选」按钮：音色不再由服务端提供，这里只按静态候选重填一次下拉框
 func _refresh_voices() -> void:
-	var url := _health_url().replace("/health", "/voices")
-	var req := HTTPRequest.new()
-	add_child(req)
-	if req.request(url) != OK:
-		req.queue_free()
-		_tts_status.text = "无法连接语音服务（%s）" % url
-		return
-	var res: Array = await req.request_completed
-	req.queue_free()
-	var parsed = JSON.parse_string((res[3] as PackedByteArray).get_string_from_utf8())
-	var list: Array = []
-	if typeof(parsed) == TYPE_DICTIONARY:
-		list = (parsed as Dictionary).get("voices", [])
-	_fill_voice_items(list)
-	_tts_status.text = "音色列表已刷新（%d 项）" % _tts_voice_opt.item_count
+	_fill_voice_items()
+	_tts_status.text = "音色候选已重填（%d 项，也可手填服务商音色）" % _tts_voice_opt.item_count
 
-func _health_url() -> String:
-	var b := cfg.tts_base_url.strip_edges().rstrip("/")
-	if b.ends_with("/v1"):
-		b = b.substr(0, b.length() - 3)
-	return b + "/health"
-
-## 是否已有语音服务实例在启动或运行：读服务端写的实例锁（pid），再用进程存活判断。
-## 模型加载期间端口未监听、/health 必然失败，只靠健康检查会误判成「没在跑」而重复拉起。
-func _service_started_or_starting() -> bool:
-	var lock := _tts_dir.path_join(".tts_server.lock")
-	if not FileAccess.file_exists(lock):
-		return false
-	var f := FileAccess.open(lock, FileAccess.READ)
-	if f == null:
-		return false
-	var pid := int(f.get_as_text().strip_edges())
-	f.close()
-	return pid > 0 and OS.is_process_running(pid)
-
-## 一次健康检查（3 秒超时）：HTTP 链路通且状态码 > 0 即视为服务已监听
-func _tts_health_once() -> bool:
-	var probe := HTTPRequest.new()
-	add_child(probe)
-	probe.timeout = 3.0
-	var ok := false
-	if probe.request(_health_url()) == OK:
-		var res: Array = await probe.request_completed
-		ok = int(res[0]) == HTTPRequest.RESULT_SUCCESS and int(res[1]) > 0
-	probe.queue_free()
-	return ok
-
-## 等本地语音服务就绪：每 1.5 秒探一次，最多 iterations 次；就绪则刷新音色列表。
-## 等待期间 tts.service_loading=true：加载期只显示文字不出声，也绝不降级系统语音
-## （降级会让用户突然听到 Windows 音色——「你累了吧」那句的病因）。
-func _wait_tts_health(iterations: int) -> bool:
-	tts.service_loading = true
-	for i in iterations:
-		await get_tree().create_timer(1.5).timeout
-		if await _tts_health_once():
-			_refresh_voices()
-			tts.notify_service_ready()
-			return true
-	tts.notify_service_ready()                   # 超时也解除：之后真连不上再按原逻辑降级
-	return false
-
-## 启动游戏时自动拉起本地语音服务（经 VBS 以隐藏窗口的 python.exe 后台拉起）
-func _autostart_tts() -> void:
-	if not cfg.tts_enabled or cfg.tts_mode == "system":
-		return
-	if not _is_local_url(cfg.tts_base_url):
-		# 地址已改成外部 API：切断本地这条线——不拉起、不等待、不降级
-		print("[TTS] 已配置外部语音 API（%s），不启动本地语音服务" % cfg.tts_base_url)
-		_tts_status.text = "已配置外部语音 API：不启动本地语音服务"
-		return
-	if await _tts_health_once():                 # 服务已在跑：直接连上
-		_tts_status.text = "已连接本地语音服务（%s）" % cfg.tts_base_url
-		_refresh_voices()
-		return
-	# 服务加载模型（1~2 分钟）期间端口还没监听，健康检查必然失败：
-	# 先看有没有实例正在启动/运行，避免重复拉起——两个实例互抢 CPU 会让「启动」看起来一直失败
-	var starting := _service_started_or_starting()
-	if not cfg.tts_auto_start and not starting:
-		return                                   # 没让自动拉起、也没有现成实例：什么都不做
-	if starting:
-		print("[TTS] 已有语音服务实例在启动/运行，等待它就绪（不重复拉起）")
-		_tts_status.text = "语音服务已在启动（加载模型约 1~2 分钟），等它就绪…"
-	else:
-		var py := _tts_dir.path_join(".venv/Scripts/python.exe")
-		if not FileAccess.file_exists(py):
-			_tts_status.text = "未找到本地语音环境（缺 %s）" % py
-			return
-		_spawn_tts_server()
-	if await _wait_tts_health(160):              # 等就绪（双模型加载较慢，最多约 4 分钟）
-		_tts_status.text = "本地语音服务已就绪（%s）" % cfg.tts_base_url
-	else:
-		_tts_status.text = "本地语音服务仍在加载，稍后自动可用（日志：cosyvoice/server_run.log）"
-
-func _spawn_tts_server() -> void:
-	var voice := cfg.tts_voice.strip_edges()
-	var low := voice.to_lower()
-	var want_cosy := low != "melo" and low != "sherpa" and low != "zh_en"
-	var launcher := _tts_dir.path_join("run_hidden.vbs")
-	var py := _tts_dir.path_join(".venv/Scripts/python.exe")
-	var script := _tts_dir.path_join("azure_tts_server.py")
-	var args := PackedStringArray([launcher, py, script, "--port", str(TTS_PORT),
-		"--threads", "12", "--cosyvoice", ("1" if want_cosy else "0")])
-	if want_cosy:
-		# 克隆音色要 0.5B 模型、预设女声要 SFT 模型：两个都加载，按音色自动路由
-		args.append_array(["--model_dir", "pretrained_models/Fun-CosyVoice3-0.5B",
-			"--sft_dir", "pretrained_models/CosyVoice-300M-SFT"])
-		if cfg.tts_bf16:
-			args.append_array(["--bf16", "1"])
-		if cfg.tts_short_prompt:
-			args.append_array(["--prompt", "short"])
-		print("[TTS] 后台启动本地语音服务（隐藏窗口）：音色=%s bf16=%s 短参考=%s"
-			% [voice, cfg.tts_bf16, cfg.tts_short_prompt])
-	var pid := OS.create_process("wscript.exe", args)
-	if pid > 0:
-		_tts_pid = pid
-		_tts_status.text = "已后台启动本地语音服务（pid=%d），正在加载模型…" % pid
-	else:
-		_tts_status.text = "本地语音服务启动失败（%s）" % launcher
-
-## 右侧栏加速开关：立即存盘；需要服务重启的（bf16/短参考）顺手重启本游戏拉起的服务
+## 右侧栏语音开关：立即存盘并即时生效（都不需要重启任何服务）
 func _on_acc_toggled(on: bool, which: String) -> void:
 	match which:
-		"bf16":
-			cfg.tts_bf16 = on
-		"short":
-			cfg.tts_short_prompt = on
 		"len":
 			cfg.tts_limit_len = on
 			if agent != null:
@@ -878,29 +685,9 @@ func _on_acc_toggled(on: bool, which: String) -> void:
 			if tts != null:
 				tts.slow_chunk_chars = 160 if on else 100
 	cfg.save()
-	if which == "len" or which == "sync" or which == "batch" or which == "chunk":
-		var nm := "短回复" if which == "len" else ("同步说话" if which == "sync" else ("整段合成" if which == "batch" else "长句合并"))
-		_tts_status.text = "%s：%s（立即生效）" % [nm, "开" if on else "关"]
-		_set_status("语音：%s已%s" % [nm, "开启" if on else "关闭"])
-		return
-	_tts_status.text = "已保存：%s（重启语音服务中…）" % ("开" if on else "关")
-	_restart_tts_server()
-
-func _restart_tts_server() -> void:
-	if not _is_local_url(cfg.tts_base_url):
-		_tts_status.text = "当前指向外部语音 API：无需重启本地服务"
-		return
-	if _tts_pid > 0 and OS.is_process_running(_tts_pid):
-		OS.kill(_tts_pid)
-		_tts_pid = -1
-		await get_tree().create_timer(1.0).timeout
-		_spawn_tts_server()
-		if await _wait_tts_health(200):          # 等模型重新加载（约 2 分钟）
-			_tts_status.text = "语音服务已按新开关重启完成"
-		else:
-			_tts_status.text = "语音服务重启中，稍后自动可用"
-	else:
-		_tts_status.text = "开关已保存；当前语音服务不是本游戏拉起的，请手动重启它（或重启游戏）后生效"
+	var nm := "短回复" if which == "len" else ("同步说话" if which == "sync" else ("整段合成" if which == "batch" else "长句合并"))
+	_tts_status.text = "%s：%s（立即生效）" % [nm, "开" if on else "关"]
+	_set_status("语音：%s已%s" % [nm, "开启" if on else "关闭"])
 
 func _on_tts_speed(v: float, persist: bool) -> void:
 	cfg.tts_speed = v
@@ -1008,10 +795,7 @@ func _director_hesitation(kind: String, waiting_behind: int, seq: int) -> float:
 func _deliver_msg(kind: String, text: String, tone: String) -> void:
 	var is_ai := kind.begins_with("ai")
 	var reveal := kind == "ai_move"          # 这条是「Azure 落子宣告」：轮到她这段语音时再落子
-	if kind == "ai_idle" and _peek_hmph:
-		_peek_hmph = false
-		_mood_sound("hmph")                  # 窥屏发言前先「哼」一声（生气/得意）：正好落在合成等待期间
-	elif tone != "":
+	if tone != "":
 		_mood_sound(tone)                    # 语气标记 → 预制语气词（同一情绪延续时不重复出声）
 	if is_ai and tts != null and tts.enabled:
 		var tts_kind := "idle" if kind == "ai_idle" else ""      # 走神搭话可被整类取消（cancel_kind("idle")）
@@ -1052,7 +836,7 @@ func _deliver_msg(kind: String, text: String, tone: String) -> void:
 		_flush_pending_ai()
 	_add_msg_now(kind, text)
 
-## 把新一句并进攒着的文本：不用换行（CosyVoice 会把 \n 当分句甚至丢掉），按标点补齐句读
+## 把新一句并进攒着的文本：不用换行（部分语音服务会把 \n 当分句甚至丢掉），按标点补齐句读
 static func _join_batch(cur: String, add: String) -> String:
 	var a := add.strip_edges()
 	if a == "":
@@ -1304,6 +1088,7 @@ func _render_bad_moves(list: Array) -> void:
 		_bad_box.add_child(btn)
 
 func _set_status(text: String, bad := false) -> void:
+	_status_bad = bad
 	_lbl_status.text = text
 	_lbl_status.add_theme_color_override("font_color",
 		Color(0.8, 0.2, 0.2) if bad else Color(0.45, 0.45, 0.45))
@@ -1357,7 +1142,7 @@ func _ask_note(title_text: String, on_ok: Callable) -> void:
 
 # ================= 启动设置面板 =================
 
-## 启动设置：思考模式 + LLM / 语音 TTS / 窥屏 VLM 的 API 配置（默认全部取当前 config.json 的值）。
+## 启动设置：思考模式 + LLM / 语音 TTS 的 API 配置（默认全部取当前 config.json 的值）。
 ## 确认后写回 config.json，_ready 再继续按新配置起服务。
 ## 调试自动化（--shot= / --demo）默认跳过面板；带 --setup 时只把面板画出来（不等确认），供截图核对样式。
 func _maybe_show_setup() -> void:
@@ -1416,7 +1201,7 @@ func _build_setup_panel() -> void:
 	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(sub)
 
-	vb.add_child(_field_label("思考模式（只影响本地 Qwen3 这类思考型模型）"))
+	vb.add_child(_field_label("思考模式（只影响 Qwen3 这类思考型模型）"))
 	var think_opt := OptionButton.new()
 	think_opt.fit_to_longest_item = false
 	think_opt.add_item("快速：不思考，首字 1~2 秒（推荐）")
@@ -1428,23 +1213,17 @@ func _build_setup_panel() -> void:
 
 	var llm_body := _setup_section(vb, "LLM 对话 API（点评 / 聊天）")
 	var le_llm_url := _setup_field(llm_body, "服务地址", cfg.llm_base_url,
-		"本地：http://127.0.0.1:8080/v1；云端：OpenAI 兼容地址（本机地址时游戏会自动拉起本地服务）")
+		"云端 OpenAI 兼容地址，如 https://api.deepseek.com/v1（也可指向自建服务）")
 	var le_llm_model := _setup_field(llm_body, "模型名", cfg.llm_model,
-		"本地 llama-server 通常任意名皆可；云端填服务商要求的模型 id")
+		"填服务商要求的模型 id，如 deepseek-chat")
 	var le_llm_key := _setup_field(llm_body, "API Key（只有云端需要）", cfg.llm_api_key,
 		"留空=不发送 Authorization；只会存在本机的 config.json 里")
 
 	var tts_body := _setup_section(vb, "语音 TTS API")
 	var le_tts_url := _setup_field(tts_body, "服务地址", cfg.tts_base_url,
-		"本地 CosyVoice 默认 http://127.0.0.1:9880/v1")
+		"云端 OpenAI 兼容地址，如 https://api.example.com/v1")
 	var le_tts_voice := _setup_field(tts_body, "音色", cfg.tts_voice,
-		"如 azure-fast（克隆音色·快速版）/ 中文女；进游戏后左侧栏也可下拉改")
-
-	var vlm_body := _setup_section(vb, "窥屏 VLM API（长时间闲置时看她一眼）")
-	var le_vlm_url := _setup_field(vlm_body, "服务地址（留空=本机自动拉起）", cfg.vlm_base_url,
-		"填了就走这个外部/自管服务，游戏不再碰本地进程；留空则由游戏在本机端口拉起")
-	var le_vlm_port := _setup_field(vlm_body, "本机服务端口", str(cfg.vlm_port),
-		"留空服务地址时，游戏在 127.0.0.1 的这个端口自动拉起 VLM 服务")
+		"云端服务的音色 id（各服务商不同，如 alloy / 中文女）；进游戏后左侧栏也可下拉改")
 
 	var hb := HBoxContainer.new()
 	hb.alignment = BoxContainer.ALIGNMENT_END
@@ -1454,7 +1233,7 @@ func _build_setup_panel() -> void:
 	start.add_theme_font_size_override("font_size", 16)
 	hb.add_child(start)
 	start.pressed.connect(func():
-		_apply_setup(think_opt, le_llm_url, le_llm_model, le_llm_key, le_tts_url, le_tts_voice, le_vlm_url, le_vlm_port)
+		_apply_setup(think_opt, le_llm_url, le_llm_model, le_llm_key, le_tts_url, le_tts_voice)
 		back.queue_free()
 		setup_confirmed.emit())
 	start.grab_focus()
@@ -1491,95 +1270,34 @@ func _setup_field(parent: Control, label_text: String, value: String, tip := "")
 
 ## 应用启动设置：写回 config.json（下次启动仍是这些值），随后 _build_services 按新配置起服务
 func _apply_setup(think_opt: OptionButton, llm_url: LineEdit, llm_model: LineEdit, llm_key: LineEdit,
-		tts_url: LineEdit, tts_voice: LineEdit, vlm_url: LineEdit, vlm_port: LineEdit) -> void:
+		tts_url: LineEdit, tts_voice: LineEdit) -> void:
 	cfg.llm_think_mode = clampi(think_opt.selected, 0, 2)
 	if llm_url.text.strip_edges() != "":         # 地址/模型/音色不允许被清成空：空则保留原值
 		cfg.llm_base_url = llm_url.text.strip_edges()
 	if llm_model.text.strip_edges() != "":
 		cfg.llm_model = llm_model.text.strip_edges()
-	cfg.llm_api_key = llm_key.text.strip_edges() # Key 可以清空（切回本地服务）
+	cfg.llm_api_key = llm_key.text.strip_edges() # Key 可以清空
 	if tts_url.text.strip_edges() != "":
 		cfg.tts_base_url = tts_url.text.strip_edges()
 	if tts_voice.text.strip_edges() != "":
 		cfg.tts_voice = tts_voice.text.strip_edges()
-	cfg.vlm_base_url = vlm_url.text.strip_edges()   # 留空=本机自动拉起，是合法值
-	var vp := vlm_port.text.strip_edges().to_int()
-	if vp > 0 and vp < 65536:
-		cfg.vlm_port = vp
-	var lip := _url_port(cfg.llm_base_url)       # 地址里写了端口就同步 llm_port：本机自动拉起要用同一个端口
-	if lip > 0 and not cfg.cli_locked.has("llm_base_url"):   # 命令行覆盖的地址不写回（llm_port 也一样）
-		cfg.llm_port = lip
 	cfg.save()
 	if _tts_url_edit != null:                    # 左侧语音栏建在面板之前：同步显示新值
 		_tts_url_edit.text = cfg.tts_base_url
 		_tts_model_edit.text = cfg.tts_model
 		_tts_voice_edit.text = cfg.tts_voice
-	print("[Setup] 启动设置已保存：思考模式=%d · LLM=%s (%s) · TTS=%s/%s · VLM=%s:%d"
+	print("[Setup] 启动设置已保存：思考模式=%d · LLM=%s (%s) · TTS=%s/%s"
 			% [cfg.llm_think_mode, cfg.llm_base_url, cfg.llm_model,
-			   cfg.tts_base_url, cfg.tts_voice, cfg.vlm_base_url, cfg.vlm_port])
-
-## 从 http(s)://host:port/... 里取端口；没写端口返回 -1
-func _url_port(url: String) -> int:
-	var re := RegEx.new()
-	if re.compile("^https?://[^:/]+:(\\d+)") != OK:
-		return -1
-	var m := re.search(url)
-	return int(m.get_string(1)) if m != null else -1
-
-## 地址是否指向本机（127.0.0.1 / localhost / ::1）：只有本机地址才自动拉起本地服务；
-## 改成外部 API（云端/局域网）时「切断」本地这条线——不拉起、不重启
-func _is_local_url(url: String) -> bool:
-	var re := RegEx.new()
-	if re.compile("^(https?)://([^:/]+)") != OK:
-		return false
-	var m := re.search(url.strip_edges())
-	if m == null:
-		return false
-	return ["127.0.0.1", "localhost", "::1"].has(m.get_string(2).to_lower())
+			   cfg.tts_base_url, cfg.tts_voice])
 
 # ================= 服务与接线 =================
 
-func _build_services() -> void:
-	if cfg.backend_mode == "remote":
-		_build_services_remote()                  # 前后端分离：编排在后端服务进程
-		return
-	# —— 本地模式（默认）：编排在本进程，行为与旧版完全一致 ——
-	katago = KataGoEngine.new()
-	katago.max_visits = cfg.max_visits
-	add_child(katago)
-	if katago.start(cfg.katago_bin, cfg.katago_model, cfg.katago_config):
-		_set_status("KataGo 已就绪：%s" % cfg.katago_bin)
-	else:
-		_set_status("KataGo 启动失败：%s" % katago.last_error(), true)
-
-	llm = LLMClient.new()
-	llm.base_url = cfg.llm_base_url
-	llm.model = cfg.llm_model
-	llm.api_key = cfg.llm_api_key
-	llm.think_mode = cfg.llm_think_mode
-	llm.relaunch_cb = _ensure_llm_url             # 对局中服务掉线（偶发 GPU 故障打死 llama-server）时自动重新拉起
-	add_child(llm)
-
-	_build_client_tts()                           # 语音/窥屏属客户端（渲染与交互在本进程）
-	_ensure_llm_url()                             # 本地模式：启动时一并拉起本地 LLM 服务（已有实例则跳过）
-
-	AzurePrompts.configure(cfg)                   # 注入 config.json 的自定义人设/称呼/阶段提示
-	agent = AzureAgent.new()
-	add_child(agent)
-	agent.setup(katago, llm)
-	agent.limit_len = cfg.tts_limit_len       # 右侧栏「短回复」开关
-	agent.joseki_teach = cfg.joseki_teach     # 右侧栏「定式导学」开关
-	_wire_agent()
-	llm.probe_models()
-	_warm_up_engine()                             # 后台预热 KataGo：把首次 OpenCL 调优放在开局前完成
-
-## 前后端分离（remote）：编排与 KataGo/LLM 都在后端服务进程；游戏只做渲染、语音与窥屏，
-## 通过 NetClient 以 REST（命令）+ WebSocket（事件）与后端通信。信号接线与本地模式共用。
 const NetClientScript := preload("res://scripts/net/NetClient.gd")
 
-func _build_services_remote() -> void:
-	_build_client_tts()                           # 语音/窥屏仍归客户端（本进程拉起）
-	AzurePrompts.configure(cfg)
+## 装配服务：编排与 KataGo/LLM 都在后端服务进程；游戏只做渲染与语音，
+## 通过 NetClient 以 REST（命令）+ WebSocket（事件）与后端通信。
+func _build_services() -> void:
+	_build_client_tts()                           # 语音朗读归客户端
 	agent = NetClientScript.new()
 	agent.base_url = cfg.backend_url
 	agent.net_status.connect(_on_net_status)
@@ -1590,7 +1308,7 @@ func _build_services_remote() -> void:
 	_wire_agent()
 	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
 
-## 客户端侧语音与窥屏（本地/远程模式共用；本机拉起语音服务、预热窥屏 VLM）
+## 客户端侧语音：只负责请求云端合成与播放，不启动任何模型服务
 func _build_client_tts() -> void:
 	tts = TTSClient.new()
 	tts.enabled = cfg.tts_enabled
@@ -1610,10 +1328,8 @@ func _build_client_tts() -> void:
 	tts.speaking_changed.connect(_on_tts_speaking)
 	tts.utterance_started.connect(_on_utterance_started)
 	tts.speech_skipped.connect(_on_speech_skipped)   # 这条语音不会再响（被停/队列溢出）：文字兜底立即显示
-	_autostart_tts()                              # 需要时后台拉起本地语音服务（无窗口）
-	_ensure_vlm_url()                             # 后台预热窥屏 VLM 服务（GPU 常驻；本机没有则静默跳过）
 
-## agent 的信号接线 + 情绪心跳（本地/远程模式共用：两者信号面完全一致）
+## agent 的信号接线 + 情绪心跳（NetClient 的信号面）
 func _wire_agent() -> void:
 	agent.message.connect(_add_msg)
 	agent.state_changed.connect(_on_state_changed)
@@ -1621,6 +1337,7 @@ func _wire_agent() -> void:
 	agent.busy_changed.connect(_on_busy_changed)
 	agent.mood_changed.connect(_on_mood_changed)
 	agent.joseki_event.connect(_on_joseki_event)
+	agent.tool_event.connect(_on_tool_event)
 	var mood_timer := Timer.new()                 # 三维情绪向基线回落的心跳：2 秒一次，区域没变时零开销
 	mood_timer.wait_time = 2.0
 	mood_timer.autostart = true
@@ -1628,25 +1345,14 @@ func _wire_agent() -> void:
 	add_child(mood_timer)
 	agent.sync_mood(true)                         # 初始「平静」立即生效（表情/音高一次对齐）
 
-## 后端连接状态（仅 remote 模式）：连上/断开提示进状态栏
+## 后端连接状态：连上/断开提示进状态栏
 func _on_net_status(text: String, bad: bool) -> void:
 	_set_status(text, bad)
 
-## 预热 KataGo：首次运行需 OpenCL 调优（约 1~3 分钟），提前触发，避免玩家第一手时干等
-func _warm_up_engine() -> void:
-	if katago == null:
-		return
-	_set_status("KataGo 正在启动（首次运行需调优，约 1~3 分钟）…")
-	var r := await katago.analyze([])
-	if r.has("error"):
-		_set_status("KataGo 启动失败：%s" % str(r["error"]), true)
-	else:
-		_set_status("KataGo 已就绪")
-
-## 本地语音服务没启动时自动降级到系统语音（只影响本次运行，不改配置）
+## 语音服务不可达时自动降级到系统语音（只影响本次运行，不改配置）
 func _on_tts_fallback(_kind: String) -> void:
-	_tts_status.text = "本地语音服务未启动，已临时改用系统语音"
-	_set_status("语音：本地服务未启动，已临时改用系统语音（配置里仍是你的选择）")
+	_tts_status.text = "语音服务连不上，已临时改用系统语音"
+	_set_status("语音：语音服务不可达，已临时改用系统语音（配置里仍是你的选择）")
 
 ## 语气词统一出口：同一情绪在 MOOD_KEEP_MS 内延续时只刷新计时、不再出声（治「一惊一乍、语气太多」）；
 ## 情绪变化或隔了很久才再次出现，才真正响一声。"" 是 no-op（平淡发言不代表情绪结束）。
@@ -1682,6 +1388,21 @@ func _on_joseki_event(payload: Dictionary) -> void:
 	if pts.is_empty():
 		return
 	board.highlight_points(pts, str(payload.get("kind", "formed")))
+
+## 她自己查资料（发言侧工具）：只在状态栏提示一句，end 时恢复原文案（连错误色一起恢复）。
+## 工具返回的原始盘面/JSON 永远不会显示给玩家——她的台词仍由后端生成的对话事件送达。
+func _on_tool_event(payload: Dictionary) -> void:
+	if _lbl_status == null:
+		return
+	if str(payload.get("phase", "")) == "start":
+		if not _tool_active:
+			_status_before_tool = _lbl_status.text          # 记下原状态（文案 + 是不是错误色），工具返回后原样恢复
+			_status_before_tool_bad = _status_bad
+			_tool_active = true
+		_set_status("她正在查资料…")
+	elif _tool_active:
+		_set_status(_status_before_tool, _status_before_tool_bad)
+		_tool_active = false
 
 ## 左键点在 Azure 头部附近摸摸头：开心 + 微微脸红 + 一句轻快的语气词（情绪模型同步静默加成）
 func _on_head_patted() -> void:
@@ -1743,6 +1464,8 @@ func _on_info_changed(wr: float, sc: float) -> void:
 	_lbl_score.text = "目差: %+.1f" % sc
 
 func _on_busy_changed(busy: bool) -> void:
+	if not busy:
+		_tool_active = false               # 回合结束：某个 start 的 end 万一没到，别让它卡住下一次 start
 	if avatar != null:
 		avatar.set_thinking(busy)          # 思考中回到中性表情，空闲时恢复常态微笑
 	if busy:
@@ -1795,7 +1518,6 @@ func _cancel_idle_speech() -> void:
 			continue                     # 还没轮到显示的走神搭话文字：直接丢
 		kept.append(e)
 	_pending_ai = kept
-	_peek_hmph = false                   # 玩家已回来：窥屏的「哼」作废
 	var kept_q: Array[Dictionary] = []
 	for e in _msg_queue:
 		if str((e as Dictionary).get("kind", "")) == "ai_idle":
@@ -1833,7 +1555,6 @@ func _input(event: InputEvent) -> void:
 
 func _bump_activity() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
-	_last_player_activity_ms = _last_activity_ms      # 只有真实玩家操作才推进这个时钟（窥屏门槛的另一把尺）
 	if _idle:
 		_idle = false
 		_set_idle_state(false)
@@ -1854,18 +1575,7 @@ func _process(delta: float) -> void:
 	if _idle and now >= _next_talk_ms and agent != null and not agent.busy:
 		_next_talk_ms = now + randi_range(int(IDLE_TALK_MIN * 1000.0), int(IDLE_TALK_MAX * 1000.0))
 		_idle_muted = false                             # 新的一轮搭话：先解除「玩家已回来」的作废标记
-		if not _peek_busy:
-			var idle_ms := now - _last_player_activity_ms   # 用「真实玩家操作」时钟：她边搭话边把闲置刷掉也不会卡住窥屏
-			# 玩家切去了别的窗口（微信/浏览器…）：搭话一律先窥屏再开口，不说默认的「还在吗」；
-			# 游戏窗口在前台 = 玩家就在游戏里（窥屏只会看到游戏本身）：直接普通搭话，不白起 python 进程。
-			# 窥屏失败/看到的是游戏本身时，_tick_peek 会自动退回普通搭话（优雅降级）。
-			var peekable := not DisplayServer.window_is_focused()
-			if peekable and idle_ms >= int(IDLE_SEC * 1000.0) and now - _peek_last_ms >= PEEK_COOLDOWN_MS and _peek_available():
-				_start_peek(now)                        # 窥屏看一眼他在干嘛，结合屏幕内容开口
-			else:
-				agent.idle_remark()
-	if _peek_busy:
-		_tick_peek(now)                                 # 窥屏结果就绪后由她主动开口
+		agent.idle_remark()                             # 长时间没动静：主动问一句（后端 POST /api/idle）
 	_update_thinking(now)
 	_tick_typing(delta)                                 # 打字节奏推进（AI 消息逐字显示）
 
@@ -1922,169 +1632,6 @@ func _on_speech_skipped(group: int) -> void:
 	else:
 		_on_utterance_started(group)
 
-# ================= 长时间闲置窥屏（本地 PaddleOCR + Qwen2.5-VL，独立 python 进程一跑一停） =================
-
-## 窥屏环境是否可用：需要 azure_peek.py 与一个装好 paddleocr / llama-cpp-python 的 python。
-## 探测一次后缓存；缺任何一样就永远退回普通走神搭话（优雅降级）
-func _peek_available() -> bool:
-	if _peek_probed:
-		return _peek_ok
-	_peek_probed = true
-	var exe_dir := OS.get_executable_path().get_base_dir()
-	var dirs: Array[String] = [exe_dir.path_join("peek"), "D:/KataGo/peek"]
-	for d in dirs:
-		var script := d.path_join("azure_peek.py")
-		if not FileAccess.file_exists(script):
-			continue
-		var pys: Array[String] = [d.path_join(".venv/Scripts/python.exe"), d.path_join("python.exe"), "E:/AI_Omni/Python/python.exe"]
-		for py in pys:
-			if FileAccess.file_exists(py):
-				_peek_script = script
-				_peek_exe = py
-				_peek_ok = true
-				print("[Peek] 窥屏可用：%s + %s" % [py, script])
-				return true
-	print("[Peek] 未找到窥屏环境（azure_peek.py / python），长时间闲置只走普通搭话")
-	return false
-
-## 确保窥屏 VLM 服务可用，返回传给窥屏脚本的 --vlm-url（空字符串=不可用，窥屏脚本会自动回退 CPU 推理）。
-## - cfg.vlm_base_url 填了：视为外部/自管服务，直接用，不碰本地进程（分享版可指向远程 API）
-## - 留空且 vlm_auto_start：由本机 python 拉起 start_vlm_server.py（内部有 lock+健康检查防重复），
-##   服务是 GPU 常驻的（加载一次，之后每次窥屏推理 1~2 秒）
-func _ensure_vlm_url() -> String:
-	var manual := cfg.vlm_base_url.strip_edges()
-	if manual != "":
-		return manual
-	if not cfg.vlm_auto_start:
-		return ""
-	if not _peek_available():                     # 窥屏环境本身不可用：不值得起服务
-		return ""
-	if _vlm_starter == "":
-		var exe_dir := OS.get_executable_path().get_base_dir()
-		var dirs: Array[String] = [exe_dir.path_join("peek"), "D:/KataGo/peek"]
-		for d in dirs:
-			var st := d.path_join("start_vlm_server.py")
-			if FileAccess.file_exists(st):
-				_vlm_starter = st
-				break
-	if _vlm_starter == "":
-		return ""                                 # 本机没有 VLM 启动器（分享版）：窥屏走 CPU/降级
-	var args := PackedStringArray([_vlm_starter, "--port", str(cfg.vlm_port)])
-	if cfg.vlm_exe != "":
-		args.append_array(["--exe", cfg.vlm_exe])
-	if cfg.vlm_model != "":
-		args.append_array(["--model", cfg.vlm_model])
-	if cfg.vlm_mmproj != "":
-		args.append_array(["--mmproj", cfg.vlm_mmproj])
-	var pid := OS.create_process(_peek_exe, args)
-	if pid <= 0:
-		print("[Peek] VLM 服务启动器拉起失败，窥屏将回退 CPU 推理")
-		return ""
-	return "http://127.0.0.1:%d/v1" % cfg.vlm_port
-
-## 确保本地 LLM 服务可用（启动游戏时一并拉起，免去手动开服务），返回配置里的 base_url。
-## - cfg.llm_base_url 指向非本机（云端/局域网）或 llm_auto_start=false：原样返回，不碰对方
-## - 本机地址：用 python 拉起 start_llm_server.py（内部有「锁 + 健康检查」，已在跑则直接跳过），
-##   模型加载在后台进行，游戏不用等它——聊天/点评会在就绪后自动恢复
-func _ensure_llm_url() -> String:
-	var url := cfg.llm_base_url.strip_edges()
-	if not _is_local_url(url) or not cfg.llm_auto_start:
-		return url                                 # 外部 API 或关掉自动拉起：不碰对方
-	var exe_dir := OS.get_executable_path().get_base_dir()
-	if _llm_starter == "":
-		for p in [exe_dir.path_join("start_llm_server.py"), "D:/KataGo/tools/start_llm_server.py"]:
-			if FileAccess.file_exists(p):
-				_llm_starter = p
-				break
-	if _llm_starter == "":
-		print("[LLM] 未找到 start_llm_server.py，跳过自动拉起（服务需自行启动）")
-		return url
-	if _llm_py == "":
-		for py in [exe_dir.path_join("peek/.venv/Scripts/python.exe"),
-				"D:/KataGo/peek/.venv/Scripts/python.exe",
-				"E:/AI_Omni/Python/python.exe"]:
-			if FileAccess.file_exists(py):
-				_llm_py = py
-				break
-	if _llm_py == "":
-		print("[LLM] 未找到可用的 python，跳过自动拉起（服务需自行启动）")
-		return url
-	var args := PackedStringArray([_llm_starter, "--port", str(cfg.llm_port),
-			"--game-pid", str(OS.get_process_id())])   # 启动器据此判断游戏是否还在：退出后不再续拉服务
-	if cfg.llm_exe != "":
-		args.append_array(["--exe", cfg.llm_exe])
-	if cfg.llm_model_path != "":
-		args.append_array(["--model", cfg.llm_model_path])
-	var pid := OS.create_process(_llm_py, args)
-	if pid <= 0:
-		print("[LLM] 本地 LLM 服务启动器拉起失败（服务需自行启动）")
-		return url
-	print("[LLM] 已后台拉起本地 LLM 服务（启动器 pid=%d，端口 %d），加载模型需要一段时间" % [pid, cfg.llm_port])
-	return url
-
-## 后台拉起一次窥屏：独立 python 进程截图 → OCR → VLM，把结果写成 json（不阻塞游戏）
-func _start_peek(now: int) -> void:
-	_peek_busy = true
-	_peek_hmph = false                       # 新的一轮窥屏：旧标记作废
-	_peek_started_ms = now
-	_peek_ctx_activity = _last_player_activity_ms
-	# 结果文件按次命名：超时被杀掉的旧进程即使晚写结果，也不会串到下一轮窥屏里
-	_peek_out = OS.get_user_data_dir().path_join("peek_result_%d.json" % now)
-	var pargs := PackedStringArray([
-		_peek_script, "--out", _peek_out, "--game-pid", str(OS.get_process_id())])
-	var vlm_url := _ensure_vlm_url()             # 顺手确保 GPU 常驻 VLM 服务在跑（幂等）
-	if vlm_url != "":
-		pargs.append_array(["--vlm-url", vlm_url])
-	var pid := OS.create_process(_peek_exe, pargs)
-	if pid <= 0:
-		_peek_busy = false
-		agent.idle_remark()                      # 拉不起来：照旧问一句
-		return
-	_peek_pid = pid
-	_peek_last_ms = now                          # 真的拉起来了才吃冷却：拉起失败不该白等 3 分钟
-	print("[Peek] 已发起窥屏（pid=%d），等结果…" % pid)
-
-## 每帧看窥屏结果好了没；等不到就超时放弃
-func _tick_peek(now: int) -> void:
-	if FileAccess.file_exists(_peek_out):
-		_peek_pid = -1
-		var data: Dictionary = {}
-		var f := FileAccess.open(_peek_out, FileAccess.READ)
-		if f != null:
-			var parsed = JSON.parse_string(f.get_as_text())
-			if typeof(parsed) == TYPE_DICTIONARY:
-				data = parsed
-			f.close()
-		DirAccess.remove_absolute(_peek_out)
-		_peek_busy = false
-		if data.is_empty():
-			print("[Peek] 结果文件为空/损坏，放弃本次窥屏")
-			return
-		# 结果回来时玩家已经动过（或已不闲置）：这条窥屏内容过期了，不说
-		if _last_player_activity_ms != _peek_ctx_activity or not _idle or agent.busy:
-			print("[Peek] 结果到达时玩家已回来/不再闲置/Azure 正忙，本次窥屏作废")
-			return
-		if not bool(data.get("ok", true)):
-			print("[Peek] 窥屏失败（ok=false），退回普通搭话")
-			agent.idle_remark()                  # 窥屏失败：退回普通搭话
-			return
-		if bool(data.get("is_game", true)):
-			print("[Peek] 前台仍是游戏本身，退回普通搭话")
-			agent.idle_remark()                  # 前台还是游戏：普通走神提醒
-		else:
-			print("[Peek] 结合窥屏内容搭话：前台=%s" % str(data.get("fg_title", "")))
-			_peek_hmph = true                    # 窥屏发言前先「哼」一声（生气/得意）：投递 ai_idle 时出声
-			agent.peer_remark(data)              # 切去别的窗口了：结合窥屏内容与性格说
-		return
-	if now - _peek_started_ms > PEEK_TIMEOUT_MS:
-		if _peek_pid > 0:
-			OS.kill(_peek_pid)                       # 超时进程多半还在跑（截图/CPU 推理很重）：必须杀掉，别留孤儿占资源
-		_peek_pid = -1
-		_peek_busy = false
-		if _idle and not agent.busy and _last_player_activity_ms == _peek_ctx_activity:
-			print("[Peek] 超时仍未出结果，退回普通搭话")
-			agent.idle_remark()                  # 窥屏没结果：退回普通搭话
-
 # ================= 调试截图 =================
 
 func _handle_cli() -> void:
@@ -2134,46 +1681,3 @@ func _handle_cli() -> void:
 	print("[shot] viewport=%s  left_panel=%.0f  right_panel=%.0f  (PANEL_W=%d)"
 			% [get_viewport().get_visible_rect().size, _left_panel.size.x, _right_panel.size.x, PANEL_W])
 	get_tree().quit()
-
-# ================= 退出清理 =================
-
-## 退出游戏：结束本次运行拉起的窥屏/语音服务，避免残留进程继续占用显存/CPU。
-## LLM 例外——不再随游戏退出（35B 模型冷加载要十几秒到半分钟，是「一开始加载太慢」的主因）：
-## 让它常驻，下次开局直接秒用。想立刻释放：任务管理器结束 llama-server.exe，
-## 或删掉 .llm_server.lock 后按其中记录的 pid 结束（下次开局会自动重新拉起）。
-## 只动「写了锁记录」的进程；用户手动起、没写锁的服务（如 bat 起的 TTS）不受影响。
-func _exit_tree() -> void:
-	if _peek_pid > 0:
-		OS.kill(_peek_pid)                       # 窥屏进程（截图 + OCR + VLM 推理）还在跑
-		_peek_pid = -1
-	# VLM：锁文件就在启动器同级目录（开发机=D:/KataGo，分享版=可执行文件目录）
-	if _vlm_starter != "":
-		_kill_lock(_vlm_starter.get_base_dir().path_join(".vlm_server.lock"))
-	_kill_lock(_tts_dir.path_join(".tts_server.lock"))   # 语音服务（实例锁由服务自己写）
-	if _tts_pid > 0:
-		OS.kill(_tts_pid)                        # 语音服务的窗口启动器也一并收掉
-		_tts_pid = -1
-
-## 按锁文件结束它记录的进程，并清掉锁。
-## 注意：不能先查 OS.is_process_running 再杀——Godot 在 Windows 上只认自己 create_process
-## 出来的进程，服务进程是「启动器 python 的子进程」，会被误判成已退出（TTSClient 也踩过同样的坑）。
-## 直接杀：进程若已经退出，kill 只会返回错误，没有副作用。
-func _kill_lock(path: String) -> void:
-	var pid := _read_lock_pid(path)
-	if pid <= 0:
-		return
-	var err := OS.kill(pid)
-	print("[exit] 已请求结束本地服务进程 pid=%d（%s，锁：%s）" % [pid, error_string(err), path])
-	DirAccess.remove_absolute(path)
-
-## 读锁文件里记录的 pid；文件不存在或内容非法时返回 -1
-static func _read_lock_pid(path: String) -> int:
-	if not FileAccess.file_exists(path):
-		return -1
-	var f := FileAccess.open(path, FileAccess.READ)
-	if f == null:
-		return -1
-	var pid := int(f.get_as_text().strip_edges())
-	f.close()
-	return pid if pid > 0 else -1
-

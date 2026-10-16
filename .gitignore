@@ -2,7 +2,7 @@
 game/.godot/
 *.pck
 
-# —— 打包产物 / 分享包 ——
+# —— 导出 / 分发产物 ——
 build/
 dist/
 *.zip
@@ -27,6 +27,16 @@ server_run.log
 .tts_server.lock
 gtp_logs/
 shots/
+
+# —— 后端运行产物（SQLite / 引擎日志，计划 03 起使用）——
+backend/data/
+backend/logs/
+
+# —— KataGo 服务运行产物（引擎日志）——
+katago_service/logs/
+
+# —— SDD 工作区（本地临时产物，不入库）——
+.superpowers/
 
 # —— 系统 ——
 Thumbs.db

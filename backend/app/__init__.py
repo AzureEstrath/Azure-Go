@@ -1,6 +1,7 @@
 """Azure 后端（前后端分离后的服务端）。
 
-目录约定（与 Godot 客户端 scripts/ 一一对应，便于对齐与回归）：
+目录约定（本目录的模块最初与 Godot 客户端 scripts/ 一一对应；**v3.0.0 起客户端侧的实现
+已删除**，下表只作来源记录，不再有可对齐的 GDScript 文件）：
 
     coords.py   ↔  game/scripts/core/Coords.gd
     board.py    ↔  game/scripts/core/GoBoard.gd
@@ -14,7 +15,6 @@
     agent.py    ↔  game/scripts/ai/AzureAgent.gd
     events.py   ↔  WS 事件契约（对应 AzureAgent 的 signal）
     main.py     ↔  FastAPI 入口（REST + WS 路由装配）
-    services.py ↔  本地服务编排（现 Main.gd 服务拉起/看护的职责）
 
 行为对齐：tests/golden/ 存放由 Godot 端导出的期望输出（golden），
 tests/ 下的用例逐模块比对，保证「现有效果不变」。
