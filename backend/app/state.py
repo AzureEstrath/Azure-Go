@@ -20,6 +20,9 @@ class GameState:
         # kind="review"＝点评/落子后感想；side：E=玩家，A=Azure。**纯追加：不滚动、不截断**
         # （memory_log 是它旁边那份滚动 18 条 / 截 80 字的副本，两者互不影响）
         self.move_notes = []
+        # 本局全部真亏手（v3.7.0）：{move_no, gtp, drop, reason}；只有 drop > 0.10 才入账，不截断。
+        # bad_moves 语义不变（最近 3 条俗手，供右侧栏「俗手回档」），这是另开的一份完整账
+        self.losses = []
         # 带标签的对局记忆：{tag, move_no, text}；E=Estarth(黑)的棋，A=Azure(白)的棋
         self.memory_log = []
         # 定式识别去重记录：{key, move_no}；随快照回滚（悔棋后可以重新讲解）
@@ -99,6 +102,20 @@ class GameState:
             "text": text,
         })
 
+    def record_loss(self, gtp, drop, reason):
+        """记一条真亏手（v3.7.0）：本局全部、不截断；**只有 ``drop > 0.10`` 才入账**。
+
+        ``drop`` 与俗手判定同一个量（winrate_before - after_black_wr）；「只掉名次不掉胜率」
+        （drop == 0）不入 ``losses``。俗手 ``bad_moves`` 的判定与 3 条上限不在这里、也不受影响。
+        """
+        if drop > 0.10:
+            self.losses.append({
+                "move_no": len(self.move_seq),
+                "gtp": gtp,
+                "drop": drop,
+                "reason": reason,
+            })
+
     def reset(self):
         self.moves = []
         self.move_seq = []
@@ -106,6 +123,7 @@ class GameState:
         self.snapshots = []
         self.bad_moves = []
         self.move_notes = []
+        self.losses = []
         self.memory_log = []
         self.joseki_log = []
         self.joseki_counted = []

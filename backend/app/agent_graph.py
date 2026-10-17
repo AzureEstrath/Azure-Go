@@ -177,6 +177,9 @@ async def _prepare_after_player(agent, data):
     if player_rank < 0 or drop > 0.10:
         reason = "不在我算的前5候选" if player_rank < 0 else "胜率下滑%d%%" % int(round(drop * 100.0))
         agent.st.record_bad_move(turn_index, gtp, reason)
+        # 本局全部真亏手（v3.7.0）：另开一份完整账，只有 drop > 0.10 才入账；纯记录、不发事件。
+        # 触发条件与俗手一字不改——只掉名次不掉胜率的仍然进 bad_moves，但进不了 losses。
+        agent.st.record_loss(gtp, drop, reason)
     agent._emit(events.state(agent.st.payload()))
 
     # ④″ 定式识别（纯本地计算、零引擎调用）

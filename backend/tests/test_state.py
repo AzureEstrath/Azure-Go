@@ -153,5 +153,64 @@ class MoveNotesTest(unittest.TestCase):
         self.assertEqual(len(st.move_notes), 2, "回滚不截断逐手存档")
 
 
+class LossesTest(unittest.TestCase):
+    """B：本局全部真亏手 ``losses`` —— 与俗手 ``bad_moves`` 各自记账。"""
+
+    def test_bad_moves_still_capped_at_three(self):
+        st = GameState()
+        for i in range(5):
+            st.record_bad_move(i, "D4", "不在我算的前5候选")
+        self.assertEqual(len(st.bad_moves), 3, "俗手仍是最近 3 条（右侧栏回档行为不变）")
+
+    def test_losses_are_not_capped(self):
+        st = GameState()
+        for i in range(5):
+            st.record_loss("D4", 0.3, "胜率下滑30%")
+        self.assertEqual(len(st.losses), 5, "真亏手不封顶")
+
+    def test_rank_only_bad_move_is_not_a_loss(self):
+        """只掉名次不掉胜率 ⇒ 不算真亏。"""
+        st = GameState()
+        st.record_loss("D4", 0.0, "不在我算的前5候选")
+        self.assertEqual(st.losses, [])
+
+    def test_element_shape(self):
+        st = GameState()
+        st.add_move("B", "D4")
+        st.add_move("W", "Q16")
+        st.add_move("B", "C3")
+        st.record_loss("C3", 0.25, "胜率下滑25%")
+        self.assertEqual(
+            st.losses[0],
+            {"move_no": 3, "gtp": "C3", "drop": 0.25, "reason": "胜率下滑25%"},
+        )
+
+    def test_losses_append_in_order_with_player_move_no(self):
+        """接线（形状）：按发生顺序追加，``move_no`` 是玩家那手的 1 基序号。"""
+        st = GameState()
+        st.add_move("B", "D4")                      # 玩家第 1 手
+        st.record_loss("D4", 0.2, "胜率下滑20%")
+        st.add_move("W", "Q16")                     # 她第 2 手
+        st.add_move("B", "C3")                      # 玩家第 3 手
+        st.record_loss("C3", 0.15, "胜率下滑15%")
+        self.assertEqual([x["move_no"] for x in st.losses], [1, 3])
+        self.assertEqual([x["gtp"] for x in st.losses], ["D4", "C3"])
+        self.assertEqual([x["drop"] for x in st.losses], [0.2, 0.15])
+
+    def test_drop_exactly_point_one_is_not_a_loss(self):
+        """接线（边界）：``drop == 0.10`` 整不记，``> 0.10`` 才记。"""
+        st = GameState()
+        st.record_loss("D4", 0.10, "胜率下滑10%")
+        self.assertEqual(st.losses, [], "整 0.10 不入账")
+        st.record_loss("D4", 0.100001, "胜率下滑10%")
+        self.assertEqual(len(st.losses), 1)
+
+    def test_reset_clears_losses(self):
+        st = GameState()
+        st.record_loss("D4", 0.4, "胜率下滑40%")
+        st.reset()
+        self.assertEqual(st.losses, [])
+
+
 if __name__ == "__main__":
     unittest.main()
