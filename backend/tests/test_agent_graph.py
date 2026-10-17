@@ -323,3 +323,183 @@ class ToolMoveCandidateTest(unittest.TestCase):
         self.assertEqual(agent.st.board.at(mv["x"], mv["y"]), "white")
         self.assertTrue(agent._reveal_pending)
 
+
+# —— 以下为计划 07 · Task 3 追加（既有断言一个字符都没改；追加在文件末尾，是为了让上面的既有内容
+#    保持逐字节不变——`unittest.main()` 在本仓的唯一跑法 `python -m unittest discover -s tests` 下
+#    不会执行）——
+
+
+class JosekiMistakeRuleTest(unittest.TestCase):
+    """「走错」= 真亏 **且** 不在库线上：计划 Step 1 给的四条纯函数用例，原样保留。"""
+
+    def test_on_library_line_is_never_a_mistake(self):
+        from app.agent_graph import is_joseki_mistake
+        self.assertFalse(is_joseki_mistake({"kind": "deviated"}, True, 0.5, False))
+
+    def test_off_line_without_loss_is_not_a_mistake(self):
+        from app.agent_graph import is_joseki_mistake
+        self.assertFalse(is_joseki_mistake({"kind": "deviated"}, False, 0.01, True))
+
+    def test_off_line_and_losing_is_a_mistake(self):
+        from app.agent_graph import is_joseki_mistake
+        self.assertTrue(is_joseki_mistake({"kind": "deviated"}, False, 0.12, True))
+
+    def test_formed_is_never_a_mistake(self):
+        from app.agent_graph import is_joseki_mistake
+        self.assertFalse(is_joseki_mistake({"kind": "formed"}, False, 0.5, False))
+
+
+class _LosingEngine(StubEngine):
+    """接线用例的引擎替身：按**手数**定死胜率，好造出「胜率掉 > 10%」的那半边。
+
+    默认 `StubEngine` 恒返回 0.5，落子前后同值 ⇒ `drop` 永远是 0，构造不出真亏的局面；这里
+    只多给一个 `winrates` 表（键＝分析时的总手数）。`CAND` 把玩家那一手排第一，让 `player_rank`
+    ＝0（`rank_ok=True`），于是「判成走错」靠的确实是 `drop > 0.10` 这一条，而不是排名那一条。
+    """
+
+    CAND = ["B15"] + StubEngine.CAND
+
+    def __init__(self, winrates=None):
+        super().__init__()
+        self.winrates = dict(winrates or {4: 0.50, 5: 0.70})   # 落子前 50%；落子后白方视角 70% ⇒ 黑方掉 20%
+
+    async def analyze(self, moves):
+        self.calls.append([list(m) for m in moves])
+        wr = float(self.winrates.get(len(moves), 0.5))
+        return {
+            "rootInfo": {"winrate": wr, "scoreLead": 0.0},
+            "moveInfos": [{"move": m, "visits": 1} for m in self.CAND],
+            "ownership": [0.0] * 361,
+        }
+
+
+def _seed_moves(agent, seq):
+    """把一串 ``[color, gtp]`` 直接铺进 stub 局面的棋盘与棋谱。
+
+    省掉真下棋的多阶段编排（那会让她在中间插进自己的应手，角上的手顺就不再是库里那条）；
+    识别器只看 ``st.moves`` 的手顺与颜色，棋盘同步铺好是为了让快照 / 形势文本自洽。
+    """
+    from app import coords
+    for color, gtp in seq:
+        x, y = coords.gtp_to_xy(gtp)
+        agent.st.board.play(x, y, "black" if color == "B" else "white")
+        agent.st.add_move(color, gtp)
+
+
+# 左上角已按库线吻合 4 手（星位点三三基本型；golden joseki.json 的 deviated 局面就是它的第 5 手）
+_DEVIATED_BASE = [["B", "D16"], ["W", "C17"], ["B", "C16"], ["W", "D17"]]
+
+
+class JosekiMistakeWiringTest(unittest.TestCase):
+    """T3 接线：判定结论落进**本轮** ``data["jk_mistake"]``，且既有俗手路径一字不变（U19）。"""
+
+    def _after_player(self, agent, x, y):
+        """只跑 ``after_player`` 这一个阶段（与 ``player_move`` 的公开路径同一入口）。"""
+        from app.agent_graph import PHASE_AFTER_PLAYER
+        agent._new_turn()
+        return asyncio.run(agent._turn(PHASE_AFTER_PLAYER, {"x": x, "y": y}))
+
+    def test_deviated_and_losing_lands_as_mistake_and_keeps_bad_move(self):
+        agent, _eng, _llm, bus = _mk()
+        agent.katago = _LosingEngine()
+        # 角上已按库线吻合 4 手，玩家再落 B15 偏离库线（golden joseki.json 的 deviated 局面）
+        _seed_moves(agent, _DEVIATED_BASE)
+        state = self._after_player(agent, 1, 4)
+
+        self.assertEqual(str(state["data"]["jk"]["kind"]), "deviated")
+        got = state["data"]["jk_mistake"]
+        self.assertEqual(
+            set(got.keys()), {"is_mistake", "on_line", "gtp", "x", "y", "drop", "rank_ok"})
+        self.assertIs(got["is_mistake"], True)                  # 偏离 + 真亏 ⇒ 走错
+        self.assertIs(got["on_line"], False)                    # 库线上的那一手是 (5,2)，不是这手
+        self.assertEqual(got["gtp"], "B15")
+        self.assertEqual((got["x"], got["y"]), (1, 4))
+        self.assertGreater(got["drop"], 0.10)
+        self.assertIs(got["rank_ok"], True)
+
+        # U19：既有俗手记录照旧触发，条目形状 / 文案 / 位置一字不变（走的就是 drop 那半边）
+        self.assertEqual(agent.st.bad_moves, [{
+            "turn_index": 0, "move_no": 5, "gtp": "B15", "reason": "胜率下滑20%",
+        }])
+        self.assertEqual(bus.of_type("state")[-1]["bad_moves"], agent.st.bad_moves)
+
+    def test_formed_is_not_a_mistake(self):
+        """收尾（formed）不吃误判：这一课走完就不判「走错」，哪怕排名不足。
+
+        手顺用的是 golden ``basic_formed`` 那四手（左上星位点三三基本型）——玩家执黑、最后一手
+        必须是他自己下的，故取其**换色映射**（golden 的 ``kobayashi_formed`` 正是这一支，结果与
+        ``basic_formed`` 逐字段相同）；下面同时钉住 four points，确保比对的确实是那一课。
+        """
+        agent, _eng, _llm, _bus = _mk()
+        _seed_moves(agent, [["W", "D16"], ["B", "C17"], ["W", "C16"]])
+        state = self._after_player(agent, 3, 2)                 # 玩家落 D17，恰好走完基本型
+
+        self.assertEqual(str(state["data"]["jk"]["kind"]), "formed")
+        self.assertEqual(
+            state["data"]["jk"]["points"], [(3, 3), (2, 2), (2, 3), (3, 2)])
+        self.assertIs(state["data"]["jk_mistake"]["is_mistake"], False)
+        self.assertIs(state["data"]["jk_mistake"]["on_line"], False)
+
+    # —— 修复轮 1（裁决 U21）：护栏 D「照书下不许被骂」——
+
+    def test_following_another_library_line_is_not_a_mistake(self):
+        """U21 第一款（护栏 D 端到端）：照**另一条**库线走，不许被说成走错。
+
+        手顺是「基本型 4 手 + 定形二的第 5 手 E16(4,3)」。这一手**不是** deviated——识别器会把它
+        读成 k=5 的「正跟着书走的中段」而按设计沉默，所以「没有 deviated」这条断言我用的是**识别器
+        口径**：另立一个同局面的 stub agent 调 ``_joseki_check()`` 断言返回 ``{}``，并同时断言本回合
+        没有任何 ``kind == "deviated"`` 的 ``joseki`` 事件。
+
+        引擎特意用会掉胜率的那个替身（drop=0.20、排名也在前 5 之外）：这场合**单按俗手口径必判坏手**，
+        所以下面那个 ``is_mistake is False`` 不是「什么都没发生」换来的。
+        """
+        agent, _eng, _llm, bus = _mk()
+        agent.katago = _LosingEngine()
+        _seed_moves(agent, _DEVIATED_BASE)
+        state = self._after_player(agent, 4, 3)                 # 玩家落 E16＝定形二在该格的下一手
+
+        # ① 识别器口径（另立一个同局面：`_joseki_check()` 会写去重日志，不能拿本回合那个 agent 问）
+        probe, _e2, _l2, _b2 = _mk()
+        _seed_moves(probe, _DEVIATED_BASE)
+        probe.st.board.play(4, 3, "black")
+        probe.st.add_move("B", "E16")
+        self.assertEqual(probe._joseki_check(), {})              # 中段推进 ⇒ 沉默，不判 deviated
+        # ② 端到端：本回合没有 deviated 的 joseki 事件
+        self.assertEqual(
+            [e for e in bus.of_type("joseki") if str(e.get("kind", "")) == "deviated"], [])
+        # ③ 结论：照书下（另一本）⇒ 不是走错（尽管这一手真亏、排名也在前 5 之外）
+        got = state["data"]["jk_mistake"]
+        self.assertGreater(got["drop"], 0.10)
+        self.assertIs(got["rank_ok"], False)
+        self.assertIs(got["is_mistake"], False)
+
+    def test_guard_d_covers_the_other_library_line_at_a_fork(self):
+        """U21 第二款（护栏 D 的**候选**分支）：玩家这手若正是候选线上那一手，也不算走错。
+
+        现在 ``scan()`` 产不出「deviated + 这手落在候选上」这种组合（见上一条：那种手顺被读成中段
+        推进而沉默）——所以这里**按识别器的形状合成一个 deviated 结果**（``line`` / ``k`` / ``candidates``
+        齐全，坐标照 golden 的 deviated 局面）把这一款钉成活代码；扩库（T11a）之后它就会真的被走到。
+        """
+        agent, _eng, _llm, _bus = _mk()
+        agent.katago = _LosingEngine()                          # drop = 0.20：单按俗手口径必然判错
+        _seed_moves(agent, _DEVIATED_BASE)
+
+        full = [{"x": 3, "y": 3, "c": "B"}, {"x": 2, "y": 2, "c": "W"},
+                {"x": 2, "y": 3, "c": "B"}, {"x": 3, "y": 2, "c": "W"},
+                {"x": 5, "y": 2, "c": "B"}, {"x": 4, "y": 2, "c": "W"},
+                {"x": 4, "y": 3, "c": "B"}, {"x": 5, "y": 1, "c": "W"}]     # = 定形一（golden 的 line）
+        other = full[:4] + [{"x": 4, "y": 3, "c": "B"}, {"x": 5, "y": 2, "c": "W"}]   # = 定形二
+        agent._joseki_check = lambda: {
+            "kind": "deviated", "k": 4, "corner": "左上", "cat": "star",
+            "name": "点三三·定形", "family": "star_33", "key": "（合成）",
+            "line": full, "expect": (5, 2),
+            "candidates": [{"name": "点三三·定形", "family": "star_33",
+                            "next": (4, 3), "line": other}],
+        }
+        state = self._after_player(agent, 4, 3)                  # 玩家落 E16＝候选线的下一手
+
+        got = state["data"]["jk_mistake"]
+        self.assertIs(got["on_line"], True)                      # 照书下（另一本）：候选那一手
+        self.assertIs(got["is_mistake"], False)                  # ⇒ 不算走错
+        self.assertGreater(got["drop"], 0.10)                    # 这一手确实「真亏」：判 False 靠的正是护栏
+

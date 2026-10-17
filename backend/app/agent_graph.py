@@ -104,6 +104,23 @@ class TurnState(TypedDict):
     data: dict              # 阶段之间的中间数据（引擎分析 / 提示词 / 定式结果 / short / 落点）
 
 
+# ================= 走错判定（纯函数，供 after_player 用） =================
+
+def is_joseki_mistake(jk: dict, player_on_line: bool, drop: float, rank_ok: bool) -> bool:
+    """「走错」＝**真亏**且**不在库线上**（纯函数，无副作用、不调引擎）。
+
+    - ``player_on_line=True``（这手正好是库里那一手）⇒ **恒为 False**：库里线条本身略亏时
+      会出现「照书下还被骂」，这是最难看的误判，必须在进入任何教学分支之前就拦掉；
+    - ``jk["kind"] != "deviated"``（没偏离库线，或识别器压根没出声）⇒ ``False``；
+    - 其余与**既有俗手判定同一口径**：不在她算的前 5（``not rank_ok``）或胜率掉 > 10%。
+    """
+    if player_on_line:
+        return False
+    if str((jk or {}).get("kind", "")) != "deviated":
+        return False
+    return (not rank_ok) or (drop > 0.10)
+
+
 # ================= ① prepare：建上下文与提示词 =================
 
 async def _prepare_after_player(agent, data):
@@ -166,6 +183,41 @@ async def _prepare_after_player(agent, data):
     jk = agent._joseki_check()
     if jk:
         agent._joseki_emit(jk)
+
+    # ④‴ 走错判定：真亏 **且** 偏离库线才算「走错」；库线那一手永不判错（见 is_joseki_mistake）。
+    #     只把结论放进本轮 data，不发事件、不改台词（卡片与事件由 T5/T6/T7 消费）。
+    #
+    #     「库线那一手」取两款（设计 §6 D「库里线条本身略亏时不许出现『照书下还被骂』」）：
+    #       ① 显示线的第 k 手（`line[k]`，0 基）——识别器给偏离用的那个「正解」点；
+    #       ② 任一**候选线**在本格的下一手（`candidates[i]["next"]`）——玩家照的是分岔处的另一本。
+    #     ⚠ 在现在的 `scan()` 语义下这一款**结构性不触发**：能被判成 `deviated` 的前提正是「玩家这手
+    #     与共享前缀的下一手都不吻合」（吻合了的话那条线的最长前缀早就前进到 k+1，`len(seq) == k+1`
+    #     这个偏离条件也就不成立，识别器会改判成中段 / 进入 / 分岔）。换句话说，「照书下不被骂」今天
+    #     由识别器的判定严格性兜着；这条护栏是按设计先立在**编排侧**，扩库（T11a）之后继续成立。
+    player_on_line = False
+    if str(jk.get("kind", "")) == "deviated":
+        line = jk.get("line") or []
+        k = int(jk.get("k", 0))
+        if len(line) > k:                               # line[k]（0 基）＝库里那一手
+            p = line[k]
+            player_on_line = int(p["x"]) == x and int(p["y"]) == y
+        if not player_on_line:                          # 也可能是照着**另一条**库线走的（分岔那一手）
+            for c in jk.get("candidates") or []:
+                nxt = c.get("next")
+                if (isinstance(nxt, (tuple, list)) and len(nxt) >= 2
+                        and int(nxt[0]) == x and int(nxt[1]) == y):
+                    player_on_line = True
+                    break
+    rank_ok = player_rank >= 0                          # 是否在她算的前 5（与俗手判定同一判据）
+    data["jk_mistake"] = {
+        "is_mistake": is_joseki_mistake(jk, player_on_line, drop, rank_ok),
+        "on_line": player_on_line,
+        "gtp": gtp,
+        "x": x,
+        "y": y,
+        "drop": drop,
+        "rank_ok": rank_ok,
+    }
 
     # ④′ 情绪反应：按这一手的好坏结算三维情绪（即时反馈不等 LLM）
     ev = "player_ok"
