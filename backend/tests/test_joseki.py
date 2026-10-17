@@ -62,7 +62,8 @@ class JosekiTest(unittest.TestCase):
             ["star_33"] * 3 + ["star_kakari_small"] * 2 + ["star_double_kakari"] * 2
             + ["star_kakari_small"] * 2 + ["star_shimari"] * 2
             + ["star_kakari_big"] * 2 + ["star_kakari_one"] * 2
-            + ["komoku_small_kakari"] * 2 + ["komoku_shimari"] + ["komoku_low_kakari"],
+            + ["komoku_small_kakari"] * 2 + ["komoku_shimari"] + ["komoku_low_kakari"]
+            + ["sansan_kakari"] * 2,
         )
 
     def test_real_library_at_least_two_lines_or_exception(self):
