@@ -313,13 +313,21 @@ async def _joseki_own_move(agent, data):
 
     ``data`` 里已有 ``jk2`` 就立刻返回——``_joseki_check()`` 会消耗去重键，**绝不能调第二次**
     （同角同族第二次必然返回 ``{}``）。``joseki_count_entry`` 同族同局只计一次，重复调用是 no-op。
+
+    **F1：她这一手的入围结论必须按她自己那一手重算。** ``data["jk_show_card"]`` 里若已有值，那
+    是**玩家**那一手的结论（``_prepare_after_player`` 定的），照搬会把她的 ``joseki`` 事件写成玩家
+    的判定；``mistake`` 同理——走错是玩家那一手的事，她这一手没有 mistake（她这手也不会是
+    ``deviated``：``scan()`` 只对玩家开口）。所以 ``jk2`` 非空时重算并传 ``mistake=None``；
+    ``jk2`` 为空时保持旧口径（缺省补 False，已有值不动——反正空结果不会发事件）。
     """
     if "jk2" in data:
         return
     jk2 = agent._joseki_check()
     data["jk2"] = jk2
-    if "jk_show_card" not in data:               # 一个回合只有一个入围结论：after_player 定过就不改
-        data["jk_show_card"] = await agent.joseki_show_card(jk2, data.get("jk_mistake"))
+    if jk2:
+        data["jk_show_card"] = await agent.joseki_show_card(jk2, None)
+    elif "jk_show_card" not in data:
+        data["jk_show_card"] = False
     await agent.joseki_count_entry(jk2)
 
 
@@ -346,9 +354,18 @@ async def _prepare_just_moved(agent, data):
         agent.st.pre_analysis = {"n": len(agent.st.moves), "a": post}
     agent._emit(events.info(wr, sc))
 
-    if str(jk2.get("kind", "")) == "formed":
+    if str(jk2.get("kind", "")) == "entered":
+        # T7（U36）+ F2：她走出的**结构点**并进**她的**发言位（这条落子后的感想），与玩家那一侧
+        #   同一套分流——进入 / 分岔 / 收尾必说，只按 `kind`（`show_card` 只管卡片，不管说不说，
+        #   U34 修订版）；讲解**顶替**本来那句普通感想，不新增气泡、不多调一次模型。
+        ai_eval_prompt = prompts.joseki_enter_prompt(
+            str(jk2.get("name") or ""), str(jk2.get("key") or ""), str(jk2.get("corner") or ""))
+    elif str(jk2.get("kind", "")) == "branch":
+        ai_eval_prompt = prompts.joseki_branch_prompt(
+            str(jk2.get("name") or ""), str(jk2.get("key") or ""),
+            list(jk2.get("candidates") or []))
+    elif str(jk2.get("kind", "")) == "formed":
         # T7（U36）：她走完定式时，「收尾」并进**她的**发言位（这条落子后的感想）。
-        #   同样只看 `kind`：`show_card` 只管卡片，不管说不说（U34 修订版）。
         ai_eval_prompt = prompts.joseki_close_prompt(
             str(jk2.get("name") or ""), str(jk2.get("key") or ""),
             str(jk2.get("corner") or ""), "azure")
@@ -746,7 +763,9 @@ async def _speak_just_moved(agent, data, msgs):
     """她落子后那句感想。"""
     jk2 = data.get("jk2") or {}
     ai_eval = await _say(agent, msgs, 120)
-    if str(jk2.get("kind", "")) == "formed" and agent._llm_failed(ai_eval):
+    # F2：她这一手的**结构点**（进入 / 分岔 / 收尾）在云端失败时也要退化成定式兜底台词，
+    #   不能只认 `formed`——台词分流只看 `kind`（U34 修订版），与 `_prepare_just_moved` 的模板一致。
+    if str(jk2.get("kind", "")) in ("entered", "branch", "formed") and agent._llm_failed(ai_eval):
         ai_eval = prompts.joseki_fallback(str(jk2["name"]), str(jk2["key"]))
     elif agent._llm_failed(ai_eval):            # 云端失败：落子后那句退化为兜底台词
         ai_eval = agent._fallback_line("game")
@@ -962,11 +981,12 @@ async def _finalize_just_moved(agent, data):
     text = str(data.get("reply") or "")
     agent.st.log_memory("A", text, len(agent.st.moves))
     await _emit_deduped(agent, events.AI_COMMENT, text)
-    # 卡片载荷（T6）：`jk_show_card` / `jk_mistake` 是**本回合 data 里既有的值**——玩家那一手在
-    # `after_player` 里定，她那一手由 `finalize` 节点（T7）在她这一格补齐；这里只读不改。
+    # 卡片载荷（T6）：`jk_show_card` 是**她那一步**的入围结论（`_joseki_own_move` 按她的族重算，
+    # F1）；`mistake` **恒为 None**——走错是玩家那一手的事，她这一手没有 mistake（F1：不再照搬
+    # 玩家那手的 `jk_mistake`，否则红标会画在玩家的偏离点上）。
     # `_set_busy(False)` 的位置**不动**（T7 只换了 `jk2` 的算法在哪一步，事件顺序与解锁点一字未变）。
     agent._joseki_emit(data.get("jk2") or {},
-                       data.get("jk_show_card", False), data.get("jk_mistake"))
+                       data.get("jk_show_card", False), None)
     agent._set_busy(False)
     await agent._mood_llm_refine()
     # 不在这里 emit state：落子的可见更新由 reveal_move() 在她这段语音开始时触发

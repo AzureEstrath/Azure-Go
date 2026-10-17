@@ -845,3 +845,118 @@ class JosekiActiveSpeechTest(unittest.TestCase):
         self.assertEqual(len(agent.bus.messages()), 3, "点评 + 落子宣告 + 她的感想")
         self.assertEqual(str(after["data"]["reply"]), "第3句话。")
 
+
+# —— 以下为阶段一终审修复波（F1 / F2）追加（既有断言一个字符都没改；追加在文件末尾）——
+
+
+class _HerJosekiFixture(unittest.TestCase):
+    """F1/F2 的共用夹具：玩家那手与她那一手都想出定式结果时，驱动完整的三阶段回合。"""
+
+    # 她那一手的合成识别结果（族与玩家那手不同，便于断言「用的是她的族」）
+    HER_ENTER = {"kind": "entered", "family": "komoku_low_kakari", "cat": "komoku",
+                 "name": "小目·一间低挂", "key": "（要点）", "corner": "右下", "k": 2,
+                 "line": [{"x": 3, "y": 15, "c": "B"}, {"x": 5, "y": 15, "c": "W"}],
+                 "candidates": [], "points": [(3, 15), (5, 15)]}
+    HER_BRANCH = {"kind": "branch", "family": "star_kakari_small", "cat": "star",
+                  "name": "小飞挂·靠压定式", "key": "（要点）", "corner": "左上", "k": 2, "line": [],
+                  "candidates": [{"name": "小飞挂·靠压定形", "family": "star_kakari_small",
+                                  "next": (4, 2), "line": []}],
+                  "points": [(15, 3)]}
+
+    def _drive(self, agent, x, y):
+        """``after_player → own_turn → just_moved`` 三个公开阶段依次跑完（与 ``player_move`` 同入口）。"""
+        agent._new_turn()
+        state = asyncio.run(agent._turn(PHASE_AFTER_PLAYER, {"x": x, "y": y}))
+        own = asyncio.run(agent._turn(PHASE_OWN_TURN, state["data"], state["turn_id"]))
+        after = asyncio.run(agent._turn(PHASE_JUST_MOVED, own["data"], own["turn_id"]))
+        return state, own, after
+
+    def _script_her(self, agent, her, real):
+        """第一次 ``_joseki_check()`` 走真识别（玩家那手），第二次起返回她的合成结果。"""
+        calls = []
+
+        def fake():
+            calls.append(1)
+            return real() if len(calls) == 1 else dict(her)
+
+        agent._joseki_check = fake
+        return calls
+
+
+class HerOwnJosekiVerdictTest(_HerJosekiFixture):
+    """F1 回归：她那一手的 ``joseki`` 事件用自己的 ``jk2`` 结论，绝不照搬玩家那手的 mistake / show_card。"""
+
+    def test_her_event_never_carries_the_players_mistake(self):
+        agent, _eng, _llm, bus = _mk()
+        agent.katago = _LosingEngine()               # 玩家那手真亏 ⇒ 真走错
+        _seed_moves(agent, _DEVIATED_BASE)           # 左上 star_33 已吻合 4 手
+        her = dict(self.HER_ENTER, family="star_kakari_big")     # 第一次见的一族（与玩家那手不同）
+        calls = self._script_her(agent, her, agent._joseki_check)
+        state, _own, after = self._drive(agent, 1, 4)
+
+        self.assertIs(state["data"]["jk_mistake"]["is_mistake"], True)
+        self.assertIs(state["data"]["jk_show_card"], True)        # 玩家那一手自己的结论
+        self.assertEqual(len(calls), 2, "她那一步只许识别一次")
+        her_event = bus.of_type("joseki")[-1]
+        self.assertEqual(str(her_event["family"]), "star_kakari_big", "事件是她的族")
+        self.assertIsNone(her_event["mistake"], "她那手的事件不得带上玩家那手的走错标记（F1）")
+        self.assertIs(her_event["show_card"], True)
+        self.assertIs(after["data"]["jk_show_card"], True)
+
+    def test_her_card_verdict_comes_from_her_own_family(self):
+        """玩家那一族已教过 3 次（他这一手不上卡片），她那一手是另一族、第一次见 ⇒ 她上卡片。"""
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        progress = JosekiProgress(os.path.join(d.name, "joseki_progress.db"))
+        for _ in range(3):
+            progress.bump("komoku_low_kakari")                   # 玩家那一族：已教 3 次
+        agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus(),
+                           joseki_progress=progress)
+        _seed_moves(agent, [["W", "D17"]])                       # 左上小目；玩家落 F17(5,2) ⇒ entered
+        her = dict(self.HER_ENTER, family="star_kakari_big")     # 她那一族：第一次见
+        calls = self._script_her(agent, her, agent._joseki_check)
+        state, own, _after = self._drive(agent, 5, 2)
+
+        self.assertEqual(str(state["data"]["jk"]["kind"]), "entered")
+        self.assertEqual(str(state["data"]["jk"]["family"]), "komoku_low_kakari")
+        self.assertIs(state["data"]["jk_show_card"], False, "玩家那一族已教 3 次：他这一手不上卡片")
+        self.assertIs(own["data"]["jk_show_card"], True, "她那手第一次见 ⇒ 用**她的**族重算后上卡片")
+        her_event = agent.bus.of_type("joseki")[-1]
+        self.assertEqual(str(her_event["family"]), "star_kakari_big")
+        self.assertIs(her_event["show_card"], True)
+        self.assertIsNone(her_event["mistake"])
+        self.assertEqual(len(calls), 2)
+
+
+class HerStructureSpeechTest(_HerJosekiFixture):
+    """F2：她那一手的进入 / 分岔也并进她的发言位（此前只换 formed 的模板）。"""
+
+    def test_her_entered_and_branch_speak_the_matching_wording(self):
+        cases = (("entered", self.HER_ENTER), ("branch", self.HER_BRANCH))
+        for kind, result in cases:
+            with self.subTest(kind=kind):
+                llm = _FreshLLM()
+                agent = AzureAgent(StubEngine(), llm, events.RecordingBus())
+                calls = []
+
+                def fake():
+                    calls.append(1)
+                    return {} if len(calls) == 1 else dict(result)   # 玩家那手没结果；她那一步有
+
+                agent._joseki_check = fake
+                _seed_moves(agent, [["W", "D17"]])
+                asyncio.run(agent.player_move(5, 2))
+
+                text = _phase_texts(llm)[-1]                     # 最后一条阶段提示＝她那句感想
+                name = str(result["name"])
+                key = str(result["key"])
+                if kind == "entered":
+                    self.assertIn(prompts.joseki_enter_prompt(name, key, str(result["corner"])), text)
+                else:
+                    self.assertIn(prompts.joseki_branch_prompt(
+                        name, key, list(result["candidates"])), text)
+                self.assertNotIn("换一句新话", text, "顶替：普通感想那一档一个字都不在")
+                self.assertEqual(len(agent.bus.messages()), 3,
+                                 "结构点顶替本来那条：气泡数仍是 3，不新增")
+                self.assertEqual(len(calls), 2, "她那一步只许识别一次")
+
