@@ -110,6 +110,7 @@ var _chk_pass: CheckBox
 var _chk_joseki: CheckBox
 var _bad_box: HBoxContainer
 var _chat_input: LineEdit
+var _lbl_queue: Label                           # 右下角那行「排队中 N 条 · 队头前几个字」（队列空则隐藏）
 var _buttons: Array[Button] = []
 var _shot_path := ""
 
@@ -332,6 +333,14 @@ func _build_right_panel(root: Control) -> void:
 	send.text = "发送"
 	send.pressed.connect(_send_chat)
 	inp_row.add_child(send)
+
+	# 排队提示（她忙时发的聊天先排着；右下角显示「排队中 N 条 · 队头前几个字」，队列空则隐藏）
+	_lbl_queue = Label.new()
+	_lbl_queue.add_theme_font_size_override("font_size", 11)
+	_lbl_queue.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
+	_lbl_queue.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_lbl_queue.visible = false
+	vb.add_child(_lbl_queue)
 
 	# 功能按钮
 	var btn_row := HBoxContainer.new()
@@ -1402,6 +1411,7 @@ func _wire_agent() -> void:
 	agent.tool_event.connect(_on_tool_event)
 	agent.token_event.connect(_on_token_event)    # 可选（默认关闭）的流式增量：只影响气泡显示过程
 	agent.speech_event.connect(_on_speech_event)  # 语音指令（合成在后端）：取音频 / 调系统语音 + 与台词配对
+	agent.chat_queue_changed.connect(func(): _refresh_chat_queue_hint())   # 排队内容变了：刷新右下角提示
 	var mood_timer := Timer.new()                 # 三维情绪向基线回落的心跳：2 秒一次，区域没变时零开销
 	mood_timer.wait_time = 2.0
 	mood_timer.autostart = true
@@ -1556,10 +1566,29 @@ func _send_chat() -> void:
 	var t := _chat_input.text
 	if t.strip_edges() == "":
 		return
+	if agent != null and not agent.chat(t):
+		# 队列满了：**不吞玩家的话**——原文留在输入框，只在状态栏提示（聊天栏不出现这条）
+		_set_status("排队已满（最多 %d 条），等她说完了再发" % ChatQueue.CHAT_QUEUE_MAX)
+		return
 	_allow_tts_fillers()
 	_add_msg("user", t)
 	_chat_input.text = ""
-	agent.chat(t)
+
+## 右下角那行排队提示：`排队中 N 条 · 队头前几个字`（队列空 ⇒ 隐藏）
+func _refresh_chat_queue_hint() -> void:
+	if _lbl_queue == null:
+		return
+	var queued: bool = agent != null and agent.has_queued_chat()
+	_lbl_queue.text = agent.queued_chat_hint() if queued else ""
+	_lbl_queue.visible = queued
+
+## 她已经处于「这一轮结束、语音也播完」（`hold` 为假）时，把玩家排队的聊天自动发下一条——
+## 玩家不用再发一条来「催」。队列空时每帧只多一次判断，零开销；`flush_queued_chat` 自己还有
+## 「没连上后端就不发 / 失败节流窗口」两道闸。
+func _tick_chat_queue(hold: bool) -> void:
+	if agent == null or hold or not agent.has_queued_chat():
+		return
+	agent.flush_queued_chat({"busy": agent.busy, "speaking": tts != null and tts.is_speaking()})
 
 ## 玩家主动发起对局互动：允许 TTS 在合成等待时插「嗯…」这类语气词。
 ## 同时把还在合成/排队/播放的走神搭话全部作废——人已经回来下棋了，别再追着问「在忙什么呀」
@@ -1621,13 +1650,15 @@ func _bump_activity() -> void:
 
 func _process(delta: float) -> void:
 	var now := Time.get_ticks_msec()
-	if _azure_hold_active():
+	var hold := _azure_hold_active()
+	if hold:
 		# 她还在思考 / 朗读 / 有句子没播完：棋盘锁着，玩家此刻根本无法落子，
 		# 这段时间不能算「玩家闲置」——否则会出现她边堵着棋盘边问「你在忙什么呀？还要继续下棋吗」
 		_last_activity_ms = now
 		if _idle:
 			_idle = false
 			_set_idle_state(false)
+	_tick_chat_queue(hold)                              # 她这一轮结束、语音也播完：自动续发排队的聊天
 	if not _idle and now - _last_activity_ms >= int(IDLE_SEC * 1000.0):
 		_idle = true                                    # 长时间没操作：看向玩家、准备歪头
 		_set_idle_state(true)
