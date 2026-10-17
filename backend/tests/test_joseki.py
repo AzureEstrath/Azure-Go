@@ -42,6 +42,22 @@ class JosekiTest(unittest.TestCase):
             exp = case["result"]
             self.assertEqual(got, exp, "%s scan: 期望 %r 实际 %r" % (case["case"], exp, got))
 
+    def test_every_entry_has_family(self):
+        for e in JosekiData.LIST:
+            self.assertIn("family", e)
+            self.assertRegex(e["family"], r"^[a-z0-9_]+$")
+
+    def test_variants_of_one_lesson_share_family(self):
+        fams = [e["family"] for e in JosekiData.LIST if e["name"].startswith("点三三")]
+        self.assertEqual(len(set(fams)), 1)
+
+    def test_family_values_per_entry(self):
+        # 七条各归哪一族（顺序同 JosekiData.LIST，golden 已锁死顺序）
+        self.assertEqual(
+            [e["family"] for e in JosekiData.LIST],
+            ["star_33"] * 3 + ["star_kakari_small"] * 2 + ["star_double_kakari"] * 2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
