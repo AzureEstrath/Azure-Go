@@ -13,6 +13,9 @@
     POST /api/interaction {what}            玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话
     POST /api/mood/tick                     情绪心跳（向基线回落）
+    POST /api/review      {on}              进入 / 退出复盘模式（只读回看；期间落子/聊天/闲置/提示/分析被拒）
+    POST /api/review/goto {n}               复盘：把第 n 手（含）之后的**只读**快照推一份 state 事件
+    GET  /api/review/notes                  复盘：本局逐手存档（move_notes）+ 亏损手账（losses）
     POST /api/tts/speak   {text}            试听/手动合成 → audio/wav（合成不出来 → 409）
     GET  /api/tts/audio/{audio_id}          取一条已合成的音频 → audio/wav（未命中 → 404）
     POST /api/memory/query  {query, k?}     检索长期记忆（管理面；默认关闭时返回空列表）
@@ -153,6 +156,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     @app.post("/api/move")
     async def move(body: dict):
         s = a()
+        denied = review_gate()                  # 复盘先于 busy（V6）
+        if denied is not None:
+            return denied
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
         x = _int(body.get("x"), -1)
@@ -165,6 +171,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     @app.post("/api/hint")
     async def hint():
         s = a()
+        denied = review_gate()                  # 复盘先于 busy（V6）
+        if denied is not None:
+            return denied
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
         await s.hint()
@@ -173,6 +182,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     @app.post("/api/analyze")
     async def analyze():
         s = a()
+        denied = review_gate()                  # 复盘先于 busy（V6）
+        if denied is not None:
+            return denied
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
         await s.analyze_position()
@@ -181,6 +193,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     @app.post("/api/chat")
     async def chat(body: dict):
         s = a()
+        denied = review_gate()                  # 复盘先于 busy（V6）
+        if denied is not None:
+            return denied
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
         await s.chat(str(body.get("text", "")))
@@ -236,6 +251,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     @app.post("/api/idle")
     async def idle():
         s = a()
+        denied = review_gate()                  # 复盘先于 busy（V6）
+        if denied is not None:
+            return denied
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
         await s.idle_remark()
@@ -245,6 +263,55 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     async def mood_tick():
         a().tick_mood()
         return ok()
+
+    # ================= 复盘模式（v3.7.0） =================
+    # 复盘是**后端的模式**（只把前端棋盘设成只读挡不住她出声）：期间她不能开口——落子 / 聊天 /
+    # 闲置 / 提示 / 分析一律可读拒绝，情绪心跳与语气词在 agent 侧冻结（V14）；回看只推 `state`
+    # 事件（复用既有 payload 形状），不新增事件种类、不新增 LLM 调用。
+    # 复盘**可进可出**且退出后回到进入前的状态：`goto` 只重放一份临时盘面，一个字都不改 `st`
+    # （V7/V8），也**不碰** `st.finished` 的既有语义（「🏁 结束之后仍可继续落子」不变）。
+
+    def review_gate():
+        """复盘门禁（V6）：命中时返回**可读拒绝**，未命中返回 ``None``。
+
+        判定顺序是**复盘先于 busy**：复盘期间本来就不该有在途回合，两个拒绝的形状刻意不同
+        （复盘回 ``{"ok": False, "error": "复盘模式中"}``，busy 回 ``{"ok": False, "busy": True, …}``），
+        前端据 ``error`` / ``busy`` 区分提示文案。**两种都不得触碰 ``busy``**。
+        """
+        if bool(getattr(a(), "review", False)):
+            return {"ok": False, "error": "复盘模式中"}
+        return None
+
+    @app.post("/api/review")
+    async def review(body: dict):
+        """进入 / 退出复盘模式（本端点**自身不受**复盘门禁，否则进不去也出不来）。"""
+        s = a()
+        s.set_review(bool(body.get("on", False)))
+        return {"ok": True, "on": bool(s.review)}
+
+    @app.post("/api/review/goto")
+    async def review_goto(body: dict):
+        """回看第 ``n`` 手（含）的**只读**快照：重放临时盘面并推 `state`，**不改 ``st``**（V7）。
+
+        ``n`` 越界夹到 ``[0, len(move_seq)]``（本任务钉住：不报错、不 500）；返回体回夹好的 ``n``，
+        供前端知道实际落在第几手。
+        """
+        s = a()
+        payload = s.review_snapshot(_int(body.get("n"), 0))
+        s._emit(events.state(payload))
+        return {"ok": True, "busy": s.busy, "n": payload["move_count"]}
+
+    @app.get("/api/review/notes")
+    async def review_notes():
+        """本局逐手存档 + 亏损手账（V13 之后，悔掉的那几手已从两份账上消失）。
+
+        形状＝ ``st`` 上那两份账的**副本**（空文本的 note **不过滤**——存档是原样回放，
+        展示侧的取舍属于前端 D）。本端点同样不被复盘门禁挡（复盘期间正是要读它）。
+        """
+        s = a()
+        return {"ok": True,
+                "notes": [dict(n) for n in s.st.move_notes if isinstance(n, dict)],
+                "losses": [dict(l) for l in s.st.losses if isinstance(l, dict)]}
 
     # ================= 云端语音（计划 05） =================
     # 对局中的台词由 WS 的 `speech` 事件驱动（前端据 id 来拉音频）；这里两个端点是**试听/手动用**的。

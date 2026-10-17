@@ -4,6 +4,7 @@
 以及一次落子能把事件推给 WS 订阅者。
 """
 
+import copy
 import os
 import sys
 import tempfile
@@ -587,6 +588,208 @@ class TtsAsyncPathTest(unittest.TestCase):
         asyncio.run(go(agent))
         self.assertEqual(len(bus.messages()), 4)         # undo×2 / set_allow_pass / reset_game 各一条
         self.assertEqual(bus.of_type("speech"), [], "同步方法的短提示不得发 speech（T20②）")
+
+
+# ================= 计划 08 · Task C：后端复盘模式（v3.7.0） =================
+# 复盘是**后端的模式**（只把前端棋盘设成只读挡不住她出声）：这里守门禁（复盘先于 busy）、
+# 只读重放、静音、存档形状，以及阶段一顺延的 V13 剪枝。
+# 沿用本文件既有的 ``create_app(engine=…, llm=…, autostart=False)`` + ``TestClient`` 套路；
+# 需要看 bus 事件（静音）或直接注入状态（V15 / finished / V13）的用例改为注入 agent。
+
+
+class ReviewModeTest(unittest.TestCase):
+    def _client(self):
+        app = create_app(engine=StubEngine(), llm=StubLLM(), autostart=False)
+        return app, TestClient(app)
+
+    def _enter(self, client, on=True):
+        r = client.post("/api/review", json={"on": on})
+        self.assertEqual(r.status_code, 200)
+        return r.json()
+
+    def _goto(self, client, n):
+        r = client.post("/api/review/goto", json={"n": n})
+        self.assertEqual(r.status_code, 200)
+        return r.json()
+
+    def _next_state(self, ws, tries=6):
+        """读到第一条 ``state`` 事件（``goto`` 只推这一条）。"""
+        for _ in range(tries):
+            e = ws.receive_json()
+            if e.get("type") == "state":
+                return e
+        self.fail("没收到 state 事件")
+
+    def test_review_blocks_move_chat_idle(self):
+        """① 复盘期间五个入口一律可读拒绝（V6 形状），且**不碰 busy**、一条都落不下去。"""
+        app, client = self._client()
+        with client:
+            self.assertEqual(self._enter(client), {"ok": True, "on": True})
+            for path, body in (("/api/move", {"x": 3, "y": 3}),
+                               ("/api/chat", {"text": "在吗"}),
+                               ("/api/idle", {}),
+                               ("/api/hint", {}),
+                               ("/api/analyze", {})):
+                with self.subTest(path=path):
+                    r = client.post(path, json=body)
+                    self.assertEqual(r.status_code, 200)
+                    # V6：不复用 busy 那套形状（{"ok": False, "busy": True, "state": …}）
+                    self.assertEqual(r.json(), {"ok": False, "error": "复盘模式中"})
+                    self.assertFalse(app.state.agent.busy, "复盘拒绝不得改动 busy")
+            self.assertEqual(client.get("/api/state").json()["move_count"], 0)
+
+    def test_exit_review_restores_normal_play(self):
+        """② 退出复盘后落子重新可用（复盘可进可出）。"""
+        app, client = self._client()
+        with client:
+            self._enter(client, True)
+            self.assertEqual(self._enter(client, False), {"ok": True, "on": False})
+            r = client.post("/api/move", json={"x": 3, "y": 3})
+            self.assertTrue(r.json()["ok"])
+            self.assertEqual(r.json()["state"]["move_count"], 2)
+
+    def test_enter_review_while_busy_keeps_busy(self):
+        """V15：busy 为真时**允许**进复盘（否则永远进不去），但进出都不许擅自改 busy。"""
+        app, client = self._client()
+        with client:
+            agent = app.state.agent
+            agent._set_busy(True)
+            self.assertEqual(self._enter(client, True), {"ok": True, "on": True})
+            self.assertTrue(agent.busy, "进复盘不许动 busy")
+            # 判定顺序：复盘**先于** busy（V6）——两个都命中时回的是复盘那套形状
+            r = client.post("/api/move", json={"x": 3, "y": 3})
+            self.assertEqual(r.json(), {"ok": False, "error": "复盘模式中"})
+            self.assertTrue(agent.busy)
+            self._enter(client, False)
+            self.assertTrue(agent.busy, "退出复盘也不许擅自改 busy")
+
+    def test_review_does_not_touch_finished_semantics(self):
+        """③ 复盘进出不改 ``finished`` 语义：结束后仍可继续落子这个现状不变。"""
+        app, client = self._client()
+        with client:
+            agent = app.state.agent
+            agent.st.finished = True                        # 现状：总结之后仍能接着下
+            self._enter(client, True)
+            self._enter(client, False)
+            self.assertTrue(agent.st.finished, "复盘不许碰 finished")
+            r = client.post("/api/move", json={"x": 3, "y": 3})
+            self.assertTrue(r.json()["ok"], "finished 为真不挡落子（既有语义）")
+            self.assertEqual(r.json()["state"]["move_count"], 2)
+
+    def test_goto_pushes_state_for_that_move(self):
+        """④ ``goto`` 推一份只读 ``state``（前 n 手），``st`` 逐字段不变；越界的 n 夹到合法范围。"""
+        app, client = self._client()
+        with client:
+            agent = app.state.agent
+            for x, y in ((0, 0), (0, 18), (18, 18)):        # 玩家三手 ⇒ 共 6 手
+                self.assertTrue(client.post("/api/move", json={"x": x, "y": y}).json()["ok"])
+            self.assertEqual(agent.st.payload()["move_count"], 6)
+            before = (copy.deepcopy(agent.st.moves), list(agent.st.move_seq),
+                      copy.deepcopy(agent.st.board.grid), agent.st.board.ko_point,
+                      copy.deepcopy(agent.st.bad_moves), agent.st.allow_pass,
+                      agent.st.finished, copy.deepcopy(agent.st.move_notes),
+                      copy.deepcopy(agent.st.losses), len(agent.st.snapshots))
+            self._enter(client, True)
+            with client.websocket_connect("/ws") as ws:
+                self.assertEqual(ws.receive_json()["type"], "hello")
+                self.assertEqual(self._goto(client, 4)["n"], 4)
+                replay = self._next_state(ws)
+                self.assertEqual(replay["move_count"], 4)
+                self.assertEqual(replay["move_seq"], before[1][:4])
+                self.assertEqual(len(replay["stones"]), 4)
+                self.assertEqual(replay["bad_moves"], before[4])
+                self.assertEqual(replay["allow_pass"], before[5])
+                # 越界：n < 0 → 0；n > 手数 → len(move_seq)
+                self.assertEqual(self._goto(client, -3)["n"], 0)
+                self.assertEqual(self._next_state(ws)["move_count"], 0)
+                self.assertEqual(self._goto(client, 99)["n"], 6)
+                self.assertEqual(self._next_state(ws)["move_count"], 6)
+            self.assertEqual(agent.st.payload()["move_count"], 6, "goto 不许改 st")
+            self.assertEqual(copy.deepcopy(agent.st.moves), before[0])
+            self.assertEqual(list(agent.st.move_seq), before[1])
+            self.assertEqual(copy.deepcopy(agent.st.board.grid), before[2])
+            self.assertEqual(agent.st.board.ko_point, before[3])
+            self.assertEqual(copy.deepcopy(agent.st.bad_moves), before[4])
+            self.assertEqual(agent.st.allow_pass, before[5])
+            self.assertEqual(agent.st.finished, before[6])
+            self.assertEqual(copy.deepcopy(agent.st.move_notes), before[7])
+            self.assertEqual(copy.deepcopy(agent.st.losses), before[8])
+            self.assertEqual(len(agent.st.snapshots), before[9])
+            self.assertEqual(client.get("/api/state").json()["move_count"], 6)
+
+    def test_reconnect_during_review_still_blocks(self):
+        """⑤ 断线重连（``hello`` 同步）后仍是复盘模式；``hello`` 给权威盘面、重放交给 ``goto``。"""
+        app, client = self._client()
+        with client:
+            for x, y in ((0, 0), (0, 18)):                  # 共 4 手
+                self.assertTrue(client.post("/api/move", json={"x": x, "y": y}).json()["ok"])
+            self._enter(client, True)
+            with client.websocket_connect("/ws") as ws:
+                self.assertEqual(ws.receive_json()["type"], "hello")
+            with client.websocket_connect("/ws") as ws:
+                hello = ws.receive_json()
+                self.assertEqual(hello["type"], "hello")
+                self.assertEqual(hello["state"]["move_count"], 4)
+            r = client.post("/api/move", json={"x": 3, "y": 3})
+            self.assertEqual(r.json(), {"ok": False, "error": "复盘模式中"})
+            self.assertEqual(client.post("/api/idle", json={}).json()["error"], "复盘模式中")
+
+    def test_review_notes_shape(self):
+        """⑥ 存档端点：``ok`` + ``notes`` + ``losses`` 与 ``st`` 两份账一致；空文本的 note **不过滤**。"""
+        app, client = self._client()
+        with client:
+            agent = app.state.agent
+            self.assertTrue(client.post("/api/move", json={"x": 0, "y": 0}).json()["ok"])
+            # StubEngine 的胜率前后都是 0.5 ⇒ 不会有真亏手，手工造一条（端点只做透传）
+            agent.st.record_loss("Q16", 0.3, "胜率下滑30%")
+            agent.st.note_move(len(agent.st.moves), "review", "A", "")   # 空文本存档
+            self._enter(client, True)                       # 复盘期间照样可读（本端点不被门禁挡）
+            r = client.get("/api/review/notes")
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            self.assertEqual(set(body), {"ok", "notes", "losses"})
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["notes"], agent.st.move_notes)
+            self.assertEqual(body["losses"], agent.st.losses)
+            self.assertEqual(set(body["notes"][0]), {"move_no", "kind", "side", "text"})
+            self.assertEqual(set(body["losses"][0]), {"move_no", "gtp", "drop", "reason"})
+            self.assertEqual(body["notes"][-1]["text"], "", "空文本的 note 不过滤（口径钉在这里）")
+
+    def test_review_freezes_mood(self):
+        """⑦ 静音（V14）：复盘期间心跳与互动不衰减、不发 ``mood`` 事件；``mood_payload`` 照常可读。"""
+        agent, _eng, _llm, bus = mk_agent()
+        with TestClient(create_app(agent=agent, autostart=False)) as client:
+            client.post("/api/interaction", json={"what": "patted"})    # 复盘外：真的会动情绪
+            self.assertTrue(bus.of_type("mood"), "复盘外互动应当有 mood 事件（否则本用例空转）")
+            self._enter(client, True)
+            before = (agent.mood.v, agent.mood.c, agent.mood.a)
+            bus.clear()
+            client.post("/api/mood/tick", json={})
+            client.post("/api/interaction", json={"what": "patted"})
+            self.assertEqual((agent.mood.v, agent.mood.c, agent.mood.a), before, "复盘期间情绪不许漂移")
+            self.assertEqual(bus.of_type("mood"), [])
+            payload = agent.mood_payload()                              # hello 同步要用：照常可读
+            self.assertEqual(payload["name"], agent.mood.region_name())
+            self.assertAlmostEqual(payload["v"], before[0], places=2)
+
+    def test_undo_prunes_move_notes_and_losses(self):
+        """⑧ V13：``undo`` 后两份账里 ``move_no > len(st.moves)`` 的尾部被剪掉（``<=`` 保留到最后保留那一手）。"""
+        agent, _eng, _llm, _bus = mk_agent()
+
+        async def play():
+            await agent.player_move(0, 0)
+            await agent.player_move(0, 18)
+
+        asyncio.run(play())
+        self.assertEqual(len(agent.st.moves), 4)
+        agent.st.losses.append({"move_no": 2, "gtp": "Q16", "drop": 0.3, "reason": "胜率下滑30%"})
+        agent.st.losses.append({"move_no": 4, "gtp": "D4", "drop": 0.4, "reason": "胜率下滑40%"})
+        # 1=玩家点评（E）；2=她的用意 + 落子后感想（A）；3 / 4 同理
+        self.assertEqual([n["move_no"] for n in agent.st.move_notes], [1, 2, 2, 3, 4, 4])
+        agent.undo(1)                                       # 退回第 2 手之前（快照 1）
+        self.assertEqual(len(agent.st.moves), 2)
+        self.assertEqual([n["move_no"] for n in agent.st.move_notes], [1, 2, 2])
+        self.assertEqual([l["move_no"] for l in agent.st.losses], [2], "留到 len(st.moves)（含）为止")
 
 
 if __name__ == "__main__":

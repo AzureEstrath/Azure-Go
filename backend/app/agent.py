@@ -20,7 +20,7 @@ from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, is_joseki_mistake, _emit_line,
 )
-from .board import SIZE as BOARD_SIZE
+from .board import GoBoard, SIZE as BOARD_SIZE
 from .emotion import EmotionModel
 from .joseki import JosekiRecognizer
 from .llm_chain import chunk_text_of, content_of
@@ -111,6 +111,15 @@ class AzureAgent:
         self.joseki_teach = joseki_teach
         self.limit_len = limit_len
         self.busy = False
+
+        # —— 复盘模式（v3.7.0）：后端的**独立模式**（可进可出、不碰 `st`、不碰 `busy`）——
+        #    `review` 期间她不能开口：落子/聊天/闲置/提示/分析在 main.py 侧一律可读拒绝，
+        #    情绪心跳与语气词在这里冻结（tick_mood / player_interaction 直接返回，V14）。
+        #    回看只推 `state` 事件（复用既有 payload 形状），不新增事件种类、不新增 LLM 调用。
+        self.review = False
+        # 进入复盘那一刻的 `busy` 快照（V15）：**只记下、不回落**——复盘期间本来就不该有在途回合，
+        # 退出时擅自把 busy 改回去会与「复盘不得改动 busy」冲突；故它只是诊断信息，没有消费方。
+        self._review_busy_before = False
 
         # —— 发言侧工具：默认关闭，行为与没有工具时完全一致 ——
         self.tools_enabled = bool(tools_enabled)
@@ -645,11 +654,22 @@ class AzureAgent:
         }))
 
     def tick_mood(self):
-        """客户端每 2 秒的心跳：只结算「向基线回落」。"""
+        """客户端每 2 秒的心跳：只结算「向基线回落」。
+
+        复盘期间**直接返回**（V14）：不衰减、不发 ``mood`` 事件——回看全程她要静音。
+        ``mood_payload()`` 不受影响（``hello`` 同步照常可读）。
+        """
+        if self.review:
+            return
         self.sync_mood(False)
 
     def player_interaction(self, what):
-        """玩家亲密互动（摸头等）：本地增量 + 静默同步（语气词让位给互动音效）。"""
+        """玩家亲密互动（摸头等）：本地增量 + 静默同步（语气词让位给互动音效）。
+
+        复盘期间**直接返回**（V14）：不产生任何情绪变化（连增量都不落）、不发 ``mood`` 事件。
+        """
+        if self.review:
+            return
         self.mood.apply_event(what)
         self._mood_desc = EmotionModel.event_desc(what)
         self.sync_mood(False, True)
@@ -1106,6 +1126,14 @@ class AzureAgent:
         self.st.snapshots = self.st.snapshots[:turn_index]
         self.st.bad_moves = [b for b in self.st.bad_moves if int(b["turn_index"]) < turn_index]
         self.st.pre_analysis = None
+        # V13：逐手存档 / 亏损手账**不随快照回滚**，但悔掉的那几手必须从两份账上消失——
+        # 否则「悔棋 + 重下」会在同一 move_no 留下两条 (move_no, kind, side) 完全相同的记录，
+        # 复盘存档分不出哪条有效，losses 还会给出「这一手掉了 30%」这种事实错误的数据。
+        # `<=`：move_no 是**落子后**的手数，快照恢复后的 len(st.moves) 就是最后留下的那一手。
+        # （memory_log / joseki_log 的既有回滚行为不动）
+        keep = len(self.st.moves)
+        self.st.move_notes = [nd for nd in self.st.move_notes if int(nd["move_no"]) <= keep]
+        self.st.losses = [ls for ls in self.st.losses if int(ls["move_no"]) <= keep]
         # 退回计数：快照里没有、回档前却有 ⇒ 这一手（及其后）计过数的族。把它们记进 joseki_dropped
         # （再计数时会被 joseki_count_entry 摘掉），并把库里的计数退回去。
         rolled = [f for f in dict.fromkeys(old_counted) if f not in self.st.joseki_counted]
@@ -1139,6 +1167,62 @@ class AzureAgent:
             return
         self._reveal_pending = False
         self._emit(events.state(self.st.payload()))
+
+    # ================= 复盘模式（v3.7.0） =================
+
+    def set_review(self, on):
+        """进入 / 退出复盘模式。
+
+        **不碰 ``busy``**（V15）：``busy`` 为真时也允许进入——否则玩家永远进不去；退出时也不
+        擅自把它改回去（复盘期间本来就不该有在途回合，改了反而与「复盘不得改动 busy」冲突）。
+        进入那一刻的 ``busy`` 只记进 ``_review_busy_before`` 备查（取舍见任务报告）。
+
+        退出**什么都不用恢复**：``review_snapshot()`` 只重放临时盘面，``st`` 一个字都没改（V8）。
+        """
+        v = bool(on)
+        if v and not self.review:
+            self._review_busy_before = bool(self.busy)
+        self.review = v
+
+    def review_snapshot(self, n) -> dict:
+        """按 ``st.move_seq`` 的前 ``n`` 手重放一份**只读**盘面，返回与 ``payload()`` 同形状的 dict。
+
+        **只读**（V7/V8）：临时盘面、临时列表都是新建的，``st`` 上一个字段都不改——既不临时改
+        ``st.moves`` 再改回来（异常路径会留半截状态），也不碰 ``st.finished``；退出复盘因此
+        **不需要恢复任何东西**。
+
+        规则与真实对局一致（提子 / 打劫都由 ``GoBoard.play`` 结算）：坐标按 ``move_seq`` 取，
+        颜色按交手顺序推（黑先，玩家永远是黑、她永远是白，``st.moves`` 逐手交替）；``pass``
+        跳过落子但仍占一手（``move_count`` / ``move_seq`` 与「这一手存在」一致），脏坐标只跳过
+        不抛。``n`` 越界夹到 ``[0, len(move_seq)]``（不报错、不 500）；``stones`` 用临时盘面的
+        着子表，最后一手按 ``last_played_xy`` 的语义带 ``last=true``。
+        """
+        seq = list(self.st.move_seq)
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            n = 0
+        n = max(0, min(n, len(seq)))
+        temp = GoBoard()
+        last_xy = (-1, -1)
+        for i in range(n):
+            gtp = str(seq[i])
+            if gtp.lower() == "pass":
+                temp.pass_move()
+                continue
+            xy = coords.gtp_to_xy(gtp)
+            if xy[0] < 0 or xy[1] < 0:
+                continue
+            res = temp.play(xy[0], xy[1], "black" if i % 2 == 0 else "white")
+            if res.get("ok"):
+                last_xy = xy
+        return {
+            "stones": temp.stones_list(last_xy),
+            "move_count": n,
+            "move_seq": seq[:n],
+            "bad_moves": [dict(b) for b in self.st.bad_moves],
+            "allow_pass": self.st.allow_pass,
+        }
 
     def mood_payload(self) -> dict:
         """当前情绪快照（WS 连接建立时随 hello 一起下发）。"""
