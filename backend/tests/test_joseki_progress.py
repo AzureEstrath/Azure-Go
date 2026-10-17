@@ -380,13 +380,17 @@ class RealCountTest(unittest.TestCase):
 class DedupKeySplitTest(unittest.TestCase):
     """U26（T2 评审顺延的必办项）：``entered`` / ``branch`` 不许吃 ``deviated`` 的 ``D:`` 预算。"""
 
-    def test_entered_does_not_consume_the_deviation_budget(self):
-        """先 entered 再真偏离：偏离仍须被识别（旧实现里 ``D:左上`` 已被 entered 吃掉 ⇒ 沉默）。"""
+    def test_enter_or_branch_does_not_consume_the_deviation_budget(self):
+        """先（进入/）分岔再真偏离：偏离仍须被识别（旧实现里 ``D:左上`` 已被非偏离事件吃掉 ⇒ 沉默）。
+
+        点三三补了「挡另一边」之后（T11 修复轮 U49），角内恰好 2 手的这个局面判 ``branch``；
+        本用例钉的不变量是「非偏离事件不吃 ``D:`` 额度」，故断言按分岔的键写。
+        """
         agent = _agent(None)
-        _seed(agent, [["B", "D16"], ["W", "C17"]])               # 角内恰好 2 手吻合 ⇒ entered
+        _seed(agent, [["B", "D16"], ["W", "C17"]])               # 角内恰好 2 手吻合、第 3 手有分岔 ⇒ branch
         first = agent._joseki_check()
-        self.assertEqual(str(first.get("kind")), "entered")
-        self.assertEqual([e["key"] for e in agent.st.joseki_log], ["E:左上:star_33"])
+        self.assertEqual(str(first.get("kind")), "branch")
+        self.assertEqual([e["key"] for e in agent.st.joseki_log], ["B:左上:star_33"])
 
         _seed(agent, [["B", "C16"], ["W", "D17"]])               # 第 4 手走完核心手顺 ⇒ formed
         self.assertEqual(str(agent._joseki_check().get("kind")), "formed")
@@ -395,13 +399,13 @@ class DedupKeySplitTest(unittest.TestCase):
         got = agent._joseki_check()
         self.assertEqual(str(got.get("kind")), "deviated")
         self.assertEqual([e["key"] for e in agent.st.joseki_log],
-                         ["E:左上:star_33", "F:左上:star", "D:左上"])
+                         ["B:左上:star_33", "F:左上:star", "D:左上"])
 
     def test_branch_has_its_own_key(self):
         """``branch`` 单列 ``B:<角>:<族>``（每角每族一次），不吃 ``D:`` 的额度。"""
         agent = _agent(None)
-        # 现在的库产不出 branch（最低吻合 4 手时成型已经先命中），这里按识别器形状合成一个结果，
-        # 只钉「去重键怎么分家」这一条；扩库（T11a）之后它会真的被走到。
+        # 真实库现在也有真分岔（见 test_joseki 的 fork 用例），这里仍按识别器形状合成一个结果，
+        # 只钉「去重键怎么分家」这一条。
         result = {"kind": "branch", "family": "star_kakari_small", "corner": "左上", "cat": "star",
                   "name": "小飞挂·靠压定式", "key": "（合成）", "k": 2, "line": [], "points": [],
                   "candidates": [{"name": "小飞挂·靠压定形", "family": "star_kakari_small",

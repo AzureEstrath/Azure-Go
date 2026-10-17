@@ -63,7 +63,7 @@ class JosekiTest(unittest.TestCase):
             + ["star_kakari_small"] * 2 + ["star_shimari"] * 2
             + ["star_kakari_big"] * 2 + ["star_kakari_one"] * 2
             + ["komoku_small_kakari"] * 2 + ["komoku_shimari"] + ["komoku_low_kakari"]
-            + ["sansan_kakari"] * 2,
+            + ["sansan_kakari"] * 2 + ["star_33"] * 2 + ["komoku_tsuke"] * 2,
         )
 
     def test_real_library_at_least_two_lines_or_exception(self):
@@ -98,43 +98,67 @@ class JosekiTest(unittest.TestCase):
                 self.assertLess(max(nx, ny), REGION, "%s 有角外坐标：%r" % (e["name"], [nx, ny]))
 
     def test_family_entries_share_two_move_prefix(self):
-        """U12：同族内任一条都必须与同族另一条共享 ≥ 2 手前缀（核心+延伸 / 分岔都真的存在）。"""
+        """U12：同族内任一条都必须与同族另一条共享 ≥ 2 手**逐手相同**的前缀（核心+延伸 / 分岔都真的存在）。"""
         fams = {}
         for e in JosekiData.LIST:
             fams.setdefault(e["family"], []).append(tuple(tuple(int(v) for v in s) for s in e["seq"]))
         for fam, seqs in fams.items():
             if len(seqs) < 2:
                 continue                                     # 单条族由例外清单兜住
-            for s in seqs:
-                shared = max(
-                    (len([1 for i in range(min(len(s), len(o))) if s[i] == o[i]])
-                     for o in seqs if o is not s),
-                    default=0,
+            for i, s in enumerate(seqs):
+                best = 0
+                for j, o in enumerate(seqs):
+                    if i == j:
+                        continue
+                    k = 0
+                    while k < min(len(s), len(o)) and s[k] == o[k]:
+                        k += 1
+                    best = max(best, k)
+                self.assertGreaterEqual(
+                    best, 2,
+                    "族 %s 的第 %d 条线（%s）没跟同族另一条共享 ≥2 手前缀" % (fam, i, s[:2]),
                 )
-                self.assertGreaterEqual(shared, 2, "族 %s 里有条线没跟同族另一条共享 ≥2 手前缀" % fam)
 
-    def test_entered_on_first_library_move(self):
-        # 星位 + 点三三（角内恰好 2 手）仍是进入：本条手顺上库内只有一条读法（点三三·基本型），
-        # 第 3 手没有分歧。T11a 的「挡这边」替代线**没有**入库——它会把这个局面变成 branch，
-        # 而 pin 住 entered 的编排用例（test_joseki_progress / test_agent / test_agent_graph）
-        # 不在本任务的提交范围内，详见 task-11-report.md。
-        r = JosekiRecognizer.scan([["B", "D16"], ["W", "C17"]])   # 左上：星位 + 点三三
+    def test_entered_is_still_reachable(self):
+        """U49 附则：补了分岔之后，「进入」必须仍然到得了——拿一条 2 手不构成分岔的手顺钉住它。
+
+        小目一间低挂（3 手核心）在角内 2 手时没有第二条同前缀线，所以还是 `entered`；
+        守角 / 大飞挂 / 一间挂那几族是 2 手条目，走到那里已是 `formed`（成型），不是进入。
+        """
+        r = JosekiRecognizer.scan([["W", "D17"], ["B", "F17"]])   # 左上：白小目 + 黑一间低挂
         self.assertEqual(r["kind"], "entered")
+        self.assertEqual(r["family"], "komoku_low_kakari")
+        self.assertEqual(r["k"], 2)
+        self.assertEqual(r["candidates"], [])
+        self.assertEqual(len(r["line"]), 3)                       # 显示线＝这一课的核心手顺
+
+    def test_branch_on_real_library_star_33_fork(self):
+        # U49：点三三补了「挡另一边」（另一边的挡法）之后，进入这一课第 3 手就是真分岔：
+        # 显示线＝点三三·基本型（挡 (2,3) 那一边），候选＝另一边挡 (3,2)。
+        r = JosekiRecognizer.scan([["B", "D16"], ["W", "C17"]])   # 左上：星位 + 点三三
+        self.assertEqual(r["kind"], "branch")
         self.assertEqual(r["family"], "star_33")
         self.assertEqual(r["k"], 2)
-        self.assertEqual(len(r["line"]), 4)                        # 显示线＝核心手顺（点三三·基本型）
+        self.assertEqual(len(r["line"]), 4)
         self.assertEqual(r["line"][0]["c"], "B")
-        self.assertEqual(r["candidates"], [])
+        ref_next = (r["line"][r["k"]]["x"], r["line"][r["k"]]["y"])
+        self.assertEqual(ref_next, (2, 3))
+        self.assertEqual(
+            [(c["family"], c["name"], tuple(c["next"])) for c in r["candidates"]],
+            [("star_33", "点三三·挡另一边", (3, 2))],
+        )
 
     def test_line_maps_mirrored_corner(self):
         r = JosekiRecognizer.scan([["B", "D4"], ["W", "C3"]])      # 左下角，对角镜像
-        self.assertEqual(r["kind"], "entered")
+        # 与 test_branch_on_real_library_star_33_fork 同一局面的镜像读法：补了「挡另一边」之后
+        # 进入这一课第 3 手即有分岔。本用例只钉「显示线映射到镜像角」这件事，故两种都收。
+        self.assertIn(r["kind"], ("entered", "branch"))
+        self.assertEqual(r["family"], "star_33")
         self.assertTrue(all(0 <= p["x"] < 19 and 0 <= p["y"] < 19 for p in r["line"]))
 
     def test_branch_when_two_lines_share_prefix(self):
-        # 现有库里很难稳定构造出「同一方、下一步不同」的真实分岔（不同朝向把两条课凑到同一
-        # 前缀时，下一步往往不是同一方），故用两条合成线钉住 branch 的判定；真实分岔由后续
-        # 扩库任务补。
+        # T2 的合成库用例（U4 要求原样留着）：真实库现在也有真分岔了（见 test_branch_on_real_library_star_33_fork
+        # 与 test_branch_on_real_library_after_knight_approach），这里继续用两条合成线钉住 branch 的最基本判定。
         saved = JosekiData.LIST
         try:
             JosekiData.LIST = [
@@ -153,28 +177,32 @@ class JosekiTest(unittest.TestCase):
             JosekiData.LIST = saved
 
     def test_branch_candidates_are_always_the_same_colour(self):
-        # U16：候选只能是「轮到的那一方」的走法。星位 + 白小飞挂之后，真实库里现在有两条同一方
-        # （黑）的应法——贴住（E17 一路）与小飞应（另一边），所以这里由 entered 变成 branch；
-        # 不变的是：每个候选第 k 手的颜色必须与显示线第 k 手相同（跨族同色允许，跨色不许）。
+        # U16：候选只能是「轮到的那一方」的走法。星位 + 白小飞挂之后，真实库里有两条同一方（黑）
+        # 的应法——贴住（4,2 一路，原有靠压线）与在另一边小飞应（2,5，新线）；这里钉住候选的**实际内容**
+        # （名字 + 落点；跨族同色允许），并确认另一条读法（双飞燕）的下一步是白棋、不在候选里。
         r = JosekiRecognizer.scan([["B", "D16"], ["W", "C14"]])
         self.assertEqual(r["kind"], "branch")
-        self.assertGreaterEqual(len(r["candidates"]), 1)
-        ref_col = r["line"][r["k"]]["c"]
-        for c in r["candidates"]:
-            self.assertEqual(c["line"][r["k"]]["c"], ref_col)
-            self.assertNotEqual(tuple(c["next"]),
-                                (r["line"][r["k"]]["x"], r["line"][r["k"]]["y"]))
-        # 另一条读法（双飞燕）的下一步是白棋，不能当作同一方分岔的候选
+        self.assertEqual(r["family"], "star_kakari_small")
+        self.assertEqual(r["k"], 2)
+        self.assertEqual(
+            [(c["family"], c["name"], tuple(c["next"])) for c in r["candidates"]],
+            [("star_kakari_small", "小飞挂·靠压定式", (2, 4))],
+        )
         self.assertNotIn("star_double_kakari", [c["family"] for c in r["candidates"]])
 
     def test_branch_on_real_library_after_knight_approach(self):
-        # U4：真实库的第二条分岔——白小飞挂之后，黑既可贴住（原有靠压线）也可在另一边小飞应（新线）。
+        # U4：真实库的分岔——白小飞挂之后，黑既可贴住（4,2，原有靠压线）也可在另一边小飞应（2,5，新线）。
         r = JosekiRecognizer.scan([["B", "D16"], ["W", "F17"]])
         self.assertEqual(r["kind"], "branch")
+        self.assertEqual(r["family"], "star_kakari_small")
         self.assertEqual(r["k"], 2)
-        fams = sorted(c["family"] for c in r["candidates"])
-        self.assertIn("star_kakari_small", fams)
-        self.assertTrue(all(c["line"][r["k"]]["c"] == r["line"][r["k"]]["c"] for c in r["candidates"]))
+        ref_next = (r["line"][r["k"]]["x"], r["line"][r["k"]]["y"])
+        self.assertEqual(ref_next, (2, 5))                        # 显示线＝新线（小飞挂·小飞应）
+        self.assertEqual(
+            [(c["name"], c["family"], tuple(c["next"])) for c in r["candidates"]],
+            [("小飞挂·靠压定式", "star_kakari_small", (4, 2))],
+        )
+        self.assertNotEqual(tuple(r["candidates"][0]["next"]), ref_next)
 
     def test_formed_and_points_unchanged(self):
         r = JosekiRecognizer.scan([["B", "D16"], ["W", "C17"], ["B", "C16"], ["W", "D17"]])

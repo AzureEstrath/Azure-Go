@@ -558,8 +558,10 @@ def _phase_texts(llm):
 class JosekiActiveSpeechTest(unittest.TestCase):
     """T7 接线：进入 / 分岔 / 走错 / 收尾 四处开口 + 中段沉默 + 闸门 + 她那一格 + 不新增台词。"""
 
-    # 角内先铺 1 手（白），玩家再落 C17(2,2) ⇒ k == len(seq) == 2 且无分岔 ⇒ entered
-    ENTER_SEED = [["W", "D16"]]
+    # 角内先铺 1 手（白小目 D17），玩家再落 F17(5,2)＝一间低挂 ⇒ k == len(seq) == 2 且无分岔 ⇒ entered
+    # （T11 修复轮 U49：点三三补了「挡另一边」之后，星位＋点三三那个局面已经是真分岔，故换到这里；
+    #  小目一间低挂只有一条 3 手线，2 手时不会分岔）
+    ENTER_SEED = [["W", "D17"]]
     # 中段推进：角内 4 手吻合核心手顺后，玩家落 F17(5,2)＝更长那条定式的第 5 手（黑）
     # ⇒ k == len(seq) == 5、没有候选 ⇒ 识别器沉默（`jk == {}`），一个字都不该提定式
     MID_SEED = [["B", "D16"], ["W", "C17"], ["B", "C16"], ["W", "D17"]]
@@ -598,7 +600,7 @@ class JosekiActiveSpeechTest(unittest.TestCase):
     def test_enter_replaces_the_comment(self):
         agent, _eng, llm, bus = _mk()
         _seed_moves(agent, self.ENTER_SEED)
-        state = self._after_player(agent, 2, 2)
+        state = self._after_player(agent, 5, 2)
 
         jk = state["data"]["jk"]
         self.assertEqual(str(jk["kind"]), "entered")
@@ -618,9 +620,8 @@ class JosekiActiveSpeechTest(unittest.TestCase):
     # —— ② 分岔 / 走错：并进这一手的发言位，候选的下一手坐标当素材 ——
 
     def test_branch_dispatch_gives_each_candidate_its_next_move(self):
-        """现在的库产不出真分岔（最低吻合 4 手时成型已经先命中），所以按识别器形状**合成**一个
-        `branch` 结果（与 T2 的 `test_branch_has_its_own_key` 同一手法）；扩库（T11a）之后这条路
-        会被真的走到。"""
+        """这里的库已经有真分岔了（见 test_joseki 的 fork 用例），但本用例要钉的是**分流模板**，
+        所以仍按识别器形状合成一个 `branch` 结果（与 T2 的 `test_branch_has_its_own_key` 同一手法）。"""
         agent, _eng, llm, _bus = _mk()
         result = {"kind": "branch", "family": "star_kakari_small", "cat": "star", "corner": "左上",
                   "name": "小飞挂·靠压定式", "key": "（要点）", "k": 4, "side": "player",
@@ -728,11 +729,11 @@ class JosekiActiveSpeechTest(unittest.TestCase):
         self.addCleanup(d.cleanup)
         progress = JosekiProgress(os.path.join(d.name, "joseki_progress.db"))
         for _ in range(3):
-            progress.bump("star_33")                             # 前 3 次已经教过
+            progress.bump("komoku_low_kakari")                   # 前 3 次已经教过
         llm = StubLLM()
         agent = AzureAgent(StubEngine(), llm, events.RecordingBus(), joseki_progress=progress)
         _seed_moves(agent, self.ENTER_SEED)
-        state = self._after_player(agent, 2, 2)
+        state = self._after_player(agent, 5, 2)
 
         jk = state["data"]["jk"]
         self.assertEqual(str(jk["kind"]), "entered")
@@ -811,7 +812,7 @@ class JosekiActiveSpeechTest(unittest.TestCase):
     def test_entered_turn_still_has_exactly_three_lines(self):
         agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus())
         _seed_moves(agent, self.ENTER_SEED)
-        asyncio.run(agent.player_move(2, 2))
+        asyncio.run(agent.player_move(5, 2))
 
         msgs = agent.bus.messages()
         self.assertEqual(len(msgs), 3, "点评/讲解 + 落子宣告 + 落子后感想：一条都不许多")
@@ -822,7 +823,7 @@ class JosekiActiveSpeechTest(unittest.TestCase):
     def test_llm_calls_stay_within_budget(self):
         agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus())
         _seed_moves(agent, self.ENTER_SEED)
-        asyncio.run(agent.player_move(2, 2))
+        asyncio.run(agent.player_move(5, 2))
         self.assertEqual(len(_phase_texts(agent.llm)), 3, "本任务只换提示词：一回合仍恰好三次")
 
         # 开了工具的那条路照旧受硬上限管（本任务不动预算、也不加调用）
@@ -831,7 +832,7 @@ class JosekiActiveSpeechTest(unittest.TestCase):
         chain = _ScriptChain([_Ai(content="嗯~ 这手我想想。")])
         agent2.chain = chain
         _seed_moves(agent2, self.ENTER_SEED)
-        state = self._after_player(agent2, 2, 2)
+        state = self._after_player(agent2, 5, 2)
         state = asyncio.run(agent2._turn(PHASE_OWN_TURN, state["data"], state["turn_id"]))
         self.assertEqual(int(state["data"]["llm_rounds"]), 1)
         self.assertLessEqual(int(state["data"]["llm_rounds"]), MAX_LLM_CALLS_PER_TURN)
