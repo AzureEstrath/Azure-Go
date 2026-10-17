@@ -49,6 +49,9 @@ var busy := false
 ## `flush_queued_chat()` 续发；提示文案与「能不能发」的判据都在 `ChatQueue` 里（纯逻辑、有门卫）。
 var _chat_queue := ChatQueue.new()
 var _chat_retry_ms := 0                  # 发送失败后的重试闸：`CHAT_RETRY_GAP_MS` 内不重发同一条
+## 刚发出去一条聊天：等她这一轮**真的结束**（收到 `busy=false`）之前不再发下一条。
+## 「一条接一条」不能只看 `busy`——`busy` 事件有网络往返，本机可能刚好赶不上，远端后端就会两条并排发出去。
+var _chat_in_flight := false
 var limit_len := false:
 	set(v):
 		limit_len = v
@@ -137,8 +140,7 @@ func _handle_packet(raw: String) -> void:
 		"hello":
 			state_changed.emit(_dict(d.get("state", {})))
 			mood_changed.emit(_dict(d.get("mood", {})))
-			busy = bool(d.get("busy", false))
-			busy_changed.emit(busy)
+			_apply_busy(bool(d.get("busy", false)))
 		"message":
 			message.emit(str(d.get("kind", "ai")), str(d.get("text", "")))
 		"state":
@@ -146,8 +148,7 @@ func _handle_packet(raw: String) -> void:
 		"info":
 			info_changed.emit(float(d.get("winrate", 0.5)), float(d.get("score", 0.0)))
 		"busy":
-			busy = bool(d.get("busy", false))
-			busy_changed.emit(busy)
+			_apply_busy(bool(d.get("busy", false)))
 		"mood":
 			mood_changed.emit(_without_type(d))
 		"joseki":
@@ -190,10 +191,28 @@ func analyze_position() -> void:
 func chat(text: String) -> bool:
 	if text.strip_edges() == "":
 		return true                      # 空话后端也当没发：既不排队也不发（别占住队头）
-	if busy:
-		return _enqueue_chat(text)
-	_send_chat_now(text)
-	return true
+	if _can_send_now():
+		_chat_in_flight = true           # 这一条出去了：下一条要等她这一轮结束（busy=false）才放
+		_send_chat_now(text)
+		return true
+	return _enqueue_chat(text)
+
+## 能不能**直发**（而不是排队）：她这一轮没在跑、没有刚发出去还没结账的、队列是空的、后端也连着。
+## 只有这条路走直发 —— 于是 `_send_chat_now` 失败时的 `push_front` 一定是真正的队头（顺序不乱），
+## 上限也不会被绕过（未连接 / 忙 / 队里还有东西时一律走 `enqueue`，那里才有 `CHAT_QUEUE_MAX` 这道闸）。
+func _can_send_now() -> bool:
+	return not busy and not _chat_in_flight and _chat_queue.is_empty() and _ws_open()
+
+func _ws_open() -> bool:
+	return _ws != null and _ws.get_ready_state() == WebSocketPeer.STATE_OPEN
+
+## 忙闲同步（WS 的 `hello` / `busy` 事件都走这里）：`busy=false` 说明她这一轮结束了 ——
+## 排队聊天可以发下一条了（「一条接一条」的另一半：放行在 `chat()` / `flush_queued_chat()`）。
+func _apply_busy(v: bool) -> void:
+	busy = v
+	if not v:
+		_chat_in_flight = false
+	busy_changed.emit(v)
 
 ## 入队（尾部）：满了/空文本 ⇒ `false`（队列不变）；成功 ⇒ 发一次 `chat_queue_changed`。
 func _enqueue_chat(text: String) -> bool:
@@ -209,7 +228,8 @@ func _send_chat_now(text: String) -> void:
 	fetch_bytes("/api/chat", HTTPClient.METHOD_POST, {"text": text},
 		func(ok: bool, _code: int, body: PackedByteArray):
 			if ok and _chat_reply_ok(body):
-				return
+				return                   # 收下了：`_chat_in_flight` 交给随后的 `busy` 事件清（她这一轮开始）
+			_chat_in_flight = false      # 没送出去：立刻放行（重试由节流窗口管）
 			_chat_retry_ms = Time.get_ticks_msec() + CHAT_RETRY_GAP_MS
 			_chat_queue.push_front(text)
 			chat_queue_changed.emit())
@@ -224,15 +244,17 @@ static func _chat_reply_ok(body: PackedByteArray) -> bool:
 	return typeof(d) == TYPE_DICTIONARY and bool((d as Dictionary).get("ok", false))
 
 ## 催一次续发。`env` 是「她现在闲不闲」的外部事实（`{"busy": …, "speaking": …}`，由 Main 打包）。
-## 三道门禁：① 状态机判据（空 / 忙 / 还在朗读都不发）；② WS 已连上（没连上不发请求，
-## 免得 Main 每帧催成请求风暴）；③ 失败节流窗口内不重发同一条。
+## 四道门禁：① 没有刚发出去还等她开播/结账的（`_chat_in_flight`，保证一条接一条）；② 状态机判据
+## （空 / 忙 / 还在朗读都不发）；③ WS 已连上（没连上不发请求，免得 Main 每帧催成请求风暴）；
+## ④ 失败节流窗口内不重发同一条。
 func flush_queued_chat(env: Dictionary) -> void:
-	if not _chat_queue.should_flush(env):
+	if _chat_in_flight or not _chat_queue.should_flush(env):
 		return
-	if _ws == null or _ws.get_ready_state() != WebSocketPeer.STATE_OPEN:
+	if not _ws_open():
 		return                           # 没连上后端：消息留在队列里，等重连 + 空闲再自动补发
 	if Time.get_ticks_msec() < _chat_retry_ms:
 		return
+	_chat_in_flight = true
 	_send_chat_now(_chat_queue.pop())
 	chat_queue_changed.emit()
 

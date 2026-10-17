@@ -68,6 +68,19 @@ func _run() -> void:
 
 	nc.free()
 
+	# —— ⑦ 未连接（`_ws == null`）：一律走队列（不尝试直发）——顺序与上限都不许被绕过 ——
+	# 回归护栏（独立评审发现）：老写法在「没连上后端 + busy 恰是 false」时会走直发，失败回调再
+	# `push_front`，于是 ① 后一句排到前一句前面（顺序反了）② 每次都绕开 `enqueue` 的上限，队列无界。
+	var nd := NetClient.new()
+	nd.busy = false                      # 后端不在线时收不到 busy 事件，busy 往往就是 false
+	var accepted := true
+	for i in 6:
+		accepted = nd.chat("第%d句" % (i + 1)) and accepted
+	_check("⑦ 未连接时 6 条里只收 5 条（上限照旧拦住第 6 条）",
+			not accepted and nd.queued_chat_count() == 5)
+	_check("⑦ 未连接时顺序仍是最早那句在队头", nd.queued_chat_hint() == "排队中 5 条 · 第1句")
+	nd.free()
+
 	if _fail == 0:
 		print("[netchat] PASS：", _total, " 项断言全部通过")
 	else:
