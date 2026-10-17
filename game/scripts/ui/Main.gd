@@ -1526,10 +1526,48 @@ func _on_joseki_event(payload: Dictionary) -> void:
 		_joseki_card.apply_event(payload)
 	if board == null:
 		return
-	var pts: Array = payload.get("points", [])
+	var pts := joseki_points(payload)
 	if pts.is_empty():
 		return
 	board.highlight_points(pts, str(payload.get("kind", "formed")))
+
+## 后端 `joseki` 事件的 `points` → `Board3D.highlight_points` 认的 `Vector2i` 数组。
+## WebSocket 送来的是 JSON：后端的 Python 元组 `(x, y)` 到这里是数组 `[x, y]`（也可能是 `{x, y}`），
+## 而 `Board3D.highlight_points` 只认 `Vector2i`（非 `Vector2i` 一律跳过）——不在这里转换，高亮轨迹
+## 就一笔都画不出来。纯函数、不碰场景树，门卫可直接调（`preload("res://scripts/ui/Main.gd")`）。
+static func joseki_points(payload: Dictionary) -> Array[Vector2i]:
+	var out: Array[Vector2i] = []
+	var raw = payload.get("points", [])
+	if typeof(raw) != TYPE_ARRAY:
+		return out                      # 非列表（脏值）：一个都不画
+	for it in raw:
+		var p := _joseki_point(it)
+		if p.x >= 0:
+			out.append(p)
+	return out
+
+## 单个 `points` 项 → `Vector2i`：`[x, y]` 与 `{x, y}` 两种形态都认；脏值 / 出盘 / `pass` → `(-1, -1)`
+static func _joseki_point(v) -> Vector2i:
+	var x := -1
+	var y := -1
+	if typeof(v) == TYPE_ARRAY:
+		var a: Array = v
+		if a.size() >= 2:
+			x = _int_coord(a[0])
+			y = _int_coord(a[1])
+	elif typeof(v) == TYPE_DICTIONARY:
+		var d: Dictionary = v
+		x = _int_coord(d.get("x", null))
+		y = _int_coord(d.get("y", null))
+	return Vector2i(x, y) if Coords.valid(x, y) else Vector2i(-1, -1)
+
+## JSON 整数在前端是 float（x.0），这里只认整数值；字符串 / null / `1.5` / `"pass"` → `-1`
+static func _int_coord(v) -> int:
+	if typeof(v) == TYPE_INT:
+		return v
+	if typeof(v) == TYPE_FLOAT and is_finite(float(v)) and float(v) == floor(float(v)):
+		return int(v)
+	return -1
 
 ## 她自己查资料（发言侧工具）：只在状态栏提示一句，end 时恢复原文案（连错误色一起恢复）。
 ## 工具返回的原始盘面/JSON 永远不会显示给玩家——她的台词仍由后端生成的对话事件送达。

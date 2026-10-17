@@ -224,6 +224,30 @@ func _run() -> void:
 			ca._clamp_pos(Vector2(9999, -9999), Vector2(1280, 800)) == Vector2(1280.0 - 48.0, 0.0))
 	ca.free()
 
+	# —— ⑫ F5：后端 `points`（JSON 数组 / 对象）→ 棋盘高亮认的 `Vector2i`（Main.joseki_points） ——
+	# 后端从 Python 元组 `(x, y)` 经 JSON 化到前端是数组 `[x, y]`，而 Board3D.highlight_points 只认
+	# `Vector2i`——此前缺这一段转换，高亮轨迹一笔都画不出来。Main.gd 无 class_name，用 preload 调静态方法。
+	var main_script := preload("res://scripts/ui/Main.gd")
+	var jpts := main_script.joseki_points({"points": [[3, 3], {"x": 15, "y": 3}, [5, 5]]})
+	_check("⑫ [x,y] 与 {x,y} 两种形态都转成 Vector2i（顺序不变）",
+			jpts.size() == 3 and jpts[0] == Vector2i(3, 3)
+			and jpts[1] == Vector2i(15, 3) and jpts[2] == Vector2i(5, 5))
+	_check("⑫ JSON 整数以 float 到达（x.0）也认",
+			main_script.joseki_points({"points": [[3.0, 3.0]]})[0] == Vector2i(3, 3))
+	var bad_pts := main_script.joseki_points({"points": [
+		"pass", null, 3, {}, [1],
+		["a", 2], [1.5, 2], [-1, 4], [19, 4], [4, 19],
+		{"x": 3}, {"y": 4}, {"x": -1, "y": 2},
+		[3, 4],
+	]})
+	_check("⑫ 脏值 / pass / 越界 / 缺键一律跳过，只留合法那一手（不抛）",
+			bad_pts.size() == 1 and bad_pts[0] == Vector2i(3, 4))
+	_check("⑫ 坐标对多带的元素只读前两个（[1,2,3] → (1,2)）",
+			main_script.joseki_points({"points": [[1, 2, 3]]})[0] == Vector2i(1, 2))
+	_check("⑫ points 为空列表 → 空数组", main_script.joseki_points({"points": []}).is_empty())
+	_check("⑫ points 非列表（脏值）→ 空数组、不抛", main_script.joseki_points({"points": "oops"}).is_empty())
+	_check("⑫ payload 没有 points 键 → 空数组", main_script.joseki_points({}).is_empty())
+
 	if _fail == 0:
 		print("[josekicard] PASS：", _total, " 项断言全部通过")
 	else:
