@@ -1,7 +1,8 @@
 extends SceneTree
 ## 定式参考图卡片（JosekiCard）自检 —— **纯逻辑门卫**，不渲染、不依赖场景树、不许真 sleep。
 ## 覆盖任务书 07-T8 的九条意图：缺字段不崩 / pass 与未知键忽略 / clear 收起 /
-## show_card 缺省 / 收尾即收起 / k 越界不抛 / 避让状态机 / 兜底 TTL / stone_count 合法性；
+## show_card 缺省 / 收尾只有 `formed`（U45：`deviated` 不是收尾）/ k 越界不抛 / 避让状态机 /
+## 兜底 TTL / stone_count 合法性；
 ## 另加修复轮 1 的三条：⑩ 避让的脏输入不抛（M5）、⑪ 拖动的松键与边界（M2）、
 ## ⑥ 里的高亮/候选/走错判据（M4：从 `_draw` 里抽成纯函数才测得到）。
 ## 运行：godot --headless --path game --script res://tests/test_joseki_card.gd
@@ -73,16 +74,23 @@ func _run() -> void:
 	c4.apply_event({"kind": "entered", "show_card": true, "line": [{"x": 3, "y": 3, "c": "B"}]})
 	_check("④ show_card=true → 显示", c4.state() == "shown")
 
-	# —— ⑤ 收尾（线走完 / 脱先）即收起（U38） ——
+	# —— ⑤ 收尾只有 `formed` 一种；`deviated`（走错）**不是收尾**（U45） ——
 	c4.apply_event({"kind": "formed"})
-	_check("⑤ kind=formed → 立即 hidden", c4.state() == "hidden" and c4.stone_count() == 0)
-	c4.apply_event({"kind": "entered", "line": [{"x": 3, "y": 3, "c": "B"}]})
+	_check("⑤ kind=formed → 立即 hidden（库线走完才是收尾）",
+			c4.state() == "hidden" and c4.stone_count() == 0)
+	# 回归：真走错那一手是「第 4 次起」唯一会上卡片的事件，绝不能被当成收尾收掉
+	c4.apply_event({"kind": "deviated", "show_card": true,
+			"line": [{"x": 3, "y": 3, "c": "B"}, {"x": 5, "y": 5, "c": "W"}],
+			"mistake": {"move_no": 5, "x": 1, "y": 4, "drop": 0.2}})
+	_check("⑤ deviated + show_card=true → **不是收尾**，卡片照样上（U45 回归）",
+			c4.state() == "shown" and c4.stone_count() == 2)
+	_check("⑤ deviated 带的 mistake 那一手能标红（`_mistake_cell` 命中）",
+			c4._mistake_cell() == Vector2i(1, 4))
+	c4.apply_event({"kind": "deviated", "show_card": false})
+	_check("⑤ deviated + show_card=false → 不上卡片（hidden）",
+			c4.state() == "hidden" and c4.stone_count() == 0)
 	c4.apply_event({"kind": "deviated"})
-	_check("⑤ kind=deviated → 立即 hidden", c4.state() == "hidden" and c4.stone_count() == 0)
-	c4.apply_event({"kind": "entered", "line": [{"x": 3, "y": 3, "c": "B"}]})
-	c4.apply_event({"kind": "deviated", "show_card": true, "line": [{"x": 5, "y": 5, "c": "B"}]})
-	_check("⑤ deviated 即使带 show_card=true 也是收尾（不因缺省判据反转）",
-			c4.state() == "hidden")
+	_check("⑤ deviated 缺 show_card → 按 true 上卡片（与 entered 同一套缺省）", c4.state() == "shown")
 	c4.free()
 
 	# —— ⑥ k 高亮 / 候选记号 / 走错标红的判据（M4） ——

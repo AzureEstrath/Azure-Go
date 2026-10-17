@@ -10,7 +10,8 @@ extends Control
 ##   · `_draw` / `_gui_input` / `_process` 只在 `is_inside_tree()` 为真时工作；树外只更新纯数据。
 ##   · 卡片不产生任何台词 / `speech`，不碰 `message`。
 ##   · 非法坐标（越界 / 非数字 / 缺键）不画、不计数、不抛；`pass` 一律忽略。
-##   · TTL 兜底走**可注入**的 `_tick(delta)`：后端不识别「脱先」（不发收尾事件），久无新事件就自己收起。
+##   · TTL 兜底走**可注入**的 `_tick(delta)`：后端不识别「脱先」（不发收尾事件），久无新事件就自己收起；
+##     而收尾**只有** `formed`（库线走完）一种，`deviated` 是「走错」→ 照常上卡片并把那一手标红（U45）。
 
 const CARD_TTL_SEC := 120.0   # 兜底 TTL：距最后一次 apply_event 超过这么久仍没新事件 → 自动收起（U38）
 const CARD_W := 200.0         # 卡片宽（含内边距），Main 的默认落位与避让几何都用它
@@ -67,8 +68,11 @@ func apply_event(e: Dictionary) -> void:
 	if typeof(e) != TYPE_DICTIONARY:
 		return
 	var kind := str(e.get("kind", ""))
-	# 收尾（线走完 formed / 任一方脱先 deviated）：立即收起，不等兜底 TTL（U38）
-	if kind == "formed" or kind == "deviated":
+	# 收尾**只有**库线走完（`formed`）这一种：立即收起，不等兜底 TTL（U38）。
+	# **偏离库线（`deviated`）不是收尾**（U45）：它是「走错」，而 `mistake` 只在真走错时才非 null——
+	# 「第 4 次起只在真走错时才上卡片」正是靠这种事件上卡片，所以它走正常路径
+	# （`show_card` 门禁 → 渲染 → 把走错那一手标红），绝不在这里 clear。
+	if kind == "formed":
 		clear()
 		return
 	# show_card：缺失＝true（旧后端不带该字段）；显式 false＝这一手不上卡片（U7）
@@ -103,7 +107,7 @@ func set_panel_overlap(rects: Array) -> void:
 			return
 	_set_faded(false)
 
-## 收起：清数据 + 藏卡片（收尾事件、show_card=false、兜底 TTL 都走这里）
+## 收起：清数据 + 藏卡片（`formed` 收尾、`show_card=false`、兜底 TTL 都走这里）
 func clear() -> void:
 	_active = false
 	_faded = false
