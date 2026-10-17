@@ -181,11 +181,11 @@ async def _prepare_after_player(agent, data):
 
     # ④″ 定式识别（纯本地计算、零引擎调用）
     jk = agent._joseki_check()
-    if jk:
-        agent._joseki_emit(jk)
 
     # ④‴ 走错判定：真亏 **且** 偏离库线才算「走错」；库线那一手永不判错（见 is_joseki_mistake）。
     #     只把结论放进本轮 data，不发事件、不改台词（卡片与事件由 T5/T6/T7 消费）。
+    #     （T5：本块整体上移到 `_joseki_check()` 之后、发 joseki 事件之前——卡片门禁要先拿到它；
+    #      块内容一字未改，也不发任何事件，故事件顺序仍是 state → joseki → mood。）
     #
     #     「库线那一手」取两款（设计 §6 D「库里线条本身略亏时不许出现『照书下还被骂』」）：
     #       ① 显示线的第 k 手（`line[k]`，0 基）——识别器给偏离用的那个「正解」点；
@@ -218,6 +218,14 @@ async def _prepare_after_player(agent, data):
         "drop": drop,
         "rank_ok": rank_ok,
     }
+
+    # ④‴′ 卡片门禁（T5）：前 3 次都上卡片，第 4 次起只在真的走错时才上。**先问后记**：
+    #      ``seen < 3`` 必须在自增之前读（否则第一次出现时 seen 已是 1，前 3 次就只成立 2 次）。
+    #      结论只落进本轮 data 交给 T6/T7 消费：本任务不新增/不删除任何事件，_joseki_emit 照旧。
+    if jk:
+        data["jk_show_card"] = await agent.joseki_show_card(jk, data.get("jk_mistake"))
+        await agent.joseki_count_entry(jk)
+        agent._joseki_emit(jk)
 
     # ④′ 情绪反应：按这一手的好坏结算三维情绪（即时反馈不等 LLM）
     ev = "player_ok"

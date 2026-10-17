@@ -7,6 +7,7 @@
 import asyncio
 import os
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -14,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import events
 from app.agent import AzureAgent
+from app.joseki_progress import JosekiProgress
 from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM
 from helpers import mk_agent as _mk
 
@@ -1075,4 +1077,102 @@ class StreamMarkerFormTest(unittest.TestCase):
         for s in deltas:                                      # 标记（含被切块的前半截）任何时候都不外发
             self.assertNotIn("｜end", s)
             self.assertNotIn("▁of▁thinking", s)
+
+
+# ================= T5：入围规则接线（前 3 次都上卡片，第 4 次起只在走错时上） =================
+
+class JosekiCardGateTest(unittest.TestCase):
+    """端到端（真 ``JosekiProgress`` + 临时库）：入围结论落进 ``data["jk_show_card"]``。
+
+    ``after_player`` 阶段既算「走错」（``jk_mistake``）又算入围，所以这里直接用公开的图入口
+    （``_turn(PHASE_AFTER_PLAYER, ...)``）走一遍，断言下游 T6/T7 要消费的那个字段。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.progress = JosekiProgress(os.path.join(self.dir.name, "joseki_progress.db"))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _agent(self):
+        return AzureAgent(StubEngine(), StubLLM(), events.RecordingBus(),
+                          joseki_progress=self.progress)
+
+    def _turn(self, agent, seed, x, y):
+        """铺好角内既有手顺，再跑 ``after_player``（玩家那一手由这个阶段落到谱上）。"""
+        from app import coords
+        from app.agent_graph import PHASE_AFTER_PLAYER
+        for color, gtp in seed:
+            sx, sy = coords.gtp_to_xy(gtp)
+            agent.st.board.play(sx, sy, "black" if color == "B" else "white")
+            agent.st.add_move(color, gtp)
+        agent._new_turn()
+        return asyncio.run(agent._turn(PHASE_AFTER_PLAYER, {"x": x, "y": y}))
+
+    def _entered(self, agent):
+        """角内第 1 手已在谱上，玩家再落 C17＝角内第 2 手 ⇒ entered。"""
+        return self._turn(agent, [["W", "D16"]], 2, 2)
+
+    def _deviated(self, agent):
+        """角内 4 手吻合，玩家再落 B15 出线 ⇒ deviated（默认 stub 引擎下这手不在前 5 ⇒ 真亏）。"""
+        return self._turn(agent, [["B", "D16"], ["W", "C17"], ["B", "C16"], ["W", "D17"]], 1, 4)
+
+    def test_first_three_entries_show_the_card_the_fourth_does_not(self):
+        for i in range(3):
+            agent = self._agent()
+            state = self._entered(agent)
+            with self.subTest(round=i + 1):
+                self.assertEqual(str(state["data"]["jk"]["kind"]), "entered")
+                self.assertEqual(str(state["data"]["jk"]["family"]), "star_33")
+                self.assertIs(state["data"]["jk_show_card"], True)
+                self.assertEqual(self.progress.seen("star_33"), i + 1, "跨局累计：每局只 +1")
+                self.assertEqual(agent.st.joseki_counted, ["star_33"])
+        agent = self._agent()
+        state = self._entered(agent)
+        self.assertEqual(str(state["data"]["jk"]["family"]), "star_33")
+        self.assertIs(state["data"]["jk_show_card"], False, "第 4 次进入：不再上卡片")
+        self.assertEqual(self.progress.seen("star_33"), 4)
+
+    def test_deviated_mistake_gets_the_card_after_the_third_time(self):
+        for _ in range(3):
+            self.progress.bump("star_33")                        # 前 3 次已经教过
+        agent = self._agent()
+        state = self._deviated(agent)
+        self.assertEqual(str(state["data"]["jk"]["kind"]), "deviated")
+        self.assertIs(state["data"]["jk_mistake"]["is_mistake"], True)
+        self.assertIs(state["data"]["jk_show_card"], True, "第 4 次但真的走错 ⇒ 上卡片")
+
+    def test_deviated_without_mistake_gets_no_card_after_the_third_time(self):
+        """不亏的偏离（她算的前 5 之内、胜率没掉）⇒ 第 4 次起不上卡片。"""
+        for _ in range(3):
+            self.progress.bump("star_33")
+
+        class _FlatEngine(StubEngine):
+            """把玩家那一手放进前 5，且胜率前后同值 ⇒ ``drop == 0`` 且 ``rank_ok`` ⇒ 不算走错。"""
+
+            CAND = ["B15"] + StubEngine.CAND
+
+        agent = self._agent()
+        agent.katago = _FlatEngine()
+        state = self._deviated(agent)
+        self.assertEqual(str(state["data"]["jk"]["kind"]), "deviated")
+        self.assertIs(state["data"]["jk_mistake"]["is_mistake"], False)
+        self.assertIs(state["data"]["jk_show_card"], False)
+
+    def test_event_order_stays_state_joseki_mood(self):
+        """U28：`jk_mistake` 块整体上移后，事件顺序仍是 ``state → joseki → mood``。"""
+        agent = self._agent()
+        self._deviated(agent)
+        types = [str(e.get("type")) for e in agent.bus.events]
+        self.assertLess(types.index("state"), types.index("joseki"))
+        self.assertLess(types.index("joseki"), types.index("mood"))
+
+    def test_no_store_keeps_teaching_every_time(self):
+        """未接线（默认）⇒ 每次都上卡片，且不写任何计数状态。"""
+        agent, _eng, _llm, _bus = _mk()
+        self.assertIsNone(agent.joseki_progress)
+        state = self._deviated(agent)
+        self.assertIs(state["data"]["jk_show_card"], True)
+        self.assertEqual(agent.st.joseki_counted, [])
 

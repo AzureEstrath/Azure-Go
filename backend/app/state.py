@@ -20,6 +20,10 @@ class GameState:
         self.memory_log = []
         # 定式识别去重记录：{key, move_no}；随快照回滚（悔棋后可以重新讲解）
         self.joseki_log = []
+        # 定式族计数（T5）：本局已计过数的族，以及本局已被退回计数的族（供 undo 用）；
+        # 两者都随快照回滚（悔棋重走那一族时，退回的那一次可以重新计入）
+        self.joseki_counted = []
+        self.joseki_dropped = []
         self.chat_history = []
         self.allow_pass = False    # 是否允许 Azure 虚着
         self.pre_analysis = None   # {n, a} 落子前局面分析缓存
@@ -37,6 +41,8 @@ class GameState:
             "move_seq": list(self.move_seq),
             "memory_log": copy.deepcopy(self.memory_log),
             "joseki_log": copy.deepcopy(self.joseki_log),
+            "joseki_counted": copy.deepcopy(self.joseki_counted),
+            "joseki_dropped": copy.deepcopy(self.joseki_dropped),
         }
 
     def last_played_xy(self):
@@ -84,6 +90,8 @@ class GameState:
         self.bad_moves = []
         self.memory_log = []
         self.joseki_log = []
+        self.joseki_counted = []
+        self.joseki_dropped = []
         self.chat_history = []
         self.pre_analysis = None
         self.last_katago = ""

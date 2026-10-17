@@ -18,7 +18,7 @@ from langchain_core.messages import ToolMessage
 from . import coords, events, prompt_chains, prompts
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
-    PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, _emit_line,
+    PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, is_joseki_mistake, _emit_line,
 )
 from .board import SIZE as BOARD_SIZE
 from .emotion import EmotionModel
@@ -101,7 +101,7 @@ CHAT_FALLBACK_LINES = [
 class AzureAgent:
     def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False,
                  tools_enabled=False, max_tool_calls=None, memory=None, stream_tokens=False,
-                 tts=None):
+                 tts=None, joseki_progress=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -133,6 +133,10 @@ class AzureAgent:
 
         # —— 跨局长期记忆：默认不接线（None），由 main.py 的 lifespan 注入 MemoryService ——
         self.memory = memory
+
+        # —— 跨局的定式族计数（T5）：默认不接线（None）⇒ 一律当作「第 1 次」、每次都上卡片；
+        #    由 main.py 的 lifespan 无条件注入 JosekiProgress（没有开关，设计 §8.4）——
+        self.joseki_progress = joseki_progress
 
         self._mood_region = -1
         self._mood_ms = 0
@@ -739,8 +743,18 @@ class AzureAgent:
         if not r:
             return {}
         kind = str(r["kind"])
-        # 去重防刷屏：成型「每角每类一次」；偏离「每角一次、全局最多 2 次」（悔棋回滚后可重新识别）
-        dedup = ("F:%s:%s" % (r["corner"], r["cat"])) if kind == "formed" else ("D:%s" % r["corner"])
+        # 去重防刷屏，**按 kind 分家**（Entry/分叉各自记账，不许吃掉偏离的提醒额度）：
+        #   进入「E:<角>:<族>」每角每族一次；分岔「B:<角>:<族>」每角每族一次；
+        #   成型「F:<角>:<类>」每角每类一次；偏离「D:<角>」每角一次、全局最多 2 次（悔棋回滚后
+        #   可重新识别）。未知 kind 退回 D:<角>（防御：绝不让它绕过去重）。
+        if kind == "entered":
+            dedup = "E:%s:%s" % (r["corner"], r.get("family", ""))
+        elif kind == "branch":
+            dedup = "B:%s:%s" % (r["corner"], r.get("family", ""))
+        elif kind == "formed":
+            dedup = "F:%s:%s" % (r["corner"], r["cat"])
+        else:
+            dedup = "D:%s" % r["corner"]
         if self._joseki_logged(dedup):
             return {}
         if kind == "deviated":
@@ -766,6 +780,97 @@ class AzureAgent:
         if not pts:
             return
         self._emit(events.joseki({"kind": str(r["kind"]), "corner": str(r["corner"]), "points": pts}))
+
+    # —— 卡片门禁（T5）：前 3 次都上卡片，第 4 次起只在真的走错时才上 ——
+
+    async def joseki_show_card(self, jk, mistake=None) -> bool:
+        """这一手该不该上「定式教学卡片」（**只读**：不改 ``st``、不碰计数）。
+
+        自增在 ``joseki_count_entry`` 里，顺序固定「**先问后记**」——若先自增再问，第一次出现时
+        ``seen`` 已是 1，``seen < 3`` 只在第 1、2 次成立，与「前 3 次都上卡片」矛盾。
+
+        判定：同一族历史出现次数（跨局）``seen < 3`` ⇒ 一律 True；第 4 次起只有 ``kind ==
+        "deviated"`` 且 ``is_joseki_mistake(...)``（真亏**且**不在库线上）才 True。
+        ``joseki_progress`` 未接线 / 族 id 缺失（旧库、异常形状）⇒ **保守地 True**（宁可多教一次）；
+        次数读不出来时 ``JosekiProgress.seen`` 自己降到 ``0``（当成第 1 次），所以坏库的表现就是
+        「每次都教」，绝不影响对局。``mistake`` 是 T3 放进 ``data["jk_mistake"]`` 的那个 dict
+        （键 ``is_mistake/on_line/gtp/x/y/drop/rank_ok``）——这里按 ``is_joseki_mistake`` 的口径
+        重算，而不是直接采信 ``is_mistake``。
+        """
+        if not jk:
+            return False
+        if self.joseki_progress is None:
+            return True
+        family = str(jk.get("family") or "")
+        if family == "":
+            return True
+        seen = await asyncio.to_thread(self.joseki_progress.seen, family)   # 永不抛，故障时 0
+        try:
+            seen = int(seen)
+        except (TypeError, ValueError):      # 替身 / 将来实现给了脏值：当成第 1 次（fail-open）
+            seen = 0
+        if seen < 3:
+            return True
+        if str(jk.get("kind", "")) != "deviated":
+            return False
+        if not isinstance(mistake, dict):
+            return False
+        try:
+            return is_joseki_mistake(jk, bool(mistake.get("on_line")),
+                                     float(mistake.get("drop") or 0.0),
+                                     bool(mistake.get("rank_ok")))
+        except Exception as e:                  # noqa: BLE001 —— 脏 mistake 绝不许把这一回合打挂
+            # 保守取向（与整条链一致）：判不出来就**当没走错**——第 4 次起默认不上卡片，
+            # 既不误判「走错」、也不额外打扰玩家；只留一行日志，对局照常。
+            print("[Joseki] 走错判定失败（按「不算走错」保守处理，不影响对局）：%s" % e)
+            return False
+
+    async def joseki_count_entry(self, jk) -> None:
+        """记一次「这一族被走到了」（**同族同局最多计 1 次**；只写计数，不发事件、不决定卡片）。
+
+        先把族落进 ``st.joseki_counted``（并把它从 ``st.joseki_dropped`` 里摘掉——新的一集开始），
+        再 ``bump``。磁盘 IO 走 ``to_thread``（慢库不得冻住事件循环）；失败也只是丢这一次记忆——
+        ``JosekiProgress`` 内部已吞掉异常并降级返回旧值，这里绝不抛、绝不影响对局。
+        """
+        if not jk or self.joseki_progress is None:
+            return
+        family = str(jk.get("family") or "")
+        if family == "":
+            return
+        if family in self.st.joseki_counted:
+            return
+        self.st.joseki_counted.append(family)
+        if family in self.st.joseki_dropped:
+            self.st.joseki_dropped = [f for f in self.st.joseki_dropped if f != family]
+        await asyncio.to_thread(self.joseki_progress.bump, family)
+
+    def _unbump_offloop(self, families):
+        """退回族计数（悔棋）：只做磁盘 IO，异常在 ``JosekiProgress`` 内部已吞。
+
+        ``undo`` 是**同步**方法，而 ``/api/undo`` 是 ``async def``，所以按「有没有运行中的事件
+        循环」分两种走法：**有 loop**（真实端点）时把磁盘动作丢到线程池（``run_in_executor``，
+        不 await）；**没有 loop**（纯同步单测 / 被同步代码直接调用）时就地同步做完——两者都
+        **不阻塞**调用方。绝不能把整个 ``undo`` 丢线程：``_emit`` / ``bus.publish`` 从工作线程唤醒
+        ``asyncio.Queue`` 不是线程安全的，所以这一层只碰 ``JosekiProgress``。
+        """
+        if self.joseki_progress is None:
+            return
+        fams = [f for f in dict.fromkeys(families or []) if f]      # 去重 + 丢掉空族
+        if not fams:
+            return
+
+        def run():
+            for f in fams:
+                self.joseki_progress.unbump(f)          # 内部已降级，不会抛
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:                            # 没有运行中的 loop：就地做完（确定性）
+            loop = None
+        if loop is None:
+            run()
+            return
+        loop.run_in_executor(None, run)
 
     # ================= 玩家落子 =================
 
@@ -957,15 +1062,29 @@ class AzureAgent:
             self._emit(events.message(events.AI, "这个回档点已经不存在了哦"))
             return
         self._mood_event("undo")
+        # 族计数要在**覆盖 st 之前**先记下「回档前已计过数的族」——覆盖之后就再也看不到它们了
+        old_counted = list(self.st.joseki_counted)
         s = self.st.snapshots[turn_index]
         self.st.board = s["board"]
         self.st.moves = s["moves"]
         self.st.move_seq = s["move_seq"]
         self.st.memory_log = s["memory_log"]
         self.st.joseki_log = s["joseki_log"]      # 定式去重记录随快照回滚：悔棋重走那手可以重新讲解
+        self.st.joseki_counted = s["joseki_counted"]    # 族计数随快照回滚（快照＝这一手之前，故这一手计的那次退回）
+        self.st.joseki_dropped = s["joseki_dropped"]    # 已被退回计数的族也随快照回到当时的样子
         self.st.snapshots = self.st.snapshots[:turn_index]
         self.st.bad_moves = [b for b in self.st.bad_moves if int(b["turn_index"]) < turn_index]
         self.st.pre_analysis = None
+        # 退回计数：快照里没有、回档前却有 ⇒ 这一手（及其后）计过数的族。把它们记进 joseki_dropped
+        # （再计数时会被 joseki_count_entry 摘掉），并把库里的计数退回去。
+        rolled = [f for f in dict.fromkeys(old_counted) if f not in self.st.joseki_counted]
+        if rolled:
+            merged = list(self.st.joseki_dropped)
+            for f in rolled:
+                if f not in merged:
+                    merged.append(f)
+            self.st.joseki_dropped = merged
+            self._unbump_offloop(rolled)
         self._emit(events.state(self.st.payload()))
         self._emit(events.message(events.AI, "嗯~ 那我们退回第%d手，重新想想…" % len(self.st.moves)))
 

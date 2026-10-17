@@ -44,6 +44,7 @@ from . import config as config_mod
 from . import coords, events, prompts
 from .agent import AzureAgent
 from .engine import KataGoEngine
+from .joseki_progress import JosekiProgress
 from .llm import LLMClient
 from .llm_chain import merge_extra_body
 from .memory_service import MemoryService
@@ -64,6 +65,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     ``memory`` 显式传入时优先于 lifespan 构造的 ``MemoryService``（测试 seam）：
     ``agent`` 分支也不再覆盖它。``tts`` 同理——显式传入的假 TTS 优先；不传时 lifespan
     构造 ``TTSClient(cfg)``，**两个分支**（自建 agent / 注入 agent）都把它挂到 agent 上（T16）。
+    定式族计数（T5）没有 seam、也没有开关：lifespan 无条件构造 ``JosekiProgress()``（构造期不碰
+    磁盘），**两个分支**都挂同一个实例（有开关就等于能悄悄关掉教学记忆，设计 §8.4 明确不设）。
     """
     cfg = cfg if cfg is not None else config_mod.AzureConfig.load()
 
@@ -76,6 +79,10 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         # 云端语音：显式注入优先（测试用假 TTS）；默认关闭时 speak() 零请求
         tts_client = tts if tts is not None else TTSClient(cfg)
         app.state.tts = tts_client
+        # 定式族计数（T5）：**无条件装配**、不设开关（设计 §8.4）；构造期不碰磁盘——
+        # 库目录 / 库文件只在真正 bump 时才按需创建（tick 只读时连目录都不建）。
+        joseki_progress = JosekiProgress()
+        app.state.joseki_progress = joseki_progress
         if agent is None:
             eng = engine if engine is not None else KataGoEngine(cfg.katago_url, cfg.katago_token, cfg.max_visits, cfg.katago_timeout_ms)
             cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key,
@@ -84,7 +91,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent = AzureAgent(eng, cli, events.EventBus(), joseki_teach=cfg.joseki_teach,
                                          tools_enabled=cfg.tools_enabled, max_tool_calls=cfg.max_tool_calls,
                                          stream_tokens=cfg.stream_tokens,
-                                         memory=mem, tts=tts_client)
+                                         memory=mem, tts=tts_client,
+                                         joseki_progress=joseki_progress)
             if autostart:
                 ok = await eng.start()
                 if not ok:
@@ -93,6 +101,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent = agent
             app.state.agent.memory = mem         # 注入的 agent 也接上同一个实例（显式 memory= 优先）
             app.state.agent.tts = tts_client     # 注入的 agent 同样接上（显式 tts= 优先）
+            app.state.agent.joseki_progress = joseki_progress   # T5：注入的 agent 也接上同一个实例
         yield
         mem.close()                              # 退出时收尾（可重复调用）
         await tts_client.close()                 # 语音客户端**无条件**关闭（autostart 为假时也要关）
