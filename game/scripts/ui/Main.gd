@@ -21,6 +21,8 @@ var tts: TTSClient
 
 var _left_panel: PanelContainer            # 左侧：语音设置
 var _right_panel: PanelContainer           # 右侧：对局 / 聊天
+var _joseki_card: JosekiCard = null        # 定式浮层参考图卡片（浮在棋盘上方，不进任何侧栏）
+var _joseki_card_home := Vector2.ZERO      # 我们最后一次给卡片摆的位置（用户拖走后不再接管）
 var _left_open := false                    # 左侧默认收起，保持棋盘视野
 var _right_open := true
 var _left_toggle: Button
@@ -227,10 +229,76 @@ func _build_ui() -> void:
 	layer.add_child(root)
 	_ui_root = root
 
+	# 卡片先加：它是浮层，任何既有控件（左右栏 / 开关）都压在它上面——只浮在棋盘上，不挤压既有控件
+	_build_joseki_card(root)
 	_build_right_panel(root)
 	_build_left_panel(root)
 	_build_toggles(root)
-	_apply_panel_layout(false)
+	_apply_panel_layout(false)                  # 侧栏就位 + 棋盘取景按侧栏让位
+	_place_joseki_card()                        # 再定卡片默认落位（必须等棋盘取景定下来，否则用错相机）
+
+## 定式浮层参考图卡片：2D Control 浮在 3D 之上（与左右栏同一套「代码建节点」的做法，**不进侧栏**）。
+## 内容全部来自后端 `joseki` 事件（后端是唯一权威）；默认落位在 `_place_joseki_card()` 里现算。
+func _build_joseki_card(root: Control) -> void:
+	_joseki_card = JosekiCard.new()
+	_joseki_card.theme = root.theme                 # 用同一套中文字体
+	root.add_child(_joseki_card)
+	get_viewport().size_changed.connect(_on_viewport_resized)
+
+## 默认落位：按**棋盘投影**挑第一个不与棋盘 / 已展开侧栏相交、且完整落在窗口内的空白角落。
+## 原先硬编码「左下角」在 1280×800 下正压棋盘（棋盘近左角伸进卡片)，卡片一出生就被判 faded——故现算。
+func _place_joseki_card() -> void:
+	if _joseki_card == null:
+		return
+	_joseki_card.position = _joseki_card_anchor()
+	_joseki_card_home = _joseki_card.position
+
+## 窗口尺寸变了：只有用户还没动过卡片（还在我们摆的位置上）才重新摆位，绝不抢用户的手
+func _on_viewport_resized() -> void:
+	if _joseki_card == null or _joseki_card.position != _joseki_card_home:
+		return
+	_place_joseki_card()
+
+## 候选落位，按序取第一个可行的；全都不可行就退回左下角（会被避让判成 faded，但至少完整在窗口内）。
+## 棋盘投影拿不到（没棋盘 / 没相机）时直接退回左下角，保持旧行为。
+func _joseki_card_anchor() -> Vector2:
+	var vp := get_viewport().get_visible_rect().size
+	var fallback := Vector2(24.0, maxf(24.0, vp.y - JosekiCard.CARD_H - 24.0))
+	var br := _board_screen_rect()
+	if not br.has_area():
+		return fallback
+	var w := JosekiCard.CARD_W
+	var h := JosekiCard.CARD_H
+	var lx := float(PANEL_W) if _left_open else 0.0            # 展开的侧栏占掉的左右边界
+	var rx := vp.x - (float(PANEL_W) if _right_open else 0.0)
+	var x_lo := lx + 12.0
+	var x_hi := maxf(x_lo, rx - w - 12.0)
+	# 躲的东西：棋盘投影 + 已展开的侧栏（卡片不得挤压既有控件）
+	var forbid: Array[Rect2] = [br]
+	if _left_open and _left_panel != null:
+		forbid.append(_left_panel.get_global_rect())
+	if _right_open and _right_panel != null:
+		forbid.append(_right_panel.get_global_rect())
+	var inside := Rect2(Vector2(12.0, 12.0), vp - Vector2(24.0, 24.0))
+	var anchors: Array[Vector2] = [
+		Vector2(clampf(br.position.x, x_lo, x_hi), br.end.y + 12.0),                       # ① 棋盘左下外侧
+		Vector2(clampf(br.position.x - w - 12.0, x_lo, x_hi), br.get_center().y - h * 0.5), # ② 棋盘左侧居中
+		Vector2(clampf(rx - w - 12.0, x_lo, x_hi), br.end.y + 12.0),                       # ③ 右栏左边的空档
+		Vector2(clampf(br.get_center().x - w * 0.5, x_lo, x_hi), br.end.y + 12.0),         # ④ 棋盘正下方
+		Vector2(clampf(br.position.x, x_lo, x_hi), br.position.y - h - 12.0),              # ⑤ 棋盘左上外侧
+	]
+	for a in anchors:
+		var r := Rect2(a, Vector2(w, h))
+		if not inside.encloses(r):
+			continue                                  # 露不全（窗口太矮/太窄）：换下一个
+		var clash := false
+		for f in forbid:
+			if f.intersects(r):
+				clash = true
+				break
+		if not clash:
+			return a
+	return fallback
 
 ## 右侧：对局信息 / 聊天 / 功能按钮 / 俗手回档
 func _build_right_panel(root: Control) -> void:
@@ -1452,7 +1520,10 @@ func _on_mood_changed(p: Dictionary) -> void:
 		_mood_sound(f)                             # 区域对应的预制语气词（同情绪延续时不出声）
 
 ## 定式识别成功：角部手顺高亮轨迹（几秒后自动淡出；纯显示，不影响棋局状态）
+## + 浮层参考图卡片（只渲染后端给的字段：name / line / k / candidates / mistake）
 func _on_joseki_event(payload: Dictionary) -> void:
+	if _joseki_card != null:
+		_joseki_card.apply_event(payload)
 	if board == null:
 		return
 	var pts: Array = payload.get("points", [])
@@ -1673,6 +1744,43 @@ func _process(delta: float) -> void:
 	_sync_speech_hold()                                 # 语音侧锁的兜底对齐（音频 404/取不回时不会锁死棋盘）
 	_update_thinking(now)
 	_tick_typing(delta)                                 # 打字节奏推进（AI 消息逐字显示）
+	_tick_joseki_card()                                 # 浮层卡片的避让重算（几何算在这里，卡片只认矩形）
+
+## 定式浮层卡片的每帧避让：把「棋盘落点热区」「鼠标附近的小方块」「展开的侧栏」喂给卡片。
+## 几何计算留在本文件（U39：卡片只认矩形，U39 里那两个是最小集）；兜底 TTL 由卡片自己的 `_process` 推进。
+func _tick_joseki_card() -> void:
+	if _joseki_card == null:
+		return
+	var mp := get_viewport().get_mouse_position()
+	var rects: Array = [
+		_board_screen_rect(),
+		Rect2(mp - Vector2(48.0, 48.0), Vector2(96.0, 96.0)),
+	]
+	if _left_open and _left_panel != null:
+		rects.append(_left_panel.get_global_rect())    # 展开的左侧栏也算「别挡」：不挤压既有控件
+	if _right_open and _right_panel != null:
+		rects.append(_right_panel.get_global_rect())
+	_joseki_card.set_panel_overlap(rects)
+
+## 棋盘（19 路）在屏幕上的包围盒：四角经棋盘相机 `unproject_position` 出来再取包围盒。
+## 相机背后的角要丢掉：它的 unproject 会翻到画面另一侧，把包围盒撑到整个视口（＝永久 faded），
+## 与 `Board3D` 的摸头判定（`Board3D.gd:374`）用同一个守卫（M6）。
+func _board_screen_rect() -> Rect2:
+	if board == null or board.cam == null:
+		return Rect2()
+	var cam := board.cam
+	var lo := Vector2(INF, INF)
+	var hi := Vector2(-INF, -INF)
+	for c: Vector2i in [Vector2i(0, 0), Vector2i(18, 0), Vector2i(0, 18), Vector2i(18, 18)]:
+		var w := board.stone_world(c.x, c.y)
+		if cam.is_position_behind(w):
+			continue
+		var p := cam.unproject_position(w)
+		lo = Vector2(minf(lo.x, p.x), minf(lo.y, p.y))
+		hi = Vector2(maxf(hi.x, p.x), maxf(hi.y, p.y))
+	if lo.x > hi.x or lo.y > hi.y:
+		return Rect2()                                 # 四角全在相机背后：当拿不到棋盘投影
+	return Rect2(lo, hi - lo)
 
 ## 棋盘锁的语音侧判据每帧对齐一次：音频也可能「根本没来」（404 / 后端断了），
 ## 只靠 speaking_changed / busy 事件会漏掉那种情况，`_speech_hold` 就会一直挂着把棋盘锁死。
