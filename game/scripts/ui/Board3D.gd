@@ -30,6 +30,7 @@ func set_view(yaw_deg: float, pitch_deg: float, dist := 0.0) -> void:
 	_update_camera()
 
 var locked := false              # Azure 思考中时禁止落子
+var readonly := false            # 复盘回看（v3.7.0）：棋盘整体只读——**落子与摸头都不接受**（与 locked 独立）
 var idle_attention := false      # 玩家长时间无操作：化身转为看向玩家
 var cam: Camera3D = null
 
@@ -449,11 +450,25 @@ func pick(mouse_pos: Vector2) -> Vector2i:
 		return Vector2i(-1, -1)
 	return Vector2i(bx, by)
 
+## 能不能在棋盘上动手（**落子与摸头同源**，V20）：复盘只读或她思考中都不行。
+## 纯函数、只读两个标志、不碰场景树 ⇒ `Board3D.new()` 就能断言（V11，不必合成输入事件）。
+func placement_allowed() -> bool:
+	return not readonly and not locked
+
+## 复盘只读开关（进入/退出复盘时由 `Main._refresh_lock()` 逐次对齐）：
+## 顺手作废进行中的摸头手势——否则手势的松手与 `_process` 触发会落到只读期间。
+func set_readonly(v: bool) -> void:
+	readonly = v
+	if v:
+		_pat_active = false
+
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
 		var mb := event as InputEventMouseButton
 		if mb.button_index == MOUSE_BUTTON_LEFT:
 			if mb.pressed:
+				if not placement_allowed():
+					return                     # 复盘只读 / 她思考中：落子与摸头一起被挡（V20）
 				if _in_head_zone(mb.position):
 					# 摸头模式：视角不动，头部/视线跟着鼠标微动；滑动/按住在 _process 里触发，快速点一下松手补一次
 					_pat_active = true
@@ -462,12 +477,11 @@ func _unhandled_input(event: InputEvent) -> void:
 					_pat_down_ms = Time.get_ticks_msec()
 					get_viewport().set_input_as_handled()
 					return
-				if not locked:
-					var hit := pick(mb.position)
-					if hit.x >= 0 and not is_occupied(hit.x, hit.y):
-						add_optimistic(hit.x, hit.y, "black")
-						intersection_clicked.emit(hit.x, hit.y)
-						get_viewport().set_input_as_handled()
+				var hit := pick(mb.position)
+				if hit.x >= 0 and not is_occupied(hit.x, hit.y):
+					add_optimistic(hit.x, hit.y, "black")
+					intersection_clicked.emit(hit.x, hit.y)
+					get_viewport().set_input_as_handled()
 				return
 			if _pat_active:
 				if not _pat_fired:
@@ -510,7 +524,7 @@ func _unhandled_input(event: InputEvent) -> void:
 
 func _update_hover(mouse_pos: Vector2) -> void:
 	_hover = pick(mouse_pos)
-	var valid := _hover.x >= 0 and not is_occupied(_hover.x, _hover.y) and not locked \
+	var valid := _hover.x >= 0 and not is_occupied(_hover.x, _hover.y) and placement_allowed() \
 			and not _in_head_zone(mouse_pos)   # 头部附近左键是摸头，不提示落子
 	_ghost.visible = valid
 	_tip.visible = valid

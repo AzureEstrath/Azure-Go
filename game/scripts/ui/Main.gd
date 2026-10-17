@@ -116,6 +116,19 @@ var _lbl_queue: Label                           # 右下角那行「排队中 N 
 var _buttons: Array[Button] = []
 var _shot_path := ""
 
+## —— 局后只读复盘（v3.7.0 任务 D）——
+## 入口只在**对局结束后**出现（`st.finished` 全仓没人读 ⇒ 前端自己记一个本地标志，V19）；
+## 复盘期间棋盘只读、四个按钮置灰、聊天禁用，退出时**逐项恢复**（V20/V21）。
+var _game_ended := false                   # 本地标志：🏁 结束 流程走完置真、🔄 重来 置假
+var _reviewing := false                    # 复盘回看中：冻结 UI + 静音（不调 chat/idle/hint/analyze）
+var _review_total := 0                     # 进入复盘时的总手数（翻页夹取的上界）
+var _review_cur := 0                       # 当前回看到第几手（0.._review_total）
+var _review_box: HBoxContainer             # 复盘按钮组（对局结束前整组隐藏，不挤界面）
+var _btn_review: Button                    # 📖 复盘 / ✅ 退出复盘
+var _btn_prev: Button                      # ◀ 上一手（只在复盘模式内可见）
+var _btn_next: Button                      # 下一手 ▶（只在复盘模式内可见）
+var _btn_send: Button                      # 聊天发送（复盘期间与输入框一起禁用）
+
 func _ready() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
 	cfg = AzureConfig.load_config()
@@ -401,6 +414,7 @@ func _build_right_panel(root: Control) -> void:
 	send.text = "发送"
 	send.pressed.connect(_send_chat)
 	inp_row.add_child(send)
+	_btn_send = send
 
 	# 排队提示（她忙时发的聊天先排着；右下角显示「排队中 N 条 · 队头前几个字」，队列空则隐藏）
 	_lbl_queue = Label.new()
@@ -422,6 +436,19 @@ func _build_right_panel(root: Control) -> void:
 		agent.analyze_position()))
 	_buttons.append(_button(btn_row, "🔄 重来", _ask_reset))
 	_buttons.append(_button(btn_row, "🏁 结束", _ask_end))
+
+	# 复盘（v3.7.0）：**只在对局结束后**出现（未结束整组隐藏 ⇒ 界面不变挤，V19）。
+	# 进复盘后棋盘只读、上面四个按钮置灰、聊天禁用；◀ / ▶ 与 ← / → 只在复盘模式内生效。
+	_review_box = HBoxContainer.new()
+	_review_box.add_theme_constant_override("separation", 6)
+	_review_box.visible = false
+	vb.add_child(_review_box)
+	_btn_prev = _button(_review_box, "◀ 上一手", func(): _review_step(-1))
+	_btn_next = _button(_review_box, "下一手 ▶", func(): _review_step(1))
+	_btn_prev.visible = false
+	_btn_next.visible = false
+	_btn_review = _button(_review_box, "📖 复盘", _on_review_toggle)
+	_btn_review.tooltip_text = "只读回看这一局：棋盘不接受落子与摸头，她也不开口（← / → 翻页）"
 
 	# 俗手回档
 	var bad_title := Label.new()
@@ -1189,13 +1216,59 @@ func _clear_thinking_if_idle() -> void:
 		return
 	_clear_thinking()
 
-## 棋盘锁：Azure 思考中，或她还有话没播完（整段关闭时尤其要等她说完）
+## 棋盘锁 + 复盘冻结：Azure 思考中，或她还有话没播完（整段关闭时尤其要等她说完），
+## 或**正在只读复盘**。冻结范围（棋盘只读 / 四个按钮 / 聊天）在静态 `review_lock_state` 里一处定死，
+## 这里只把它**逐项应用**到控件上——退出复盘时同样走这里，所以「逐项恢复」不需要另一套逻辑（V20/V21）。
 func _refresh_lock() -> void:
-	var locked: bool = (agent != null and agent.busy) or _speech_hold
+	var s := review_lock_state(_reviewing, agent != null and agent.busy, _speech_hold)
 	if board != null:
-		board.locked = locked
+		board.locked = bool(s["locked"])
+		board.set_readonly(bool(s["readonly"]))   # 复盘只读（落子与摸头同源）
 	for b in _buttons:
-		b.disabled = locked
+		b.disabled = bool(s["buttons_disabled"])
+	if _chat_input != null:
+		_chat_input.editable = bool(s["chat_editable"])
+	if _btn_send != null:
+		_btn_send.disabled = not bool(s["chat_editable"])
+	# 复盘期间一并冻住的「别的改动入口」（I1）：同一个判据、同一处落值——`state` 事件反复重建
+	# 俗手回档按钮也不会把冻结冲掉（重建后由 `_render_bad_moves` 再叫一次这里）。
+	var extra := bool(s["extra_disabled"])
+	if _bad_box != null:
+		for c in _bad_box.get_children():
+			if c is Button:
+				(c as Button).disabled = extra
+	if _chk_pass != null:
+		_chk_pass.disabled = extra
+	if _chk_joseki != null:
+		_chk_joseki.disabled = extra
+
+## 界面的「冻结状态」：进复盘 / 她思考中 / 她还有话没播完，各自的冻结范围。
+## 纯函数、不碰场景树 ⇒ 门卫可直接断言「进入复盘 ⇒ 冻结；退出 ⇒ 逐项回到进入前」（V11/V21）。
+static func review_lock_state(reviewing: bool, busy: bool, speech_hold: bool) -> Dictionary:
+	var locked := busy or speech_hold
+	return {
+		"readonly": reviewing,                  # 棋盘只读：**只在复盘**（不接受落子与摸头）
+		"locked": locked,                       # 她思考中 / 她的语音还没播完
+		"buttons_disabled": locked or reviewing,   # 四个功能按钮：锁着或复盘中都置灰
+		"chat_editable": not reviewing,         # 聊天：复盘期间禁用（她忙时照旧可排队）
+		# 别的会改动**真实棋局**的入口（I1）：`⏪ 俗手回档` 按钮（`_bad_box`，每次 state 事件都会重建）
+		# 与两个开关（允许虚着 → POST /api/config、定式导学）。后端刻意不门禁 /api/undo 与 /api/config，
+		# 所以只能靠前端冻住——但**只有复盘**冻它们：她忙碌时回档 / 改配置是既有且被支持的玩法，不许回退。
+		"extra_disabled": reviewing,
+	}
+
+## 能不能进复盘（I2）：正在跑回合（如「🏁 结束」的总结还在途中）或她还有语音没播完时**先别进**。
+## 后端 `set_review` 允许 busy 进入、且**不取消**在途回合 ⇒ 那段台词 + 语音 + 气泡会落到复盘期间，
+## 破掉「回看全程不出声」。纯函数、门卫可直接断言。
+static func review_can_enter(busy: bool, speech_hold: bool) -> bool:
+	return not (busy or speech_hold)
+
+## 复盘翻页的目标手数：`cur + delta` 夹到 `0..total`（上界＝总手数，下界＝0 手）。
+## 纯函数、不碰场景树（V11）；`delta` 先夹到 ±total，`cur` 越界也照夹——脏值一律不抛、不越界。
+static func review_step_target(cur: int, delta: int, total: int) -> int:
+	var t := maxi(0, total)
+	var d := clampi(delta, -t, t)
+	return clampi(cur + d, 0, t)
 
 ## 让 Azure 的那颗子在她这段语音开始时才出现在棋盘上
 func _reveal_move() -> void:
@@ -1230,6 +1303,8 @@ func _render_bad_moves(list: Array) -> void:
 				pairing.mark_text_only()     # 回档提示只有文字（后端同步方法，T20②）
 			agent.undo(idx))
 		_bad_box.add_child(btn)
+	# 复盘期间重建出来的按钮**必须是灰的**（I1）：每次 `state` 事件（含复盘翻页的只读快照）都会走到这里
+	_refresh_lock()
 
 func _set_status(text: String, bad := false) -> void:
 	_status_bad = bad
@@ -1629,6 +1704,8 @@ func _on_state_changed(p: Dictionary) -> void:
 		if not stone.is_empty() and str(stone["c"]) == "white":
 			board.look_at_board_point(board.stone_world(int(stone["x"]), int(stone["y"])), 2.0)
 	_last_move_count = mc
+	if _reviewing:
+		_review_cur = mc                                # 复盘翻页的进度以后端推来的只读快照为准
 	_lbl_moves.text = "手数: %d" % mc
 	_chk_pass.set_pressed_no_signal(bool(p["allow_pass"]))
 	_render_bad_moves(p["bad_moves"])
@@ -1732,12 +1809,183 @@ func _ask_reset() -> void:
 	_ask_note("重新开始？当前棋局与俗手记录都会清空。", func(_note):
 		_allow_tts_fillers()
 		pairing.mark_text_only()             # 重来提示只有文字（后端同步方法，T20②）
+		_game_ended = false                  # 新的一局：复盘入口收起（V19，本地标志）
+		_refresh_review_entry()
 		agent.reset_game())
 
 func _ask_end() -> void:
 	_ask_note("对局总结：想对Azure说什么吗？（可留空直接确定）", func(note):
 		_allow_tts_fillers()
+		_game_ended = true                   # 「🏁 结束」流程走完：复盘入口出现（V19；不读 st.finished）
+		_refresh_review_entry()
 		agent.summarize(note))
+
+# ================= 局后只读复盘（v3.7.0 任务 D） =================
+# 反目标：回看全程她**不出声**（后端已冻结，前端也绝不为此发 chat/idle/hint/analyze）、界面不更挤
+# （入口只在局后出现）。只读范围：棋盘（落子与摸头同源，Board3D.placement_allowed）+ 四个功能按钮
+# + 聊天输入。冻结与恢复都经由既有的 `_refresh_lock()`（V20/V21），不另起一套互斥逻辑。
+
+## 复盘入口 / 退出（📖 复盘 ↔ ✅ 退出复盘）。三个端点都走 `Main.gd` 的 `fetch_bytes`（V18：
+## 不给 `NetClient.gd` 加方法）。
+## 入口闸门（I2）：`🏁 结束` 的总结还在途中（`busy`）或她的语音没播完（`_speech_hold`）时**拒绝进入**——
+## 后端允许 busy 进复盘且不取消在途回合，那样总结的台词 + 语音会落到复盘期间（破「回看全程不出声」）。
+func _on_review_toggle() -> void:
+	if _reviewing:
+		_exit_review()
+		return
+	if not review_can_enter(agent != null and agent.busy, _speech_hold):
+		_set_status("她还在总结这一局（或语音还没说完），等这一轮收尾再复盘")
+		return
+	_enter_review()
+
+## 进入复盘：POST /api/review {"on": true} → 冻结 UI + 空闲收尾 + 用**新鲜**的 state 对齐总手数 + 拉存档。
+## **不推盘面**：棋盘上本来就是终局那手，玩家按 ◀ 往回看即可。
+func _enter_review() -> void:
+	if agent == null:
+		_set_status("后端未连接：无法进入复盘")
+		return
+	agent.fetch_bytes("/api/review", HTTPClient.METHOD_POST, {"on": true},
+		func(ok: bool, code: int, body: PackedByteArray):
+			if not ok:
+				_set_status("进入复盘失败：%s" % _api_error_text(code, body))
+				return
+			_reviewing = true
+			_cancel_idle_speech()                       # 复盘期间绝不出声：作废还没开口 / 还在合成的走神搭话（V20）
+			_review_total = _last_move_count            # 先给个下界；下面用新鲜 state 覆盖（Minor #6）
+			_review_cur = _review_total
+			_btn_prev.visible = true
+			_btn_next.visible = true
+			_btn_review.text = "✅ 退出复盘"
+			_refresh_lock()                             # 冻结（只读 / 置灰 / 禁聊天 / 俗手回档与开关）在这里一处收口
+			_set_status("复盘：只读回看中 · 第 %d / %d 手（← → 或按钮翻页）"
+					% [_review_cur, _review_total])
+			_load_review_notes()
+			# 总手数取**新鲜**的 `GET /api/state`：本地 `_last_move_count` 可能因 WS 断线而落后（Minor #6）。
+			# 复用的 `_on_state_changed` 顺便把棋盘 / 手数 / 俗手回档也对齐一次（它内部会同步 `_review_cur`）。
+			agent.fetch_bytes("/api/state", HTTPClient.METHOD_GET, {},
+				func(ok2: bool, code2: int, body2: PackedByteArray):
+					if not ok2 or not _reviewing:
+						return
+					var st := _json_dict(body2)
+					if not st.is_empty():
+						_review_total = int(st.get("move_count", _review_total))
+						_on_state_changed(st)))
+
+## 退出复盘：POST /api/review {"on": false} → 逐项恢复 + **重新同步**。
+## 后端退出复盘**不推 state**（V18）：棋盘上还留着复盘到的那一手，必须自己 `GET /api/state` 拉回终局。
+## 退出**什么都不改**（V21）：不调 undo / reset。复盘期间「什么都不改」靠的是**前端把改动入口全冻住**——
+## 除四个功能按钮与聊天外，`⏪ 俗手回档`（走 /api/undo）与两个开关（走 /api/config）也一并置灰（I1），
+## 后端刻意不门禁这两个端点，所以复盘期间 `st` 确实一个字都没被改过，重同步只是把显示拉回来。
+func _exit_review() -> void:
+	if agent == null:
+		return
+	agent.fetch_bytes("/api/review", HTTPClient.METHOD_POST, {"on": false},
+		func(ok: bool, code: int, body: PackedByteArray):
+			if not ok:
+				_set_status("退出复盘失败：%s" % _api_error_text(code, body))
+				return
+			_reviewing = false
+			_btn_prev.visible = false
+			_btn_next.visible = false
+			_btn_review.text = "📖 复盘"
+			_refresh_lock()                             # 只读 / 四个按钮 / 聊天逐项回到进入前（V21）
+			agent.fetch_bytes("/api/state", HTTPClient.METHOD_GET, {},
+				func(ok2: bool, code2: int, body2: PackedByteArray):
+					if not ok2:
+						_set_status("退出复盘后同步失败：%s" % _api_error_text(code2, body2))
+						return
+					var st := _json_dict(body2)
+					if not st.is_empty():
+						_on_state_changed(st)           # 复用既有 state 处理：棋盘 / 手数 / 虚着 / 俗手回档一起回位
+					_set_status("已退出复盘，回到当前局面")))
+
+## 翻页：POST /api/review/goto {"n"}（后端推一份**只读** state 快照回来）。
+## 夹取逻辑在静态 `review_step_target`（纯函数、门卫直接测）；这里只发请求 + 报进度（V11/V18）。
+func _review_step(delta: int) -> void:
+	if not _reviewing or agent == null:
+		return
+	var target := review_step_target(_review_cur, delta, _review_total)
+	if target == _review_cur:
+		return                                          # 已经在头 / 尾：不发冗余请求
+	var prev := _review_cur
+	_review_cur = target                                # 乐观推进：连按两下按的是新位置
+	agent.fetch_bytes("/api/review/goto", HTTPClient.METHOD_POST, {"n": target},
+		func(ok: bool, code: int, body: PackedByteArray):
+			if not _reviewing:
+				return                                  # 已经退出复盘：这份迟到的回包什么都不改（Minor #7）
+			if not ok:
+				_review_cur = prev                      # 显示没动，计数也退回去（她自己会由 state 校准）
+				_set_status("复盘翻页失败：%s" % _api_error_text(code, body))
+				return
+			_set_status("复盘：第 %d / %d 手" % [_review_cur, _review_total]))
+
+## 复盘入口的显隐：只在**对局结束后**出现（V19 的本地标志，不改后端 `finished` 语义）。
+func _refresh_review_entry() -> void:
+	if _review_box != null:
+		_review_box.visible = _game_ended
+
+## 复盘翻页键（← / →）：**只在复盘模式内生效**，绝不抢聊天框的键盘输入（V20）。
+## 走 `_input`（最早一步）而不是 `_unhandled_input`：复盘期间聊天框已被禁用（`editable=false`），
+## 而焦点在按钮上时方向键会在 GUI 阶段被吃掉去做焦点导航——放到最早才抢不到。
+## 复盘模式外立刻返回，键盘行为与以前一字不差。
+func _review_keys(event: InputEvent) -> void:
+	if not _reviewing or not (event is InputEventKey):
+		return
+	var k := event as InputEventKey
+	if not k.pressed or k.echo:
+		return
+	if k.keycode == KEY_LEFT:
+		_review_step(-1)
+		get_viewport().set_input_as_handled()
+	elif k.keycode == KEY_RIGHT:
+		_review_step(1)
+		get_viewport().set_input_as_handled()
+
+## 拉本局逐手存档（GET /api/review/notes）并**只渲染**到聊天区：**一条** system 气泡（不刷屏）、
+## 不登记语音配对、不触发任何 LLM/TTS ⇒ 复盘期间她一个字都不说。
+## 拉不到就静默跳过（存档是锦上添花，不影响回看）。
+func _load_review_notes() -> void:
+	if agent == null:
+		return
+	agent.fetch_bytes("/api/review/notes", HTTPClient.METHOD_GET, {},
+		func(ok: bool, code: int, body: PackedByteArray):
+			if not ok:
+				return
+			var d := _json_dict(body)
+			if d.is_empty():
+				return
+			var lines := review_note_lines(d.get("notes", []), d.get("losses", []))
+			if lines.is_empty():
+				_add_msg("system", "复盘：这一局没有留下逐手存档")
+				return
+			var joined := ""
+			for l in lines:
+				joined += l + "\n"
+			_add_msg("system", "复盘存档（%d 条）：\n%s" % [lines.size(), joined.strip_edges(false, true)]))
+
+## 逐手存档 / 亏损手账 → 聊天区的纯文本行（**只渲染后端字段，不评判**，V18）。
+## 纯函数、不碰场景树，门卫可直接调（与 `joseki_points` 同一套做法：`preload("res://scripts/ui/Main.gd")`）。
+static func review_note_lines(notes, losses) -> Array[String]:
+	var out: Array[String] = []
+	if typeof(notes) == TYPE_ARRAY:
+		for n in notes:
+			if typeof(n) != TYPE_DICTIONARY:
+				continue                                # 脏值跳过
+			var d: Dictionary = n
+			var text := str(d.get("text", "")).strip_edges()
+			if text == "":
+				continue                                # 空文本不算内容（后端不过滤，前端也不硬造）
+			var who := "你" if str(d.get("side", "")) == "E" else "Azure"
+			var what := "用意" if str(d.get("kind", "")) == "aim" else "感想"
+			out.append("第%d手 · %s的%s：%s" % [int(d.get("move_no", 0)), who, what, text])
+	if typeof(losses) == TYPE_ARRAY:
+		for l in losses:
+			if typeof(l) != TYPE_DICTIONARY:
+				continue
+			var d2: Dictionary = l
+			out.append("亏损手 第%d手 %s：%s" % [int(d2.get("move_no", 0)), str(d2.get("gtp", "")),
+				str(d2.get("reason", ""))])
+	return out
 
 # ================= 闲置互动（看玩家 / 歪头 / 主动搭话） =================
 
@@ -1750,6 +1998,7 @@ func _input(event: InputEvent) -> void:
 		_bump_activity()
 	elif event is InputEventKey and (event as InputEventKey).pressed:
 		_bump_activity()
+	_review_keys(event)
 
 func _bump_activity() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
@@ -1759,7 +2008,9 @@ func _bump_activity() -> void:
 
 func _process(delta: float) -> void:
 	var now := Time.get_ticks_msec()
-	var hold := _azure_hold_active()
+	# 复盘期间也按「她占着棋盘」处理（M3）：闲置计时停摆、聊天队列不续发——否则玩家回看时会被算成闲置，
+	# 一退出复盘她就立刻来一句（而且复盘期间本来就该静音）。
+	var hold := _azure_hold_active() or _reviewing
 	if hold:
 		# 她还在思考 / 朗读 / 有句子没播完：棋盘锁着，玩家此刻根本无法落子，
 		# 这段时间不能算「玩家闲置」——否则会出现她边堵着棋盘边问「你在忙什么呀？还要继续下棋吗」
@@ -1772,7 +2023,8 @@ func _process(delta: float) -> void:
 		_idle = true                                    # 长时间没操作：看向玩家、准备歪头
 		_set_idle_state(true)
 		_next_talk_ms = now + int(IDLE_TALK_FIRST * 1000.0)
-	if _idle and now >= _next_talk_ms and agent != null and not agent.busy:
+	# 复盘期间绝不出声（V20/M3）：走神搭话本来该由后端门禁挡住，前端也不许发——不依赖 Task C。
+	if _idle and now >= _next_talk_ms and not _reviewing and agent != null and not agent.busy:
 		_next_talk_ms = now + randi_range(int(IDLE_TALK_MIN * 1000.0), int(IDLE_TALK_MAX * 1000.0))
 		_idle_muted = false                             # 新的一轮搭话：先解除「玩家已回来」的作废标记
 		agent.idle_remark()                             # 长时间没动静：主动问一句（后端 POST /api/idle）
@@ -1909,6 +2161,11 @@ static func _api_error_text(code: int, body: PackedByteArray) -> String:
 	if typeof(d) == TYPE_DICTIONARY and str((d as Dictionary).get("error", "")) != "":
 		return str((d as Dictionary)["error"])
 	return "HTTP %d" % code
+
+## 响应体 → Dictionary：非 JSON 对象 / 解析失败一律空字典（调用方不必自己判类型）
+static func _json_dict(body: PackedByteArray) -> Dictionary:
+	var d = JSON.parse_string(body.get_string_from_utf8())
+	return d if typeof(d) == TYPE_DICTIONARY else {}
 
 ## 交给配对状态机的「外部事实」：她这一轮是否还在跑 / 音频是否在播或排队 / 是否还有取音频请求在途
 func _pair_facts() -> Dictionary:
