@@ -6,9 +6,11 @@
 做法：取「最新一手所在角」的全部着子序列做角部归一化，
      再对定式库做 4 组变换（2 朝向 × 2 换色）下的最长前缀游走。
 识别结果（统一结构，命中时一律含 kind/family/name/cat/corner/k/key/line/points/candidates/side）：
-  entered  —— 角内恰好 2 手吻合库中起手、且没有分岔：line = 这一课的核心手顺（刚进入这一课）
+  entered  —— 角内**恰好 2 手**吻合库中某条起手：line = 这一课的核心手顺（刚进入这一课；2 手条目
+               同样算进入）。优先级高于 formed 与 branch（U52），候选照旧带在 candidates 里
   branch   —— 角内全部手都吻合、但第 k+1 手存在分歧：candidates = 其余线条的落点与整条线
-  formed   —— 序列恰好走完某条定式（刚成型）：points = 该定式实际棋盘点（供棋盘高亮轨迹）
+               （角内恰好 2 手的那一次由 entered 接手；现实库的分岔落在 index ≥ 3）
+  formed   —— 序列恰好走完某条定式（len(条目) ≥ 3；刚成型）：points = 该定式实际棋盘点（供棋盘高亮轨迹）
   deviated —— 玩家在角内落子偏离了已吻合 ≥MIN_PREFIX 手的定式：expect = 库中下一手的棋盘点
 其余情况一律不出结果：角内最后一手没吻合共享前缀（含不足 2 手）、以及 k == len(seq) > 2 且无
 分歧的「中段推进」——后者按设计保持沉默，由编排走普通点评。
@@ -413,11 +415,18 @@ class JosekiRecognizer:
                 "name": str(s["e"]["name"]), "family": str(s["e"]["family"]),
                 "next": nxt, "line": s["line"],
             })
-        # 8) 分类：分岔只在「轮到你在这一角选点」时才成立——角内最后一手必须正好吻合那条共享前缀
-        #    （k == len(seq)）；最后一手已出线时既不是分岔也不是进入（k ≥ MIN_PREFIX 的真偏离由
+        # 8) 分类（U52/U53）：**进入优先**——角内恰好 2 手、吻合库中某条起手时一律判「进入」，
+        #    优先级高于「收尾」（2 手条目在第 2 手不判 formed：那只是认出了这个字形，角并没走完，
+        #    判 formed 会让卡片当场 `clear()`，11 族里有 4 族的参考图永远打不出来）与「分岔」
+        #    （候选**照旧**填进结果，两种走法交给卡片——这一刻还没轮到谁选点，第一句该说的是
+        #    「这一角开始走 X」）。
+        #    其余情况：分岔只在「轮到你在这一角选点」时才成立——角内最后一手必须正好吻合那条共享
+        #    前缀（k == len(seq)）；最后一手已出线时既不是分岔也不是进入（k ≥ MIN_PREFIX 的真偏离由
         #    上面 deviated 处理，k < MIN_PREFIX 不打扰）。k == len(seq) > 2 且无候选是「正跟着书
         #    走的中段」，按设计必须沉默：识别器不出结果，编排自然走普通点评（T7 的前提）。
-        if best["complete"]:
+        if k == 2 and len(seq) == 2:
+            kind = "entered"
+        elif best["complete"]:
             kind = "formed"
         elif expect is not None:
             kind = "deviated"
@@ -425,8 +434,6 @@ class JosekiRecognizer:
             return {}
         elif candidates:
             kind = "branch"
-        elif k == 2:
-            kind = "entered"
         else:
             return {}
         pts = []

@@ -1110,8 +1110,11 @@ class JosekiCardGateTest(unittest.TestCase):
         agent._new_turn()
         return asyncio.run(agent._turn(PHASE_AFTER_PLAYER, {"x": x, "y": y}))
 
-    def _branched_entry(self, agent):
-        """角内第 1 手已在谱上，玩家再落 C17＝角内第 2 手 ⇒ 第 3 手有分岔，判 ``branch``（T11 修复轮 U49）。"""
+    def _entered_entry(self, agent):
+        """角内第 1 手已在谱上，玩家再落 C17＝角内第 2 手 ⇒ 判 ``entered``（U52：角内恰好 2 手一律「进入」）。
+
+        点三三这一族在第 3 手有真分岔（候选照旧带在事件里），但第一句说的是「这一角开始走」。
+        """
         return self._turn(agent, [["W", "D16"]], 2, 2)
 
     def _deviated(self, agent):
@@ -1121,15 +1124,15 @@ class JosekiCardGateTest(unittest.TestCase):
     def test_first_three_entries_show_the_card_the_fourth_does_not(self):
         for i in range(3):
             agent = self._agent()
-            state = self._branched_entry(agent)
+            state = self._entered_entry(agent)
             with self.subTest(round=i + 1):
-                self.assertEqual(str(state["data"]["jk"]["kind"]), "branch")
+                self.assertEqual(str(state["data"]["jk"]["kind"]), "entered")
                 self.assertEqual(str(state["data"]["jk"]["family"]), "star_33")
                 self.assertIs(state["data"]["jk_show_card"], True)
                 self.assertEqual(self.progress.seen("star_33"), i + 1, "跨局累计：每局只 +1")
                 self.assertEqual(agent.st.joseki_counted, ["star_33"])
         agent = self._agent()
-        state = self._branched_entry(agent)
+        state = self._entered_entry(agent)
         self.assertEqual(str(state["data"]["jk"]["family"]), "star_33")
         self.assertIs(state["data"]["jk_show_card"], False, "第 4 次进入这一族：不再上卡片")
         self.assertEqual(self.progress.seen("star_33"), 4)

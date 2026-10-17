@@ -1550,7 +1550,7 @@
         "family": "star_33",
         "k": 2,
         "key": "对方点三三就还他角地：挡在这边守住外侧，之后可以先手转向别处——现在最常见的开局就是它。",
-        "kind": "branch",
+        "kind": "entered",
         "line": [
           {
             "c": "B",
@@ -1637,7 +1637,7 @@
         "family": "star_kakari_small",
         "k": 2,
         "key": "对方小飞挂进来不必贴上去：自己在另一边小飞一手，角地守住了，外边也顺手张开，是很稳的应法。",
-        "kind": "branch",
+        "kind": "entered",
         "line": [
           {
             "c": "B",
@@ -1719,7 +1719,7 @@
         "family": "star_shimari",
         "k": 2,
         "key": "星位不用急着挂别人，先小飞守角把角地做实：这两手一落角就是你的，之后放心去抢大场。",
-        "kind": "formed",
+        "kind": "entered",
         "line": [
           {
             "c": "B",
@@ -1796,7 +1796,7 @@
         "family": "star_kakari_big",
         "k": 2,
         "key": "对方大飞挂隔得远，一时杀不进来：先占大场，回头再补角也来得及。",
-        "kind": "formed",
+        "kind": "entered",
         "line": [
           {
             "c": "B",
@@ -1873,7 +1873,7 @@
         "family": "star_kakari_one",
         "k": 2,
         "key": "对方一间挂隔着一路、角上并不吃紧：先看他想走哪边，别急着贴上去。",
-        "kind": "formed",
+        "kind": "entered",
         "line": [
           {
             "c": "B",
@@ -1970,7 +1970,7 @@
         "family": "komoku_small_kakari",
         "k": 2,
         "key": "小目被小飞挂时贴着角尖一手：把他挡在外面，角地稳稳归你，外边的模样也顺手张开。",
-        "kind": "branch",
+        "kind": "entered",
         "line": [
           {
             "c": "B",
@@ -2052,7 +2052,7 @@
         "family": "sansan_kakari",
         "k": 2,
         "key": "三三被对方从星位方向挂进来时，挨着他顶一手最实在：角地还留在你手里，外围顺着长出去。",
-        "kind": "branch",
+        "kind": "entered",
         "line": [
           {
             "c": "B",
