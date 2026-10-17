@@ -33,14 +33,22 @@ signal token_event(turn_id: String, delta: String)
 signal speech_event(payload: Dictionary)
 ## 连接状态提示（Main 接到状态栏）
 signal net_status(text: String, bad: bool)
+## 聊天排队内容变了（入队 / 出队 / 退回 / 清空）：Main 据此刷新右下角那行提示（计划 06）
+signal chat_queue_changed()
 
 const RECONNECT_MIN := 1.0
 const RECONNECT_MAX := 8.0
 const POST_TIMEOUT := 30.0   # REST 请求超时：后端卡住时也能回调释放节点，避免泄漏
+const CHAT_RETRY_GAP_MS := 2000  # 聊天发送失败（含被后端挡下）后的重试间隔：Main 每帧催一次也不会变成请求风暴
 
 var base_url := "http://127.0.0.1:8000"
 
 var busy := false
+
+## 她忙时玩家发的聊天在这里排队（计划 06）：`chat()` 忙则入队，`Main` 在她空闲时调
+## `flush_queued_chat()` 续发；提示文案与「能不能发」的判据都在 `ChatQueue` 里（纯逻辑、有门卫）。
+var _chat_queue := ChatQueue.new()
+var _chat_retry_ms := 0                  # 发送失败后的重试闸：`CHAT_RETRY_GAP_MS` 内不重发同一条
 var limit_len := false:
 	set(v):
 		limit_len = v
@@ -177,8 +185,71 @@ func hint() -> void:
 func analyze_position() -> void:
 	_post("/api/analyze")
 
-func chat(text: String) -> void:
-	_post("/api/chat", {"text": text})
+## 自由聊天。她忙（后端 `POST /api/chat` 会挡下）时**先本地排队**，空闲时 `flush_queued_chat()` 续发。
+## 返回 `false` 表示**队列满了、这条没收** —— 调用方要保留输入框原文并在状态栏提示，绝不吞玩家的话。
+func chat(text: String) -> bool:
+	if text.strip_edges() == "":
+		return true                      # 空话后端也当没发：既不排队也不发（别占住队头）
+	if busy:
+		return _enqueue_chat(text)
+	_send_chat_now(text)
+	return true
+
+## 入队（尾部）：满了/空文本 ⇒ `false`（队列不变）；成功 ⇒ 发一次 `chat_queue_changed`。
+func _enqueue_chat(text: String) -> bool:
+	if not _chat_queue.enqueue(text):
+		return false
+	chat_queue_changed.emit()
+	return true
+
+## 真发一条聊天（带回复判定）：**只有明确回 `ok: true` 才算收下**；忙（`busy=false` 事件还没到的竞态）、
+## 非 2xx、回包读不懂（代理 HTML 错误页一类）⇒ 这条**退回队头**（它本来是最该发的一条，退回也保序），
+## 并压一个重试闸防每帧重发。宁可极少数情况下重复发一次，也不吞玩家的话。
+func _send_chat_now(text: String) -> void:
+	fetch_bytes("/api/chat", HTTPClient.METHOD_POST, {"text": text},
+		func(ok: bool, _code: int, body: PackedByteArray):
+			if ok and _chat_reply_ok(body):
+				return
+			_chat_retry_ms = Time.get_ticks_msec() + CHAT_RETRY_GAP_MS
+			_chat_queue.push_front(text)
+			chat_queue_changed.emit())
+
+## 回包是否表示「后端收下了这条聊天」（成功是 `{"ok": true}`；忙时是 `{"ok": false, "busy": true, …}`）。
+## 先看首字节再解析：空包 / HTML 错误页这类一眼就不是 JSON 对象的，直接判「没收下」，
+## 顺带避开 `JSON.parse_string` 对脏输入的报错噪音。
+static func _chat_reply_ok(body: PackedByteArray) -> bool:
+	if body.is_empty() or body[0] != 123:       # 123 = '{'
+		return false
+	var d = JSON.parse_string(body.get_string_from_utf8())
+	return typeof(d) == TYPE_DICTIONARY and bool((d as Dictionary).get("ok", false))
+
+## 催一次续发。`env` 是「她现在闲不闲」的外部事实（`{"busy": …, "speaking": …}`，由 Main 打包）。
+## 三道门禁：① 状态机判据（空 / 忙 / 还在朗读都不发）；② WS 已连上（没连上不发请求，
+## 免得 Main 每帧催成请求风暴）；③ 失败节流窗口内不重发同一条。
+func flush_queued_chat(env: Dictionary) -> void:
+	if not _chat_queue.should_flush(env):
+		return
+	if _ws == null or _ws.get_ready_state() != WebSocketPeer.STATE_OPEN:
+		return                           # 没连上后端：消息留在队列里，等重连 + 空闲再自动补发
+	if Time.get_ticks_msec() < _chat_retry_ms:
+		return
+	_send_chat_now(_chat_queue.pop())
+	chat_queue_changed.emit()
+
+## 清空排队（测试 / 收尾用）
+func clear_queued_chat() -> void:
+	_chat_queue.clear()
+	chat_queue_changed.emit()
+
+func has_queued_chat() -> bool:
+	return not _chat_queue.is_empty()
+
+func queued_chat_count() -> int:
+	return _chat_queue.size()
+
+## 右下角那行提示（`排队中 N 条 · 队头前 8 字`；队列空 ⇒ `""`）
+func queued_chat_hint() -> String:
+	return _chat_queue.hint_text()
 
 func summarize(note: String) -> void:
 	_post("/api/summarize", {"note": note})
