@@ -16,6 +16,10 @@ class GameState:
         self.board = GoBoard()     # 对应 GoBoard.gd
         self.snapshots = []        # 每个玩家手之前的完整状态，供俗手回档
         self.bad_moves = []        # 最近三次俗手
+        # 本局逐手存档（v3.7.0）：{move_no, kind, side, text}；kind="aim"＝落子宣告（她这一手的用意），
+        # kind="review"＝点评/落子后感想；side：E=玩家，A=Azure。**纯追加：不滚动、不截断**
+        # （memory_log 是它旁边那份滚动 18 条 / 截 80 字的副本，两者互不影响）
+        self.move_notes = []
         # 带标签的对局记忆：{tag, move_no, text}；E=Estarth(黑)的棋，A=Azure(白)的棋
         self.memory_log = []
         # 定式识别去重记录：{key, move_no}；随快照回滚（悔棋后可以重新讲解）
@@ -82,12 +86,26 @@ class GameState:
         while len(self.bad_moves) > 3:
             self.bad_moves.pop(0)
 
+    def note_move(self, move_no, kind, side, text):
+        """逐手存档（v3.7.0）：**纯追加，不滚动、不截断**（与 memory_log 互不影响）。
+
+        kind = "aim"（她这一手的用意，落子宣告的原文）或 "review"（点评 / 落子后感想）；
+        side = "E"（玩家）或 "A"（Azure）。存的是**未截断的原文**。
+        """
+        self.move_notes.append({
+            "move_no": move_no,
+            "kind": kind,
+            "side": side,
+            "text": text,
+        })
+
     def reset(self):
         self.moves = []
         self.move_seq = []
         self.board = GoBoard()
         self.snapshots = []
         self.bad_moves = []
+        self.move_notes = []
         self.memory_log = []
         self.joseki_log = []
         self.joseki_counted = []

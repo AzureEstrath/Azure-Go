@@ -755,6 +755,9 @@ async def _speak_own_turn(agent, data, msgs):
         agent.st.board.play(ai_x, ai_y, "white")
         agent.st.add_move("W", ai_gtp)
     agent._reveal_pending = True
+    # 逐手存档（v3.7.0）：她这一手的用意（落子宣告原文，未截断），1 基序号＝落子后的手数。
+    # **纯追加**：不发事件、不参与去重、不改上面 ai_move 的直发与 speech 配对。
+    agent.st.note_move(len(agent.st.moves), "aim", "A", think_msg)
     if ai_gtp == "pass":
         await _emit_line(agent, events.AI, "（Azure本手选择了虚着）")
 
@@ -963,6 +966,8 @@ async def _finalize_after_player(agent, data):
     """点评入档并发给玩家（tag ``E``）。**不归位 busy**：本回合还有她自己的落子。"""
     text = str(data.get("reply") or "")
     agent.st.log_memory("E", text, len(agent.st.moves))
+    # 逐手存档（v3.7.0）：玩家那手的点评，存**未截断的原文**（log_memory 那条仍是滚动 18 条 / 截 80 字）
+    agent.st.note_move(len(agent.st.moves), "review", "E", text)
     await _emit_deduped(agent, events.AI_COMMENT, text)
 
 
@@ -980,6 +985,8 @@ async def _finalize_just_moved(agent, data):
     """落子后感想入档（tag ``A``）、发事件、定式轨迹，然后归位 busy 与情绪小调用。"""
     text = str(data.get("reply") or "")
     agent.st.log_memory("A", text, len(agent.st.moves))
+    # 逐手存档（v3.7.0）：她这一手的落子后感想，存**未截断的原文**
+    agent.st.note_move(len(agent.st.moves), "review", "A", text)
     await _emit_deduped(agent, events.AI_COMMENT, text)
     # 卡片载荷（T6）：`jk_show_card` 是**她那一步**的入围结论（`_joseki_own_move` 按她的族重算，
     # F1）；`mistake` **恒为 None**——走错是玩家那一手的事，她这一手没有 mistake（F1：不再照搬
