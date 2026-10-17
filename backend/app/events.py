@@ -89,10 +89,11 @@ def joseki(payload):
         show_card   False   这一手该不该上教学卡片（T5 的入围结论）
         mistake     None    **仅当真是走错**时是 ``{"move_no", "x", "y", "drop"}``，否则 ``None``
 
-    ``mistake`` 的两种形态：调用方（``_joseki_emit``）已按 ``is_mistake is True`` 过滤过一次；
-    这里再兜一层——传进来的是 ``data["jk_mistake"]`` 那种**带 ``is_mistake`` 的原始 dict** 时，
-    同样只在它 ``is True`` 时才认（没亏的那一手不许被标红，U31）；四个数值各自包在 ``try`` 里，
-    脏值退化成 ``0`` / ``0.0``。``payload`` 本身不是 dict 时按空 payload 处理。
+    ``mistake`` 的**唯一过滤点就是 ``_joseki_mistake``**（``_joseki_emit`` 不判、原样透传）。它收
+    两种形态：``data["jk_mistake"]`` 那种**带 ``is_mistake`` 的原始 dict**（只在它 ``is True`` 时
+    才认），以及已收敛好的 ``{"move_no","x","y","drop"}``（无该键就直接认）——没亏的那一手一律
+    ``None``（不许被标红，U31）；四个数值各自包在 ``try`` 里，脏值退化成 ``0`` / ``0.0``。
+    ``payload`` 本身不是 dict 时按空 payload 处理。
     """
     p = payload if isinstance(payload, dict) else {}
     e = {"type": "joseki"}

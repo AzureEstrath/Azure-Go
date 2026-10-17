@@ -772,9 +772,10 @@ class AzureAgent:
 
         卡片载荷（计划 07 T6）：``show_card`` / ``mistake`` 由调用方（``agent_graph`` 的两个
         ``_joseki_emit`` 调用点）从**本轮** ``data`` 里传进来，两个参数都有安全缺省，既有的单参
-        调用签名照旧可用。``mistake`` 收的是 ``data["jk_mistake"]`` 那个 dict，**只在
-        ``is_mistake is True`` 时**才转成 ``{"move_no","x","y","drop"}``，否则 ``None``（没亏的
-        那一手不上卡片标记，U31）；缺键 / 脏值一律退化成 ``0``，不抛。
+        调用签名照旧可用。``mistake`` 这里**原样透传**（本函数不做任何判定）：传进来的可能是
+        ``data["jk_mistake"]`` 那种带 ``is_mistake`` 的原始 dict（玩家那一手），也可能是已收敛好的
+        ``{"move_no","x","y","drop"}`` 或 ``None``；**唯一的过滤点在 ``events._joseki_mistake``**
+        （它只在 ``is_mistake is True`` 时才认，否则 ``None``——没亏的那一手不上卡片标记，U31）。
 
         旧行为一字不动（U32）：``deviated`` 仍把 ``points`` 换成 ``[expect]``、``expect`` 缺失
         时提前 return，``points`` 为空时也提前 return（不发事件）——新字段只是**追加**在发出去的
