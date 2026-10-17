@@ -505,3 +505,342 @@ class JosekiMistakeWiringTest(unittest.TestCase):
         self.assertIs(got["is_mistake"], False)                  # ⇒ 不算走错
         self.assertGreater(got["drop"], 0.10)                    # 这一手确实「真亏」：判 False 靠的正是护栏
 
+
+# —— 以下为计划 07 · Task 7 追加（既有断言一个字符都没改；追加在文件末尾，理由同上）——
+#
+# T7：结构点开口（进入 / 分岔 / 收尾）并进**既有发言位**。台词分流**只看 `kind`**（+ 走错时看
+# `is_mistake`，U34 修订版）：进入顶替玩家那一手的点评、分岔与走错并进同一格、收尾并进**走完那一方**
+# 的发言位；中间吻合的推进一个字都不提（识别器自己沉默）。`data["jk_show_card"]` 是**卡片**的次数
+# 规则（T5/T6/T8），管的是卡片字段，不管说不说——讲解是**顶替**那条本来就要发的台词，不多气泡、
+# 不多调一次模型。
+
+import tempfile                                                # noqa: E402
+
+from app import coords, events, prompts                         # noqa: E402
+from app.agent import AzureAgent                               # noqa: E402
+from app.agent_graph import (MAX_LLM_CALLS_PER_TURN, PHASE_AFTER_PLAYER,   # noqa: E402
+                             PHASE_JUST_MOVED, PHASE_OWN_TURN)
+from app.joseki import JosekiData                              # noqa: E402
+from app.joseki_progress import JosekiProgress                 # noqa: E402
+
+
+class _FreshLLM(StubLLM):
+    """每次回一句新话：免得原话去重把后面几条气泡吃掉，「这一回合几条台词」就数不准。"""
+
+    def __init__(self):
+        super().__init__()
+        self.n = 0
+
+    async def chat(self, messages, max_tokens=300, no_think=False):
+        self.n += 1
+        self.text = "第%d句话。" % self.n
+        return await super().chat(messages, max_tokens, no_think)
+
+
+def _user_texts(llm):
+    """模型收到的**用户消息**文本（含情绪小调用那类旁路）。"""
+    out = []
+    for msgs, _mx, _nt in llm.calls:
+        for m in msgs:
+            if str(m.get("role", "")) == "user":
+                out.append(str(m.get("content", "")))
+    return out
+
+
+def _phase_texts(llm):
+    """只挑**阶段提示词**那一份：经 `with_context` 装配的才带「【现在】」（情绪小调用之类不带）。
+
+    这样「这一回合到底出过几条编排提示」不受限频的情绪小调用影响。
+    """
+    return [t for t in _user_texts(llm) if "【现在】" in t]
+
+
+class JosekiActiveSpeechTest(unittest.TestCase):
+    """T7 接线：进入 / 分岔 / 走错 / 收尾 四处开口 + 中段沉默 + 闸门 + 她那一格 + 不新增台词。"""
+
+    # 角内先铺 1 手（白），玩家再落 C17(2,2) ⇒ k == len(seq) == 2 且无分岔 ⇒ entered
+    ENTER_SEED = [["W", "D16"]]
+    # 中段推进：角内 4 手吻合核心手顺后，玩家落 F17(5,2)＝更长那条定式的第 5 手（黑）
+    # ⇒ k == len(seq) == 5、没有候选 ⇒ 识别器沉默（`jk == {}`），一个字都不该提定式
+    MID_SEED = [["B", "D16"], ["W", "C17"], ["B", "C16"], ["W", "D17"]]
+    # 她走完定式、而玩家那一手没结果时用的**合成**识别结果（识别器形状，见 `_joseki.py`）
+    FORM = {"kind": "formed", "family": "star_33", "cat": "star", "name": "点三三·基本型",
+            "key": "（要点）", "corner": "左上", "k": 4, "line": [], "candidates": [],
+            "points": [(15, 3)]}
+
+    def _after_player(self, agent, x, y):
+        """只跑 `after_player` 那一个阶段（与 `player_move` 的公开路径同一入口）。"""
+        agent._new_turn()
+        return asyncio.run(agent._turn(PHASE_AFTER_PLAYER, {"x": x, "y": y}))
+
+    def _own_turn_formed(self):
+        """「玩家那手没结果、她那一步走完定式」：结论只在**她那一格**出的整条路。
+
+        第 1 次 `_joseki_check()` 是玩家那手（返回空 = 没结果），第 2 次是她那一步（返回 formed）。
+        返回 (agent, llm, calls, own_turn 终态, just_moved 终态)。
+        """
+        llm = _FreshLLM()
+        agent = AzureAgent(StubEngine(), llm, events.RecordingBus())
+        calls = []
+
+        def fake():
+            calls.append(1)
+            return dict(self.FORM) if len(calls) > 1 else {}
+
+        agent._joseki_check = fake
+        state = self._after_player(agent, 3, 3)
+        own = asyncio.run(agent._turn(PHASE_OWN_TURN, state["data"], state["turn_id"]))
+        after = asyncio.run(agent._turn(PHASE_JUST_MOVED, own["data"], own["turn_id"]))
+        return agent, llm, calls, own, after
+
+    # —— ① 进入：**顶替**这一手的普通点评（同一时刻只出一条气泡）——
+
+    def test_enter_replaces_the_comment(self):
+        agent, _eng, llm, bus = _mk()
+        _seed_moves(agent, self.ENTER_SEED)
+        state = self._after_player(agent, 2, 2)
+
+        jk = state["data"]["jk"]
+        self.assertEqual(str(jk["kind"]), "entered")
+        self.assertIs(state["data"]["jk_show_card"], True)
+
+        text = _phase_texts(llm)[0]
+        self.assertIn(prompts.joseki_enter_prompt(
+            str(jk["name"]), str(jk["key"]), str(jk["corner"])), text)
+        # 顶替：普通点评那几档与旧的整段讲解一个字都不在
+        self.assertNotIn("用你自己的口吻评", text)
+        for marker in ("这是我算的最优手", "不在前5", "没进我算的前5"):
+            self.assertNotIn(marker, text)
+        self.assertNotIn(prompts.joseki_teach_prompt(
+            str(jk["name"]), str(jk["key"]), str(jk["corner"])), text)
+        self.assertEqual(len(bus.messages()), 1, "进入那一手只发一条台词")
+
+    # —— ② 分岔 / 走错：并进这一手的发言位，候选的下一手坐标当素材 ——
+
+    def test_branch_dispatch_gives_each_candidate_its_next_move(self):
+        """现在的库产不出真分岔（最低吻合 4 手时成型已经先命中），所以按识别器形状**合成**一个
+        `branch` 结果（与 T2 的 `test_branch_has_its_own_key` 同一手法）；扩库（T11a）之后这条路
+        会被真的走到。"""
+        agent, _eng, llm, _bus = _mk()
+        result = {"kind": "branch", "family": "star_kakari_small", "cat": "star", "corner": "左上",
+                  "name": "小飞挂·靠压定式", "key": "（要点）", "k": 4, "side": "player",
+                  "points": [(15, 3)], "line": [],
+                  "candidates": [{"name": "小飞挂·靠压定形", "family": "star_kakari_small",
+                                  "next": (4, 2), "line": []},
+                                 {"name": "小飞挂·靠压定形", "family": "star_kakari_small",
+                                  "next": (5, 3), "line": []}]}
+        agent._joseki_check = lambda: dict(result)
+        _seed_moves(agent, self.MID_SEED)
+        state = self._after_player(agent, 5, 2)
+
+        self.assertEqual(str(state["data"]["jk"]["kind"]), "branch")
+        self.assertIs(state["data"]["jk_show_card"], True)
+        text = _phase_texts(llm)[0]
+        self.assertIn(prompts.joseki_branch_prompt(
+            "小飞挂·靠压定式", "（要点）", result["candidates"]), text)
+        self.assertNotIn("用你自己的口吻评", text)
+
+    def test_mistake_uses_the_branch_template(self):
+        """走错（真亏 **且** 偏离库线）：这一手也走「这里有别的走法」那一套，末尾不再轻提。"""
+        agent, _eng, llm, _bus = _mk()
+        agent.katago = _LosingEngine()
+        _seed_moves(agent, _DEVIATED_BASE)
+        state = self._after_player(agent, 1, 4)                  # B15：真亏且偏出库线
+
+        self.assertIs(state["data"]["jk_mistake"]["is_mistake"], True)
+        self.assertIs(state["data"]["jk_show_card"], True)
+        jk = state["data"]["jk"]
+        text = _phase_texts(llm)[0]
+        self.assertIn(prompts.joseki_branch_prompt(
+            str(jk["name"]), str(jk["key"]), list(jk.get("candidates") or [])), text)
+        self.assertNotIn("用你自己的口吻评", text)
+        self.assertNotIn(prompts.joseki_hint_clause(
+            str(jk["name"]), coords.xy_to_gtp(jk["expect"][0], jk["expect"][1])), text)
+
+    def test_deviated_without_loss_keeps_the_plain_comment_and_hint_clause(self):
+        """偏离但没亏**不是**走错：原样普通点评 + 末尾那句轻提（U35 表里的「其余」一路）。"""
+        class _FlatEngine(StubEngine):
+            CAND = ["B15"] + StubEngine.CAND        # 排名进前 5、胜率不掉 ⇒ 不算真亏
+
+        agent, _eng, llm, _bus = _mk()
+        agent.katago = _FlatEngine()
+        _seed_moves(agent, _DEVIATED_BASE)
+        state = self._after_player(agent, 1, 4)
+
+        self.assertEqual(str(state["data"]["jk"]["kind"]), "deviated")
+        self.assertIs(state["data"]["jk_mistake"]["is_mistake"], False)
+        self.assertIs(state["data"]["jk_show_card"], True, "第一次见到这一族：仍然入围")
+        jk = state["data"]["jk"]
+        text = _phase_texts(llm)[0]
+        self.assertIn("用你自己的口吻评", text)
+        self.assertIn(prompts.joseki_hint_clause(
+            str(jk["name"]), coords.xy_to_gtp(jk["expect"][0], jk["expect"][1])), text)
+        self.assertNotIn("不要提胜率数值", text)
+
+    # —— ③ 收尾：并进**走完那一方**的发言位 ——
+
+    def test_close_follows_the_side_that_finished(self):
+        # ① 玩家走完：角内 3 手吻合后，他落 D17(3,2) 收尾 ⇒ after_player 那条点评
+        agent, _eng, llm, _bus = _mk()
+        _seed_moves(agent, [["W", "D16"], ["B", "C17"], ["W", "C16"]])
+        state = self._after_player(agent, 3, 2)
+        jk = state["data"]["jk"]
+        self.assertEqual(str(jk["kind"]), "formed")
+        self.assertIn(prompts.joseki_close_prompt(
+            str(jk["name"]), str(jk["key"]), str(jk["corner"]), "player"), _phase_texts(llm)[0])
+        self.assertNotIn(prompts.joseki_short_prompt(
+            str(jk["name"]), str(jk["key"]), "D17"), _phase_texts(llm)[0])
+
+        # ② 她走完：玩家那手没结果 ⇒ 入围在她那一格补齐，她落子后的感想说 azure 那一版
+        agent2, llm2, calls, _own, _after = self._own_turn_formed()
+        hers = _phase_texts(llm2)[-1]                    # 最后一条阶段提示＝她那句感想
+        self.assertIn(prompts.joseki_close_prompt(
+            "点三三·基本型", "（要点）", "左上", "azure"), hers)
+        self.assertNotIn(prompts.joseki_short_prompt("点三三·基本型", "（要点）", "Q16"), hers)
+        self.assertNotIn(prompts.joseki_close_prompt(
+            "点三三·基本型", "（要点）", "左上", "player"), hers)
+        self.assertEqual(len(calls), 2, "她那一步只许识别一次")
+
+    # —— ④ 中段推进：一个字都不提定式（靠识别器沉默，不靠提示词兜）——
+
+    def test_middle_moves_do_not_mention_joseki(self):
+        agent, _eng, llm, bus = _mk()
+        _seed_moves(agent, self.MID_SEED)
+        state = self._after_player(agent, 5, 2)                  # F17＝更长那条线的第 5 手
+
+        self.assertEqual(state["data"]["jk"], {}, "中段推进：识别器必须沉默")
+        self.assertEqual(bus.of_type("joseki"), [])
+        text = _phase_texts(llm)[0]
+        self.assertIn("用你自己的口吻评", text)                     # 走的是普通点评
+        for e in JosekiData.LIST:                                # 定式名一个字都不出现
+            self.assertNotIn(str(e["name"]), text)
+        self.assertNotIn("不要提胜率数值", text)                    # 三条模板的文案也不出现
+
+    # —— ⑤ `show_card` 只管卡片：台词分流**只看 kind**（U34 修订版）——
+
+    def test_speech_dispatch_does_not_depend_on_the_card_gate(self):
+        """这一族已经教过 3 次（卡片不上），但 `entered` 是结构点 ⇒ 讲的仍是进入那一课的讲解。
+
+        U34 修订版：`show_card` 是**卡片**的次数规则（T5/T6/T8），管的是卡片字段，不管说不说；
+        台词只按 `kind`（+ 走错时按 `is_mistake`）分流，而且讲不讲都只有本来那一条气泡。
+        """
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        progress = JosekiProgress(os.path.join(d.name, "joseki_progress.db"))
+        for _ in range(3):
+            progress.bump("star_33")                             # 前 3 次已经教过
+        llm = StubLLM()
+        agent = AzureAgent(StubEngine(), llm, events.RecordingBus(), joseki_progress=progress)
+        _seed_moves(agent, self.ENTER_SEED)
+        state = self._after_player(agent, 2, 2)
+
+        jk = state["data"]["jk"]
+        self.assertEqual(str(jk["kind"]), "entered")
+        self.assertIs(state["data"]["jk_show_card"], False, "第 4 次进入：卡片照旧不上")
+        text = _phase_texts(llm)[0]
+        self.assertIn(prompts.joseki_enter_prompt(
+            str(jk["name"]), str(jk["key"]), str(jk["corner"])), text)
+        self.assertNotIn("用你自己的口吻评", text)                # 顶替：普通点评一个字都不在
+
+    # —— ⑥ 她那一步：`jk2` 被算出来、卡片结论被补齐，事件照发 ——
+
+    def test_own_turn_slot_computes_jk2_fills_the_gate_and_emits(self):
+        _agent, _llm, calls, own, after = self._own_turn_formed()
+
+        self.assertEqual(str(own["data"]["jk2"]["kind"]), "formed")
+        self.assertIs(own["data"]["jk_show_card"], True, "after_player 没结论 ⇒ 在她那一格补齐")
+        self.assertEqual(len(calls), 2, "`_joseki_check()` 只调一次（第二次会吃掉去重键）")
+        # 事件照发：她那一手的 joseki 轨迹仍在 `just_moved` 的 finalize 里、带卡片载荷
+        event = _agent.bus.of_type("joseki")[-1]
+        self.assertEqual(str(event["kind"]), "formed")
+        self.assertIs(event["show_card"], True)
+        self.assertEqual(after["data"]["jk2"], own["data"]["jk2"])
+
+    def test_just_moved_driven_alone_still_gets_her_verdict(self):
+        """直接驱动 `just_moved`（本回合没跑过 `own_turn`）：兜底也要在她那句之前算出结论。
+
+        用的是真识别结果（角内 4 手走完基本型、最后一手是她下的）——兜底若落在挑模板**之后**，
+        这条就会红：她这句会退回普通感想。
+        """
+        agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus())
+        _seed_moves(agent, [["B", "D16"], ["W", "C17"], ["B", "C16"], ["W", "D17"]])
+        agent._new_turn()
+        state = asyncio.run(agent._turn(PHASE_JUST_MOVED, {}))
+
+        jk2 = state["data"]["jk2"]
+        self.assertEqual(str(jk2["kind"]), "formed")
+        self.assertIs(state["data"]["jk_show_card"], True)
+        self.assertIn(prompts.joseki_close_prompt(
+            str(jk2["name"]), str(jk2["key"]), str(jk2["corner"]), "azure"),
+            _phase_texts(agent.llm)[-1])
+        self.assertIs(agent.bus.of_type("joseki")[-1]["show_card"], True)
+
+    def test_her_close_also_ignores_the_card_gate(self):
+        """她那一步同理（U34 修订版）：`formed` ⇒ 收尾讲解（azure 版），卡片不上也照讲。
+
+        玩家那手没出定式结果、这一族又已经教过 3 次 ⇒ `show_card` 在她那一格才定下来、且为假；
+        她那句仍是 `joseki_close_prompt(..., "azure")`，**不**退回 `joseki_short_prompt`。
+        """
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        progress = JosekiProgress(os.path.join(d.name, "joseki_progress.db"))
+        for _ in range(3):
+            progress.bump("star_33")
+        llm = _FreshLLM()
+        agent = AzureAgent(StubEngine(), llm, events.RecordingBus(), joseki_progress=progress)
+        calls = []
+
+        def fake():
+            calls.append(1)
+            return dict(self.FORM) if len(calls) > 1 else {}     # 玩家那手没结果；她那一步成型
+
+        agent._joseki_check = fake
+        state = self._after_player(agent, 3, 3)
+        self.assertNotIn("jk_show_card", state["data"], "玩家那手没出定式结果")
+        state = asyncio.run(agent._turn(PHASE_OWN_TURN, state["data"], state["turn_id"]))
+        self.assertIs(state["data"]["jk_show_card"], False, "这一族已教过 3 次：卡片不上")
+        ai_gtp = str(state["data"]["move"]["gtp"])
+        state = asyncio.run(agent._turn(PHASE_JUST_MOVED, state["data"], state["turn_id"]))
+
+        text = _phase_texts(llm)[-1]
+        self.assertIn(prompts.joseki_close_prompt("点三三·基本型", "（要点）", "左上", "azure"), text)
+        self.assertNotIn(prompts.joseki_short_prompt("点三三·基本型", "（要点）", ai_gtp), text)
+
+    # —— ⑦ 不新增台词 / 不多调一次模型 ——
+
+    def test_entered_turn_still_has_exactly_three_lines(self):
+        agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus())
+        _seed_moves(agent, self.ENTER_SEED)
+        asyncio.run(agent.player_move(2, 2))
+
+        msgs = agent.bus.messages()
+        self.assertEqual(len(msgs), 3, "点评/讲解 + 落子宣告 + 落子后感想：一条都不许多")
+        kinds = [str(e.get("kind", "")) for e in msgs]
+        self.assertEqual(kinds.count(events.AI_COMMENT), 2)
+        self.assertEqual(kinds.count(events.AI_MOVE), 1)
+
+    def test_llm_calls_stay_within_budget(self):
+        agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus())
+        _seed_moves(agent, self.ENTER_SEED)
+        asyncio.run(agent.player_move(2, 2))
+        self.assertEqual(len(_phase_texts(agent.llm)), 3, "本任务只换提示词：一回合仍恰好三次")
+
+        # 开了工具的那条路照旧受硬上限管（本任务不动预算、也不加调用）
+        llm2 = _FreshLLM()
+        agent2 = AzureAgent(StubEngine(), llm2, events.RecordingBus(), tools_enabled=True)
+        chain = _ScriptChain([_Ai(content="嗯~ 这手我想想。")])
+        agent2.chain = chain
+        _seed_moves(agent2, self.ENTER_SEED)
+        state = self._after_player(agent2, 2, 2)
+        state = asyncio.run(agent2._turn(PHASE_OWN_TURN, state["data"], state["turn_id"]))
+        self.assertEqual(int(state["data"]["llm_rounds"]), 1)
+        self.assertLessEqual(int(state["data"]["llm_rounds"]), MAX_LLM_CALLS_PER_TURN)
+        self.assertEqual(len(chain.seen), 1, "工具轮只走一轮")
+        self.assertEqual(len(_phase_texts(llm2)), 1, "她那一步的用意来自工具轮，不走 llm.chat")
+
+    def test_own_turn_gate_does_not_add_a_line(self):
+        """她那一步的卡片结论补齐只写 `data`、**不发**事件，也不多出一条台词（发话点仍只在 finalize）。"""
+        agent, _llm, _calls, _own, after = self._own_turn_formed()
+        self.assertEqual(len(agent.bus.messages()), 3, "点评 + 落子宣告 + 她的感想")
+        self.assertEqual(str(after["data"]["reply"]), "第3句话。")
+

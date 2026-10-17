@@ -11,7 +11,7 @@ import json
 import os
 import unittest
 
-from app import prompts
+from app import coords, prompts
 
 _GOLDEN = os.path.join(os.path.dirname(__file__), "golden", "prompts.json")
 
@@ -288,6 +288,138 @@ class TestConfigureOverride(_Base):
             prompts.configure(DEFAULT_CFG)   # 复原默认配置
         # 复原校验：默认态不含覆盖
         self.assertEqual(prompts.system_prompt(), self.data["system_prompt"], "复原后 system_prompt 应回到内置")
+
+
+# ===================== 计划 07 · Task 7：结构点开口（进入 / 分岔 / 收尾）=====================
+#
+# 三条新模板**只写素材 + 要求**（中文、一句话、用她自己的口吻、不要提胜率数值），不放可被照抄的
+# 范文；它们**不写进 golden**（golden 只锁既有函数，见 `TestGoldenFrozen`）。
+
+
+class TestJosekiActiveTemplates(_Base):
+    """T7：`joseki_enter_prompt` / `joseki_branch_prompt` / `joseki_close_prompt` 的形状。"""
+
+    NAME = JOSEKI_BASIC_NAME
+    KEY = JOSEKI_BASIC_KEY
+    CORNER = "左上"
+
+    def _assert_common(self, out):
+        """三条模板共有的要求句（U35）：一句话、用她自己的口吻、不要提胜率数值。"""
+        self.assertIn("一句话", out)
+        self.assertIn("你自己的口吻", out)
+        self.assertIn("不要提胜率数值", out)
+        for bad in ("%s", "%(", "（可选）", "例如"):
+            self.assertNotIn(bad, out)
+
+    def test_enter_prompt_is_material_plus_instruction(self):
+        out = prompts.joseki_enter_prompt(self.NAME, self.KEY, self.CORNER)
+        self._assert_common(out)
+        # 素材：角 + 这一课的名字 + 要点
+        self.assertIn(self.CORNER, out)
+        self.assertIn(self.NAME, out)
+        self.assertIn(self.KEY, out)
+        # 换一份素材 ⇒ 换一份输出（不是写死的范文）
+        other = prompts.joseki_enter_prompt(JOSEKI_KOMPA_NAME, JOSEKI_KOMPA_KEY, "右下")
+        self.assertNotEqual(out, other)
+        self.assertIn(JOSEKI_KOMPA_KEY, other)
+        self.assertNotIn(self.KEY, other)
+
+    def test_branch_prompt_gives_each_candidate_its_next_move(self):
+        cands = [{"name": JOSEKI_BASIC_NAME, "family": "star_33", "next": (4, 3), "line": []},
+                 {"name": JOSEKI_BASIC_NAME, "family": "star_33", "next": (5, 2), "line": []}]
+        out = prompts.joseki_branch_prompt(self.NAME, self.KEY, cands)
+        self._assert_common(out)
+        self.assertIn(self.NAME, out)
+        self.assertIn(self.KEY, out)
+        # 候选**各自**的下一手坐标（0 基元组 → GTP）必须进素材，否则模型没法说清岔口
+        self.assertIn(coords.xy_to_gtp(4, 3), out)
+        self.assertIn(coords.xy_to_gtp(5, 2), out)
+
+    def test_branch_prompt_without_candidates_has_no_stub_wording(self):
+        out = prompts.joseki_branch_prompt(self.NAME, self.KEY, [])
+        self._assert_common(out)
+        self.assertIn(self.NAME, out)
+        self.assertIn(self.KEY, out)
+        self.assertNotIn("另有走法", out)             # 没候选就不留半截句式
+        # …也不许反过来要求她说「别的走法」：没给她的东西，不能叫她说（U35：退回只说要点）
+        self.assertNotIn("别的走法", out)
+        self.assertNotIn("下一手在", out)
+
+    def test_branch_prompt_drops_dirty_candidates_without_raising(self):
+        """脏 `next`（缺值 / 非数字 / 出盘 / 不是元组）一律丢掉，**绝不抛**。
+
+        这段跑在 `_prepare_after_player` 里：抛一次就是整条 `player_move` 丢台词
+        （与 `agent.py` 的「缺键 / 脏值一律退化成 0，不抛」同一口径）。
+        """
+        dirty = [{"name": "点三三·定形", "next": (None, 3)},
+                 {"name": "点三三·定形", "next": ("x", 3)},
+                 {"name": "点三三·定形", "next": (99, 99)},      # 出盘（≥ 19）：不许变成假坐标
+                 {"name": "点三三·定形", "next": (-1, 4)},
+                 {"name": "点三三·定形", "next": "D17"},
+                 {"name": "点三三·定形", "next": (4,)},
+                 {"next": None},
+                 "（连 dict 都不是）"]
+        out = prompts.joseki_branch_prompt(self.NAME, self.KEY, dirty)
+        self.assertIn(self.NAME, out)
+        self.assertIn(self.KEY, out)
+        self.assertNotIn("另有走法", out)             # 一个能用的都没有 ⇒ 只讲要点
+        self.assertNotIn("下一手在", out)
+        self.assertNotIn("别的走法", out)
+
+        # 混一个合法的：只有它进文案；脏值不产生任何坐标
+        good = {"name": "小飞挂·靠压定形", "next": (4, 2)}
+        out2 = prompts.joseki_branch_prompt(self.NAME, self.KEY, dirty + [good])
+        self.assertEqual(out2.count("下一手在"), 1)
+        self.assertIn(coords.xy_to_gtp(4, 2), out2)
+        self.assertIn("别的走法", out2)               # 有候选才要求她说别的走法
+        self.assertNotIn("。。", out2)                # 要点本身以句号收尾时不许拼出「。。」
+
+    def test_close_prompt_says_which_side_finished(self):
+        player = prompts.joseki_close_prompt(self.NAME, self.KEY, self.CORNER, "player")
+        azure = prompts.joseki_close_prompt(self.NAME, self.KEY, self.CORNER, "azure")
+        self._assert_common(player)
+        self._assert_common(azure)
+        for out in (player, azure):
+            self.assertIn(self.NAME, out)
+            self.assertIn(self.KEY, out)
+            self.assertIn(self.CORNER, out)
+        # 谁走完的说清楚：玩家 / Azure 各一份，互不串味
+        self.assertIn("Estarth", player)
+        self.assertNotIn("Azure", player)
+        self.assertIn("Azure", azure)
+        self.assertNotIn("Estarth", azure)
+        self.assertNotEqual(player, azure)
+
+
+class TestGoldenFrozen(_Base):
+    """T7 门卫：本任务只**新增**三条模板，golden 锁定的既有输出一字未改。"""
+
+    def test_context_block_golden_unchanged(self):
+        for c in self.data["context_block"]:
+            board = None if c["board"] == "null" else _board(c["board"])
+            self.eq(prompts.context_block(
+                _moves(c["moves"]), _memory(c["memory"]), _chat(c["chat"]), c["phase"],
+                c["skip_last_chat"], c["katago"], board),
+                c["result"], "context_block board=%s phase=%s" % (c["board"], c["phase"]))
+
+    def test_existing_joseki_helpers_output_unchanged(self):
+        for c in self.data["joseki_teach_prompt"]:
+            key = JOSEKI_BASIC_KEY if c["name"] == JOSEKI_BASIC_NAME else JOSEKI_KOMPA_KEY
+            self.eq(prompts.joseki_teach_prompt(c["name"], key, c["corner"]),
+                    c["result"], "teach name=%s" % c["name"])
+        for c in self.data["joseki_short_prompt"]:
+            self.eq(prompts.joseki_short_prompt(c["name"], JOSEKI_BASIC_KEY, c["gtp"]),
+                    c["result"], "short gtp=%s" % c["gtp"])
+        for c in self.data["joseki_hint_clause"]:
+            self.eq(prompts.joseki_hint_clause(c["name"], c["expect_gtp"]),
+                    c["result"], "hint name=%s" % c["name"])
+        for c in self.data["joseki_fallback"]:
+            self.eq(prompts.joseki_fallback(c["name"], JOSEKI_BASIC_KEY),
+                    c["result"], "fallback name=%s" % c["name"])
+
+    def test_new_templates_are_not_written_into_golden(self):
+        for name in ("joseki_enter_prompt", "joseki_branch_prompt", "joseki_close_prompt"):
+            self.assertNotIn(name, self.data, "新模板不写进 golden（golden 只锁既有函数）")
 
 
 if __name__ == "__main__":

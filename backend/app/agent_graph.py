@@ -241,11 +241,25 @@ async def _prepare_after_player(agent, data):
         ev = "player_off"
     agent._mood_event(ev)
 
-    # ⑤ Azure 点评这一手（定式成型时换成讲解，不额外增加 LLM 调用）
+    # ⑤ Azure 点评这一手（T7：结构点按 `kind` **顶替**这一手的普通点评，不额外增加 LLM 调用）
+    #    分流**只看 `kind`**（+ 走错时看 `is_mistake`）：进入 / 分岔 / 收尾必说。`show_card` 是**卡片**
+    #    的次数规则（T5/T6/T8），管的是卡片字段、不管说不说——讲解顶替的是本来那条点评，不多气泡。
     eval_prompt = ""
-    if str(jk.get("kind", "")) == "formed":
-        eval_prompt = prompts.joseki_teach_prompt(str(jk["name"]), str(jk["key"]), str(jk["corner"]))
-    else:
+    kind = str(jk.get("kind", ""))
+    mistake = data.get("jk_mistake") or {}
+    if kind == "entered":
+        eval_prompt = prompts.joseki_enter_prompt(
+            str(jk.get("name") or ""), str(jk.get("key") or ""), str(jk.get("corner") or ""))
+    elif kind == "branch" or (kind == "deviated" and mistake.get("is_mistake") is True):
+        # 「走错」＝真亏又出线：这里正是「有别的走法」的场合，与分岔同一套
+        eval_prompt = prompts.joseki_branch_prompt(
+            str(jk.get("name") or ""), str(jk.get("key") or ""),
+            list(jk.get("candidates") or []))
+    elif kind == "formed":
+        eval_prompt = prompts.joseki_close_prompt(
+            str(jk.get("name") or ""), str(jk.get("key") or ""), str(jk.get("corner") or ""),
+            "player")
+    if eval_prompt == "":
         if player_rank == 0:
             eval_prompt = "Estarth下了 %s，这是我算的最优手！胜率%s。轻描淡写夸一下，1-2句。" % (gtp, agent._pct(winrate_before))
         elif 0 < player_rank < 3:
@@ -286,8 +300,32 @@ async def _prepare_own_turn(agent, data):
     return
 
 
+async def _joseki_own_move(agent, data):
+    """她那一步的定式识别 + 入围补齐（**只调一次** ``agent._joseki_check()``）。
+
+    结论落在 ``data["jk2"]`` 与 ``data["jk_show_card"]``：识别器给的是她**自己那一手**的结果
+    （纯本地计算），入围要 ``await``（``joseki_show_card`` / ``joseki_count_entry``），所以只能在
+    async 的节点里做。两个调用点：
+
+    ① ``finalize`` 节点的 ``own_turn``（正常回合，紧接在 ``just_moved`` 的 prepare 之前，结论正好
+       赶上给她那句感想挑模板）；
+    ② ``_prepare_just_moved`` 的表头（兜底：本回合没跑过 ``own_turn`` 就直接驱动 ``just_moved``）。
+
+    ``data`` 里已有 ``jk2`` 就立刻返回——``_joseki_check()`` 会消耗去重键，**绝不能调第二次**
+    （同角同族第二次必然返回 ``{}``）。``joseki_count_entry`` 同族同局只计一次，重复调用是 no-op。
+    """
+    if "jk2" in data:
+        return
+    jk2 = agent._joseki_check()
+    data["jk2"] = jk2
+    if "jk_show_card" not in data:               # 一个回合只有一个入围结论：after_player 定过就不改
+        data["jk_show_card"] = await agent.joseki_show_card(jk2, data.get("jk_mistake"))
+    await agent.joseki_count_entry(jk2)
+
+
 async def _prepare_just_moved(agent, data):
     """她落子后：引擎复算 → info → 落子后那句的提示词。"""
+    await _joseki_own_move(agent, data)          # 她那一手的定式结论（没跑过 own_turn 时在这里补上）
     player_eval = str(data.get("player_eval") or "")     # 本回合她对玩家那手的点评（after_player 阶段产出）
     think_msg = str(data.get("think_msg") or "")
     jk2 = data.get("jk2") or {}
@@ -309,7 +347,11 @@ async def _prepare_just_moved(agent, data):
     agent._emit(events.info(wr, sc))
 
     if str(jk2.get("kind", "")) == "formed":
-        ai_eval_prompt = prompts.joseki_short_prompt(str(jk2["name"]), str(jk2["key"]), ai_gtp)
+        # T7（U36）：她走完定式时，「收尾」并进**她的**发言位（这条落子后的感想）。
+        #   同样只看 `kind`：`show_card` 只管卡片，不管说不说（U34 修订版）。
+        ai_eval_prompt = prompts.joseki_close_prompt(
+            str(jk2.get("name") or ""), str(jk2.get("key") or ""),
+            str(jk2.get("corner") or ""), "azure")
     elif ai_gtp == "pass":
         ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (player_eval, think_msg)
     else:
@@ -906,8 +948,13 @@ async def _finalize_after_player(agent, data):
 
 
 async def _finalize_own_turn(agent, data):
-    """落子完成后立刻做定式识别（纯本地计算），供下一阶段的上下文使用。**不归位 busy**。"""
-    data["jk2"] = agent._joseki_check()
+    """她那一步的定式结论（``jk2``）**已由 ``finalize`` 节点算好**，这里只把它留在本轮 data 里，
+    供下一阶段（``just_moved`` 挑模板 / 发 ``joseki`` 事件）使用。**不归位 busy**。
+
+    这里**不得**再调 ``agent._joseki_check()``：它会消耗去重键（同角同族第二次必然返回 ``{}``），
+    而结论已经在上一步算出来了（T7 把这次识别上移到 async 的节点外壳，因为要 ``await`` 入围判定）。
+    """
+    data["jk2"] = data.get("jk2") or {}
 
 
 async def _finalize_just_moved(agent, data):
@@ -915,9 +962,9 @@ async def _finalize_just_moved(agent, data):
     text = str(data.get("reply") or "")
     agent.st.log_memory("A", text, len(agent.st.moves))
     await _emit_deduped(agent, events.AI_COMMENT, text)
-    # 卡片载荷（T6）：`jk_show_card` / `jk_mistake` 是**本回合 data 里既有的值**（玩家那一手在
-    # `after_player` 里算出来的）——`own_turn` 这一格自己的入围判定还没接（它由同步的
-    # `_finalize_own_turn` 里的 `_joseki_check` 产出，本任务不解决），补上它是 **T7** 的必办项。
+    # 卡片载荷（T6）：`jk_show_card` / `jk_mistake` 是**本回合 data 里既有的值**——玩家那一手在
+    # `after_player` 里定，她那一手由 `finalize` 节点（T7）在她这一格补齐；这里只读不改。
+    # `_set_busy(False)` 的位置**不动**（T7 只换了 `jk2` 的算法在哪一步，事件顺序与解锁点一字未变）。
     agent._joseki_emit(data.get("jk2") or {},
                        data.get("jk_show_card", False), data.get("jk_mistake"))
     agent._set_busy(False)
@@ -988,6 +1035,12 @@ def _finalize_node(agent):
     async def finalize(state: TurnState) -> TurnState:
         phase = str(state.get("phase") or "")
         data = dict(state.get("data") or {})
+        # —— T7（U36）：她那一步的定式识别从同步的 ``_finalize_own_turn`` 上移到这个 async 节点 ——
+        # 入围判定要 ``await``，而结论必须赶在 ``_prepare_just_moved`` 挑模板之前算好，所以落在
+        # ``own_turn`` 这一步（紧接在 ``just_moved`` 的 prepare 之前）。``just_moved`` 那一格不在这里
+        # ——它由 ``_prepare_just_moved`` 自己的兜底覆盖（更早，正好在挑模板之前）。
+        if phase == PHASE_OWN_TURN:
+            await _joseki_own_move(agent, data)
         fn = _FINALIZE.get(phase)
         if fn is not None:
             await fn(agent, data)

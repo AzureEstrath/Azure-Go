@@ -383,16 +383,88 @@ def to_black_perspective(analysis, num_moves):
 # ================= 定式导学 =================
 
 def joseki_teach_prompt(name, key, corner):
-    """定式成型讲解（玩家视角：名称 + 要点 2~3 句）。"""
+    """定式成型讲解（玩家视角：名称 + 要点 2~3 句）。
+
+    v3.6.0 起收尾讲解改用 `joseki_close_prompt`，本函数仅为兼容与黄金样本保留。
+    """
     return ("刚才%s角这一片走出了定式——【%s】。要点：%s\n"
         + "用你自己的口吻（我/你）给Estarth讲 2~3 句：先说这是「%s」，再把上面的要点讲给他听（更口语、更软一点），"
         + "最后轻轻带一句这类形状什么时候能用。别像教科书背课文，别点具体坐标，别用「黑方/白棋」，也别重复你之前说过的话。") % (corner, name, key, name)
 
 
 def joseki_short_prompt(name, key, gtp):
-    """她自己走出定式时的一句短话（不展开成讲解）。"""
+    """她自己走出定式时的一句短话（不展开成讲解）。
+
+    v3.6.0 起她那一步的收尾改用 `joseki_close_prompt(..., "azure")`，本函数仅为兼容与黄金样本保留。
+    """
     return ("你（Azure）刚下的 %s 让这一片成型为【%s】定式。要点：%s\n"
         + "用一句你自己的话把这手的意思带出来即可：点一下这是「%s」，口吻自然，别展开成讲解，别点具体坐标。") % (gtp, name, key, name)
+
+
+# —— v3.6.0：结构点开口（进入 / 分岔 / 收尾）并进**既有发言位**（计划 07 · T7）——
+# 三条都只写「素材 + 要求」：中文、一句话、用她自己的口吻、不要提胜率数值；不放可被照抄的范文。
+# 是否换用它们由编排侧**按 `kind`** 定（进入／分岔／收尾必说）；`data["jk_show_card"]` 只决定
+# **卡片**（T5/T6/T8 的次数规则），不决定说与不说；模板自己不判。
+
+
+def joseki_enter_prompt(name, key, corner):
+    """进入：这一角开始走【name】——讲解**顶替**这一手的普通点评（同一时刻只出一条气泡）。"""
+    return ("Estarth 这一手把%s角带进了【%s】这一课。这一角的要点是：%s\n"
+        + "用你自己的口吻（我/你）一句话把这一课点开：先说这一角现在开始走的是「%s」，"
+        + "再把上面的要点用更口语、更软的说法讲给他听——别像教科书背课文。"
+        + "不要提胜率数值，不要点具体坐标，别像解说员那样说「黑方/白棋」，也别复读你最近用过的口头禅。") % (
+        corner, name, key, name)
+
+
+def joseki_branch_prompt(name, key, candidates):
+    """分岔 / 真走错：这一手走到了岔口——并进这一手的发言位（**不追加**第二条气泡）。
+
+    素材＝这一课的名字与要点 + 每个候选**自己**的下一手坐标（``candidates[i]["next"]`` 是 0 基
+    元组，这里转成 GTP 交给模型）；候选为空时只给要点，不留「（可选）」这类残缺句式。
+    """
+    ways = []
+    for c in candidates or []:
+        if not isinstance(c, dict):
+            continue
+        nxt = c.get("next")
+        if not (isinstance(nxt, (tuple, list)) and len(nxt) >= 2):
+            continue
+        try:                                        # 缺键 / 脏值一律丢掉，绝不抛（整条回合不能被它打挂）
+            x = int(nxt[0])
+            y = int(nxt[1])
+        except (TypeError, ValueError):
+            continue
+        if not coords.valid(x, y):                  # 出盘的也丢（不许变成假坐标）
+            continue
+        gtp = coords.xy_to_gtp(x, y)
+        nm = str(c.get("name") or "")
+        ways.append(gtp if nm == "" else "「%s」的下一手在 %s" % (nm, gtp))
+    material = "Estarth 这一手从【%s】走到了岔口。这一课的要点是：%s" % (name, key)
+    if ways:
+        # 要点本身常以句号收尾：先去掉再补一个，免得拼出「。。」
+        material = material.rstrip("。") + "。这里另有走法：" + "；".join(ways)
+        # 有候选才要求她说「别的走法」——没给她的东西不能叫她说（U35：候选为空退回只说要点）
+        with_ways = "再把别的走法用软一点的说法带给他（别生硬地念坐标，也别批评他这一手）。"
+    else:
+        with_ways = ""
+    return (material + "\n"
+        + "用你自己的口吻（我/你）一句话把这一手说清楚：点一下这一角本来走的是「%s」，"
+        + with_ways
+        + "不要提胜率数值，别像解说员那样说「黑方/白棋」，也别复读你最近用过的口头禅。") % name
+
+
+def joseki_close_prompt(name, key, corner, side):
+    """收尾：这一课走完了——并进**走完那一方**的发言位。
+
+    ``side`` 取 ``"player"``（玩家走完，并进他那一手的点评）/ ``"azure"``（她自己走完，并进她
+    落子后的那句感想）。素材＝角 + 名字 + 要点。
+    """
+    who = "Estarth 这一手" if str(side) != "azure" else "你（Azure）刚下的这一手"
+    return ("%s把%s角这一片走完了，成的是【%s】。这一课的要点是：%s\n"
+        + "用你自己的口吻（我/你）一句话收个尾：先点一下这一角走出来的是「%s」，"
+        + "再用更口语、更软的说法把要点带一句——是收尾，不是开讲。"
+        + "不要提胜率数值，不要点具体坐标，别像解说员那样说「黑方/白棋」，也别复读你最近用过的口头禅。") % (
+        who, corner, name, key, name)
 
 
 def joseki_hint_clause(name, expect_gtp):
