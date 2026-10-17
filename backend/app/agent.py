@@ -767,8 +767,19 @@ class AzureAgent:
     def _joseki_logged(self, key) -> bool:
         return any(str(e.get("key", "")) == key for e in self.st.joseki_log)
 
-    def _joseki_emit(self, r):
-        """棋盘高亮轨迹：成型=按手顺点亮；偏离=只点「常规一手」那个位置。"""
+    def _joseki_emit(self, r, show_card=False, mistake=None):
+        """棋盘高亮轨迹：成型=按手顺点亮；偏离=只点「常规一手」那个位置。
+
+        卡片载荷（计划 07 T6）：``show_card`` / ``mistake`` 由调用方（``agent_graph`` 的两个
+        ``_joseki_emit`` 调用点）从**本轮** ``data`` 里传进来，两个参数都有安全缺省，既有的单参
+        调用签名照旧可用。``mistake`` 收的是 ``data["jk_mistake"]`` 那个 dict，**只在
+        ``is_mistake is True`` 时**才转成 ``{"move_no","x","y","drop"}``，否则 ``None``（没亏的
+        那一手不上卡片标记，U31）；缺键 / 脏值一律退化成 ``0``，不抛。
+
+        旧行为一字不动（U32）：``deviated`` 仍把 ``points`` 换成 ``[expect]``、``expect`` 缺失
+        时提前 return，``points`` 为空时也提前 return（不发事件）——新字段只是**追加**在发出去的
+        那个 payload 上。
+        """
         if not r:
             return
         pts = list(r.get("points", []))
@@ -779,7 +790,26 @@ class AzureAgent:
             pts = [ex]
         if not pts:
             return
-        self._emit(events.joseki({"kind": str(r["kind"]), "corner": str(r["corner"]), "points": pts}))
+        try:
+            k = int(r.get("k", 0))
+        except (TypeError, ValueError):
+            k = 0
+        cands = []
+        for c in r.get("candidates") or []:
+            if isinstance(c, dict):            # 只留卡片要的两键；`next` 原样（JSON 化后是数组）
+                cands.append({"name": c.get("name"), "next": c.get("next")})
+        self._emit(events.joseki({
+            "kind": str(r["kind"]),
+            "corner": str(r["corner"]),
+            "points": pts,
+            "family": str(r.get("family") or ""),
+            "name": str(r.get("name") or ""),
+            "k": k,
+            "line": list(r.get("line") or []),
+            "candidates": cands,
+            "show_card": bool(show_card),
+            "mistake": mistake,
+        }))
 
     # —— 卡片门禁（T5）：前 3 次都上卡片，第 4 次起只在真的走错时才上 ——
 

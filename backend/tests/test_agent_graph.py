@@ -409,13 +409,15 @@ class JosekiMistakeWiringTest(unittest.TestCase):
         self.assertEqual(str(state["data"]["jk"]["kind"]), "deviated")
         got = state["data"]["jk_mistake"]
         self.assertEqual(
-            set(got.keys()), {"is_mistake", "on_line", "gtp", "x", "y", "drop", "rank_ok"})
+            set(got.keys()),
+            {"is_mistake", "on_line", "gtp", "x", "y", "drop", "rank_ok", "move_no"})
         self.assertIs(got["is_mistake"], True)                  # 偏离 + 真亏 ⇒ 走错
         self.assertIs(got["on_line"], False)                    # 库线上的那一手是 (5,2)，不是这手
         self.assertEqual(got["gtp"], "B15")
         self.assertEqual((got["x"], got["y"]), (1, 4))
         self.assertGreater(got["drop"], 0.10)
         self.assertIs(got["rank_ok"], True)
+        self.assertEqual(got["move_no"], 5)                     # T6：4 手铺好 + 玩家这手 ＝ 第 5 手
 
         # U19：既有俗手记录照旧触发，条目形状 / 文案 / 位置一字不变（走的就是 drop 那半边）
         self.assertEqual(agent.st.bad_moves, [{

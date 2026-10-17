@@ -217,6 +217,10 @@ async def _prepare_after_player(agent, data):
         "y": y,
         "drop": drop,
         "rank_ok": rank_ok,
+        # T6：玩家这一手的 1 基序号。**必须在这里记下来**——`just_moved` 那个 `_joseki_emit`
+        # 站点是在她自己落子之后才 emit 的，那里 `len(st.moves)` 已经前进，事件里的
+        # `mistake.move_no` 只能用这里记下的值（取在 `add_move` 之后，正是玩家这手）。
+        "move_no": len(agent.st.moves),
     }
 
     # ④‴′ 卡片门禁（T5）：前 3 次都上卡片，第 4 次起只在真的走错时才上。**先问后记**：
@@ -225,7 +229,7 @@ async def _prepare_after_player(agent, data):
     if jk:
         data["jk_show_card"] = await agent.joseki_show_card(jk, data.get("jk_mistake"))
         await agent.joseki_count_entry(jk)
-        agent._joseki_emit(jk)
+        agent._joseki_emit(jk, data.get("jk_show_card", False), data.get("jk_mistake"))
 
     # ④′ 情绪反应：按这一手的好坏结算三维情绪（即时反馈不等 LLM）
     ev = "player_ok"
@@ -911,7 +915,11 @@ async def _finalize_just_moved(agent, data):
     text = str(data.get("reply") or "")
     agent.st.log_memory("A", text, len(agent.st.moves))
     await _emit_deduped(agent, events.AI_COMMENT, text)
-    agent._joseki_emit(data.get("jk2") or {})
+    # 卡片载荷（T6）：`jk_show_card` / `jk_mistake` 是**本回合 data 里既有的值**（玩家那一手在
+    # `after_player` 里算出来的）——`own_turn` 这一格自己的入围判定还没接（它由同步的
+    # `_finalize_own_turn` 里的 `_joseki_check` 产出，本任务不解决），补上它是 **T7** 的必办项。
+    agent._joseki_emit(data.get("jk2") or {},
+                       data.get("jk_show_card", False), data.get("jk_mistake"))
     agent._set_busy(False)
     await agent._mood_llm_refine()
     # 不在这里 emit state：落子的可见更新由 reveal_move() 在她这段语音开始时触发

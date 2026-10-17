@@ -9,7 +9,7 @@
     info          ↔  info_changed(winrate, score)
     busy          ↔  busy_changed(busy)
     mood          ↔  mood_changed(payload)      三维情绪区域（表情/语气词/音高）
-    joseki        ↔  joseki_event(payload)      定式高亮轨迹（kind/corner/points）
+    joseki        ↔  joseki_event(payload)      定式高亮轨迹（kind/corner/points）+ 卡片载荷
     tool          ↔  tool_event(payload)        她自己查资料（start/end，只给状态栏看）
     token         ↔  token_event(turn_id, delta) 流式增量（可选、默认关闭；最终内容以 message 为准）
     speech        ↔  speech_event(payload)      一条台词对应的语音（音频 id 或系统语音指令）
@@ -24,6 +24,11 @@ message.kind 取值与前端 message 信号一致：
 
 ``tool`` 只描述「她自己查了一次资料」的进度（``phase`` = start/end），**不是台词**：
 前端只用它更新状态栏文案，工具返回的原始文本永远只回到模型手里。
+
+``joseki``（计划 07 T6）在旧三键之外带出**卡片载荷**：``kind/corner/points`` 是原来那条高亮轨迹
+（取值路径不变），``family/name/k/line/candidates/show_card/mistake`` 供定式教学卡片（前端
+Task 8）绘制。新字段**全部有安全缺省**（缺字段 / 脏值不抛），``mistake`` 只在**真是走错**时非
+``None``。它仍是**棋盘注记、不是台词**：不新增事件种类，也不进任何 LLM 上下文。
 
 ``speech`` 是**语音**（计划 05）：与对应的 ``message`` 一一配对（同 ``turn_id`` + 递增 ``seq``），
 ``mode == "openai"`` 时按 ``id`` 去 ``GET /api/tts/audio/{id}`` 取音频，``mode == "system"`` 时
@@ -70,9 +75,67 @@ def mood(payload):
 
 
 def joseki(payload):
+    """定式高亮轨迹 + **卡片载荷**（计划 07 T6）。
+
+    旧字段（``kind`` / ``corner`` / ``points``）仍走原来那条「``payload`` 原样并入」的路，
+    取值路径一行不改；新增的卡片字段一律用 ``.get()`` 取并给**安全缺省**——缺字段、错类型、
+    脏值都只是退化成缺省，**绝不抛**（缺字段的旧后端 / 新前端混跑时不崩）：
+
+        family      ""      族 id（``star_33`` 一类；计数与召回都按它）
+        name        ""      课名（卡片标题）
+        k          0       角内已吻合的手数（透明前缀长度）
+        line        []      显示线：``[{"x": int, "y": int, "c": str}]``，**原样透传**
+        candidates  []      分岔候选，**只留** ``{"name", "next"}``（``next`` 是坐标对，不手工转 list）
+        show_card   False   这一手该不该上教学卡片（T5 的入围结论）
+        mistake     None    **仅当真是走错**时是 ``{"move_no", "x", "y", "drop"}``，否则 ``None``
+
+    ``mistake`` 的两种形态：调用方（``_joseki_emit``）已按 ``is_mistake is True`` 过滤过一次；
+    这里再兜一层——传进来的是 ``data["jk_mistake"]`` 那种**带 ``is_mistake`` 的原始 dict** 时，
+    同样只在它 ``is True`` 时才认（没亏的那一手不许被标红，U31）；四个数值各自包在 ``try`` 里，
+    脏值退化成 ``0`` / ``0.0``。``payload`` 本身不是 dict 时按空 payload 处理。
+    """
+    p = payload if isinstance(payload, dict) else {}
     e = {"type": "joseki"}
-    e.update(payload)
+    e.update(p)                                   # ← 旧字段：取值路径不变
+    e["family"] = str(p.get("family") or "")
+    e["name"] = str(p.get("name") or "")
+    try:
+        e["k"] = int(p.get("k", 0))
+    except (TypeError, ValueError):
+        e["k"] = 0
+    line = p.get("line")
+    e["line"] = line if isinstance(line, list) else []
+    cands = p.get("candidates")
+    e["candidates"] = cands if isinstance(cands, list) else []
+    e["show_card"] = bool(p.get("show_card", False))
+    e["mistake"] = _joseki_mistake(p.get("mistake"))
     return e
+
+
+def _joseki_mistake(m):
+    """把「走错那一手」收敛成卡片的注记，**不是走错就 None**（U31）。
+
+    接受两种输入：``_joseki_emit`` 已过滤好的 ``{"move_no","x","y","drop"}``（无 ``is_mistake``
+    键），以及 ``data["jk_mistake"]`` 那种带 ``is_mistake`` 的原始 dict。后者只在
+    ``is_mistake is True`` 时才认——没亏的那一手不该被标红。
+    """
+    if not isinstance(m, dict):
+        return None
+    if "is_mistake" in m and m.get("is_mistake") is not True:
+        return None
+
+    def _num(v, cast, default):
+        try:
+            return cast(v)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "move_no": _num(m.get("move_no"), int, 0),
+        "x": _num(m.get("x"), int, 0),
+        "y": _num(m.get("y"), int, 0),
+        "drop": _num(m.get("drop"), float, 0.0),
+    }
 
 
 def tool(phase, name, args=None, ok=True, ms=0):

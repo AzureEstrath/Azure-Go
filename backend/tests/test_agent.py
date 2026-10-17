@@ -1176,3 +1176,145 @@ class JosekiCardGateTest(unittest.TestCase):
         self.assertIs(state["data"]["jk_show_card"], True)
         self.assertEqual(agent.st.joseki_counted, [])
 
+    # —— T6：`move_no` 记在玩家这一手上，事件里带出来 ——
+
+    def test_jk_mistake_records_the_players_one_based_move_number(self):
+        """`data["jk_mistake"]["move_no"]` ＝ 玩家这一手的 1 基序号（4 手铺好 + 这手 ＝ 5）。"""
+        agent = self._agent()
+        state = self._deviated(agent)
+        self.assertEqual(state["data"]["jk_mistake"]["move_no"], 5)
+        self.assertEqual(state["data"]["jk_mistake"].get("gtp"), "B15")
+
+    def test_deviated_event_carries_card_payload_and_move_no(self):
+        """端到端：偏差那一手的 `joseki` 事件带出卡片载荷与走错注记（含 `move_no`）。"""
+        for _ in range(3):
+            self.progress.bump("star_33")                        # 前 3 次已教过 ⇒ 第 4 次只看是否真走错
+        agent = self._agent()
+        state = self._deviated(agent)
+
+        jk = state["data"]["jk"]
+        event = agent.bus.of_type("joseki")[-1]
+        self.assertEqual(str(event["kind"]), "deviated")
+        self.assertEqual(event["corner"], "左上")
+        self.assertEqual(event["points"], [(5, 2)])              # U32：仍是「只点常规一手」
+        self.assertIs(event["show_card"], True)
+        # 透传：族 / 名 / k / 显示线逐键等于识别器那一份（line 的 `expect` 不在事件里）
+        self.assertEqual(event["family"], str(jk["family"]))
+        self.assertEqual(event["name"], str(jk["name"]))
+        self.assertEqual(event["k"], int(jk["k"]))
+        self.assertEqual(event["line"], jk["line"])
+        self.assertEqual(event["mistake"], {
+            "move_no": 5, "x": 1, "y": 4,
+            "drop": state["data"]["jk_mistake"]["drop"],
+        })
+        self.assertTrue(event["line"])                           # 透传识别器的显示线
+        self.assertEqual([set(c.keys()) for c in event["candidates"]], [{"name", "next"}] * len(event["candidates"]))
+
+
+# ================= T6：`joseki` 事件扩字段（卡片载荷），旧字段路径一行不改 =================
+
+class JosekiEventPayloadTest(unittest.TestCase):
+    """`_joseki_emit` 直接发事件的形状：旧字段照旧、新字段齐全、`deviated` 行为不动（U30–U33）。"""
+
+    def _emit(self, agent, r, **kw):
+        agent._joseki_emit(r, **kw)
+        return agent.bus.of_type("joseki")[-1]
+
+    def test_legacy_fields_are_untouched_end_to_end(self):
+        """同一 payload 经真事件总线出去：`type/kind/corner/points` 逐键相等。"""
+        agent, _eng, _llm, _bus = _mk()
+        e = self._emit(agent, {"kind": "formed", "corner": "左上", "cat": "star",
+                               "points": [(3, 3), (2, 2)]})
+        self.assertEqual({k: e[k] for k in ("type", "kind", "corner", "points")},
+                         {"type": "joseki", "kind": "formed", "corner": "左上",
+                          "points": [(3, 3), (2, 2)]})
+
+    def test_sparse_scan_result_gets_safe_defaults(self):
+        """识别器只给旧字段时，卡片载荷全部安全缺省，且不抛。"""
+        agent, _eng, _llm, _bus = _mk()
+        e = self._emit(agent, {"kind": "formed", "corner": "左上", "points": [(3, 3)]})
+        self.assertEqual(e["family"], "")
+        self.assertEqual(e["name"], "")
+        self.assertEqual(e["k"], 0)
+        self.assertEqual(e["line"], [])
+        self.assertEqual(e["candidates"], [])
+        self.assertIs(e["show_card"], False)
+        self.assertIsNone(e["mistake"])
+
+    def test_dirty_k_falls_back_to_zero(self):
+        agent, _eng, _llm, _bus = _mk()
+        e = self._emit(agent, {"kind": "formed", "corner": "左上", "points": [(3, 3)],
+                               "family": "star_33", "k": "x"})
+        self.assertEqual(e["k"], 0)
+
+    def test_candidates_keep_only_name_and_next(self):
+        """U33：候选只透传 `name` / `next`，不把 `family` / `line` 塞进去；`next` 不手工转 list。"""
+        agent, _eng, _llm, _bus = _mk()
+        e = self._emit(agent, {
+            "kind": "entered", "corner": "左上", "points": [(3, 3)],
+            "candidates": [{"name": "点三三·定形", "family": "star_33", "next": (4, 3),
+                            "line": [{"x": 1, "y": 1, "c": "B"}]}],
+        })
+        self.assertEqual(e["candidates"], [{"name": "点三三·定形", "next": (4, 3)}])
+
+    def test_deviated_points_replacement_is_unchanged(self):
+        """U32：给了 `expect` ⇒ 事件 `points == [expect]`（前端高亮轨迹仍在用）。"""
+        agent, _eng, _llm, _bus = _mk()
+        e = self._emit(agent, {"kind": "deviated", "corner": "左上", "points": [(9, 9)],
+                               "expect": (5, 2)})
+        self.assertEqual(e["points"], [(5, 2)])
+
+    def test_deviated_without_expect_sends_nothing(self):
+        """U32：`deviated` 且 `expect` 缺失 ⇒ 提前 return（不发事件），保持不变。"""
+        agent, _eng, _llm, bus = _mk()
+        agent._joseki_emit({"kind": "deviated", "corner": "左上", "points": [(9, 9)]})
+        self.assertEqual(bus.of_type("joseki"), [])
+
+    def test_empty_points_sends_nothing(self):
+        agent, _eng, _llm, bus = _mk()
+        agent._joseki_emit({"kind": "formed", "corner": "左上", "points": []})
+        self.assertEqual(bus.of_type("joseki"), [])
+
+    def test_mistake_payload_only_when_is_mistake_true(self):
+        """U31：`jk_mistake` 的 `is_mistake` 为 True ⇒ 含 `move_no/x/y/drop`；False ⇒ None。"""
+        agent, _eng, _llm, _bus = _mk()
+        e = self._emit(agent, {"kind": "deviated", "corner": "左上", "points": [(9, 9)],
+                               "expect": (5, 2), "name": "点三三·定形", "family": "star_33",
+                               "k": 4, "line": [], "candidates": []},
+                       show_card=True,
+                       mistake={"is_mistake": True, "on_line": False, "gtp": "B15",
+                                "x": 1, "y": 4, "drop": 0.203, "rank_ok": True,
+                                "move_no": 5})
+        self.assertEqual(e["mistake"], {"move_no": 5, "x": 1, "y": 4, "drop": 0.203})
+        self.assertIs(e["show_card"], True)
+
+        agent2, _e2, _l2, bus2 = _mk()
+        agent2._joseki_emit({"kind": "formed", "corner": "左上", "points": [(3, 3)]},
+                            show_card=False,
+                            mistake={"is_mistake": False, "on_line": False, "gtp": "B15",
+                                     "x": 1, "y": 4, "drop": 0.0, "rank_ok": True,
+                                     "move_no": 5})
+        e2 = bus2.of_type("joseki")[-1]
+        self.assertIsNone(e2["mistake"])
+        self.assertIs(e2["show_card"], False)
+
+    def test_missing_or_dirty_mistake_is_none(self):
+        agent, _eng, _llm, _bus = _mk()
+        for bad in (None, "oops", {"is_mistake": True, "move_no": "x", "x": None,
+                                   "y": "y", "drop": "z"}):
+            with self.subTest(mistake=bad):
+                agent.bus.clear()
+                e = self._emit(agent, {"kind": "formed", "corner": "左上", "points": [(3, 3)]},
+                               mistake=bad)
+                if isinstance(bad, dict):
+                    self.assertEqual(e["mistake"], {"move_no": 0, "x": 0, "y": 0, "drop": 0.0})
+                else:
+                    self.assertIsNone(e["mistake"])
+
+    def test_default_call_signature_still_works(self):
+        """U30：新增参数有安全缺省 ⇒ 既有单参调用照旧可用。"""
+        agent, _eng, _llm, bus = _mk()
+        agent._joseki_emit({"kind": "formed", "corner": "左上", "points": [(3, 3)]})
+        self.assertEqual(len(bus.of_type("joseki")), 1)
+        self.assertIsNone(bus.of_type("joseki")[-1]["mistake"])
+
