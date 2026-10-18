@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1511,5 +1512,108 @@ class PlayerEventWriteTest(unittest.TestCase):
         self.assertEqual(ev["detail"]["rank"], 3)
         self.assertIn("胜率掉了约30%", ev["text"])
         self.assertIn("左上这一片", ev["text"], "方位词按坐标核对（D16 在左上）")
+
+
+# —— 以下为阶段四 · Q1（v3.9.0）追加：画像 / 时间两个区块的**装配点接线** ——
+#    （追加在文件末尾；本仓唯一跑法 `python -m unittest discover -s tests` 会照常收集）
+
+
+class _FakeProfileStore:
+    """画像库的测试替身：只提供装配点用到的三个读接口，并记录被访问过几次。
+
+    ``_ctx_extras`` 只在对应开关打开时才碰它，所以 ``reads`` 同时是「关着＝零磁盘访问」的证据。
+    """
+
+    def __init__(self, profile=None, last_ts=None, ts_list=None):
+        self.profile = dict(profile or {})
+        self.last_ts = last_ts
+        self.ts_list = list(ts_list or [])
+        self.reads = []
+
+    def get_profile(self):
+        self.reads.append("get_profile")
+        return dict(self.profile)
+
+    def last_game_ts(self):
+        self.reads.append("last_game_ts")
+        return self.last_ts
+
+    def recent_game_ts(self, n=0):
+        self.reads.append("recent_game_ts")
+        return list(self.ts_list)
+
+    def games(self, n=0):
+        self.reads.append("games")
+        return []
+
+
+class CtxExtrasGateTest(unittest.TestCase):
+    """``_ctx_extras`` 的门控与降级（v3.9.0）：两个开关是「注不注入」的唯一闸门。"""
+
+    def _agent(self, store):
+        agent, _eng, _llm, _bus = _mk()
+        agent.profile_store = store
+        return agent
+
+    def test_both_switches_off_touch_no_disk(self):
+        from app.agent_graph import _ctx_extras
+        store = _FakeProfileStore(profile={"open.star": 0.9}, last_ts=1.0, ts_list=[1.0])
+        agent = self._agent(store)
+        got = asyncio.run(_ctx_extras(agent, {}))
+        self.assertEqual(got, ({}, None), "两个开关都关 ⇒ 空素材（等价于不传）")
+        self.assertEqual(store.reads, [], "关着时一次磁盘访问都不做（零开销）")
+
+    def test_profile_only_reads_the_profile(self):
+        from app.agent_graph import _ctx_extras
+        store = _FakeProfileStore(profile={"open.star": 0.9}, last_ts=1.0, ts_list=[1.0])
+        agent = self._agent(store)
+        agent.profile_enabled = True
+        profile, time_facts = asyncio.run(_ctx_extras(agent, {}))
+        self.assertEqual(profile, {"open.star": 0.9})
+        self.assertIsNone(time_facts)
+        self.assertEqual(store.reads, ["get_profile"], "时间关着 ⇒ 不读时刻")
+
+    def test_time_only_reads_the_timestamps(self):
+        from app.agent_graph import _ctx_extras
+        base = time.time() - 3 * 86400.0        # 3 天前的那一局（session 也在那天）
+        store = _FakeProfileStore(last_ts=base, ts_list=[base])
+        agent = self._agent(store)
+        agent.time_aware_enabled = True
+        agent.mark_move_time(base)
+        profile, time_facts = asyncio.run(_ctx_extras(agent, {}))
+        self.assertEqual(profile, {})
+        self.assertAlmostEqual(time_facts["last_gap_days"], 3.0, delta=5.0)
+        self.assertEqual(time_facts["streak_days"], 0, "断在三天前：今天与昨天都没有对局")
+        self.assertIn("date", time_facts)
+        self.assertEqual(store.reads, ["last_game_ts", "recent_game_ts"], "画像关着 ⇒ 不读画像")
+
+    def test_reads_happen_once_per_turn(self):
+        """一回合（同一份 ``data``）只算一次：第二次调用直接吃缓存，不再碰盘。"""
+        from app.agent_graph import _ctx_extras
+        store = _FakeProfileStore(profile={"open.star": 0.9}, last_ts=1.0, ts_list=[1.0])
+        agent = self._agent(store)
+        agent.profile_enabled = True
+        agent.time_aware_enabled = True
+        data = {}
+
+        async def run():
+            await _ctx_extras(agent, data)
+            await _ctx_extras(agent, data)
+            await _ctx_extras(agent, data)
+
+        asyncio.run(run())
+        self.assertEqual(store.reads, ["get_profile", "last_game_ts", "recent_game_ts"])
+
+    def test_store_failure_degrades_to_empty_material(self):
+        from app.agent_graph import _ctx_extras
+
+        class Boom(_FakeProfileStore):
+            def get_profile(self):
+                raise RuntimeError("库坏了")
+
+        agent = self._agent(Boom())
+        agent.profile_enabled = True
+        self.assertEqual(asyncio.run(_ctx_extras(agent, {})), ({}, None), "读画像炸了 ⇒ 按「不注入」降级")
+
 
 

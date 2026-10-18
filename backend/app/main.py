@@ -54,6 +54,7 @@ from .joseki_progress import JosekiProgress
 from .llm import LLMClient
 from .llm_chain import merge_extra_body
 from .memory_service import MemoryService
+from .profile_store import ProfileStore
 from .tts import TTSClient
 
 
@@ -89,6 +90,11 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         # 库目录 / 库文件只在真正 bump 时才按需创建（tick 只读时连目录都不建）。
         joseki_progress = JosekiProgress()
         app.state.joseki_progress = joseki_progress
+        # 玩家棋风画像（v3.9.0）：**无条件装配**——构造期不碰磁盘、库按需懒建 ⇒ 关着时零开销；
+        # 与 `memory.db` **解耦**（不读 `memory_enabled`，设计 §五 I）。**写入只在 `summarize()`
+        # 且 `profile_enabled=true` 时发生**；`GET /api/profile` 始终可读（关着 / 无画像 ⇒ 空结果）。
+        profile_store = ProfileStore(cfg.profile_db_path)
+        app.state.profile_store = profile_store
         if agent is None:
             eng = engine if engine is not None else KataGoEngine(cfg.katago_url, cfg.katago_token, cfg.max_visits, cfg.katago_timeout_ms)
             cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key,
@@ -116,6 +122,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent.memory = mem         # 注入的 agent 也接上同一个实例（显式 memory= 优先）
             app.state.agent.tts = tts_client     # 注入的 agent 同样接上（显式 tts= 优先）
             app.state.agent.joseki_progress = joseki_progress   # T5：注入的 agent 也接上同一个实例
+            app.state.agent.profile_store = profile_store       # v3.9.0：画像库同样无条件接上
             # v3.9.0：画像 / 时间感知两个开关同样以 cfg 为准（关着＝现状）
             app.state.agent.profile_enabled = bool(cfg.profile_enabled)
             app.state.agent.time_aware_enabled = bool(cfg.time_aware_enabled)

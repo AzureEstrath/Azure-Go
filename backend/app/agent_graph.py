@@ -199,6 +199,51 @@ def _deep_visits(agent) -> int:
 
 # ================= ① prepare：建上下文与提示词 =================
 
+# 「连续下棋天数」最多回看多少局（v3.9.0）：只要**日期集合**，不需要全量历史。
+# 90 局足够覆盖任何真实连续天数（连着 90 天已远超口语里的「连续」），而查询只取 ``ts`` 一列、
+# 带 ``LIMIT`` ⇒ 开销是「几十行的一列读」，不会随库变大而变慢。
+CTX_STREAK_GAMES = 90
+
+
+async def _ctx_extras(agent, data):
+    """画像块 / 时间块的素材（v3.9.0，设计 §6.3）：``(profile, time_facts)``。
+
+    **门控**：``profile_enabled=false`` ⇒ ``profile={}``；``time_aware_enabled=false`` ⇒
+    ``time_facts=None``——两个开关都关时**一次磁盘 IO 都不做**，``context_block`` 的输出与没有
+    这两个功能时逐字符一致（golden 锁定）。
+
+    **异步纪律**：``ProfileStore`` 的方法都是同步阻塞的（读画像 / 读时刻），一律
+    ``await asyncio.to_thread(...)``；任何异常只打日志、退化成空素材（不抛、不影响对局）。
+    时间事实的「距上次对局 / 连续天数」要读库，所以**构造**放在这里（而不是 ``agent.time_facts``
+    里）——那个方法保持纯计算、时钟可注入。
+
+    **每回合只算一次**：结果缓存在 ``data["_ctx"]``。``player_move`` 的三次 ``ainvoke`` 共用同一份
+    ``data``，所以一回合最多两次库读（画像一次、时刻一次），不会每个阶段都去碰盘。代价是同一回合
+    内三块提示词的「时间事实」取的是同一时刻（差几秒，可忽略；``move_ts_list`` 在一回合内本来也不变）。
+    """
+    cached = data.get("_ctx")
+    if cached is not None:
+        return cached
+    profile = {}
+    time_facts = None
+    try:
+        if bool(getattr(agent, "profile_enabled", False)):
+            profile = await asyncio.to_thread(agent.profile_facts)
+        if bool(getattr(agent, "time_aware_enabled", False)):
+            store = getattr(agent, "profile_store", None)
+            last_ts = None
+            ts_list = None
+            if store is not None:
+                last_ts = await asyncio.to_thread(store.last_game_ts)
+                ts_list = await asyncio.to_thread(store.recent_game_ts, CTX_STREAK_GAMES)
+            time_facts = agent.time_facts(last_game_ts=last_ts, game_ts_list=ts_list)
+    except Exception as e:                      # noqa: BLE001 —— 画像 / 时间故障绝不影响对局
+        print("[Agent] 画像 / 时间素材读取异常（按「不注入」降级）：%s" % e)
+        profile, time_facts = {}, None
+    data["_ctx"] = (profile, time_facts)
+    return profile, time_facts
+
+
 async def _prepare_after_player(agent, data):
     """玩家落子：两次引擎分析 → 落子入谱 → 定式 → 情绪 → 点评提示词。"""
     x = int(data["x"])
@@ -404,11 +449,12 @@ async def _prepare_after_player(agent, data):
     data["after_infos"] = after_infos
     data["after_black_wr"] = after_black_wr
     data["after_black_score"] = after_black_score
+    profile, time_facts = await _ctx_extras(agent, data)
     return agent._phase_messages(
         "after_player",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
                              eval_prompt, "after_player", False, agent.st.last_katago, agent.st.board,
-                             events=agent.event_log.all()),
+                             events=agent.event_log.all(), profile=profile, time_facts=time_facts),
         len_note=agent._len_note(teach=(jk_teach and jk_kind in ("entered", "branch", "formed"))),
     )
 
@@ -502,11 +548,13 @@ async def _prepare_just_moved(agent, data):
         ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (player_eval, think_msg)
     else:
         ai_eval_prompt = "你（Azure）刚下了 %s。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说：现在这盘棋我感觉怎么样、接下来我打算怎么走；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话，别用「黑方/白棋」这种旁观口吻。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (ai_gtp, player_eval, think_msg)
+    profile, time_facts = await _ctx_extras(agent, data)
     return agent._phase_messages(
         "just_moved",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
                              ai_eval_prompt, "just_moved", False, agent.st.last_katago, agent.st.board,
-                             data.get("lt"), events=agent.event_log.all()),
+                             data.get("lt"), events=agent.event_log.all(),
+                             profile=profile, time_facts=time_facts),
     )
 
 
@@ -531,11 +579,12 @@ async def _prepare_observe(agent, data):
     agent._update_katago_brief(analysis, n)
     prompt = "当前局面：%s。我算到的好点：%s。Estarth还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）；换个说法开场，别重复你上一次提示的句式和口头禅。" % (
         prompts.board_summary(agent.st.move_seq), agent._py_list(tops))
+    profile, time_facts = await _ctx_extras(agent, data)
     return agent._phase_messages(
         "observe",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
                              prompt, "observe", False, agent.st.last_katago, agent.st.board,
-                             events=agent.event_log.all()),
+                             events=agent.event_log.all(), profile=profile, time_facts=time_facts),
     )
 
 
@@ -561,11 +610,12 @@ async def _prepare_analyze(agent, data):
     prompt = "当前局面：%s，共%d手。你（Azure，执白）算出的判断：白方胜率约%s（%s），目差%s（正数是你领先）。你在考虑的几个点：%s。请用你自己的视角（我/你，别说「黑方/白棋」）分析当前局势3-4句：局面走向、关键处或薄弱处，可以点醒Estarth；语气慵懒但专业，先结合【当前棋面】核对再说，别提到盘上没有的子。" % (
         prompts.board_summary(agent.st.move_seq), n, agent._pct(azure_wr), lead, "%+.1f" % (-score_black), agent._py_list(tops))
     data["info"] = {"wr": black_wr, "score": score_black}
+    profile, time_facts = await _ctx_extras(agent, data)
     return agent._phase_messages(
         "analyze",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
                              prompt, "analyze", False, agent.st.last_katago, agent.st.board,
-                             events=agent.event_log.all()),
+                             events=agent.event_log.all(), profile=profile, time_facts=time_facts),
     )
 
 
@@ -578,10 +628,12 @@ async def _prepare_chat(agent, data):
     text = str(data.get("text") or "")
     try:
         lt = await asyncio.to_thread(agent._long_term, text)     # 慢 embedding 不得冻住事件循环
+        profile, time_facts = await _ctx_extras(agent, data)
         msgs = [
             agent._sys_msg(),
             agent._user_msg(prompts.context_block(agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True, agent.st.last_katago, agent.st.board,
-                                                  long_term=lt, events=agent.event_log.all())),
+                                                  long_term=lt, events=agent.event_log.all(),
+                                                  profile=profile, time_facts=time_facts)),
         ]
         hist = agent.st.chat_history
         upto = len(hist) - 1            # 最后一条是刚追加的这句，下面单独发，避免重复
@@ -599,10 +651,12 @@ async def _prepare_idle(agent, data):
     """闲置搭话：情绪结算 + 一句主动开口的提示词。"""
     agent._mood_event("idle_bored")
     prompt = "Estarth 已经有一段时间没有动静了，你有点好奇他在做什么。主动对他说一句很短的话（20字以内）：问问他还在不在、在忙什么，或要不要继续下棋、聊聊天。慵懒、亲切，1句。"
+    profile, time_facts = await _ctx_extras(agent, data)
     return [
         agent._sys_msg(),
         agent._user_msg(prompts.context_block(agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True, agent.st.last_katago, agent.st.board,
-                                              events=agent.event_log.all())),
+                                              events=agent.event_log.all(),
+                                              profile=profile, time_facts=time_facts)),
         {"role": "user", "content": prompt},
     ]
 
@@ -634,11 +688,12 @@ async def _prepare_summary(agent, data):
         n, seq, agent._pct(final_wr), "%+.1f" % final_score, note)
     data["wr"] = final_wr
     data["score"] = final_score
+    profile, time_facts = await _ctx_extras(agent, data)
     return agent._phase_messages(
         "summary",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
                              prompt, "summary", False, agent.st.last_katago, agent.st.board,
-                             events=agent.event_log.all()),
+                             events=agent.event_log.all(), profile=profile, time_facts=time_facts),
     )
 
 
@@ -724,11 +779,12 @@ async def _decide_own_turn(agent, data):
     think_hint = "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
     think_prompt = "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过Estarth那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。换一个全新的说法，别总用「嗯~」「唔」开头，句式也别和刚才那条点评一样。" % think_hint
     await asyncio.sleep(THINK_BEAT_SEC)         # 落子宣告前的犹豫节拍（位置与旧 _ai_turn 一致）
+    profile, time_facts = await _ctx_extras(agent, data)
     return agent._phase_messages(
         "own_turn",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
                              think_prompt, "own_turn", False, agent.st.last_katago, agent.st.board, lt,
-                             events=agent.event_log.all()),
+                             events=agent.event_log.all(), profile=profile, time_facts=time_facts),
     )
 
 

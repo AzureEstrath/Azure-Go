@@ -10,11 +10,11 @@
   ``persona.address_pref`` 这两个**非数值维**存自然字符串，SQLite 的 NUMERIC 亲和度
   存不了数字的文本会原样留成 TEXT）+ ``confidence`` + ``n_games`` + ``updated_ts``。
 
-降级策略（fail-open）：**五个方法一个都不许抛异常**——库被删 / 只读 / 目录不存在 /
+降级策略（fail-open）：**六个方法一个都不许抛异常**——库被删 / 只读 / 目录不存在 /
 库文件是垃圾内容，一律只 ``print("[Profile] …")`` 一行后返回降级值
 （``add_game`` / ``upsert_axes`` → ``0``、``last_game_ts`` → ``None``、
-``games`` / ``get_profile`` → ``[]`` / ``{}``），绝不影响对局；且**同类原因每个实例只打一行**
-（口径同 ``joseki_progress.py`` / ``memory.py`` 的 ``_embed_warned``）。
+``games`` / ``recent_game_ts`` / ``get_profile`` → ``[]`` / ``[]`` / ``{}``），绝不影响对局；且
+**同类原因每个实例只打一行**（口径同 ``joseki_progress.py`` / ``memory.py`` 的 ``_embed_warned``）。
 
 线程与连接：所有方法都是**同步阻塞**的纯文件操作，**每次调用自开自关一条连接**、
 不跨线程共享连接对象——调用方会（且必须）用 ``await asyncio.to_thread(...)`` 把它挪到
@@ -188,6 +188,24 @@ class ProfileStore:
                 rec[col] = _parse_json(row[i], [])
             out.append(rec)
         return out
+
+    def recent_game_ts(self, n: int = 0) -> list:
+        """最近 ``n`` 局的**结束时刻**（``float``，最新在前）；``n <= 0`` 取全部；读不出来一律 ``[]``。
+
+        时间感知（v3.9.0）的「连续下棋天数」只需要**日期集合**，不需要整行记录——单独开这个方法
+        是为了不让每次落子都去读 ``games`` 的**全量**行（``moves`` / ``per_move_ms`` 两列是长 JSON，
+        解析它们纯属浪费）。查询只取 ``ts`` 一列、按 ``LIMIT`` 收口，开销是「几十行的一列读」。
+        """
+        limit = _as_int(n, 0)
+        try:
+            with self._open(create=False) as conn:
+                sql = "SELECT ts FROM games ORDER BY ts DESC, id DESC"
+                if limit > 0:
+                    sql += " LIMIT %d" % limit
+                rows = conn.execute(sql).fetchall()
+        except Exception as e:              # noqa: BLE001
+            return self._degrade("读取时刻", e, [])
+        return [_as_float(row[0]) for row in rows]
 
     def get_profile(self) -> dict:
         """整份画像：``{axis: {"value","confidence","n_games","updated_ts"}}``；读不出来一律 ``{}``。

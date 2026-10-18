@@ -1851,4 +1851,110 @@ class EmotionDriftTest(unittest.TestCase):
         self.assertEqual(ev["detail"]["line"], "b")
 
 
+# —— 以下为阶段四 · Q1（v3.9.0）追加：画像块 / 时间块**真的进了发给模型的提示词** ——
+#    （端到端：开关打开 + 有画像 + 真跑一回合；以及「两个开关都关 ⇒ 与改动前逐字符一致」）
+
+
+class _WiringStore:
+    """画像库替身（装配点用到的三个读接口 + 访问记录）。"""
+
+    def __init__(self, profile=None, last_ts=None, ts_list=None):
+        self.profile = dict(profile or {})
+        self.last_ts = last_ts
+        self.ts_list = list(ts_list or [])
+        self.reads = []
+
+    def get_profile(self):
+        self.reads.append("get_profile")
+        return dict(self.profile)
+
+    def last_game_ts(self):
+        self.reads.append("last_game_ts")
+        return self.last_ts
+
+    def recent_game_ts(self, n=0):
+        self.reads.append("recent_game_ts")
+        return list(self.ts_list)
+
+
+class ProfileTimePromptWiringTest(unittest.TestCase):
+    """v3.9.0（Q1）：8 个装配点**全部**接上画像 / 时间区块，且关掉时逐字符不变。
+
+    「装配点」＝``agent_graph`` 里所有 ``with_context`` / ``context_block`` 调用：``player_move``
+    覆盖 ``after_player`` / ``own_turn`` / ``just_moved``，``hint`` / ``analyze_position`` /
+    ``chat`` / ``idle_remark`` / ``summarize`` 各覆盖一格 —— 合起来正好 8 格。
+    """
+
+    PROFILE = {"open.star": {"value": 0.9, "confidence": 0.5, "n_games": 10, "updated_ts": 1.0}}
+
+    @staticmethod
+    def _ctx_calls(llm):
+        """所有**带上下文块**的 LLM 调用（正文里含【当前棋面】的那几条），按调用顺序。"""
+        out = []
+        for msgs, _mt, _nt in llm.calls:
+            joined = "\n".join(str(m.get("content", "")) for m in msgs)
+            if "【当前棋面" in joined:
+                out.append(joined)
+        return out
+
+    def _store(self):
+        base = time.time() - 3 * 86400.0
+        return _WiringStore(profile=self.PROFILE, last_ts=base, ts_list=[base])
+
+    def test_blocks_reach_every_assembly_point(self):
+        async def run():
+            agent, _eng, llm, _bus = _mk()
+            agent.profile_store = self._store()
+            agent.profile_enabled = True
+            agent.time_aware_enabled = True
+            await agent.player_move(3, 3)                # after_player / own_turn / just_moved
+            await agent.hint()                           # observe
+            await agent.analyze_position()               # analyze
+            await agent.chat("今天天气不错")               # chat
+            await agent.idle_remark()                    # idle
+            await agent.summarize("")                    # summary
+            return agent, llm
+
+        agent, llm = asyncio.run(run())
+        ctx = self._ctx_calls(llm)
+        self.assertEqual(len(ctx), 8, "六个公开入口覆盖 8 个装配点（一阶段一次上下文装配）")
+        for i, joined in enumerate(ctx):
+            self.assertIn("【时间事实", joined, "第 %d 条上下文缺时间块" % i)
+            self.assertIn("【她眼中的你", joined, "第 %d 条上下文缺画像块" % i)
+            self.assertIn("星位", joined, "画像块里要真的有这一维（开局爱走「星位」）")
+            self.assertIn("距上次对局", joined, "时间块里要真的有间隔事实")
+        # 两块都插在铁律段**之前**（铁律段本身一个字没动）
+        for joined in ctx:
+            self.assertLess(joined.index("【她眼中的你"), joined.index("（铁律 · 先核对再开口："))
+
+    def test_switches_off_keep_the_prompt_byte_identical(self):
+        """两个开关都关 ⇒ 提示词与「没有这两个功能」**逐字符一致**，且一次盘都不碰。"""
+
+        async def run(with_store):
+            agent, _eng, llm, _bus = _mk()
+            store = None
+            if with_store:
+                store = self._store()
+                agent.profile_store = store
+            # 两个开关保持默认（都关）
+            await agent.player_move(3, 3)
+            await agent.hint()
+            await agent.chat("聊两句")
+            await agent.summarize("")
+            return llm, store
+
+        llm_on, store = asyncio.run(run(True))
+        llm_off, _ = asyncio.run(run(False))
+        self.assertEqual(store.reads, [], "两个开关都关 ⇒ 一次磁盘访问都不做（零开销）")
+        a = self._ctx_calls(llm_on)
+        b = self._ctx_calls(llm_off)
+        self.assertEqual(len(a), len(b))
+        self.assertTrue(a, "对照组必须真的装配了上下文（否则这条断言是空的）")
+        for i, (x, y) in enumerate(zip(a, b)):
+            self.assertEqual(x, y, "第 %d 条上下文与没有画像 / 时间功能时逐字符一致" % i)
+            self.assertNotIn("【时间事实", x)
+            self.assertNotIn("【她眼中的你", x)
+
+
+
 

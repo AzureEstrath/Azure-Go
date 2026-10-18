@@ -46,6 +46,9 @@ class AzureConfig:
         #    读入口径与 `emotion_drift` / `chat_digest_llm` 同形：只认 JSON 的 true / false。
         self.profile_enabled = False
         self.time_aware_enabled = False
+        # 画像库路径：留空＝<backend>/data/profile.db（由 profile_store.DEFAULT_DB_PATH 决定，
+        # 已 gitignore、属运行产物）。与 memory_db_path 同一形状：只存路径、不在这里碰盘。
+        self.profile_db_path = ""
         self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
@@ -148,6 +151,7 @@ class AzureConfig:
         self.profile_enabled = v if isinstance(v, bool) else self.profile_enabled
         v = d.get("time_aware_enabled")
         self.time_aware_enabled = v if isinstance(v, bool) else self.time_aware_enabled
+        self.profile_db_path = str(d.get("profile_db_path", self.profile_db_path))
         self.llm_base_url = str(d.get("llm_base_url", self.llm_base_url))
         self.llm_model = str(d.get("llm_model", self.llm_model))
         self.llm_api_key = str(d.get("llm_api_key", self.llm_api_key))
