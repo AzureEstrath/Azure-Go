@@ -4,6 +4,11 @@
   "joseki_teach": true,
   "joseki_rate": 0.5,
 
+  "emotion_drift": false,
+  "chat_digest_llm": false,
+  "profile_enabled": false,
+  "time_aware_enabled": false,
+
   "katago_url": "http://127.0.0.1:8100",
   "katago_token": "",
   "katago_timeout_ms": 30000,

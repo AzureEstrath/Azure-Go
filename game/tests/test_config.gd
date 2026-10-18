@@ -187,6 +187,46 @@ func _run() -> void:
 	_check("手改 drift_base=0.5 ⇒ 前端也夹到 0.08（与后端同一个值，不再留 0.5）",
 			is_equal_approx(ccap.drift_base, 0.08))
 
+	# v3.9.0 / R-P3-4 彻底收口：`drift_base` 的上限**不再写死常量**，改读只读镜像 `drift_max`
+	# （从 config.json 读、默认 0.08、脏值 → 默认、另夹到后端配置层的 0.2）——与后端
+	# `config._apply` 的 `min(_clamp01(drift_base, 0.03), drift_max)` 逐项同形。
+	_write_raw({"drift_max": 0.2, "drift_base": 0.1})
+	var cmax := AzureConfig.load_config(TMP)
+	_check("手改 drift_max=0.2 + drift_base=0.1 ⇒ 读到 0.1（上限随镜像走，与后端一致）",
+			is_equal_approx(cmax.drift_max, 0.2) and is_equal_approx(cmax.drift_base, 0.1))
+	_write_raw({"drift_max": 0.2, "drift_base": 0.5})
+	var cmax2 := AzureConfig.load_config(TMP)
+	_check("手改 drift_max=0.2 + drift_base=0.5 ⇒ 夹到 0.2（不再夹到旧的 0.08）",
+			is_equal_approx(cmax2.drift_base, 0.2))
+	_write_raw({})
+	var cmax3 := AzureConfig.load_config(TMP)
+	_check("drift_max 键缺失 ⇒ 默认 0.08（夹取上限回到默认）", is_equal_approx(cmax3.drift_max, 0.08))
+	for bad in ["abc", null]:
+		_write_raw({"drift_max": bad, "drift_base": 0.5})
+		var cmax4 := AzureConfig.load_config(TMP)
+		_check("drift_max 脏值 %s ⇒ 默认 0.08（drift_base 照默认上限夹到 0.08）" % str(bad),
+				is_equal_approx(cmax4.drift_max, 0.08) and is_equal_approx(cmax4.drift_base, 0.08))
+	_write_raw({"drift_max": 5.0, "drift_base": 0.5})
+	var cmax5 := AzureConfig.load_config(TMP)
+	_check("drift_max 越界 5.0 ⇒ 夹到 0.2（后端 DRIFT_MAX_LIMIT），drift_base 随之夹到 0.2",
+			is_equal_approx(cmax5.drift_max, 0.2) and is_equal_approx(cmax5.drift_base, 0.2))
+	for pair in [["0.2", 0.2], ["1e308", 0.2], ["nan", 0.08]]:
+		_write_raw({"drift_max": pair[0]})
+		var cmax6 := AzureConfig.load_config(TMP)
+		_check("drift_max 字符串 \"%s\" ⇒ %s（与 drift_base 同一套守卫）" % [str(pair[0]), str(pair[1])],
+				is_equal_approx(cmax6.drift_max, pair[1]))
+	_check("drift_max 的 NaN / INF 口径：NaN ⇒ 默认 0.08，INF / 5 ⇒ 夹到 0.2",
+			is_equal_approx(AzureConfig._normalize_drift_max(NAN), 0.08)
+			and is_equal_approx(AzureConfig._normalize_drift_max(INF), 0.2)
+			and is_equal_approx(AzureConfig._normalize_drift_max(5), 0.2))
+	# 只读镜像：前端不写它（save() 不落这个键），但手改过的值随 `_raw` 原样保留
+	_write_raw({"drift_max": 0.2, "drift_base": 0.1})
+	var cmir := AzureConfig.load_config(TMP)
+	cmir.drift_base = 0.1
+	cmir.save()
+	_check("save() 不写 drift_max（只读镜像）、手改过的原值原样保留",
+			is_equal_approx(float(_read_raw().get("drift_max", -1.0)), 0.2))
+
 	# 往返：读入 → 改动 → save() → 重新解析；开关两个方向都要能回来，未知键照旧原样保留
 	_write_raw({"emotion_drift": true, "drift_base": 0.05, "future_unknown_key": "保留我"})
 	var c8 := AzureConfig.load_config(TMP)

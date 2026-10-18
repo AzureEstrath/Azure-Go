@@ -17,12 +17,21 @@ var joseki_rate := 0.5            # 定式提示频率（0~1，与开关同一�
 ## 默认关；关掉=行为零变化（恒走最优解、不掷骰、不记事件）。开关与参数同在 ⚙ 设置抽屉的一格里。
 var emotion_drift := false
 var drift_base := 0.03            # 偏航的基础概率（0~1，与开关同一格）；关闭档不动它，重新开启时概率能回来
+## `drift_max` 的**只读镜像**（v3.9.0 / R-P3-4 彻底收口）：从 `config.json` 读、默认 `0.08`、脏值 → 默认。
+## 前端**不写它、不推它**（`save()` 不落这个键、`/api/config` 也不发），只拿它当 `drift_base` 的
+## 夹取上限；手改过的值随 `_raw` 原样保留。这样手改 `drift_max` 时两端读到的上限始终一致。
+var drift_max := 0.08
 const DRIFT_BASE_DEFAULT := 0.03  # 与 `AzureConfig.drift_base` 的字段默认 / 后端 `config.drift_base` 一致
-## `drift_base` 的**上限**（v3.8.0 修复波 / #4）：与后端 `config.drift_max` 的默认一致。
-## 后端 `_apply` 把 `drift_base` 夹到 `min(值, drift_max)`（`drift_max` 默认 0.08、另夹到 0.2）；
-## 客户端过去只夹到 `[0, 1]`，于是手改 `config.json` 写 `drift_base: 0.5` 时**前端留 0.5、后端是 0.08**
-## —— 两端读到的不是同一个值（前端还会把它经 `/api/config` 推给后端）。这里对齐到同一个上限。
+## `drift_base` 的**缺省上限**（v3.8.0 修复波 / #4）：＝后端 `config.drift_max` 的默认（0.08）。
+## 后端 `_apply` 把 `drift_base` 夹到 `min(值, drift_max)`、`drift_max` 另夹到 0.2；客户端过去
+## 只夹到 `[0, 1]`，于是手改 `config.json` 写 `drift_base: 0.5` 时**前端留 0.5、后端是 0.08**。
+## v3.9.0 起上限改读只读镜像 `drift_max`（见上），这个常量降级为「`drift_max` 缺省时的默认值」。
 const DRIFT_BASE_LIMIT := 0.08
+## `drift_max` 的默认（与后端 `config.drift_max` 一致）：镜像缺键 / 脏值时用它。
+const DRIFT_MAX_DEFAULT := 0.08
+## 后端配置层给 `drift_max` 的另一道上限（`config.DRIFT_MAX_LIMIT = 0.2`）：镜像也照此夹，
+## 免得手改一个 `5.0` 时前端留 `5.0`、后端却只认 `0.2`。
+const DRIFT_MAX_LIMIT := 0.2
 ## 聊天摘要用 LLM（v3.8.0）：默认关——聊天摘要走**规则式**（纯函数分段 + 模板摘要）、**零额外 LLM 调用**；
 ## 开启后**只在局末 / 空闲**用 LLM 分段总结（落子回合内绝不加调用）。开关在 ⚙ 设置抽屉里。
 var chat_digest_llm := false
@@ -86,7 +95,8 @@ static func load_config(path := "") -> AzureConfig:
 			c.joseki_teach = bool(d.get("joseki_teach", c.joseki_teach))
 			c.joseki_rate = _normalize_joseki_rate(d.get("joseki_rate", c.joseki_rate))
 			c.emotion_drift = _normalize_flag(d.get("emotion_drift"), c.emotion_drift)
-			c.drift_base = _normalize_drift_base(d.get("drift_base", c.drift_base))
+			c.drift_max = _normalize_drift_max(d.get("drift_max", c.drift_max))
+			c.drift_base = _normalize_drift_base(d.get("drift_base", c.drift_base), c.drift_max)
 			c.chat_digest_llm = _normalize_flag(d.get("chat_digest_llm"), c.chat_digest_llm)
 			c.profile_enabled = _normalize_flag(d.get("profile_enabled"), c.profile_enabled)
 			c.time_aware_enabled = _normalize_flag(d.get("time_aware_enabled"), c.time_aware_enabled)
@@ -160,24 +170,42 @@ static func _normalize_flag(v, fallback: bool) -> bool:
 	return v if typeof(v) == TYPE_BOOL else fallback
 
 ## 偏航基础概率归一化：与 `joseki_rate` **同一套守卫**（数值 / 字符串共用判据、NaN ⇒ 默认 0.03、
-## 脏值不把启动搞崩），但**夹取上限不同**：夹到 `[0, DRIFT_BASE_LIMIT]`（＝后端 `drift_max` 默认），
-## 让两端读到同一个值（v3.8.0 修复波 / #4）。
-static func _normalize_drift_base(v) -> float:
+## 脏值不把启动搞崩），但**夹取上限不同**：夹到 `[0, limit]`（`limit` 缺省＝`DRIFT_MAX_DEFAULT`，
+## 生产路径传只读镜像 `drift_max`），让两端读到同一个值（v3.8.0 修复波 / #4 → v3.9.0 镜像化）。
+static func _normalize_drift_base(v, limit := DRIFT_MAX_DEFAULT) -> float:
 	match typeof(v):
 		TYPE_INT, TYPE_FLOAT:
-			return _clamp_drift_base(float(v))
+			return _clamp_drift_base(float(v), limit)
 		TYPE_STRING:
 			var s := (v as String).strip_edges()
-			return _clamp_drift_base(s.to_float()) if s.is_valid_float() else DRIFT_BASE_DEFAULT
+			return _clamp_drift_base(s.to_float(), limit) if s.is_valid_float() else DRIFT_BASE_DEFAULT
 		TYPE_BOOL:
 			return 1.0 if v else 0.0
 		_:
 			return DRIFT_BASE_DEFAULT
 
-## 基础概率的唯一守卫：NaN ⇒ 默认 0.03（脏值不当成 0 或 1），其余夹到 `[0, DRIFT_BASE_LIMIT]`。
-## ⚠ 上限是 `DRIFT_BASE_LIMIT`（0.08，后端 `drift_max` 默认）而**不是 1.0**：见该常量的注释。
-static func _clamp_drift_base(f: float) -> float:
-	return DRIFT_BASE_DEFAULT if is_nan(f) else clampf(f, 0.0, DRIFT_BASE_LIMIT)
+## 基础概率的唯一守卫：NaN ⇒ 默认 0.03（脏值不当成 0 或 1），其余夹到 `[0, limit]`。
+## ⚠ 上限是 `limit`（只读镜像 `drift_max`，缺省 0.08）而**不是 1.0**：见 `DRIFT_BASE_LIMIT` 的注释。
+static func _clamp_drift_base(f: float, limit := DRIFT_MAX_DEFAULT) -> float:
+	return DRIFT_BASE_DEFAULT if is_nan(f) else clampf(f, 0.0, limit)
+
+## `drift_max` 只读镜像归一化（v3.9.0）：与 `drift_base` **同一套守卫**（数值 / 字符串共用判据、
+## NaN ⇒ 默认 0.08、脏值不把启动搞崩），上限是后端配置层的 `DRIFT_MAX_LIMIT`（0.2）。
+static func _normalize_drift_max(v) -> float:
+	match typeof(v):
+		TYPE_INT, TYPE_FLOAT:
+			return _clamp_drift_max(float(v))
+		TYPE_STRING:
+			var s := (v as String).strip_edges()
+			return _clamp_drift_max(s.to_float()) if s.is_valid_float() else DRIFT_MAX_DEFAULT
+		TYPE_BOOL:
+			return 1.0 if v else 0.0
+		_:
+			return DRIFT_MAX_DEFAULT
+
+## 镜像的唯一守卫：NaN ⇒ 默认 0.08，其余夹到 `[0, DRIFT_MAX_LIMIT]`（与后端 `_apply` 同形）。
+static func _clamp_drift_max(f: float) -> float:
+	return DRIFT_MAX_DEFAULT if is_nan(f) else clampf(f, 0.0, DRIFT_MAX_LIMIT)
 
 ## 写回配置文件（语音设置改动后调用，下次启动仍生效）
 func save() -> bool:
@@ -200,6 +228,7 @@ func save() -> bool:
 	d["joseki_rate"] = joseki_rate                 # 与开关同一格：关闭档也写回（重新开启时频率能回来）
 	d["emotion_drift"] = emotion_drift
 	d["drift_base"] = drift_base                   # 与开关同一格：关闭档也写回（重新开启时概率能回来）
+	# `drift_max` 是**只读镜像**（v3.9.0）：前端不写它、也不推它——手改过的值随 `_raw` 原样保留。
 	d["chat_digest_llm"] = chat_digest_llm        # 聊天摘要用 LLM（默认关）：单字段开关，写回即生效
 	d["profile_enabled"] = profile_enabled        # 玩家棋风画像（默认关）：与下面的时间感知同一格
 	d["time_aware_enabled"] = time_aware_enabled  # 时间感知（默认关）：两个字段一起原子推一次 `/api/config`
