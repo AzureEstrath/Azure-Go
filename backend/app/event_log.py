@@ -15,7 +15,10 @@
 import re
 import time
 
-# 五个已知类别（设计 §6.3）：她下错 / 玩家下坏 / 玩家下好 / 聊过天 / 定式
+# 五个已知类别（设计 §6.3）：她下错 / 玩家下坏 / 玩家下好 / 聊过天 / 定式。
+# **`joseki` 是预留**（当前无写入点）：`prompts._KIND_WORD` 已备好它的兜底说法，识别 / 门控侧
+# 现在不往事件表写这一类（定式走的是 `joseki` WS 事件与卡片，不是这张表）；保留取值以便将来接上，
+# 也不因它「没人写」而在读取侧做任何特判（本表不因 kind 陌生而丢事件）。
 EVENT_KINDS = ("ai_bad", "player_bad", "player_good", "chat", "joseki")
 
 _WS_RE = re.compile(r"\s+")
