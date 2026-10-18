@@ -149,7 +149,7 @@ class ProfileTimeSwitchTest(unittest.TestCase):
 
 
 class ProfileApiTest(unittest.TestCase):
-    """``GET /api/profile``（v3.9.0 / Q6）：**只读**，各维值 + 置信度 + 来源局；无画像 ⇒ 空结果、不 500。"""
+    """``GET /api/profile``（v3.9.0 / Q6）：**只读**，各维值 + 置信度 + 最近 N 局记录；无画像 ⇒ 空结果、不 500。"""
 
     def _app(self, tmp, seed=True):
         db = os.path.join(tmp, "profile.db")
@@ -191,10 +191,10 @@ class ProfileApiTest(unittest.TestCase):
                 self.assertEqual(r.json()["games"], [])
 
     def test_summarize_writes_the_profile_end_to_end(self):
-        """端到端（Q7）：开关打开 + 走真端点 ⇒ 结束后 ``GET /api/profile`` 里真的出现画像与来源局。
+        """端到端（Q7）：开关打开 + 走真端点 ⇒ 结束后 ``GET /api/profile`` 里真的出现画像与最近 N 局记录。
 
         这是「画像真的生效」的整链路证据：落子（采集）→ ``/api/summarize``（写记录 + 融合画像）
-        → 只读端点（各维 + 置信度 + 来源局）。全程零额外 LLM / 引擎调用（与 ``test_agent`` 的
+        → 只读端点（各维 + 置信度 + 最近 N 局记录）。全程零额外 LLM / 引擎调用（与 ``test_agent`` 的
         调用数断言成对）。
         """
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,7 +214,7 @@ class ProfileApiTest(unittest.TestCase):
                 self.assertIn("blunder.rate", body["axes"],
                               "玩家每一手都带 drop（0.0＝量过、没亏）⇒ 失误那一组也产出")
                 self.assertAlmostEqual(body["axes"]["blunder.rate"]["value"], 0.0, places=6)
-                self.assertEqual(len(body["games"]), 1, "来源局：这一局可追溯")
+                self.assertEqual(len(body["games"]), 1, "最近 N 局记录：这一局可追溯")
                 self.assertEqual(body["games"][0]["move_count"], 4)
 
     def test_broken_store_still_returns_an_empty_result(self):

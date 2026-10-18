@@ -25,7 +25,7 @@
     POST /api/memory/write  {tag?, text}    手动写一条长期记忆（关闭 / 空文本时被拒）
     GET  /api/memory/stats                  长期记忆体量（行数 / 归档数 / 向量数 / 库路径）
     POST /api/memory/forget {ids?}/{all}    忘掉指定或全部长期记忆
-    GET  /api/profile                       玩家棋风画像（只读：各维值 + 置信度 + 来源局）
+    GET  /api/profile                       玩家棋风画像（只读：各维值 + 置信度 + 最近 N 局记录）
     GET  /api/state                         当前棋盘权威快照
     GET  /api/health                        引擎/LLM/长期记忆状态
 
@@ -44,6 +44,7 @@ REST 应答统一返回 {"ok": bool, "state": <棋盘快照>}：命令是否被�
 from contextlib import asynccontextmanager
 
 import asyncio
+import sys
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
@@ -66,6 +67,26 @@ def _int(v, d=-1):
         return int(v)
     except (TypeError, ValueError):
         return d
+
+
+def _harden_stdout() -> None:
+    """把标准输出的**编码错误策略**改成 ``replace``（v3.9.0）：日志打不出某个字符时不再抛异常。
+
+    中文 Windows 的控制台 / 重定向文件是 cp936（``errors="strict"``），而日志里会带 emoji
+    （如台词原文的 ``📋``）：``print`` 一旦遇到装不下的字符就抛 ``UnicodeEncodeError``。这些
+    ``print`` 遍布在回合的调用链上——``llm.py`` 打服务商错误体、``profile_store.py`` /
+    ``joseki_progress.py`` / ``memory.py`` 的 ``print("[…] …%s" % e)``——异常一路冒到公开方法，
+    轻则丢一句日志、重则把整回合（连同写对局记录 / 画像融合）打挂。
+
+    **只改 ``errors``、不动编码**：终端该用什么编码还用什么编码，只是把打不出的字符替换成
+    ``?``，丢一个字符好过打挂一回合。带守卫：解释器 / 测试里被换过的 ``sys.stdout``（没有
+    ``reconfigure``）或已关闭的流一律跳过，绝不让加固本身变成新故障。只在启动路径调用一次。
+    """
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
+    except Exception:                       # noqa: BLE001 —— 加固失败不是故障，照常启动
+        pass
 
 
 # 画像面板（``GET /api/profile``）随各维一起带回来的**最近对局记录**条数（v3.9.0，设计 §6.4 / O20）。
@@ -214,8 +235,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                           "move_count": _int(r.get("move_count"), 0),
                           "result": str(r.get("result") or "")}
                          for r in rows if isinstance(r, dict)]
-            except Exception as e:              # noqa: BLE001 —— 来源局读不到不影响各维
-                print("[Profile] 来源局读取失败（返回空列表）：%s" % e)
+            except Exception as e:              # noqa: BLE001 —— 最近 N 局记录读不到不影响各维
+                print("[Profile] 最近 N 局记录读取失败（返回空列表）：%s" % e)
                 games = []
         return {"ok": True, "enabled": bool(getattr(s, "profile_enabled", False)),
                 "axes": axes, "games": games}
@@ -605,5 +626,6 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
+    _harden_stdout()                         # v3.9.0：日志编码不再把整回合打挂（见函数注释）
     print("Azure 后端启动...（KataGo 走云服务，LLM 走云端）")
     uvicorn.run(app, host="127.0.0.1", port=8000)

@@ -2006,7 +2006,7 @@ class GreetWithContextTest(unittest.TestCase):
         first, second = asyncio.run(run())
         self.assertIn("好几天", first, "三天没来 ⇒ 第二档模板")
         self.assertEqual(second, "", "只触发一次：跨重连不再重复")
-        msgs = bus.of_type("message")                       # kind 是 `ai_notice`（见下一条用例）
+        msgs = bus.messages(events.AI_NOTICE)               # v3.9.0：提醒按 kind 过滤，把「它是 ai_notice」钉住
         self.assertEqual(len(msgs), 1, "只推一条 message")
         self.assertEqual(msgs[0]["text"], first)
         self.assertEqual(llm.calls, [], "模板句：一条 LLM 调用都不新增")
@@ -2020,7 +2020,7 @@ class GreetWithContextTest(unittest.TestCase):
         """
         agent, _llm, bus = self._agent(time.time() - 3 * 86400.0)
         asyncio.run(agent.greet_with_context())
-        got = bus.of_type("message")
+        got = bus.messages(events.AI_NOTICE)
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]["kind"], events.AI_NOTICE, "必须声明「这条没有语音」")
         self.assertEqual(bus.of_type("speech"), [], "它一条 speech 都不发（与声明一致）")
@@ -2032,7 +2032,7 @@ class GreetWithContextTest(unittest.TestCase):
         """
         agent, _llm, bus = self._agent(None)                 # ① 没有历史对局
         self.assertEqual(asyncio.run(agent.greet_with_context()), "")
-        self.assertEqual(bus.of_type("message"), [])
+        self.assertEqual(bus.messages(events.AI_NOTICE), [])
         agent.profile_store = _WiringStore(last_ts=time.time() - 9 * 86400.0)
         self.assertIn("好久不见", asyncio.run(agent.greet_with_context()),
                       "上一次没说成，机会还在")
@@ -2042,7 +2042,7 @@ class GreetWithContextTest(unittest.TestCase):
         self.assertEqual(asyncio.run(agent2.greet_with_context()), "")
         agent2.profile_store = _WiringStore(last_ts=time.time() - 5 * 86400.0)
         self.assertIn("好几天", asyncio.run(agent2.greet_with_context()))
-        self.assertEqual(len(bus2.of_type("message")), 1)
+        self.assertEqual(len(bus2.messages(events.AI_NOTICE)), 1)
 
         # ③ 棋盘上已经有子（不是「刚连上」）同样不吃掉机会
         agent3, _l3, bus3 = self._agent(time.time() - 5 * 86400.0)
@@ -2051,25 +2051,25 @@ class GreetWithContextTest(unittest.TestCase):
         agent3.reset_game()                                  # 它自己会发一条「重新来吧」提示
         bus3.clear()
         self.assertIn("好几天", asyncio.run(agent3.greet_with_context()))
-        self.assertEqual(len(bus3.of_type("message")), 1)
+        self.assertEqual(len(bus3.messages(events.AI_NOTICE)), 1)
 
     def test_no_greeting_without_history_or_when_too_soon(self):
         # ① 没有历史对局（库是空的 / 未装配）
         agent, llm, bus = self._agent(None)
         self.assertEqual(asyncio.run(agent.greet_with_context()), "")
-        self.assertEqual(bus.of_type("message"), [])
+        self.assertEqual(bus.messages(events.AI_NOTICE), [])
         self.assertEqual(llm.calls, [])
         # ② 距上次不足一天：刚下过，别打扰
         agent2, _l2, bus2 = self._agent(time.time() - 3600.0)
         self.assertEqual(asyncio.run(agent2.greet_with_context()), "")
-        self.assertEqual(bus2.of_type("message"), [])
+        self.assertEqual(bus2.messages(events.AI_NOTICE), [])
 
     def test_no_greeting_when_a_game_is_already_on_the_board(self):
         """不是「刚连上」（棋盘上已经有子）⇒ 不打扰，也不吃掉这次机会之外的东西。"""
         agent, _llm, bus = self._agent(time.time() - 5 * 86400.0)
         agent.st.add_move("B", "Q16")
         self.assertEqual(asyncio.run(agent.greet_with_context()), "")
-        self.assertEqual(bus.of_type("message"), [])
+        self.assertEqual(bus.messages(events.AI_NOTICE), [])
 
     def test_store_failure_is_only_a_missing_greeting(self):
         """库坏了 ⇒ 当作「没有上次」：不抛、不发、不卡。"""
@@ -2081,7 +2081,7 @@ class GreetWithContextTest(unittest.TestCase):
         agent, _eng, llm, bus = _mk()
         agent.profile_store = Boom(last_ts=time.time() - 9 * 86400.0)
         self.assertEqual(asyncio.run(agent.greet_with_context()), "")
-        self.assertEqual(bus.of_type("message"), [])
+        self.assertEqual(bus.messages(events.AI_NOTICE), [])
         self.assertFalse(agent.busy)
         self.assertEqual(llm.calls, [])
 
@@ -2364,10 +2364,3 @@ class DedupLogEncodingTest(unittest.TestCase):
                              "两局都照常落盘——去重命中只是不打这句台词，不许打挂回合（丢记录）")
             self.assertTrue(all(g["summary"] == self.EMOJI for g in store.games()),
                             "记录里的总结仍是**原文**（只降级日志副本，不动台词）")
-
-
-
-
-
-
-
