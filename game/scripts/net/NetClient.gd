@@ -55,6 +55,8 @@ var _chat_in_flight := false
 ## 定式「开关 + 频率」批量写入中（v3.7.0 修复波）：期间两个 setter 都不各自推送，
 ## 由 `set_joseki()` 收尾统一推一次（见那里的注释）。
 var _joseki_batch := false
+## 情绪波动「开关 + 基础概率」批量写入中（v3.8.0）：与 `_joseki_batch` 同理。
+var _drift_batch := false
 var limit_len := false:
 	set(v):
 		limit_len = v
@@ -68,6 +70,16 @@ var joseki_rate := 0.5:
 	set(v):
 		joseki_rate = v
 		if not _joseki_batch:
+			_push_settings()
+var emotion_drift := false:
+	set(v):
+		emotion_drift = v
+		if not _drift_batch:
+			_push_settings()
+var drift_base := 0.03:
+	set(v):
+		drift_base = v
+		if not _drift_batch:
 			_push_settings()
 
 var _ws: WebSocketPeer = null
@@ -328,11 +340,21 @@ func set_joseki(teach: bool, rate: float) -> void:
 	_joseki_batch = false
 	_push_settings()
 
+## 情绪波动「开关 + 基础概率」**原子入口**（v3.8.0）：与 `set_joseki` 同一个理由与同一个做法——
+## 两个字段一次落定、**只推一次** `/api/config`（分两次赋 setter 会各推一条 POST，到达顺序无保证）。
+func set_drift(on: bool, base: float) -> void:
+	_drift_batch = true
+	emotion_drift = on
+	drift_base = base
+	_drift_batch = false
+	_push_settings()
+
 func _flush_settings() -> void:
 	if not _settings_dirty:
 		return
 	_settings_dirty = false
-	_post("/api/config", {"limit_len": limit_len, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate})
+	_post("/api/config", {"limit_len": limit_len, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate,
+		"emotion_drift": emotion_drift, "drift_base": drift_base})
 
 func _post(path: String, body: Dictionary = {}) -> void:
 	var req := HTTPRequest.new()

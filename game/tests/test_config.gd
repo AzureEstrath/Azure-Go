@@ -151,6 +151,53 @@ func _run() -> void:
 	_check("save() 写回 joseki_teach=false", not bool(out3.get("joseki_teach", true)))
 	_check("save() 未改动的 joseki_rate 原值不变", is_equal_approx(float(out3.get("joseki_rate", -1.0)), 0.5))
 
+	# —— 5) 情绪波动＝开关 + 基础概率（emotion_drift / drift_base，v3.8.0）——
+	# 口径与 `joseki` 那一格完全一致：键缺失 ⇒ 默认（false / 0.03）；脏值 ⇒ 0.03；越界 ⇒ 夹到 [0,1]。
+	_write_raw({})
+	var c7 := AzureConfig.load_config(TMP)
+	_check("emotion_drift 键缺失 ⇒ 默认 false", not c7.emotion_drift)
+	_check("drift_base 键缺失 ⇒ 默认 0.03", is_equal_approx(c7.drift_base, 0.03))
+
+	for bad in ["abc", null]:
+		_write_raw({"drift_base": bad})
+		var cd2 := AzureConfig.load_config(TMP)
+		_check("drift_base 脏值 %s ⇒ 0.03" % str(bad), is_equal_approx(cd2.drift_base, 0.03))
+	for pair in [[5.0, 1.0], [-1, 0.0]]:
+		_write_raw({"drift_base": pair[0]})
+		var cr2 := AzureConfig.load_config(TMP)
+		_check("drift_base 越界 %s ⇒ 夹到 %s" % [str(pair[0]), str(pair[1])],
+			is_equal_approx(cr2.drift_base, pair[1]))
+	for pair in [["0.08", 0.08], ["0.03", 0.03], ["nan", 0.03], ["1e308", 1.0]]:
+		_write_raw({"drift_base": pair[0]})
+		var cstr2 := AzureConfig.load_config(TMP)
+		_check("drift_base 字符串 \"%s\" ⇒ %s（与 joseki_rate 同一套守卫）" % [str(pair[0]), str(pair[1])],
+			is_equal_approx(cstr2.drift_base, pair[1]))
+	_check("drift_base 的 NaN / INF 口径与 joseki_rate 一致",
+			is_equal_approx(AzureConfig._normalize_drift_base(NAN), 0.03)
+			and is_equal_approx(AzureConfig._normalize_drift_base(INF), 1.0)
+			and is_equal_approx(AzureConfig._normalize_drift_base(5), 1.0))
+
+	# 往返：读入 → 改动 → save() → 重新解析；开关两个方向都要能回来，未知键照旧原样保留
+	_write_raw({"emotion_drift": true, "drift_base": 0.05, "future_unknown_key": "保留我"})
+	var c8 := AzureConfig.load_config(TMP)
+	_check("emotion_drift 读入 true", c8.emotion_drift)
+	_check("drift_base 读入 0.05", is_equal_approx(c8.drift_base, 0.05))
+	c8.emotion_drift = false
+	c8.drift_base = 0.08
+	_check("save() 写回情绪波动改动成功", c8.save())
+	var out4 := _read_raw()
+	_check("save() 写回 emotion_drift=false", not bool(out4.get("emotion_drift", true)))
+	_check("save() 写回改动后的 drift_base", is_equal_approx(float(out4.get("drift_base", -1.0)), 0.08))
+	_check("save() 写回情绪波动时仍保留未知键", out4.get("future_unknown_key", "") == "保留我")
+
+	_write_raw({"emotion_drift": false, "drift_base": 0.03})
+	var c9 := AzureConfig.load_config(TMP)
+	c9.emotion_drift = true
+	c9.save()
+	var out5 := _read_raw()
+	_check("save() 写回 emotion_drift=true", bool(out5.get("emotion_drift", false)))
+	_check("save() 未改动的 drift_base 原值不变", is_equal_approx(float(out5.get("drift_base", -1.0)), 0.03))
+
 	var da := DirAccess.open("user://")
 	if da != null:
 		da.remove("test_config_tmp.json")
@@ -177,6 +224,41 @@ func _run() -> void:
 	nc3.free()
 	nc2.free()
 	nc.free()
+
+	# —— 3) 情绪波动「开关 + 基础概率」原子推送（v3.8.0，与 `set_joseki` 同一条做法） ——
+	var nd := CountingNetClient.new()
+	nd.set_drift(true, 0.08)
+	_check("一次改情绪波动档位只推一次 /api/config（原子入口）", nd.pushes == 1)
+	_check("原子入口落定后两个字段都生效",
+			nd.emotion_drift and is_equal_approx(nd.drift_base, 0.08))
+	var nd2 := CountingNetClient.new()
+	nd2.emotion_drift = true
+	_check("单独赋 emotion_drift 仍推一次（setter 语义与 joseki 一致）", nd2.pushes == 1)
+	var nd3 := CountingNetClient.new()
+	nd3.drift_base = 0.05
+	_check("单独赋 drift_base 仍推一次（setter 语义与 joseki 一致）", nd3.pushes == 1)
+	var nd4 := CountingNetClient.new()
+	nd4.emotion_drift = true
+	nd4.drift_base = 0.05
+	_check("对照：分两次赋 setter 会推两次（原子入口因此必要）", nd4.pushes == 2)
+	nd4.free()
+	nd3.free()
+	nd2.free()
+	nd.free()
+
+	# —— 4) 情绪波动档位映射（Main.drift_level_index）：关闭 ⇒ 0，否则取最近的一档、并列取更保守的一档 ——
+	var m := preload("res://scripts/ui/Main.gd")
+	_check("drift_level_index：关闭档恒 0（基础概率是多少都一样）",
+			m.drift_level_index(false, 0.08) == 0 and m.drift_level_index(false, 0.0) == 0
+			and m.drift_level_index(false, NAN) == 0)
+	_check("drift_level_index：三档精确命中（0.03 ⇒ 1 / 0.05 ⇒ 2 / 0.08 ⇒ 3）",
+			m.drift_level_index(true, 0.03) == 1 and m.drift_level_index(true, 0.05) == 2
+			and m.drift_level_index(true, 0.08) == 3)
+	_check("drift_level_index：并列取更低的一档（0.04 在 1 与 2 之间 ⇒ 1）",
+			m.drift_level_index(true, 0.04) == 1)
+	_check("drift_level_index：越界 / 脏值不越界（0.0 ⇒ 1、5.0 ⇒ 3、NaN ⇒ 1，恒在 1..3）",
+			m.drift_level_index(true, 0.0) == 1 and m.drift_level_index(true, 5.0) == 3
+			and m.drift_level_index(true, NAN) == 1)
 
 	if _fail == 0:
 		print("[config] PASS：", _total, " 项断言全部通过")

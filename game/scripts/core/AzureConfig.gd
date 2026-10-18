@@ -13,6 +13,11 @@ const TTS_VOICE_DEFAULT := "中文女"
 var max_visits := 500
 var joseki_teach := true          # 定式导学：识别对局中走出的定式并讲解（右侧栏可关；关掉=行为零变化）
 var joseki_rate := 0.5            # 定式提示频率（0~1，与开关同一格）：门控的基础概率；关闭档不动它，重新开启时频率能回来
+## 情绪波动（v3.8.0）：小概率不走最优解、在 A/B/C 三条预测线里挑（越偏越少）。
+## 默认关；关掉=行为零变化（恒走最优解、不掷骰、不记事件）。开关与参数同在 ⚙ 设置抽屉的一格里。
+var emotion_drift := false
+var drift_base := 0.03            # 偏航的基础概率（0~1，与开关同一格）；关闭档不动它，重新开启时概率能回来
+const DRIFT_BASE_DEFAULT := 0.03  # 与 `AzureConfig.drift_base` 的字段默认 / 后端 `config.drift_base` 一致
 # —— 前后端架构 ——
 # 编排（KataGo / LLM / 定式 / 情绪）全部在后端服务进程，游戏只做渲染与语音，经 REST + WebSocket 通信
 var backend_url := "http://127.0.0.1:8000"   # 后端服务地址（WS 地址由其推导）
@@ -66,6 +71,8 @@ static func load_config(path := "") -> AzureConfig:
 			c.max_visits = int(d.get("max_visits", c.max_visits))
 			c.joseki_teach = bool(d.get("joseki_teach", c.joseki_teach))
 			c.joseki_rate = _normalize_joseki_rate(d.get("joseki_rate", c.joseki_rate))
+			c.emotion_drift = bool(d.get("emotion_drift", c.emotion_drift))
+			c.drift_base = _normalize_drift_base(d.get("drift_base", c.drift_base))
 			c.backend_url = str(d.get("backend_url", c.backend_url))
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
@@ -129,6 +136,24 @@ static func _normalize_joseki_rate(v) -> float:
 static func _clamp_rate(f: float) -> float:
 	return 0.5 if is_nan(f) else clampf(f, 0.0, 1.0)
 
+## 偏航基础概率归一化：与 `joseki_rate` **同一套守卫与同一条口径**（数值 / 字符串共用判据、
+## NaN ⇒ 默认 0.03、其余夹到 [0,1]、脏值不把启动搞崩）。后端 `config._apply` 也是这么读的。
+static func _normalize_drift_base(v) -> float:
+	match typeof(v):
+		TYPE_INT, TYPE_FLOAT:
+			return _clamp_drift_base(float(v))
+		TYPE_STRING:
+			var s := (v as String).strip_edges()
+			return _clamp_drift_base(s.to_float()) if s.is_valid_float() else DRIFT_BASE_DEFAULT
+		TYPE_BOOL:
+			return 1.0 if v else 0.0
+		_:
+			return DRIFT_BASE_DEFAULT
+
+## 基础概率的唯一守卫：NaN ⇒ 默认 0.03（脏值不当成 0 或 1），其余夹到 [0,1]（与 `_clamp_rate` 同形）。
+static func _clamp_drift_base(f: float) -> float:
+	return DRIFT_BASE_DEFAULT if is_nan(f) else clampf(f, 0.0, 1.0)
+
 ## 写回配置文件（语音设置改动后调用，下次启动仍生效）
 func save() -> bool:
 	if _path == "":
@@ -148,6 +173,8 @@ func save() -> bool:
 	d["max_visits"] = max_visits
 	d["joseki_teach"] = joseki_teach
 	d["joseki_rate"] = joseki_rate                 # 与开关同一格：关闭档也写回（重新开启时频率能回来）
+	d["emotion_drift"] = emotion_drift
+	d["drift_base"] = drift_base                   # 与开关同一格：关闭档也写回（重新开启时概率能回来）
 	d.erase("backend_mode")                       # 只剩「连后端」一条路径：旧配置里的 backend_mode 不再写回
 	d["backend_url"] = backend_url
 	d["llm_base_url"] = llm_base_url

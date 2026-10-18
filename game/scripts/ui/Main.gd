@@ -114,8 +114,9 @@ var _status_bad := false                       # 状态栏当前是不是错误�
 var _tool_active := false                      # 工具进度是否在跑（start/end 成对，避免重复记原文案）
 var _chk_pass: CheckBox
 var _joseki_opt: OptionButton                     # 定式导学＝「开关 + 频率」一格（关闭 / 低 25% / 中 50% / 高 75%）
+var _drift_opt: OptionButton                      # 情绪波动＝「开关 + 基础概率」一格（关闭 / 低 3% / 中 5% / 高 8%；在 ⚙ 设置抽屉里）
 var _btn_settings: Button                         # ⚙ 设置抽屉的开关
-var _settings_box: PanelContainer                 # ⚙ 设置抽屉本体（同步说话 / 整段合成 / 长句合并，默认收起）
+var _settings_box: PanelContainer                 # ⚙ 设置抽屉本体（情绪波动 / 同步说话 / 整段合成 / 长句合并，默认收起）
 var _bad_box: HBoxContainer
 var _chat_input: LineEdit
 var _lbl_queue: Label                           # 右下角那行「排队中 N 条 · 队头前几个字」（队列空则隐藏）
@@ -427,6 +428,20 @@ func _build_right_panel(root: Control) -> void:
 	var drawer := VBoxContainer.new()
 	drawer.add_theme_constant_override("separation", 6)
 	_settings_box.add_child(drawer)
+	# 情绪波动（v3.8.0）：**开关与参数同占一格**（spec 第五节 K：不新增右栏控件位）——一个下拉框
+	# 同时表达「关 / 低 3% / 中 5% / 高 8%」。改动即时写回 config.json 并推给后端（同 joseki 那条通道）。
+	_drift_opt = OptionButton.new()
+	_drift_opt.add_item("情绪波动：关闭", 0)
+	_drift_opt.add_item("情绪波动：低 3%", 1)
+	_drift_opt.add_item("情绪波动：中 5%", 2)
+	_drift_opt.add_item("情绪波动：高 8%", 3)
+	_drift_opt.tooltip_text = "开启后她**小概率**不走最优解：在三条预测线里挑一条（越偏越少），偶尔像人一样下偏。\n" \
+		+ "· 关闭 = 行为零变化（恒走最优解、不掷骰）\n" \
+		+ "· 档位 = 基础概率（心情越低落 / 好奇 / 激动，实际概率在基础值与 8% 之间浮动）\n" \
+		+ "· 偏得太远（胜率差超 5%）的线一律不用：宁可走最优解，也不下烂棋"
+	_drift_opt.selected = drift_level_index(cfg.emotion_drift, cfg.drift_base)   # 只显示，不回写 config.json
+	_drift_opt.item_selected.connect(_on_drift_level_selected)
+	drawer.add_child(_drift_opt)
 	_acc_check(drawer, "同步说话", cfg.tts_sync_speak, "sync",
 		"开启：Azure 的文字等语音就绪后一起显示（消除文字先出、声音晚到的割裂感）；关闭：文字立即显示")
 	_acc_check(drawer, "整段合成", cfg.tts_batch_speak, "batch",
@@ -1285,6 +1300,8 @@ func _refresh_lock() -> void:
 		_chk_pass.disabled = extra
 	if _joseki_opt != null:
 		_joseki_opt.disabled = extra
+	if _drift_opt != null:
+		_drift_opt.disabled = extra
 
 ## 界面的「冻结状态」：进复盘 / 她思考中 / 她还有话没播完，各自的冻结范围。
 ## 纯函数、不碰场景树 ⇒ 门卫可直接断言「进入复盘 ⇒ 冻结；退出 ⇒ 逐项回到进入前」（V11/V21）。
@@ -1569,6 +1586,8 @@ func _build_services() -> void:
 	agent.limit_len = cfg.tts_limit_len           # 转发给后端（连上后自动补发）
 	agent.joseki_teach = cfg.joseki_teach
 	agent.joseki_rate = cfg.joseki_rate         # 定式提示频率（与开关同一格）：同一通道推给后端
+	agent.emotion_drift = cfg.emotion_drift
+	agent.drift_base = cfg.drift_base           # 情绪波动的基础概率（与开关同一格）：同一通道推给后端
 	_wire_agent()
 	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
 
@@ -1866,6 +1885,25 @@ static func joseki_level_index(teach: bool, rate: float) -> int:
 			best = idx
 	return best
 
+## 情绪波动的三档基础概率（与下拉框 index-1 一一对应）：低 3% / 中 5% / 高 8%（上限由后端 `drift_max` 兜底）
+const DRIFT_BASES := [0.03, 0.05, 0.08]
+
+## 由 (开关, 基础概率) 反推下拉框档位：关闭 ⇒ 0；否则取最接近 `drift_base` 的一档，
+## **并列时取更低的那一档**（偏航宁可保守：这是「她可能下偏」的旋钮，不是玩法难度）。
+## 纯函数、不碰场景树（门卫可直接断言，V11 同款做法）。
+static func drift_level_index(on: bool, base: float) -> int:
+	if not on:
+		return 0
+	var best := 1                                 # 初始压在最低档：并列时它胜出
+	var best_d := INF
+	for i in DRIFT_BASES.size():
+		var d := absf(base - DRIFT_BASES[i])
+		var idx := i + 1
+		if d < best_d or (is_equal_approx(d, best_d) and idx < best):
+			best_d = d
+			best = idx
+	return best
+
 ## ⚙ 设置抽屉：只切可见性，不改任何开关的值（抽屉里的开关仍各自写回 config.json）
 func _on_settings_toggled(on: bool) -> void:
 	if _settings_box != null:
@@ -1890,6 +1928,23 @@ func _on_joseki_level_selected(i: int) -> void:
 		agent.set_joseki(teach, rate)
 	var names := ["关闭", "低 25%", "中 50%", "高 75%"]
 	_set_status("定式导学：%s" % names[lvl])
+
+## 情绪波动「开关 + 基础概率」下拉（⚙ 设置抽屉）：写回 config.json，再走既有 `_flush_settings` 通道推给
+## 后端，并对当前对局立即生效。「关闭」只关开关、**不动 drift_base**（重新开启时概率能回来）。
+func _on_drift_level_selected(i: int) -> void:
+	var lvl := clampi(i, 0, DRIFT_BASES.size())
+	var on := lvl > 0
+	var base: float = float(DRIFT_BASES[lvl - 1]) if on else cfg.drift_base
+	if on == cfg.emotion_drift and is_equal_approx(base, cfg.drift_base):
+		return                       # 程序化赋值也可能触发该信号：值没变就不写配置
+	cfg.emotion_drift = on
+	cfg.drift_base = base
+	cfg.save()
+	if agent != null:
+		# 原子入口（v3.8.0）：开关与基础概率**一次推一次** `/api/config`（与 `set_joseki` 同一个理由）
+		agent.set_drift(on, base)
+	var names := ["关闭", "低 3%", "中 5%", "高 8%"]
+	_set_status("情绪波动：%s" % names[lvl])
 
 func _send_chat() -> void:
 	var t := _chat_input.text
