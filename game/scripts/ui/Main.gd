@@ -109,7 +109,7 @@ var _status_before_tool_bad := false           # 原文案的错误色标记（e
 var _status_bad := false                       # 状态栏当前是不是错误色（_set_status 记录，上面那行取用）
 var _tool_active := false                      # 工具进度是否在跑（start/end 成对，避免重复记原文案）
 var _chk_pass: CheckBox
-var _chk_joseki: CheckBox
+var _joseki_opt: OptionButton                     # 定式导学＝「开关 + 频率」一格（关闭 / 低 25% / 中 50% / 高 75%）
 var _btn_settings: Button                         # ⚙ 设置抽屉的开关
 var _settings_box: PanelContainer                 # ⚙ 设置抽屉本体（同步说话 / 整段合成 / 长句合并，默认收起）
 var _bad_box: HBoxContainer
@@ -371,13 +371,21 @@ func _build_right_panel(root: Control) -> void:
 	_style_check(_chk_pass, "允许 Azure 虚着")
 	info.add_child(_chk_pass)
 
-	# 定式导学开关：识别你与 Azure 走出的定式（讲解 + 棋盘高亮手顺），改动即时写回 config.json
-	_chk_joseki = CheckBox.new()
-	_chk_joseki.button_pressed = cfg.joseki_teach
-	_chk_joseki.toggled.connect(_on_joseki_toggled)
-	_chk_joseki.tooltip_text = "识别对局中走出的定式：讲解要点、在棋盘上高亮手顺轨迹（关掉=不识别、不打扰）"
-	_style_check(_chk_joseki, "定式导学")
-	info.add_child(_chk_joseki)
+	# 定式导学：开关 + 频率合一（关闭 / 低 25% / 中 50% / 高 75%）。改动即时写回 config.json 并对当前对局生效。
+	# OptionButton 比原来的勾选框宽，单起一行——否则会把「手数 / 胜率 / 目差 / 允许虚着」那一行挤出面板。
+	var joseki_row := HBoxContainer.new()
+	vb.add_child(joseki_row)
+	_joseki_opt = OptionButton.new()
+	_joseki_opt.add_item("定式导学：关闭", 0)
+	_joseki_opt.add_item("定式导学：低 25%", 1)
+	_joseki_opt.add_item("定式导学：中 50%", 2)
+	_joseki_opt.add_item("定式导学：高 75%", 3)
+	_joseki_opt.tooltip_text = "识别对局中走出的定式：讲解要点、在棋盘上高亮手顺轨迹。\n" \
+		+ "· 关闭 = 不识别、不打扰\n" \
+		+ "· 低 25% / 中 50% / 高 75% = 有资格提示时按该概率提示（讲解与卡片只看「有没有资格」，不重复掷骰）"
+	_joseki_opt.selected = joseki_level_index(cfg.joseki_teach, cfg.joseki_rate)   # 只显示，不回写 config.json
+	_joseki_opt.item_selected.connect(_on_joseki_level_selected)
+	joseki_row.add_child(_joseki_opt)
 
 	# 语音开关：短回复（对局常用，留外面）；同步说话 / 整段合成 / 长句合并进 ⚙ 设置抽屉（默认收起，均立即生效）
 	var acc := HBoxContainer.new()
@@ -1254,8 +1262,8 @@ func _refresh_lock() -> void:
 				(c as Button).disabled = extra
 	if _chk_pass != null:
 		_chk_pass.disabled = extra
-	if _chk_joseki != null:
-		_chk_joseki.disabled = extra
+	if _joseki_opt != null:
+		_joseki_opt.disabled = extra
 
 ## 界面的「冻结状态」：进复盘 / 她思考中 / 她还有话没播完，各自的冻结范围。
 ## 纯函数、不碰场景树 ⇒ 门卫可直接断言「进入复盘 ⇒ 冻结；退出 ⇒ 逐项回到进入前」（V11/V21）。
@@ -1539,6 +1547,7 @@ func _build_services() -> void:
 	agent.setup()                                 # 占位：引擎/LLM 由后端持有
 	agent.limit_len = cfg.tts_limit_len           # 转发给后端（连上后自动补发）
 	agent.joseki_teach = cfg.joseki_teach
+	agent.joseki_rate = cfg.joseki_rate         # 定式提示频率（与开关同一格）：同一通道推给后端
 	_wire_agent()
 	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
 
@@ -1755,6 +1764,24 @@ func _on_allow_pass_toggled(pressed: bool) -> void:
 	pairing.mark_text_only()                 # 这条提示只有文字（后端同步方法，T20②）
 	agent.set_allow_pass(pressed)
 
+## 定式导学的四档频率（与下拉框 index-1 一一对应）：低 25% / 中 50% / 高 75%
+const JOSEKI_RATES := [0.25, 0.5, 0.75]
+
+## 由 (开关, 频率) 反推下拉框档位：关闭 ⇒ 0；否则取最接近 `joseki_rate` 的一档，
+## **并列时取「中 50%」**（两侧同时等距时优先中间档）。纯函数、不碰场景树（门卫可直接断言）。
+static func joseki_level_index(teach: bool, rate: float) -> int:
+	if not teach:
+		return 0
+	var best := 2                                 # 初始就压在「中 50%」上：并列时它胜出
+	var best_d := INF
+	for i in JOSEKI_RATES.size():
+		var d := absf(rate - JOSEKI_RATES[i])
+		var idx := i + 1
+		if d < best_d or (is_equal_approx(d, best_d) and absi(idx - 2) < absi(best - 2)):
+			best_d = d
+			best = idx
+	return best
+
 ## ⚙ 设置抽屉：只切可见性，不改任何开关的值（抽屉里的开关仍各自写回 config.json）
 func _on_settings_toggled(on: bool) -> void:
 	if _settings_box != null:
@@ -1762,13 +1789,22 @@ func _on_settings_toggled(on: bool) -> void:
 	if _btn_settings != null:
 		_btn_settings.text = "⚙ 设置 ▾" if on else "⚙ 设置 ▸"
 
-## 定式导学开关（右侧栏）：写回 config.json，并对当前对局立即生效
-func _on_joseki_toggled(pressed: bool) -> void:
-	cfg.joseki_teach = pressed
+## 定式导学「开关 + 频率」下拉（右侧栏）：写回 config.json，再走既有 `_flush_settings` 通道推给后端，
+## 并对当前对局立即生效。「关闭」只关开关、**不动 joseki_rate**（重新开启时频率能回来）。
+func _on_joseki_level_selected(i: int) -> void:
+	var lvl := clampi(i, 0, JOSEKI_RATES.size())
+	var teach := lvl > 0
+	var rate: float = float(JOSEKI_RATES[lvl - 1]) if teach else cfg.joseki_rate
+	if teach == cfg.joseki_teach and is_equal_approx(rate, cfg.joseki_rate):
+		return                       # 程序化赋值也可能触发该信号：值没变就不写配置
+	cfg.joseki_teach = teach
+	cfg.joseki_rate = rate
 	cfg.save()
 	if agent != null:
-		agent.joseki_teach = pressed
-	_set_status("定式导学已%s" % ("开启" if pressed else "关闭"))
+		agent.joseki_teach = teach
+		agent.joseki_rate = rate
+	var names := ["关闭", "低 25%", "中 50%", "高 75%"]
+	_set_status("定式导学：%s" % names[lvl])
 
 func _send_chat() -> void:
 	var t := _chat_input.text

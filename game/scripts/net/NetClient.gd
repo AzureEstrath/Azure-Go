@@ -60,6 +60,10 @@ var joseki_teach := true:
 	set(v):
 		joseki_teach = v
 		_push_settings()
+var joseki_rate := 0.5:
+	set(v):
+		joseki_rate = v
+		_push_settings()
 
 var _ws: WebSocketPeer = null
 var _opened_once := false
@@ -311,7 +315,7 @@ func _flush_settings() -> void:
 	if not _settings_dirty:
 		return
 	_settings_dirty = false
-	_post("/api/config", {"limit_len": limit_len, "joseki_teach": joseki_teach})
+	_post("/api/config", {"limit_len": limit_len, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate})
 
 func _post(path: String, body: Dictionary = {}) -> void:
 	var req := HTTPRequest.new()

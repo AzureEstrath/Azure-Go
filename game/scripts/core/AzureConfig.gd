@@ -12,6 +12,7 @@ const TTS_VOICE_DEFAULT := "中文女"
 
 var max_visits := 500
 var joseki_teach := true          # 定式导学：识别对局中走出的定式并讲解（右侧栏可关；关掉=行为零变化）
+var joseki_rate := 0.5            # 定式提示频率（0~1，与开关同一格）：门控的基础概率；关闭档不动它，重新开启时频率能回来
 # —— 前后端架构 ——
 # 编排（KataGo / LLM / 定式 / 情绪）全部在后端服务进程，游戏只做渲染与语音，经 REST + WebSocket 通信
 var backend_url := "http://127.0.0.1:8000"   # 后端服务地址（WS 地址由其推导）
@@ -64,6 +65,7 @@ static func load_config(path := "") -> AzureConfig:
 			c._raw = (d as Dictionary).duplicate()
 			c.max_visits = int(d.get("max_visits", c.max_visits))
 			c.joseki_teach = bool(d.get("joseki_teach", c.joseki_teach))
+			c.joseki_rate = _normalize_joseki_rate(d.get("joseki_rate", c.joseki_rate))
 			c.backend_url = str(d.get("backend_url", c.backend_url))
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
@@ -105,6 +107,22 @@ static func _normalize_tts_voice(v: String) -> String:
 	var s := v.strip_edges()
 	return TTS_VOICE_DEFAULT if s.to_lower() in LEGACY_TTS_VOICES else s
 
+## 定式频率归一化：**与后端 `config._apply` 同口径**——数值（含数字字符串）越界夹到 [0,1]；
+## 脏值（非数字 / null / 数组等）退回默认 0.5，不让一个旋钮把启动搞崩。JSON 的 true/false 按
+## Python `float(bool)` 的语义折成 1.0/0.0（后端也是这么算的）。
+static func _normalize_joseki_rate(v) -> float:
+	match typeof(v):
+		TYPE_INT, TYPE_FLOAT:
+			var f := float(v)
+			return 0.5 if is_nan(f) else clampf(f, 0.0, 1.0)
+		TYPE_STRING:
+			var s := (v as String).strip_edges()
+			return clampf(s.to_float(), 0.0, 1.0) if s.is_valid_float() else 0.5
+		TYPE_BOOL:
+			return 1.0 if v else 0.0
+		_:
+			return 0.5
+
 ## 写回配置文件（语音设置改动后调用，下次启动仍生效）
 func save() -> bool:
 	if _path == "":
@@ -123,6 +141,7 @@ func save() -> bool:
 	d.erase("katago_config")
 	d["max_visits"] = max_visits
 	d["joseki_teach"] = joseki_teach
+	d["joseki_rate"] = joseki_rate                 # 与开关同一格：关闭档也写回（重新开启时频率能回来）
 	d.erase("backend_mode")                       # 只剩「连后端」一条路径：旧配置里的 backend_mode 不再写回
 	d["backend_url"] = backend_url
 	d["llm_base_url"] = llm_base_url
