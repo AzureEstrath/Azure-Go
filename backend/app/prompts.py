@@ -7,9 +7,10 @@
 是后端长期记忆新增的，Godot 版没有；``long_term`` 为空串时输出仍与 Godot 版逐字符一致。
 """
 
+import json
 import math
 
-from . import coords, decay
+from . import coords, decay, profile
 from .board import GoBoard, SIZE as BOARD_SIZE
 
 # 事件区块的字符预算（设计 §5-I / §6.5）：与 ``memory_max_inject_chars``（240）同量级。
@@ -21,6 +22,10 @@ EVENT_BLOCK_MAX_CHARS = 240
 # （从渲染列表尾部往回丢），画像块丢**最低置信 / 最旧维度**（见各自函数）。
 TIME_MAX_CHARS = 240
 PROFILE_MAX_CHARS = 240
+
+# 局末进步报告的素材块（v3.9.0，设计 §五 G）：**并进现有 ``summarize()`` 提示词**、不新增调用。
+# 预算比注入块宽（它只在局末出现一次，且要容纳「本局记录 + 上一版印象」两段）。
+PROGRESS_MAX_CHARS = 400
 
 # 身份底座（personality / reply_style / think_preference 三段）
 SYSTEM_PROMPT = "\r\n".join([
@@ -759,6 +764,109 @@ def _budget_block(header, tail, lines, max_chars) -> str:
     if not kept:
         return ""
     return header + "\n".join(kept) + tail
+
+
+# ================= 局末进步报告素材（v3.9.0，设计 §五 G） =================
+#
+# **并进现有 ``summarize()`` 提示词**（多给模型「上一版画像 + 本局记录」素材），**不新增 LLM 调用**。
+# 空 ⇒ 返回 ``''``（提示词逐字符不变）。纯函数：零 LLM、零引擎、零磁盘。
+
+_PROGRESS_HEADER = "\n\n【本局记录与上一版印象 · 供你写进步报告时对照】\n"
+_PROGRESS_TAIL = ("\n（这些只是素材：讲这一局的进步 / 退步时对着它说，别逐条念、别把数字当口头禅，"
+                  "也别提起这份记录本身。）")
+
+
+def _name_list(raw) -> list:
+    """``joseki_families`` / ``chat_topics`` 这类「名字列表」→ 去重保序的字符串列表（脏值不抛）。
+
+    三种形状都认：``["a","b"]`` / ``[["a", 摘要], …]`` / ``{"a": n}``（取键）；JSON 文本先解析。
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:               # noqa: BLE001 —— 解析不出来就当没有
+            return []
+    out = []
+    if isinstance(raw, dict):
+        items = list(raw.keys())
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return []
+    for it in items:
+        if isinstance(it, (list, tuple)) and it:
+            name = str(it[0])
+        elif isinstance(it, dict):
+            name = str(it.get("topic", ""))
+        elif it is None:
+            continue
+        else:
+            name = str(it)
+        name = name.strip()
+        if name != "" and name not in out:
+            out.append(name)
+    return out
+
+
+def _progress_lines(rec) -> list:
+    """本局记录 → 素材行（**只读**那条记录，缺什么就不说；纯函数、不抛）。
+
+    失误那一行用与画像**同一套提取**（``profile.extract_axes``）：进步报告与画像块同源，
+    免得两处对「这一局亏了几手」各说各话。
+    """
+    if not isinstance(rec, dict) or not rec:
+        return []
+    out = []
+    n = _move_no(rec.get("move_count"))
+    bits = []
+    if n > 0:
+        bits.append("共 %d 手" % n)
+    wr = _num(rec.get("final_black_wr"), -1.0)
+    if 0.0 <= wr <= 1.0:
+        bits.append("最终黑方（他）胜率约 %d%%" % int(round(wr * 100.0)))
+    if "final_score" in rec:                # 没这一格就不说目差（别把缺键说成 0.0）
+        score = _num(rec.get("final_score"), 0.0)
+        if math.isfinite(score):
+            bits.append("目差 %+.1f" % score)
+    if bits:
+        out.append("本局" + "、".join(bits))
+    try:
+        axes = profile.extract_axes(rec)
+    except Exception:                   # noqa: BLE001 —— 提取失败就不说这一行
+        axes = {}
+    rate = _num(axes.get("blunder.rate"), -1.0)
+    if 0.0 <= rate <= 1.0:
+        if rate > 0.0:
+            kind = str(axes.get("blunder.top_type") or "").strip()
+            out.append("他本局约 %d%% 的手明显亏损%s"
+                       % (int(round(rate * 100.0)), ("，亏得最多的一手偏「%s」" % kind) if kind else ""))
+        else:
+            out.append("他本局没有明显亏损的一手")
+    fams = _name_list(rec.get("joseki_families"))
+    if fams:
+        out.append("本局走过的定式族：" + "、".join(fams[:6]))
+    topics = _name_list(rec.get("chat_topics"))
+    if topics:
+        out.append("本局聊过：" + "、".join(topics[:4]))
+    return out
+
+
+def progress_note(prev_profile, game_rec, max_chars=PROGRESS_MAX_CHARS) -> str:
+    """局末进步报告的素材块：**上一版画像 + 本局记录**；两者都空 / 预算放不下 ⇒ ``''``。
+
+    由 ``agent_graph._prepare_summary`` 拼进**现有** ``summarize()`` 提示词（``profile_enabled``
+    关着 / 没装配画像库时那两格素材根本不存在 ⇒ 提示词逐字符不变）。渲染顺序＝**本局记录在前、
+    上一版印象在后**，所以超预算时从尾部往回丢＝先丢「上一版印象」（本局记录更要紧）。
+    本函数是纯函数（零 LLM、零引擎、零磁盘）。
+    """
+    lines = _progress_lines(game_rec)
+    prev = _profile_items(prev_profile,
+                          _move_no(game_rec.get("move_count")) if isinstance(game_rec, dict) else 0)
+    if prev:
+        lines.append("上一版印象：" + "；".join(str(it["text"]) for it in prev))
+    if not lines:
+        return ""
+    return _budget_block(_PROGRESS_HEADER, _PROGRESS_TAIL, lines, max_chars)
 
 
 def profile_note(profile, now_move_no, max_chars=PROFILE_MAX_CHARS) -> str:

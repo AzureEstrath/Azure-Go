@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app import events
 from app.agent import AzureAgent
 from app.joseki_progress import JosekiProgress
+from app.profile_store import ProfileStore
 from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM, ZeroRng
 from helpers import FixedRng, PvStubEngine
 from helpers import mk_agent as _mk
@@ -2054,6 +2055,215 @@ class GreetWithContextTest(unittest.TestCase):
             return len(llm.calls), len(eng.calls)
 
         self.assertEqual(asyncio.run(run(True)), asyncio.run(run(False)))
+
+
+# —— 以下为阶段四 · Q7（v3.9.0）追加：局末进步报告 + 写对局记录与画像 ——
+
+
+class _LossEngine(StubEngine):
+    """玩家落子**之后**胜率明显下滑的假引擎（黑方视角 0.5 → 0.2 ⇒ ``drop`` 0.3 > 0.10）。
+
+    只改「玩家落子后局面」那一次（``len(moves) == 1``）的 ``rootInfo``：KataGo 的 ``rootInfo`` 是
+    **行棋方（白）**视角，1 手时 ``to_black_perspective`` 会翻成 ``1 - 0.8 = 0.2``。
+    """
+
+    async def analyze(self, moves, max_visits=None):
+        out = await super().analyze(moves, max_visits)
+        if len(moves) == 1:
+            out["rootInfo"] = {"winrate": 0.8, "scoreLead": 0.0}
+        return out
+
+
+class GameRecordWriteTest(unittest.TestCase):
+    """v3.9.0（Q7）：``summarize()`` 里落一条对局记录 + 融合后的画像；关着 / 坏了都不影响对局。"""
+
+    REC_KEYS = {"id", "ts", "move_count", "final_black_wr", "final_score", "result",
+                "moves", "per_move_ms", "joseki_families", "chat_topics", "summary"}
+
+    @staticmethod
+    def _agent(store=None, enabled=True, engine=None):
+        agent, _eng, llm, bus = _mk()
+        agent.katago = engine if engine is not None else _LossEngine()
+        agent.profile_store = store
+        agent.profile_enabled = enabled
+        return agent, llm, bus
+
+    @staticmethod
+    def _summary_prompt(llm):
+        """最后那条「对局总结」提示（按正文特征挑出来，避免依赖调用序号）。"""
+        for msgs, _mt, _nt in reversed(llm.calls):
+            joined = "\n".join(str(m.get("content", "")) for m in msgs)
+            if "对局结束，共" in joined:
+                return joined
+        return ""
+
+    def test_summary_writes_the_record_and_merges_the_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(os.path.join(tmp, "profile.db"))
+            agent, llm, _bus = self._agent(store)
+
+            async def run():
+                await agent.player_move(3, 3)          # 玩家 D16（真亏 30%）
+                await agent.summarize("随便聊聊")
+
+            asyncio.run(run())
+            games = store.games()
+            self.assertEqual(len(games), 1, "手动结束 ⇒ 落一条对局记录（只增不减）")
+            rec = games[0]
+            self.assertEqual(set(rec), self.REC_KEYS, "键名照 spec §6.1（外加存储层的 id）")
+            self.assertEqual(rec["move_count"], 2)
+            self.assertGreater(rec["ts"], 0.0)
+            self.assertIn("胜率", rec["result"])
+            self.assertEqual(rec["summary"], llm.text, "真总结写进记录")
+            self.assertEqual(rec["per_move_ms"], [], "只有一手玩家落子 ⇒ 没有间隔（首手不计）")
+            self.assertEqual(rec["joseki_families"], [], "本局没识别出定式族")
+            self.assertEqual(rec["chat_topics"], [], "本局没聊过天")
+            # ``moves`` 的每条都带 color / gtp；**玩家（黑）的每一条带 drop**（Q2 的唯一信号源）
+            self.assertEqual([m["color"] for m in rec["moves"]], ["B", "W"])
+            for m in rec["moves"]:
+                self.assertIn("gtp", m)
+            self.assertAlmostEqual(rec["moves"][0]["drop"], 0.3, places=6, msg="真亏手填进 drop")
+            self.assertNotIn("drop", rec["moves"][1], "她那一侧不填 drop（不进玩家画像）")
+            # 画像：有 drop 信号 ⇒ 失误那一组也产出；开局偏好照旧
+            prof = store.get_profile()
+            self.assertAlmostEqual(prof["blunder.rate"]["value"], 1.0, places=6)
+            self.assertEqual(prof["blunder.rate"]["n_games"], 1)
+            self.assertIn("blunder.top_type", prof)
+            self.assertAlmostEqual(prof["open.star"]["value"], 1.0, places=6, msg="D16 在角上＝星位")
+
+    def test_no_drop_signal_still_marks_the_player_moves_as_measured(self):
+        """没有真亏手时，玩家每一手仍然带 ``drop: 0.0``——「量过、没亏」也是信号。
+
+        否则 ``extract_axes`` 的 ``_has_drop_data`` 会判成「本局没有失误信号」，
+        ``blunder.rate`` 永远不产出，「他很少下出明显亏损的棋」这句话也就永远学不到。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(os.path.join(tmp, "profile.db"))
+            agent, _llm, _bus = self._agent(store, engine=StubEngine())
+
+            async def run():
+                await agent.player_move(3, 15)          # D4：在她算的第二候选 ⇒ 不亏
+                await agent.summarize("")
+
+            asyncio.run(run())
+            rec = store.games()[0]
+            self.assertEqual(rec["moves"][0]["drop"], 0.0)
+            prof = store.get_profile()
+            self.assertAlmostEqual(prof["blunder.rate"]["value"], 0.0, places=6)
+
+    def test_nothing_is_written_when_the_switch_is_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(os.path.join(tmp, "profile.db"))
+            agent, _llm, _bus = self._agent(store, enabled=False)
+
+            async def run():
+                await agent.player_move(3, 3)
+                await agent.summarize("")
+
+            asyncio.run(run())
+            self.assertEqual(store.games(), [], "开关关着 ⇒ 一条记录都不写")
+            self.assertEqual(store.get_profile(), {}, "开关关着 ⇒ 画像不更新")
+
+    def test_summarize_calls_the_model_the_same_number_of_times(self):
+        """进步报告**并进现有** ``summarize()`` 提示词：LLM / 引擎调用数与改动前一致。"""
+
+        async def run(enabled):
+            with tempfile.TemporaryDirectory() as tmp:
+                agent, _llm, _bus = self._agent(ProfileStore(os.path.join(tmp, "profile.db")),
+                                                enabled=enabled)
+                await agent.player_move(3, 3)
+                await agent.summarize("")
+                return len(agent.llm.calls), len(agent.katago.calls)
+
+        on = asyncio.run(run(True))
+        off = asyncio.run(run(False))
+        self.assertEqual(on, off, "开关打开不新增任何 LLM / 引擎调用")
+
+    def test_progress_block_lands_in_the_summary_prompt_and_off_is_identical(self):
+        async def run(enabled, store):
+            agent, llm, _bus = self._agent(store, enabled=enabled)
+            await agent.player_move(3, 3)
+            await agent.summarize("")
+            return self._summary_prompt(llm)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(os.path.join(tmp, "profile.db"))
+            on = asyncio.run(run(True, store))
+            off = asyncio.run(run(False, store))
+        control = asyncio.run(run(False, None))
+        self.assertIn("【本局记录与上一版印象", on, "开关打开 ⇒ 素材真的进了发给模型的提示词")
+        self.assertIn("共 2 手", on)
+        self.assertEqual(off, control, "开关关着 ⇒ 与没有这个功能逐字符一致")
+        self.assertNotIn("【本局记录与上一版印象", off)
+        self.assertNotIn("【本局记录与上一版印象", control)
+
+    def test_the_previous_profile_is_the_merge_basis(self):
+        """第二局的进步报告素材里要出现**上一版印象**，且新画像在旧画像上继续融合。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(os.path.join(tmp, "profile.db"))
+
+            async def run():
+                agent, llm, _bus = self._agent(store, engine=StubEngine())
+                llm.text = "第一局的总结。"               # 两局用不同台词，避开去重窗口（见报告里的取舍）
+                await agent.player_move(3, 15)          # 第一局：D4（星位那一带）
+                await agent.summarize("")
+                first = store.get_profile()
+                agent.reset_game()                      # 同步方法：新一局（记录与画像照旧留着）
+                agent.katago = _LossEngine()
+                llm.text = "第二局的总结。"
+                await agent.player_move(3, 3)           # 第二局：D16，真亏一手
+                await agent.summarize("")
+                return first, self._summary_prompt(llm), store
+
+            first, prompt, store = asyncio.run(run())
+            self.assertIn("【本局记录与上一版印象", prompt)
+            self.assertIn("上一版印象", prompt)
+            self.assertIn("开局爱走「星位」", prompt, "上一版画像真的被喂给了模型")
+            second = store.get_profile()
+            self.assertEqual(second["open.star"]["n_games"], 2, "同维继续累加样本数")
+            self.assertGreaterEqual(len(store.games()), 2, "两局两条记录")
+
+    def test_write_failure_keeps_the_turn_alive(self):
+        """库坏了 ⇒ 只打日志：总结照常出话、``busy`` 归位（本项目最严重的故障形态不许发生）。"""
+
+        class Boom:
+            def get_profile(self):
+                raise RuntimeError("库坏了")
+
+            def add_game(self, rec):
+                raise RuntimeError("库坏了")
+
+            def upsert_axes(self, axes):
+                raise RuntimeError("库坏了")
+
+        agent, _llm, bus = self._agent(Boom())
+
+        async def run():
+            await agent.player_move(3, 3)
+            await agent.summarize("")
+
+        asyncio.run(run())
+        self.assertFalse(agent.busy, "写入故障绝不许把棋盘锁死")
+        self.assertTrue(any("📋 对局总结" in m["text"] for m in bus.messages(events.AI)))
+
+    def test_llm_failure_still_records_the_game_without_a_summary(self):
+        """云端总结失败 ⇒ 记录照写（这一局确实下完了），但 ``summary`` 留空——兜底台词不是总结。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(os.path.join(tmp, "profile.db"))
+            agent, _llm, bus = self._agent(store)
+            agent.llm = ErrLLM()                        # 真实失败形态：返回「调用出错：…」文案（不抛）
+
+            async def run():
+                await agent.player_move(3, 3)
+                await agent.summarize("")
+
+            asyncio.run(run())
+            self.assertFalse(agent.busy)
+            games = store.games()
+            self.assertEqual(len(games), 1, "总结失败也是「这一局结束了」：记录照写")
+            self.assertEqual(games[0]["summary"], "", "兜底台词不写进记录")
+            self.assertGreater(games[0]["move_count"], 0)
+
 
 
 

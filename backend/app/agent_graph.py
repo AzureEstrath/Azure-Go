@@ -684,8 +684,19 @@ async def _prepare_summary(agent, data):
     # 终局情绪：她赢下（黑方胜率 < 0.5）平和地开心，输了则有点低落
     agent._mood_event("summary_win" if final_wr < 0.5 else "summary_lose")
     seq = " → ".join(str(s) for s in agent.st.move_seq)
-    prompt = "对局结束，共%d手。\n序列：%s\n最终黑胜率：%s，目差：%s\nEstarth备注：%s\n\n写总结：1.对局回顾 2.给Estarth的改进建议 2-3条 3.你的心情\n用Azure口吻，150-250字，慵懒真诚。" % (
-        n, seq, agent._pct(final_wr), "%+.1f" % final_score, note)
+    # —— v3.9.0（Q7）：局末进步报告的素材 + 本局记录（只在 profile_enabled 且装配了库时做）——
+    #    ``rec`` 同时就是稍后要落盘的那一条（``summary`` 由 ``summarize()`` 拿到原文后补）；
+    #    ``profile_prev`` 是**这一局之前**的画像——进步报告拿它当对照，也是 ``merge`` 的基准
+    #    （两处用同一份快照，模型看到的与融合的基准不会打架）。开关关着 ⇒ 两格都不存在 ⇒ 空块。
+    block = ""
+    if bool(getattr(agent, "profile_enabled", False)) and getattr(agent, "profile_store", None) is not None:
+        rec = agent._game_record(final_wr, final_score)
+        data["game_rec"] = rec
+        prev = await asyncio.to_thread(agent.profile_facts)   # 已自带降级（关着 / 读失败 ⇒ {}）
+        data["profile_prev"] = prev
+        block = prompts.progress_note(prev, rec)
+    prompt = "对局结束，共%d手。\n序列：%s\n最终黑胜率：%s，目差：%s\nEstarth备注：%s%s\n\n写总结：1.对局回顾 2.给Estarth的改进建议 2-3条 3.你的心情\n用Azure口吻，150-250字，慵懒真诚。" % (
+        n, seq, agent._pct(final_wr), "%+.1f" % final_score, note, block)
     data["wr"] = final_wr
     data["score"] = final_score
     profile, time_facts = await _ctx_extras(agent, data)

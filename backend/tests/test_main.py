@@ -189,6 +189,33 @@ class ProfileApiTest(unittest.TestCase):
                 self.assertEqual(r.json()["axes"], {}, "空库 ⇒ 空画像（不是 500）")
                 self.assertEqual(r.json()["games"], [])
 
+    def test_summarize_writes_the_profile_end_to_end(self):
+        """端到端（Q7）：开关打开 + 走真端点 ⇒ 结束后 ``GET /api/profile`` 里真的出现画像与来源局。
+
+        这是「画像真的生效」的整链路证据：落子（采集）→ ``/api/summarize``（写记录 + 融合画像）
+        → 只读端点（各维 + 置信度 + 来源局）。全程零额外 LLM / 引擎调用（与 ``test_agent`` 的
+        调用数断言成对）。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = AzureConfig()
+            cfg.profile_db_path = os.path.join(tmp, "profile.db")
+            cfg.profile_enabled = True
+            with TestClient(create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(),
+                                       autostart=False)) as client:
+                self.assertTrue(client.post("/api/move", json={"x": 3, "y": 3}).json()["ok"])
+                self.assertTrue(client.post("/api/move", json={"x": 15, "y": 15}).json()["ok"])
+                self.assertTrue(client.post("/api/summarize", json={"note": ""}).json()["ok"])
+
+                body = client.get("/api/profile").json()
+                self.assertTrue(body["enabled"])
+                self.assertIn("open.star", body["axes"], "两手的开局偏好真的攒下来了")
+                self.assertAlmostEqual(body["axes"]["open.star"]["value"], 1.0, places=6)
+                self.assertIn("blunder.rate", body["axes"],
+                              "玩家每一手都带 drop（0.0＝量过、没亏）⇒ 失误那一组也产出")
+                self.assertAlmostEqual(body["axes"]["blunder.rate"]["value"], 0.0, places=6)
+                self.assertEqual(len(body["games"]), 1, "来源局：这一局可追溯")
+                self.assertEqual(body["games"][0]["move_count"], 4)
+
     def test_broken_store_still_returns_an_empty_result(self):
         """库不可用（父路径是个文件 ⇒ sqlite 打不开）⇒ 照旧 200 + 空结果（与记忆管理面同一套口径）。"""
         with tempfile.TemporaryDirectory() as tmp:

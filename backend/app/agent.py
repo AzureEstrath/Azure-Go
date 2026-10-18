@@ -15,7 +15,7 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import coords, events, joseki_gate, prompt_chains, prompts, pv_lines, time_ctx
+from . import coords, events, joseki_gate, profile, prompt_chains, prompts, pv_lines, time_ctx
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, is_joseki_mistake, _emit_line,
@@ -1499,6 +1499,127 @@ class AzureAgent:
             print("[Agent] 画像读取异常（按「无画像」降级）：%s" % e)
             return {}
 
+    # ================= 对局记录与画像写入（v3.9.0，设计 §6.1 / §五 G） =================
+    #
+    # **写入点只有一处**：``summarize()``（手动结束对局）成功跑完那一回合之后。素材由
+    # ``agent_graph._prepare_summary`` 备在 ``state["data"]`` 里（``game_rec`` / ``profile_prev``）
+    # ——``profile_enabled`` 关着 / 未装配画像库时那两格根本不存在，这里什么都不做。
+    # 两次同步库操作一律 ``await asyncio.to_thread``；任何故障只打日志、绝不影响对局。
+
+    def _game_record(self, final_black_wr=0.5, final_score=0.0) -> dict:
+        """组装本局的对局记录（spec §6.1 的键）；**纯内存、零 IO、零调用**。
+
+        ``moves`` 的每条都带 ``color`` / ``gtp``，**玩家（黑）的每一条还带 ``drop``**
+        （``0.0``＝量过、没亏；``> 0.10``＝真亏手）——这是 Q2 的 ``blunder.*`` / ``weak.corner_*``
+        的**唯一信号源**，数据源就是 ``st.losses``（与俗手判定同源、只收 ``drop > 0.10``，
+        且只收玩家那一手）。**只给玩家那一侧填 ``drop``**：Azure 自己的手不参与玩家的画像。
+
+        ``ts`` 不在这里填：由 ``ProfileStore.add_game`` 按**落盘那一刻**的墙钟补
+        （记录与画像的「局末」以写入时刻为准，与 ``games`` 表只增不减的语义一致）。
+        ``summary`` 留空串，由 ``summarize()`` 在拿到总结原文后补（兜底台词不写进去）。
+        """
+        losses = {}
+        for ls in self.st.losses:
+            if not isinstance(ls, dict):
+                continue
+            try:
+                losses[int(ls.get("move_no", -1))] = float(ls.get("drop", 0.0))
+            except (TypeError, ValueError):
+                continue
+        moves = []
+        for i, m in enumerate(self.st.moves, start=1):
+            if not isinstance(m, (list, tuple)) or len(m) < 2:
+                continue
+            color = str(m[0])
+            item = {"color": color, "gtp": str(m[1])}
+            if color == "B":                    # 玩家：每一手都带 drop（0.0＝量过、没亏）
+                item["drop"] = float(losses.get(i, 0.0))
+            moves.append(item)
+        return {
+            "move_count": len(self.st.moves),
+            "final_black_wr": float(final_black_wr),
+            "final_score": float(final_score),
+            "result": "黑方（%s）胜率 %s，目差 %s" % (prompts.user_name, self._pct(final_black_wr),
+                                                     "%+.1f" % float(final_score)),
+            "moves": moves,
+            "per_move_ms": self._per_move_ms(),
+            "joseki_families": self._joseki_families_played(),
+            "chat_topics": chat_topics(self.st.chat_history),
+            "summary": "",
+        }
+
+    def _per_move_ms(self) -> list:
+        """相邻两次「玩家这一手到达」的间隔（毫秒）；**首手无前一手 ⇒ 不计**（与单手用时同口径）。
+
+        纯内存、脏时刻逐条忽略；``reset_game`` 清空 ``move_ts_list``（新一局重新计）。
+        """
+        ts = []
+        for t in self.move_ts_list:
+            if isinstance(t, bool):
+                continue
+            try:
+                f = float(t)
+            except (TypeError, ValueError):
+                continue
+            if f == f and f > 0.0:              # NaN / 非正：脏值，忽略
+                ts.append(f)
+        return [round(max(0.0, b - a) * 1000.0, 1) for a, b in zip(ts, ts[1:])]
+
+    def _joseki_families_played(self) -> list:
+        """本局**走过的定式族**（去重、保序）：从 ``st.joseki_log`` 的去重键里抠族名。
+
+        键形如 ``E:<角>:<族>``（进入）/ ``B:<角>:<族>``（分岔）/ ``F:<角>:<类>``（成型）/
+        ``D:<角>``（偏离）——族名只在 E / B 两类里，F / D 没有族 ⇒ 跳过。这是
+        ``open.favorite_kakari`` 唯一的信号源（``joseki_families``），比 ``st.joseki_counted``
+        全（后者只记「讲过的」那一族）。
+        """
+        out = []
+        for e in self.st.joseki_log:
+            key = str(e.get("key", "")) if isinstance(e, dict) else ""
+            if not (key.startswith("E:") or key.startswith("B:")):
+                continue
+            parts = key.split(":")
+            fam = parts[2] if len(parts) > 2 else ""
+            if fam != "" and fam not in out:
+                out.append(fam)
+        return out
+
+    async def _persist_game(self, state):
+        """把本局记录与融合后的画像落盘（v3.9.0 / Q7）：**写入点只在 ``summarize()`` 里**。
+
+        ``state`` 是 summary 那一回合的终态（``_turn`` 的返回）；素材取不到（开关关着 /
+        未装配库 / 这一代已被看门狗作废）⇒ 直接返回，一条都不写。任何故障只打日志。
+        """
+        data = dict(state.get("data") or {}) if isinstance(state, dict) else {}
+        rec = data.get("game_rec")
+        if not isinstance(rec, dict) or not rec:
+            return
+        if not data.get("failed"):              # 兜底台词不是总结：不写进记录（与长期记忆同一口径）
+            rec = dict(rec)
+            rec["summary"] = str(data.get("reply") or "")
+        prev = data.get("profile_prev")
+        try:
+            await asyncio.to_thread(self._write_game_record, rec,
+                                    dict(prev) if isinstance(prev, dict) else {})
+        except Exception as e:                  # noqa: BLE001 —— 画像故障绝不影响对局
+            print("[Agent] 画像写入异常（已忽略）：%s" % e)
+
+    def _write_game_record(self, rec, prev):
+        """同步落盘（调用方 ``await asyncio.to_thread``）：一条对局记录 + 融合后的整份画像。
+
+        ``merge(prev, axes, 0)``：各维样本数一律以 ``prev`` 记录里的 ``n_games`` 为准（标量 ``0``
+        只是「扁平 prev 没有样本数」时的兜底）；``extract_axes`` 对无信号的维**不产出**，
+        ``merge`` 对缺键**原样带过**（不衰减、不涨计数、不改置信度）。
+        """
+        store = self.profile_store
+        if store is None:
+            return
+        try:
+            store.add_game(rec)
+            store.upsert_axes(profile.merge(prev, profile.extract_axes(rec), 0))
+        except Exception as e:                  # noqa: BLE001 —— 写不进去只丢这一次，绝不抛
+            print("[Agent] 对局记录 / 画像写入异常（已忽略）：%s" % e)
+
     # ================= 主动约战 / 提醒（v3.9.0，设计 §5-E） =================
 
     async def greet_with_context(self, *, now=None) -> str:
@@ -1974,7 +2095,12 @@ class AzureAgent:
             await self._digest_chat_llm(token)
 
     async def summarize(self, note=""):
-        """对局总结（顺序见 ``agent_graph.py`` 的 summary 阶段）。"""
+        """对局总结（顺序见 ``agent_graph.py`` 的 summary 阶段）。
+
+        v3.9.0（Q7）：这一回合跑完之后，若 ``profile_enabled`` 且装配了画像库，就把**本局记录**
+        （``games`` 表）与**融合后的画像**（``profile`` 表）落盘——素材由 ``_prepare_summary``
+        备在终态的 ``data`` 里（那一格不存在就什么都不写）。两次库操作都走 ``to_thread``。
+        """
         if self.busy:
             return
         if not self.st.moves:
@@ -1984,13 +2110,17 @@ class AzureAgent:
         self._set_busy(True)
         self._new_turn()
         token = self.begin_epoch()
+        state = None
         try:
-            await self._turn_guard(self._turn(PHASE_SUMMARY, {"note": note}))
+            state = await self._turn_guard(self._turn(PHASE_SUMMARY, {"note": note}))
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
             print("[Agent] 总结异常：%s" % e)
             await _emit_line(self, events.AI, "📋 对局总结\n" + self._fallback_line("chat"))
         finally:
             self._set_busy(False)
+        # 局末（Q7）：**写入点只有这里**——本局记录 + 融合后的画像（开关关着 / 无素材 ⇒ 不写）
+        if self.epoch_ok(token):
+            await self._persist_game(state)
         # 局末：`chat_digest_llm=true` 时在这里补做一次 LLM 分段总结（默认关，零额外调用）。
         # 代数一并带进去：那一趟 LLM ``await`` 里若玩家起了新回合，摘要不再写表（修复波 / Minor #2）。
         if self.epoch_ok(token):

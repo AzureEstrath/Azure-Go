@@ -752,5 +752,61 @@ class TestGoldenFrozen(_Base):
             self.assertNotIn(name, self.data, "新模板不写进 golden（golden 只锁既有函数）")
 
 
+class TestProgressNote(_Base):
+    """``progress_note``（v3.9.0 / Q7）：局末进步报告的素材块——**上一版画像 + 本局记录**。
+
+    它只并进**现有** ``summarize()`` 提示词（不新增 LLM 调用）；空 ⇒ 空串（提示词逐字符不变）。
+    """
+
+    REC = {
+        "move_count": 40, "final_black_wr": 0.42, "final_score": -3.5,
+        "moves": [{"color": "B", "gtp": "Q16", "drop": 0.30},
+                  {"color": "W", "gtp": "D4"},
+                  {"color": "B", "gtp": "C3", "drop": 0.0}],
+        "joseki_families": ["star_kakari_small", "star_shimori"],
+        "chat_topics": [["定式", "聊了点三三"], ["闲聊", ""]],
+    }
+    PREV = {"open.star": {"value": 0.9, "confidence": 0.4, "n_games": 8}}
+
+    def test_empty_inputs_give_an_empty_string(self):
+        for prev, rec in (({}, {}), (None, None), ({}, {"move_count": 0}), (None, {"summary": "x"})):
+            with self.subTest(prev=prev, rec=rec):
+                self.assertEqual(prompts.progress_note(prev, rec), "", "空素材 ⇒ 空串（逐字符不变）")
+
+    def test_carries_the_record_and_the_previous_impression(self):
+        got = prompts.progress_note(self.PREV, self.REC)
+        self.assertIn("共 40 手", got)
+        self.assertIn("胜率约 42%", got)
+        self.assertIn("目差 -3.5", got)
+        self.assertIn("明显亏损", got, "失误面与画像同源（profile.extract_axes）")
+        self.assertIn("本局走过的定式族：star_kakari_small、star_shimori", got)
+        self.assertIn("本局聊过：定式、闲聊", got)
+        self.assertIn("上一版印象", got)
+        self.assertIn("开局爱走「星位」", got)
+        # 素材块**不进台词**：它只喂模型（这条断言守的是「别把它当话说出来」的前提）
+        self.assertNotIn("他说", got)
+
+    def test_dirty_inputs_never_raise(self):
+        for rec in ("oops", [], {"move_count": "x", "final_black_wr": float("nan"),
+                                "final_score": float("inf"), "moves": {"bad": 1},
+                                "joseki_families": "not json", "chat_topics": 5},
+                    {"moves": [{"color": "B", "gtp": "zzz", "drop": "x"}]}):
+            with self.subTest(rec=rec):
+                out = prompts.progress_note({"open.star": "dirty"}, rec)
+                self.assertIsInstance(out, str)
+
+    def test_over_budget_drops_the_previous_impression_first(self):
+        """超预算时从尾部往回丢 ⇒ **先丢「上一版印象」**（本局记录更要紧）。"""
+        tiny = prompts.progress_note(self.PREV, self.REC, max_chars=120)
+        self.assertNotEqual(tiny, "")
+        self.assertNotIn("开局爱走", tiny, "先丢上一版印象（表头里那四个字不算：它只是标题）")
+        self.assertIn("本局", tiny)
+        self.assertEqual(prompts.progress_note(self.PREV, self.REC, max_chars=1), "",
+                         "预算连表头都放不下 ⇒ 空串（不留半截区块）")
+
+    def test_this_helper_is_not_written_into_golden(self):
+        self.assertNotIn("progress_note", self.data, "新函数不写进 golden（golden 只锁既有函数）")
+
+
 if __name__ == "__main__":
     unittest.main()
