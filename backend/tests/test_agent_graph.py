@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import events
-from test_agent import StubEngine, StubLLM, _mk
+from test_agent import ErrLLM, StubEngine, StubLLM, _mk
 
 
 class GraphShapeTest(unittest.TestCase):
@@ -518,6 +518,7 @@ import tempfile                                                # noqa: E402
 
 from app import coords, events, prompts                         # noqa: E402
 from app.agent import AzureAgent                               # noqa: E402
+from app.agent import LEN_NOTE, LEN_TEACH_NOTE                 # noqa: E402
 from app.agent_graph import (MAX_LLM_CALLS_PER_TURN, PHASE_AFTER_PLAYER,   # noqa: E402
                              PHASE_JUST_MOVED, PHASE_OWN_TURN)
 from app.joseki import JosekiData                              # noqa: E402
@@ -1138,4 +1139,59 @@ class BusyWatchdogTest(unittest.TestCase):
         self.assertNotEqual(agent.st.last_katago, "旧形势")
         self.assertTrue(bus.of_type("mood"))
         self.assertFalse(agent.busy)
+
+
+# —— 以下为修复轮 R-1（v3.7.0）追加（既有断言一个字符都没改；追加在文件末尾，理由同上）——
+#
+# Wave B 把 4 个「2 手族」的 `kind` 从 `formed` 改成 `entered` 之后，编排里有**三处仍按 `formed`
+# 门控**的耦合没跟着放宽（情绪分支 / `_len_note` / 玩家侧 LLM 失败兜底）。这里按「`entered`（含 2 手族）
+# 也算结构点」把这三条钉死：2 手族走出进入时，三处都必须走**结构点**那一支。
+
+def _system_text(llm):
+    """模型收到的**系统消息**（长度约束 ``len_note`` 落在那里，见 ``prompt_chains``）。"""
+    for msgs, _mx, _nt in llm.calls:
+        for m in msgs:
+            if str(m.get("role", "")) == "system":
+                return str(m.get("content", ""))
+    return ""
+
+
+class TwoMoveFamilyStructureCouplingTest(unittest.TestCase):
+    """R-1：2 手族走出 ``entered`` 时，情绪 / 长度约束 / 兜底台词都走结构点那一支。"""
+
+    ENTER_SEED = [["W", "D17"]]        # 小目一间低挂：角内恰好 2 手即 entered（2 手族）
+
+    def _after_player(self, agent, x, y):
+        """只跑 `after_player` 那一个阶段（与 `player_move` 的公开路径同一入口）。"""
+        agent._new_turn()
+        return asyncio.run(agent._turn(PHASE_AFTER_PLAYER, {"x": x, "y": y}))
+
+    def test_two_move_family_entered_counts_as_a_structure_point(self):
+        # ① 情绪：进入是结构点 ⇒ 与 formed 同一档（player_good），不是普通那一手点评的 player_ok
+        agent, _eng, _llm, _bus = _mk()
+        agent.limit_len = True                       # 让 `_len_note` 真的进提示词（见 ②）
+        _seed_moves(agent, self.ENTER_SEED)
+        seen = []
+        orig = agent._mood_event
+        agent._mood_event = lambda ev, desc="": (seen.append(ev), orig(ev, desc))[1]
+        state = self._after_player(agent, 5, 2)
+        jk = state["data"]["jk"]
+        self.assertEqual(str(jk["kind"]), "entered", "2 手族的角内 2 手＝进入")
+        self.assertEqual(seen, ["player_good"], "进入也算结构点：情绪走 good 那一支")
+
+        # ② 长度约束：结构点用 LEN_TEACH_NOTE（讲解允许 2~3 句），不是普通那句 LEN_NOTE
+        sys_text = _system_text(agent.llm)           # 长度约束落在**系统消息**里（见 prompt_chains）
+        self.assertIn(LEN_TEACH_NOTE, sys_text)
+        self.assertNotIn(LEN_NOTE, sys_text)
+
+        # ③ 兜底：玩家那一手云端失败时，结构点退化为**定式**兜底台词（不是普通兜底）
+        agent2, _eng2, _llm2, _bus2 = _mk()
+        agent2.llm = ErrLLM()                        # 「调用出错：…」＝真实失败形态（不抛）
+        _seed_moves(agent2, self.ENTER_SEED)
+        state2 = self._after_player(agent2, 5, 2)
+        jk2 = state2["data"]["jk"]
+        self.assertEqual(str(jk2["kind"]), "entered")
+        self.assertIn(prompts.joseki_fallback(str(jk2["name"]), str(jk2["key"])),
+                      str(state2["data"]["reply"]), "结构点的失败兜底＝定式兜底台词")
+        self.assertNotIn(agent2._fallback_line("game"), str(state2["data"]["reply"]))
 

@@ -268,7 +268,9 @@ async def _prepare_after_player(agent, data):
     if not _alive(agent, data):                     # 看门狗守卫：旧一代不再动情绪、不发 mood 事件
         return
     ev = "player_ok"
-    if (jk_teach and jk_kind == "formed") or player_rank == 0:
+    # R-1（v3.7.0）：结构点＝进入 / 分岔 / 收尾——Wave B 把 4 个「2 手族」的 kind 改成 `entered`
+    # 之后，这里只认 `formed` 会把 2 手族的进入误判成普通一手（情绪该走 good 那一支）。
+    if (jk_teach and jk_kind in ("entered", "branch", "formed")) or player_rank == 0:
         ev = "player_good"
     elif player_rank < 0 or drop > 0.10:
         ev = "player_bad"
@@ -327,7 +329,7 @@ async def _prepare_after_player(agent, data):
         "after_player",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
                              eval_prompt, "after_player", False, agent.st.last_katago, agent.st.board),
-        len_note=agent._len_note(teach=(jk_teach and jk_kind == "formed")),
+        len_note=agent._len_note(teach=(jk_teach and jk_kind in ("entered", "branch", "formed"))),
     )
 
 
@@ -778,7 +780,9 @@ async def _speak_after_player(agent, data, msgs):
     """玩家那手的点评（定式成型时换成讲解，不额外增加 LLM 调用）。"""
     jk = data.get("jk") or {}
     player_eval = await _say(agent, msgs, 300)
-    if (data.get("jk_show_card") and str(jk.get("kind", "")) == "formed"
+    # R-1（v3.7.0）：结构点＝进入 / 分岔 / 收尾——只认 `formed` 会让 2 手族（kind 已改成 `entered`）
+    # 在云端失败时退化成普通兜底台词，而不是定式兜底。
+    if (data.get("jk_show_card") and str(jk.get("kind", "")) in ("entered", "branch", "formed")
             and agent._llm_failed(player_eval)):
         player_eval = prompts.joseki_fallback(str(jk["name"]), str(jk["key"]))
     elif agent._llm_failed(player_eval):        # 云端失败：点评退化为兜底台词
