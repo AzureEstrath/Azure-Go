@@ -311,3 +311,9 @@ class PerCallMaxVisitsTest(unittest.TestCase):
         for v in (None, 0):
             body = self._body(engine_kw={"max_visits": 123}, analyze_kw={"max_visits": v})
             self.assertEqual(body["maxVisits"], 123, "max_visits=%r 必须回退实例默认" % (v,))
+
+    def test_dirty_and_negative_values_fall_back_without_raising(self):
+        """非数值 / 负值也一律回退实例默认：异常不许逃出 ``analyze`` 的 ``{"error": …}`` 契约。"""
+        for v in ("abc", -5, [], {}):
+            body = self._body(engine_kw={"max_visits": 123}, analyze_kw={"max_visits": v})
+            self.assertEqual(body["maxVisits"], 123, "max_visits=%r" % (v,))

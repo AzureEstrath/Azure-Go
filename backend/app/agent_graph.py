@@ -134,6 +134,28 @@ def is_joseki_mistake(jk: dict, player_on_line: bool, drop: float, rank_ok: bool
     return (not rank_ok) or (drop > 0.10)
 
 
+def _deep_visits(agent) -> int:
+    """「玩家落子后局面」那一次分析的搜索深度：**只增不减**（修复轮 1）。
+
+    ``pv_max_visits`` 是**下限**、不是「无条件覆盖」：取 ``max(pv_max_visits, 引擎的 max_visits)``。
+    否则代码默认配置（``max_visits=500``，例如按 AGENTS.md 手动跑 ``python -m app.main`` 且找不到
+    config.json 时）会把那一次从 500 砍到 150——比同一回合的 ``post`` 复算还浅 3.3×，既让三线系统性
+    降级（``pv`` 更短），也会污染**同一次**分析里的 ``after_black_wr``（「玩家这手亏没亏」的判据源，
+    牵动走错判定 / ``is_joseki_mistake`` / 情绪增量）。
+
+    引擎默认取不到（单测里的假引擎没有这个属性）时按 0 处理 ⇒ 就是 ``pv_max_visits`` 本身。
+    """
+    try:
+        engine_default = int(getattr(agent.katago, "max_visits", 0) or 0)
+    except (TypeError, ValueError):
+        engine_default = 0
+    try:
+        want = int(agent.pv_max_visits)
+    except (TypeError, ValueError):
+        want = 0
+    return max(want, engine_default)
+
+
 # ================= ① prepare：建上下文与提示词 =================
 
 async def _prepare_after_player(agent, data):
@@ -166,11 +188,12 @@ async def _prepare_after_player(agent, data):
             break
 
     # ② 玩家落子后局面（轮到白方）：用于选择 Azure 的应手
-    #    v3.8.0：**只有这一次**分析加深度（``pv_max_visits``）——预测线 A/B/C 只吃这一次返回的
-    #    ``moveInfos``（零额外调用），但需要更深的搜索才拿得到足够长的 ``pv``；``post`` 复算与
-    #    提示 / 分析 / 总结一律用默认深度（全局加深会让每回合都变慢）。
+    #    v3.8.0：**只有这一次**分析加深度——预测线 A/B/C 只吃这一次返回的 ``moveInfos``
+    #    （零额外调用），但需要更深的搜索才拿得到足够长的 ``pv``；``post`` 复算与提示 / 分析 /
+    #    总结一律用默认深度（全局加深会让每回合都变慢）。深度**只增不减**（``_deep_visits``）：
+    #    引擎默认比 ``pv_max_visits`` 深时用引擎默认，绝不把这一次砍浅。
     after = await agent.katago.analyze(agent._moves_with("B", gtp),
-                                       max_visits=agent.pv_max_visits)
+                                       max_visits=_deep_visits(agent))
     after_infos = []
     after_black_wr = 0.5
     after_black_score = 0.0

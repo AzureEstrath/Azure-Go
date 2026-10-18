@@ -67,19 +67,20 @@ TOOL_TIMEOUT_TEXT = "工具执行超时（%d 秒），这次没取到结果；�
 #        · ``speak`` 阶段的 3 次出话——_speak_after_player / _speak_own_turn / _speak_just_moved
 #          各一次。**这三次不在 MAX_LLM_CALLS_PER_TURN 里**，所以真实上限是 4 + 3 ＝ 7 次。
 #   ② 引擎：一回合 3 次 analyze（after_player 的「落子前 / 落子后」＋ just_moved 的复算）
-#      × 单次 katago_timeout_ms（v3.8.0 起默认 45000ms） × 引擎内部**两次尝试**
-#      （engine.py 的 ``for _ in range(2)``：首次 + 重试 1 次）＝ 3 × 45 × 2 ＝ 270s
+#      × 单次 katago_timeout_ms × 引擎内部**两次尝试**（engine.py 的 ``for _ in range(2)``：
+#      首次 + 重试 1 次）。**超时按实际配置取**：代码默认 45000ms（v3.8.0 起）⇒ 3 × 45 × 2 ＝ 270s；
+#      随包 ``game/config.json`` 仍把它钉在 30000ms ⇒ 3 × 30 × 2 ＝ 180s（下面按**较大的那一侧**算）。
 #   ③ 工具轮：max_tool_calls(2) × 单工具超时 TOOL_TIMEOUT_SEC(10s) ＝ 20s
-#   真实上限 ≈ 840 + 270 + 20 ＝ **1130s**（≈18.8 分钟）
+#   真实上限 ≈ 840 + 270 + 20 ＝ **1130s**（≈18.8 分钟；随包 30s 超时下是 1040s，更小）
 # 取值：WATCHDOG_SEC ＝ 1380s（23 分钟）＝ 真实上限 1130s × **1.22**，留 ≈250s 余量
 # （给事件推送、TTS 合成、情绪小调用、长期记忆 embedding 这些零散等待——它们各自都有超时，
 #  但叠起来仍可能吃掉几十秒）。
 # 说明：这是**真卡死**的兜底，不是延迟上限——正常偏慢的一回合（几十秒级）离它很远，不会被误伤；
-# 而云端 LLM 自己有 120s 超时、引擎自己有 30s×2、工具 10s，所以只有在「等一个永远不来的响应」
-# 时才会走到这里。
-# ⚠ **1040s 不是严格上界**：它只算「正常编排」那条路。**降级路径**（工具开但链不可用时的
+# 而云端 LLM 自己有 120s 超时、引擎自己有 45s（随包配置 30s）×2、工具 10s，所以只有在
+# 「等一个永远不来的响应」时才会走到这里。
+# ⚠ **1130s 不是严格上界**：它只算「正常编排」那条路。**降级路径**（工具开但链不可用时的
 #   ``agent._tool_loop``，模型往返上限 ``MAX_TOOL_ROUNDS = 12``，见 agent.py 常量区）按 12 次
-#   LLM × 120s 算可达 ≈1440s，**不计入**上面这个 1040s 的上界（该路径按 AGENTS.md 是「工具开但链
+#   LLM × 120s 算可达 ≈1440s，**不计入**上面这个 1130s 的上界（该路径按 AGENTS.md 是「工具开但链
 #   不可用」的兜底，本注释只描述主链路的预算）。
 WATCHDOG_SEC = 1380
 
@@ -137,9 +138,10 @@ def _discard_task(task):
 # 没有「未接线就跳过频率层」这第二种模式（漏接线不该静默退回「每次都教」）。
 JOSEKI_RATE_DEFAULT = 0.5
 
-# 预测线 A/B/C 那一次分析的默认搜索深度（与 ``config.AzureConfig.pv_max_visits`` 的字段默认一致）。
-# 它是**覆盖值**，只作用于「玩家落子后局面」那一次分析（``agent_graph._prepare_after_player``）：
-# 三线只吃既有 ``moveInfos``（零额外调用），但要求更深的搜索才拿得到足够长的 ``pv``。
+# 预测线 A/B/C 那一次分析的深度**下限**（与 ``config.AzureConfig.pv_max_visits`` 的字段默认一致）。
+# 只作用于「玩家落子后局面」那一次分析（``agent_graph._prepare_after_player``），且**只增不减**：
+# 调用点取 ``max(它, 引擎的 max_visits)``——三线只吃既有 ``moveInfos``（零额外调用），但要求更深的
+# 搜索才拿得到足够长的 ``pv``；引擎默认本来就更深时，绝不把这一次砍浅。
 PV_MAX_VISITS_DEFAULT = 150
 
 
@@ -228,8 +230,8 @@ class AzureAgent:
         self._joseki_taught = {}
 
         # —— 预测线 A/B/C（v3.8.0）：只给「玩家落子后局面」那一次分析加深度（零额外引擎调用）——
-        #    它是**覆盖值**（不是「必须比 max_visits 更大」），与 config 的 ``pv_max_visits`` 同义；
-        #    ``None`` / 脏值一律退回默认，绝不因一个旋钮把 agent 构造搞崩。
+        #    它是**下限**（只增不减，调用点取 max(它, 引擎默认)），与 config 的 ``pv_max_visits``
+        #    同义；``None`` / 脏值一律退回默认，绝不因一个旋钮把 agent 构造搞崩。
         try:
             self.pv_max_visits = max(1, int(pv_max_visits))
         except (TypeError, ValueError):

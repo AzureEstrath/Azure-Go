@@ -61,7 +61,13 @@ class EventLogTest(unittest.TestCase):
         self.assertIsNotNone(log.add("ai_bad", 2, "我在第2手下错了", {}))
 
     def test_not_in_state_snapshot_and_survives_undo_reset(self):
-        """不进 ``GameState`` 快照、不随悔棋 / 重开回退（「发生过就是发生过」）。"""
+        """不进 ``GameState`` 快照、不随悔棋 / 重开回退（「发生过就是发生过」）。
+
+        ⚠ **占位门卫**：``EventLog`` 与 ``GameState`` 今天**零耦合**，所以这里断言的是「两不相干」
+        （结构上不会互相污染）。**P2/P6 把事件表接进编排之后，必须把它升级成真断言**——
+        那时要变成「写一条事件 → 悔棋 / 重开 → 事件仍在、快照里仍然没有它」，否则这条会静默变成
+        永真断言（后人会以为它在守什么）。
+        """
         from app.event_log import EventLog
         from app.state import GameState
         st = GameState()

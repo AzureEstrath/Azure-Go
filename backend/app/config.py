@@ -15,9 +15,9 @@ class AzureConfig:
     def __init__(self):
         self.katago_url = "http://127.0.0.1:8100"   # KataGo 云服务地址（与 katago_service 默认端口一致）
         self.katago_token = ""                      # Bearer token；留空＝不鉴权（本机回环调试）
-        self.katago_timeout_ms = 45000              # 单次 /analyze 超时（v3.8.0：30000 → 45000，给深搜那一次留余量）
+        self.katago_timeout_ms = 45000              # 单次 /analyze 超时（代码默认，v3.8.0：30000 → 45000，给深搜那一次留余量；随包 game/config.json 仍写 30000）
         self.max_visits = 500
-        self.pv_max_visits = 150                    # 预测线 A/B/C 那一次分析的搜索深度（只覆盖 after_player 那一次）
+        self.pv_max_visits = 150                    # 预测线 A/B/C 那一次分析的深度**下限**（只增不减，见 agent_graph._deep_visits）
         self.joseki_teach = True
         self.joseki_rate = 0.5                      # 定式提示频率（0~1）：与开关同一格；门控唯一路径 p=clamp(rate+adj,0,1)
         self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
@@ -90,13 +90,14 @@ class AzureConfig:
         self.katago_token = str(d.get("katago_token", self.katago_token))
         self.katago_timeout_ms = int(d.get("katago_timeout_ms", self.katago_timeout_ms))
         self.max_visits = int(d.get("max_visits", self.max_visits))
-        # 预测线 A/B/C 的深搜深度（v3.8.0）：**覆盖值**，只作用于「玩家落子后局面」那一次分析。
-        # 它不是「必须比 max_visits 更大」——随包模板 max_visits=100 时 150 是加深；代码默认
-        # max_visits=500 时那一次反而更浅。脏值退回默认（不因一个旋钮把启动搞崩）。
+        # 预测线 A/B/C 那一次分析的深度**下限**（修复轮 1 起**只增不减**）：调用点取
+        # ``max(pv_max_visits, 引擎的 max_visits)``——随包模板 max_visits=100 时 150 是加深；
+        # 代码默认 max_visits=500 时那一次照旧 500（绝不被砍浅：那同一次分析的产物还是
+        # 「玩家这手亏没亏」的判据源）。脏值保留 ``__init__`` 的默认（不因一个旋钮把启动搞崩）。
         try:
             self.pv_max_visits = max(1, int(d.get("pv_max_visits", self.pv_max_visits)))
         except (TypeError, ValueError):
-            self.pv_max_visits = 150
+            pass
         self.joseki_teach = bool(d.get("joseki_teach", self.joseki_teach))
         try:
             self.joseki_rate = max(0.0, min(1.0, float(d.get("joseki_rate", self.joseki_rate))))

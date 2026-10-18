@@ -37,15 +37,21 @@ class LevelTest(unittest.TestCase):
 
 
 class CornerWordTest(unittest.TestCase):
-    def test_four_corners(self):
+    def test_quadrants_and_middles(self):
+        """象限 + 方位（不是「真角区」）：象限中部也要给词；用词与设计 §6.4 模板一致（**不带「角」**）。"""
         from app.decay import corner_word
-        self.assertEqual(corner_word(3, 3), "左上角")
-        self.assertEqual(corner_word(15, 3), "右上角")
-        self.assertEqual(corner_word(3, 15), "左下角")
-        self.assertEqual(corner_word(15, 15), "右下角")
+        cases = [
+            (3, 3, "左上"), (8, 8, "左上"), (0, 0, "左上"),      # 左上象限（含中部）
+            (15, 3, "右上"), (13, 5, "右上"), (18, 0, "右上"),
+            (3, 15, "左下"), (5, 13, "左下"), (0, 18, "左下"),
+            (15, 15, "右下"), (16, 16, "右下"), (18, 18, "右下"),
+        ]
+        for x, y, want in cases:
+            self.assertEqual(corner_word(x, y), want, "(%d,%d)" % (x, y))
+        self.assertNotIn("角", corner_word(3, 3), "档 4 只说方位，不说「角」")
 
     def test_no_direction_when_coords_are_ambiguous(self):
-        """方位词按坐标核对，核不上就不说方位（正中那一列 / 行凑不出四角词）。"""
+        """方位词按坐标核对，核不上就不说方位（正中那一列 / 行凑不出方位词）。"""
         from app.decay import corner_word
         for x, y in ((9, 3), (3, 9), (9, 9), (None, 3), (3, None), (-1, 3), (3, 99), ("a", 3)):
             self.assertEqual(corner_word(x, y), "", "(%r,%r) 不该给出方位" % (x, y))

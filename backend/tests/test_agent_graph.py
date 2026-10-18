@@ -1279,16 +1279,16 @@ class TwoMoveFamilyStructureCouplingTest(unittest.TestCase):
 
 
 class PvDepthCallSiteTest(unittest.TestCase):
-    """``max_visits`` 的调用点：整局里**只有** after_player 的那一次分析带深值。
+    """``max_visits`` 的调用点：整局里**只有** after_player 的那一次分析带深度，且**只增不减**。
 
     其余调用点（``just_moved`` 的复算、提示 / 分析 / 总结、工具）一律**不传**——全局提深度会让
     每回合都变慢（``post`` 也变慢，≈10s→≈20s，逼近超时），所以深度只给三线要用的那一次。
+    而「只给那一次」不等于「可以砍浅」：实际传的是 ``max(pv_max_visits, 引擎默认)``——代码默认
+    配置（``max_visits=500``）下必须传 500，否则三线降级，且**同一次**分析的 ``after_black_wr``
+    （玩家这手亏没亏的判据源）也会变噪。
     """
 
-    def test_only_the_after_player_analysis_is_deepened(self):
-        agent, eng, _llm, _bus = _mk()
-        self.assertEqual(agent.pv_max_visits, 150)
-
+    def _run_turn(self, agent):
         async def run():
             await agent.player_move(3, 3)
             await agent.hint()
@@ -1296,8 +1296,23 @@ class PvDepthCallSiteTest(unittest.TestCase):
             await agent.summarize("辛苦啦")
 
         asyncio.run(run())
+
+    def test_only_the_after_player_analysis_carries_the_override(self):
+        agent, eng, _llm, _bus = _mk()                       # StubEngine(max_visits=500)＝代码默认
+        self.assertEqual(agent.pv_max_visits, 150)
+        self._run_turn(agent)
         deep = [v for v in eng.visits if v is not None]
-        self.assertEqual(deep, [150], "深搜必须恰好一次，其余调用点一个都不许带")
-        i = eng.visits.index(150)
+        self.assertEqual(deep, [500], "只增不减：引擎默认 500 > 150 ⇒ 那一次传 500（不许砍到 150）")
+        i = eng.visits.index(500)
         self.assertEqual(eng.calls[i][-1], ["B", "D16"], "深搜那一次＝玩家刚落下那一手之后的局面")
+
+    def test_shallow_engine_default_is_raised_to_pv_max_visits(self):
+        """引擎默认更浅（随包 ``game/config.json`` 的 ``max_visits=100``）⇒ 那一次抬到 150。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent.katago = StubEngine(max_visits=100)
+        self._run_turn(agent)
+        deep = [v for v in agent.katago.visits if v is not None]
+        self.assertEqual(deep, [150], "150 > 100 ⇒ 三线要的更深搜索在这里生效")
+        i = agent.katago.visits.index(150)
+        self.assertEqual(agent.katago.calls[i][-1], ["B", "D16"])
 

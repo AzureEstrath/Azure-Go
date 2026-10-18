@@ -18,13 +18,16 @@ class StubEngine:
 
     ``analyze`` 收 ``max_visits``（v3.8.0 的按调用深度）：既有的 ``calls`` 语义一字不变，
     另外把每次的 ``max_visits`` 记进 ``visits``（与 ``calls`` 同序），供「深搜只给哪一次」的门卫用。
+    ``max_visits`` 是实例的**默认深度**（镜像真引擎 ``KataGoEngine(max_visits=500)`` 的代码默认），
+    调用点拿它做「只增不减」的 ``max()``。
     """
 
     CAND = ["Q16", "D4", "Q4", "D16", "K10", "C3", "R14", "F16", "J3", "O16", "C16", "R4"]
 
-    def __init__(self):
+    def __init__(self, max_visits=500):
         self.calls = []
         self.visits = []
+        self.max_visits = int(max_visits)
         self.dead = False
 
     async def analyze(self, moves, max_visits=None):

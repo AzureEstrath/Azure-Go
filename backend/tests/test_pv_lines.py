@@ -129,12 +129,15 @@ class ExtractLinesTest(unittest.TestCase):
         self.assertEqual(got["a"]["moves"], ["Q16", "D4"])
 
     def test_no_engine_call(self):
-        """零引擎调用：模块里没有任何客户端 / 请求，只读传入的四个字段。"""
+        """零引擎调用：模块**顶层没有任何 import**（结构性证据，不靠源码子串——注释里出现
+        引擎名或 ``analyze`` 这类词都不该让它红）。"""
+        import ast
         import inspect
         from app import pv_lines
-        src = inspect.getsource(pv_lines)
-        for banned in ("analyze", "httpx", "katago", "KataGo"):
-            self.assertNotIn(banned, src, "pv_lines 不许出现 %s" % banned)
+        tree = ast.parse(inspect.getsource(pv_lines))
+        imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
+        self.assertEqual(imports, [], "pv_lines 不该 import 任何东西（尤其不 import 引擎 / HTTP 客户端）")
+        # 只带四个字段的裸 dict（没有任何引擎对象参与）也能出线
         got = pv_lines.extract_lines([_info("Q16", ["Q16", "D4"])])
         self.assertEqual(got["a"]["moves"], ["Q16", "D4"])
 
