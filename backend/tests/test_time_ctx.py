@@ -205,5 +205,45 @@ class MoveEndpointPunctuationTest(unittest.TestCase):
             self.assertIsNone(s.session_start)
 
 
+class TimeFactsAccessorTest(unittest.TestCase):
+    """``agent.time_facts`` / ``agent.profile_facts``：两个开关是「注不注入」的唯一闸门。"""
+
+    def test_switches_off_mean_empty_facts(self):
+        agent, _eng, _llm, _bus = mk_agent()
+        agent.mark_move_time(1000.0)
+        self.assertFalse(agent.profile_enabled)
+        self.assertFalse(agent.time_aware_enabled)
+        self.assertEqual(agent.time_facts(now=2000.0), {}, "关着 ⇒ 空 dict（＝不注入）")
+        self.assertEqual(agent.profile_facts(), {}, "关着 ⇒ 空 dict（＝不注入）")
+
+    def test_time_facts_on_reads_the_collected_timestamps(self):
+        agent, _eng, _llm, _bus = mk_agent()
+        agent.time_aware_enabled = True
+        base = 1_700_000_000.0
+        agent.mark_move_time(base)
+        agent.mark_move_time(base + 40.0)
+        got = agent.time_facts(now=base + 100.0, last_game_ts=base - 2 * 86400.0,
+                               game_ts_list=[base])
+        self.assertAlmostEqual(got["session_sec"], 100.0, places=3)
+        self.assertAlmostEqual(got["avg_move_sec"], 40.0, places=3)
+        self.assertAlmostEqual(got["last_gap_days"], 2.0 + 100.0 / 86400.0, places=6)
+        self.assertEqual(got["streak_days"], 1)
+
+    def test_profile_facts_needs_an_assembled_store(self):
+        agent, _eng, _llm, _bus = mk_agent()
+        agent.profile_enabled = True
+        self.assertEqual(agent.profile_facts(), {}, "没装配画像库 ⇒ 无画像（不抛）")
+
+        class Boom:
+            def get_profile(self):
+                raise RuntimeError("库坏了")
+
+        agent.profile_store = Boom()
+        self.assertEqual(agent.profile_facts(), {}, "读画像抛异常 ⇒ 按「无画像」降级")
+
+        agent.profile_store = type("S", (), {"get_profile": lambda self: {"open.star": 0.5}})()
+        self.assertEqual(agent.profile_facts(), {"open.star": 0.5})
+
+
 if __name__ == "__main__":
     unittest.main()

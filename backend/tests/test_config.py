@@ -194,5 +194,39 @@ class EmotionDriftConfigTest(unittest.TestCase):
 
 
 
+class ProfileTimeConfigTest(unittest.TestCase):
+    """阶段四（v3.9.0）：``profile_enabled`` / ``time_aware_enabled`` 两个开关。
+
+    口径与 ``emotion_drift`` / ``chat_digest_llm`` **同形**：默认关、只认 JSON 的 true / false，
+    字符串 / 数字 / null 是脏值（保留默认关）。
+    """
+
+    def test_defaults_are_off(self):
+        c = AzureConfig()
+        self.assertFalse(c.profile_enabled, "画像必须默认关（关掉＝现状）")
+        self.assertFalse(c.time_aware_enabled, "时间感知必须默认关（关掉＝现状）")
+
+    def test_round_trip(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"profile_enabled": True, "time_aware_enabled": True}, f)
+            c = AzureConfig.load(p)
+        self.assertTrue(c.profile_enabled)
+        self.assertTrue(c.time_aware_enabled)
+
+    def test_switch_only_accepts_json_booleans(self):
+        import tempfile, json
+        for bad in ("false", "true", 1, 0, None, []):
+            with tempfile.TemporaryDirectory() as d:
+                p = os.path.join(d, "config.json")
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump({"profile_enabled": bad, "time_aware_enabled": bad}, f)
+                c = AzureConfig.load(p)
+            self.assertFalse(c.profile_enabled, "脏值 %r 必须退回默认 false" % (bad,))
+            self.assertFalse(c.time_aware_enabled, "脏值 %r 必须退回默认 false" % (bad,))
+
+
 if __name__ == "__main__":
     unittest.main()

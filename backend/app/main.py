@@ -10,7 +10,8 @@
     POST /api/reset                         重开一局
     POST /api/config      {allow_pass}      允许虚着开关（另见 limit_len / joseki_teach / joseki_rate /
                                             emotion_drift / drift_base / drift_max / pv_max_drop /
-                                            chat_digest_llm / tools_enabled）
+                                            chat_digest_llm / tools_enabled /
+                                            profile_enabled / time_aware_enabled）
     POST /api/reveal                        落子宣告语音开始（需要 round-trip 的客户端）
     POST /api/interaction {what}            玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话
@@ -102,6 +103,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                          drift_base=cfg.drift_base, drift_max=cfg.drift_max,
                                          pv_max_drop=cfg.pv_max_drop,
                                          chat_digest_llm=cfg.chat_digest_llm,
+                                         profile_enabled=cfg.profile_enabled,
+                                         time_aware_enabled=cfg.time_aware_enabled,
                                          memory=mem, tts=tts_client,
                                          joseki_progress=joseki_progress)
             if autostart:
@@ -113,6 +116,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent.memory = mem         # 注入的 agent 也接上同一个实例（显式 memory= 优先）
             app.state.agent.tts = tts_client     # 注入的 agent 同样接上（显式 tts= 优先）
             app.state.agent.joseki_progress = joseki_progress   # T5：注入的 agent 也接上同一个实例
+            # v3.9.0：画像 / 时间感知两个开关同样以 cfg 为准（关着＝现状）
+            app.state.agent.profile_enabled = bool(cfg.profile_enabled)
+            app.state.agent.time_aware_enabled = bool(cfg.time_aware_enabled)
         yield
         mem.close()                              # 退出时收尾（可重复调用）
         await tts_client.close()                 # 语音客户端**无条件**关闭（autostart 为假时也要关）
@@ -276,6 +282,14 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                 s.chat_digest_llm = v
         if "tools_enabled" in body:             # 发言侧工具开关：开启后她才会在提示/落子宣告里查资料
             s.tools_enabled = bool(body["tools_enabled"])
+        if "profile_enabled" in body:           # 「玩家棋风画像」开关（默认关）：关着＝不注入画像块
+            v = body["profile_enabled"]         # 只认 JSON 的 true / false；字符串 "false" 是脏值
+            if isinstance(v, bool):
+                s.profile_enabled = v
+        if "time_aware_enabled" in body:        # 「时间感知」开关（默认关）：关着＝不注入时间块
+            v = body["time_aware_enabled"]      # 与 `emotion_drift` / `chat_digest_llm` 同一口径
+            if isinstance(v, bool):
+                s.time_aware_enabled = v
         return ok()
 
     @app.post("/api/reveal")

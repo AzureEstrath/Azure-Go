@@ -41,6 +41,11 @@ class AzureConfig:
         self.pv_max_drop = 0.05                     # 偏航线与最优线的胜率差上限（超了整条不用）
         # —— 聊天事件摘要（v3.8.0）：默认规则式（零 LLM）；开启后只在局末 / 空闲补做 LLM 分段 ——
         self.chat_digest_llm = False
+        # —— 玩家棋风画像 + 时间感知（v3.9.0，设计 §6.4）：两个开关**默认都关**（关掉＝现状）——
+        #    关着时提示词里的画像块 / 时间块都不注入（与没有这两个功能逐字符同构）；
+        #    读入口径与 `emotion_drift` / `chat_digest_llm` 同形：只认 JSON 的 true / false。
+        self.profile_enabled = False
+        self.time_aware_enabled = False
         self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
@@ -137,6 +142,12 @@ class AzureConfig:
         # 字符串 `"false"` 是脏值 → 保留默认关）。
         v = d.get("chat_digest_llm")
         self.chat_digest_llm = v if isinstance(v, bool) else self.chat_digest_llm
+        # 画像 / 时间感知开关（v3.9.0）：同样**只认 JSON 的 true / false**（字符串 `"false"` /
+        # 数字 / null 是脏值 → 保留默认关）。
+        v = d.get("profile_enabled")
+        self.profile_enabled = v if isinstance(v, bool) else self.profile_enabled
+        v = d.get("time_aware_enabled")
+        self.time_aware_enabled = v if isinstance(v, bool) else self.time_aware_enabled
         self.llm_base_url = str(d.get("llm_base_url", self.llm_base_url))
         self.llm_model = str(d.get("llm_model", self.llm_model))
         self.llm_api_key = str(d.get("llm_api_key", self.llm_api_key))

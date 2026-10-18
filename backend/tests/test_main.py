@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi.testclient import TestClient
 
 from app import events
-from app.config import DRIFT_MAX_LIMIT
+from app.config import AzureConfig, DRIFT_MAX_LIMIT
 from app.llm import LLMClient
 from app.main import create_app
 from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM, mk_agent
@@ -97,6 +97,46 @@ class RestTest(unittest.TestCase):
             self.assertTrue(s.emotion_drift, "脏值不生效（`bool('false')` 会把脏值读成「关」）")
             client.post("/api/config", json={"emotion_drift": False})
             self.assertFalse(s.emotion_drift, "开关能关回去（关掉＝现状）")
+
+
+class ProfileTimeSwitchTest(unittest.TestCase):
+    """``/api/config`` 透传两个开关（v3.9.0）：默认关、只认 JSON 的 true / false、脏值不生效。"""
+
+    def test_config_forwards_profile_and_time_switches(self):
+        app = create_app(engine=StubEngine(), llm=StubLLM(), autostart=False)
+        with TestClient(app) as client:
+            s = app.state.agent
+            self.assertFalse(s.profile_enabled)
+            self.assertFalse(s.time_aware_enabled)
+            self.assertEqual(s.profile_facts(), {}, "关着 ⇒ 画像块素材为空（＝不注入）")
+            self.assertEqual(s.time_facts(now=1.0), {}, "关着 ⇒ 时间块素材为空（＝不注入）")
+
+            r = client.post("/api/config", json={"profile_enabled": True, "time_aware_enabled": True})
+            self.assertTrue(r.json()["ok"])
+            self.assertTrue(s.profile_enabled)
+            self.assertTrue(s.time_aware_enabled)
+            self.assertIn("date", s.time_facts(now=1792414980.0), "开着 ⇒ 时间事实真的有产出")
+            # 未装配画像库（lifespan 之后由 Q6/Q7 注入）⇒ 开着也是「无画像」，不抛
+            self.assertEqual(s.profile_facts(), {})
+
+            # 脏值不生效（`bool("false")` 会把脏值读成「开」，所以只认 bool）
+            client.post("/api/config", json={"profile_enabled": "false", "time_aware_enabled": 0})
+            self.assertTrue(s.profile_enabled)
+            self.assertTrue(s.time_aware_enabled)
+            client.post("/api/config", json={"profile_enabled": False, "time_aware_enabled": False})
+            self.assertFalse(s.profile_enabled)
+            self.assertFalse(s.time_aware_enabled)
+
+    def test_injected_agent_gets_the_cfg_switches(self):
+        """注入的 agent 也以 cfg 为准（与 memory / tts / joseki_progress 同一套装配纪律）。"""
+        cfg = AzureConfig()
+        cfg.profile_enabled = True
+        cfg.time_aware_enabled = True
+        agent, _eng, _llm, _bus = mk_agent()
+        app = create_app(cfg=cfg, agent=agent, autostart=False)
+        with TestClient(app):
+            self.assertTrue(agent.profile_enabled)
+            self.assertTrue(agent.time_aware_enabled)
 
 
 class WebSocketTest(unittest.TestCase):

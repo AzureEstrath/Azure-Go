@@ -15,7 +15,7 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import coords, events, joseki_gate, prompt_chains, prompts, pv_lines
+from . import coords, events, joseki_gate, prompt_chains, prompts, pv_lines, time_ctx
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, is_joseki_mistake, _emit_line,
@@ -331,7 +331,8 @@ class AzureAgent:
                  tts=None, joseki_progress=None, joseki_rate=JOSEKI_RATE_DEFAULT, joseki_rng=None,
                  pv_max_visits=PV_MAX_VISITS_DEFAULT, emotion_drift=False,
                  drift_base=DRIFT_BASE_DEFAULT, drift_max=DRIFT_MAX_DEFAULT,
-                 pv_max_drop=PV_MAX_DROP_DEFAULT, drift_rng=None, chat_digest_llm=False):
+                 pv_max_drop=PV_MAX_DROP_DEFAULT, drift_rng=None, chat_digest_llm=False,
+                 profile_enabled=False, time_aware_enabled=False):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -440,6 +441,15 @@ class AzureAgent:
         #    关闭（默认）时 ``chat()`` 之后只走规则式；开启后**只在局末 / 空闲**补一次 LLM 分段总结
         #    （``_digest_chat_llm``），落子回合内一次都不调（性能红线）。
         self.chat_digest_llm = bool(chat_digest_llm)
+
+        # —— 玩家棋风画像 + 时间感知（v3.9.0，设计 §6.4）：两个开关**默认都关**（关掉＝现状）——
+        #    关着时 ``profile_facts`` / ``time_facts`` 直接返回空 dict ⇒ 提示词里的两块都不注入
+        #    （与没有这两个功能逐字符同构）。画像库由 ``main.py`` 的 lifespan 注入
+        #    （``self.profile_store``，与 ``memory`` / ``joseki_progress`` 同一套装配纪律）；
+        #    未装配 ⇒ 一律当「无画像」（读路径不建库、不抛）。
+        self.profile_enabled = bool(profile_enabled)
+        self.time_aware_enabled = bool(time_aware_enabled)
+        self.profile_store = None
 
         self._mood_region = -1
         self._mood_ms = 0
@@ -1417,6 +1427,40 @@ class AzureAgent:
         if self.session_start is None:
             self.session_start = t
         self.move_ts_list.append(t)
+
+    def time_facts(self, *, now=None, last_game_ts=None, game_ts_list=None):
+        """**时间块**的素材（纯计算、零 IO、零调用）：``time_aware_enabled`` 关着 ⇒ ``{}``。
+
+        ``now`` 留空用系统时钟（``time_ctx.facts`` 本身要求显式锚点——时钟可注入才好测，这里替
+        生产调用方补上）；``last_game_ts`` / ``game_ts_list`` 由调用方从 ``ProfileStore`` 读出来
+        传进来（**那两次读是同步阻塞的，要 ``await asyncio.to_thread``**；本方法只做纯计算）。
+        关着开关 ⇒ 空 dict ⇒ ``prompts.time_note`` 返回空串 ⇒ 提示词**逐字符不变**。
+        """
+        if not self.time_aware_enabled:
+            return {}
+        return time_ctx.facts(now=time.time() if now is None else now,
+                              session_start=self.session_start,
+                              last_game_ts=last_game_ts,
+                              move_ts_list=list(self.move_ts_list),
+                              game_ts_list=game_ts_list)
+
+    def profile_facts(self):
+        """**画像块**的素材：``profile_enabled`` 关着 / 未装配画像库 ⇒ ``{}``（＝不注入）。
+
+        **同步读**（``ProfileStore.get_profile()`` 是阻塞的文件操作）——调用方必须
+        ``await asyncio.to_thread(self.profile_facts)``，与 ``_long_term`` 同一套异步纪律。
+        任何故障只打一行日志、返回 ``{}``：存储层自己已降级，这里再兜一次，绝不影响对局。
+        """
+        if not self.profile_enabled:
+            return {}
+        store = self.profile_store
+        if store is None:
+            return {}
+        try:
+            return store.get_profile() or {}
+        except Exception as e:                      # noqa: BLE001 —— 读画像失败＝无画像
+            print("[Agent] 画像读取异常（按「无画像」降级）：%s" % e)
+            return {}
 
     # ================= 玩家落子 =================
 
