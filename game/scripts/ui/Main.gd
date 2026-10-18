@@ -103,6 +103,7 @@ var _chat_scroll: ScrollContainer
 var _lbl_moves: Label
 var _lbl_wr: Label
 var _lbl_score: Label
+var _lbl_score_hint: Label                     # 目差下面那行 11px 小字：量级人话（空串＝还没有形势信息）
 var _lbl_status: Label
 var _status_before_tool := ""                  # 她查资料前状态栏的原文案（end 时恢复）
 var _status_before_tool_bad := false           # 原文案的错误色标记（end 时一并恢复，别把红字洗成灰字）
@@ -362,10 +363,22 @@ func _build_right_panel(root: Control) -> void:
 	_lbl_wr.text = "黑胜率: --"
 	_lbl_wr.add_theme_color_override("font_color", TEAL_DARK)
 	info.add_child(_lbl_wr)
+	# 目差：数字照旧保留（精度不丢）+ 下面一行 11px 小字给量级人话。**竖排不并排**——这一行已经贴着
+	# 380 面板的宽度上限，并排会把「允许 Azure 虚着」挤出面板（同 Task F 里定式那一格挪行的理由）。
+	var score_col := VBoxContainer.new()
+	score_col.add_theme_constant_override("separation", 0)
 	_lbl_score = Label.new()
-	_lbl_score.text = "目差: --"
+	_lbl_score.text = score_line(null)
 	_lbl_score.add_theme_color_override("font_color", Color(0.153, 0.682, 0.376))
-	info.add_child(_lbl_score)
+	_lbl_score.tooltip_text = "目差 = 黑棋实地估算 − 白棋实地估算（正数＝黑好，负数＝白好）。\n" \
+		+ "它和胜率偶尔会不同调（胜率 51% + 目差 -2.5 是正常的），两个一起看；下面那行是量级人话。"
+	score_col.add_child(_lbl_score)
+	_lbl_score_hint = Label.new()
+	_lbl_score_hint.text = ""                      # 量级人话：空串＝还没有形势信息（占位不显示，行高不跳）
+	_lbl_score_hint.add_theme_font_size_override("font_size", 11)
+	_lbl_score_hint.add_theme_color_override("font_color", Color(0.45, 0.45, 0.45))
+	score_col.add_child(_lbl_score_hint)
+	info.add_child(score_col)
 	_chk_pass = CheckBox.new()
 	_chk_pass.text = "允许Azure虚着"
 	_chk_pass.toggled.connect(_on_allow_pass_toggled)
@@ -1745,7 +1758,69 @@ static func _last_stone(stones: Array) -> Dictionary:
 
 func _on_info_changed(wr: float, sc: float) -> void:
 	_lbl_wr.text = "黑胜率: %.1f%%" % (wr * 100.0)
-	_lbl_score.text = "目差: %+.1f" % sc
+	_lbl_score.text = score_line(sc)                       # 原始数字照旧保留
+	if _lbl_score_hint != null:
+		_lbl_score_hint.text = score_hint(sc, wr)          # 下面那行量级人话
+
+## 目差的量级人话（四档；与 `winrate_band` 同一套档位编号）
+const SCORE_PHRASES := ["差不多", "半个角", "一个角的实空", "已经很难追了"]
+
+## 脏值 / null ⇒ NAN。**不认字符串**：`float("abc")` 会悄悄给 0.0，那会把脏值说成「差不多」。
+static func _metric(v) -> float:
+	match typeof(v):
+		TYPE_INT, TYPE_FLOAT:
+			return float(v)
+		_:
+			return NAN
+
+## 目差的量级档位（按 |目差| 划分；未知 / 脏值 ⇒ -1）
+static func score_band(score) -> int:
+	var s := _metric(score)
+	if is_nan(s) or is_inf(s):
+		return -1
+	var a := absf(s)
+	if a < 2.5:
+		return 0
+	if a < 6.5:
+		return 1
+	if a < 12.5:
+		return 2
+	return 3
+
+## 胜率的量级档位（按领先方距 50% 的差划分，与上面同一套编号；未知 / 脏值 ⇒ -1）
+static func winrate_band(winrate) -> int:
+	var w := _metric(winrate)
+	if is_nan(w) or is_inf(w):
+		return -1
+	var d := absf(clampf(w, 0.0, 1.0) - 0.5)
+	if d < 0.05:
+		return 0
+	if d < 0.15:
+		return 1
+	if d < 0.30:
+		return 2
+	return 3
+
+## 目差说人话（静态纯函数，门卫直接断言）：**两个信号一起看，取更保守（更接近均势）的那一档**。
+## 目差与胜率偶尔打架（胜率 51% + 目差 -2.5 是正常的），取小档保证措辞永远不会比另一个信号更笃定，
+## 读起来不矛盾；两个信号同调时该笃定就笃定。措辞本身不带「谁领先」（正负由数字自己说）。
+## 脏值 / null ⇒ "--"。
+static func score_phrase(score, winrate) -> String:
+	var sb := score_band(score)
+	if sb < 0:
+		return "--"
+	var wb := winrate_band(winrate)
+	return SCORE_PHRASES[mini(sb, wb) if wb >= 0 else sb]
+
+## 目差那一行的文案：**原始数字仍然显示**（精度不丢）；没有信息时沿用既有「目差: --」
+static func score_line(score) -> String:
+	var s := _metric(score)
+	return "目差: --" if is_nan(s) or is_inf(s) else "目差: %+.1f" % s
+
+## 目差下面那行小字：量级人话；没有信息时给空串（空串只占位、不显示）
+static func score_hint(score, winrate) -> String:
+	var p := score_phrase(score, winrate)
+	return "" if p == "--" else p
 
 func _on_busy_changed(busy: bool) -> void:
 	if not busy:
