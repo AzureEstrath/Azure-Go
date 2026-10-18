@@ -520,6 +520,12 @@ async def _prepare_summary(agent, data):
         conv = prompts.to_black_perspective(analysis, n)
         final_wr = float(conv[0])
         final_score = float(conv[1])
+    # —— 看门狗守卫（v3.7.0）：上面那次引擎分析 ``await`` 过，正是看门狗会超时的窗口；本回合若已
+    #    作废，``st.last_katago`` 与 ``mood`` 一个都不许写（过期的形势会被**下一回合**的
+    #    ``context_block`` / ``with_context`` 读走，死代的 ``mood`` 更不许推进新对局），
+    #    也不许再往下装配提示词。与 ``_prepare_observe`` / ``_prepare_analyze`` 同一做法 ——
+    if not _alive(agent, data):
+        return
     agent._update_katago_brief(analysis, n)
     # 终局情绪：她赢下（黑方胜率 < 0.5）平和地开心，输了则有点低落
     agent._mood_event("summary_win" if final_wr < 0.5 else "summary_lose")

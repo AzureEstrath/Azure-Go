@@ -60,16 +60,23 @@ TOOL_BUDGET_TEXT = "工具调用次数已达上限（%d 次），这次不再执
 TOOL_TIMEOUT_TEXT = "工具执行超时（%d 秒），这次没取到结果；别再重试同一个工具，直接回答。"
 
 # —— 回合兜底看门狗（v3.7.0）：`busy` 不归位＝棋盘永久锁死，这是本项目最严重的故障形态 ——
-# 值按**最坏一回合预算 × 2**算，再向上取整到 60 的倍数。最坏预算按代码里的真实上限推：
-#   ① LLM：MAX_LLM_CALLS_PER_TURN(4) × 单次超时 120s
-#      （llm_chain.DEFAULT_TIMEOUT_SEC，且 ChatOpenAI 固定 max_retries=0）＝ 480s
+# 值按**最坏一回合的真实上限**推（以 player_move 三阶段为最坏形态），再留余量：
+#   ① LLM：一回合真实上限 **7 次** × 单次超时 120s（llm_chain.DEFAULT_TIMEOUT_SEC；ChatOpenAI
+#      固定 max_retries=0）＝ 840s。7 次的构成：
+#        · ``decide`` 里的工具轮预算 MAX_LLM_CALLS_PER_TURN ＝ 4 次（含工具往返，那个常量只算这一层）；
+#        · ``speak`` 阶段的 3 次出话——_speak_after_player / _speak_own_turn / _speak_just_moved
+#          各一次。**这三次不在 MAX_LLM_CALLS_PER_TURN 里**，所以真实上限是 4 + 3 ＝ 7 次。
 #   ② 引擎：一回合 3 次 analyze（after_player 的「落子前 / 落子后」＋ just_moved 的复算）
-#      × 单次 katago_timeout_ms（默认 30000ms） × 引擎内部重试 2 次（engine.analyze 的 for _ in range(2)）
-#      ＝ 3 × 30 × 2 ＝ 180s
+#      × 单次 katago_timeout_ms（默认 30000ms） × 引擎内部**两次尝试**
+#      （engine.py 的 ``for _ in range(2)``：首次 + 重试 1 次）＝ 3 × 30 × 2 ＝ 180s
 #   ③ 工具轮：max_tool_calls(2) × 单工具超时 TOOL_TIMEOUT_SEC(10s) ＝ 20s
-#   预算 ≈ 680s（≈11.3 分钟）；680 × 2 ＝ 1360s → 取整到 60 的倍数 ＝ 1380s（23 分钟）
+#   真实上限 ≈ 840 + 180 + 20 ＝ **1040s**（≈17.3 分钟）
+# 取值：WATCHDOG_SEC ＝ 1380s（23 分钟）＝ 真实上限 1040s × **1.33**，留 ≈340s 余量
+# （给事件推送、TTS 合成、情绪小调用、长期记忆 embedding 这些零散等待——它们各自都有超时，
+#  但叠起来仍可能吃掉几十秒）。
 # 说明：这是**真卡死**的兜底，不是延迟上限——正常偏慢的一回合（几十秒级）离它很远，不会被误伤；
-# 而云端 LLM 自己有 120s 超时、引擎自己有 30s×2，所以只有在「等一个永远不来的响应」时才会走到这里。
+# 而云端 LLM 自己有 120s 超时、引擎自己有 30s×2、工具 10s，所以只有在「等一个永远不来的响应」
+# 时才会走到这里。
 WATCHDOG_SEC = 1380
 
 # 括号里带「着棋点位」的舞台提示不需要显示，例如（白棋落在 C4）/（第7手 Q16）/（C4）

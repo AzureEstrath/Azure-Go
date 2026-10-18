@@ -1101,3 +1101,36 @@ class BusyWatchdogTest(unittest.TestCase):
         self.assertEqual(len(bus.messages(events.AI_MOVE)), 1)
         self.assertEqual(len(agent.st.moves), 2)
 
+    def test_dead_summary_generation_writes_no_brief_and_no_mood(self):
+        """总结阶段（``_prepare_summary``）的死代守卫：过期形势与死代情绪都不许跨代外泄。
+
+        这一格是「引擎分析 ``await`` → 写 ``st.last_katago`` / 发 ``mood``」的窗口，正是看门狗会
+        超时的地方。若漏了守卫，一个已被作废的总结代会把**过期形势**留在 ``st.last_katago``
+        （它会被下一回合的 ``context_block`` / ``with_context`` 读走），并把死代的 ``mood`` 事件
+        推进新对局——本任务要拦的正是这种跨代污染。
+        """
+        agent, _eng, _llm, bus = _mk()
+        _seed_moves(agent, [["B", "Q16"], ["W", "D4"]])
+        agent.st.last_katago = "旧形势"
+        agent.katago = _HangingEngine(0.3)        # 终局那次分析挂 0.3s（看门狗先到）
+        agent.watchdog_sec = 0.05
+
+        async def run():
+            await agent.summarize("修复轮 1")
+            await asyncio.sleep(0.4)              # 卡死那一代恢复后继续跑完
+
+        asyncio.run(run())
+
+        self.assertFalse(agent.busy)
+        self.assertEqual(agent.st.last_katago, "旧形势", "死代不许把过期形势注入下一回合的上下文")
+        self.assertEqual(bus.of_type("mood"), [], "死代不许把 mood 事件推进新对局")
+        self.assertEqual(len(self._hints(bus)), 1)
+
+        # 对照：没超时的总结照旧写形势、照发 mood（证明上面那两条不是「什么都没发生」换来的）
+        agent.katago = StubEngine()
+        agent.watchdog_sec = 1.0
+        asyncio.run(agent.summarize("修复轮 1"))
+        self.assertNotEqual(agent.st.last_katago, "旧形势")
+        self.assertTrue(bus.of_type("mood"))
+        self.assertFalse(agent.busy)
+
