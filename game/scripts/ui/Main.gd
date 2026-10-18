@@ -358,6 +358,7 @@ func _build_right_panel(root: Control) -> void:
 	vb.add_child(info)
 	_lbl_moves = Label.new()
 	_lbl_moves.text = "手数: 0"
+	_lbl_moves.add_theme_color_override("font_color", Color(0.13, 0.30, 0.30))  # 面板是白底：默认主题白字看不见（R-GH-1）
 	info.add_child(_lbl_moves)
 	_lbl_wr = Label.new()
 	_lbl_wr.text = "黑胜率: --"

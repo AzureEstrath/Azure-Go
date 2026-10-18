@@ -101,7 +101,7 @@ var _occupied := {}
 var _displayed: Array = []       # 当前显示的棋子（权威 + 乐观）
 var _optimistic: Array = []
 var _hover := Vector2i(-1, -1)
-var _move_seq: Array = []        # 后端 state 的 GTP 手顺（含 "pass"）：悬停已有棋子时用它推手数
+var _move_seq_map := {}          # 后端 state 的 GTP 手顺**预建查表** {归一化 GTP: 手数}：悬停热路径只做一次 lookup
 var _font: Font = null
 var _black_mat: StandardMaterial3D
 var _white_mat: StandardMaterial3D
@@ -336,13 +336,29 @@ func is_occupied(x: int, y: int) -> bool:
 
 # ================= 悬停提示：坐标 + 手数 =================
 
-## 后端 state 的 `move_seq`（GTP 手顺，含 "pass"）：每次 state 事件对齐一次
+## 后端 state 的 `move_seq`（GTP 手顺，含 "pass"）：每次 state 事件对齐一次。
+## 这里**预建查表** `{归一化 GTP: 手数}`（同一交叉点取**最后一次**出现 ⇒ 后面的覆盖前面的）：
+## 悬停是每次鼠标移动都会走的热路径，原先每次都把整条手顺 `strip_edges().to_upper()` 扫一遍
+## （300 手 × 100Hz），现在只在 state 变更时扫一次。脏值（非数组 / 元素非字符串）一律跳过。
 func set_move_seq(seq) -> void:
-	_move_seq = (seq as Array).duplicate() if typeof(seq) == TYPE_ARRAY else []
+	_move_seq_map.clear()
+	if typeof(seq) != TYPE_ARRAY:
+		return
+	var arr := seq as Array
+	for i in arr.size():
+		var v = arr[i]
+		if typeof(v) == TYPE_STRING:
+			_move_seq_map[str(v).strip_edges().to_upper()] = i + 1
 
-## 某交叉点在 `move_seq` 里的手数（1 基）：取**最后一次**出现——同一交叉点被提后再下时以最近一手为准；
-## 复盘快照的 `move_seq` 已截到当前回看手，天然对齐。不在序列里 / 脏值 / 盘外 ⇒ 0。
-## 纯函数、不碰场景树（门卫可直接断言）。
+## 某交叉点在 `move_seq` 里的手数（1 基）：查 `set_move_seq` 预建的表；不在表里 / 盘外 ⇒ 0。
+func move_no_at(x: int, y: int) -> int:
+	if not Coords.valid(x, y):
+		return 0
+	return int(_move_seq_map.get(Coords.xy_to_gtp(x, y), 0))
+
+## 手数推法的**纯函数参照实现**（静态、不碰场景树，门卫可直接断言；语义与上面的预建表逐字一致）：
+## 取**最后一次**出现——同一交叉点被提后再下时以最近一手为准；复盘快照的 `move_seq` 已截到当前
+## 回看手，天然对齐。不在序列里 / 脏值 / 盘外 ⇒ 0。实例路径走 `move_no_at`（O(1) 查表）。
 static func move_no_in_seq(x: int, y: int, move_seq) -> int:
 	if typeof(move_seq) != TYPE_ARRAY or not Coords.valid(x, y):
 		return 0
@@ -366,7 +382,7 @@ static func tip_text_at(x: int, y: int, move_no: int) -> String:
 
 ## 悬停文案（实例入口）：已有棋子给坐标 + 手数，空点给「点击落子」
 func tip_text(x: int, y: int) -> String:
-	return tip_text_at(x, y, move_no_in_seq(x, y, _move_seq) if is_occupied(x, y) else 0)
+	return tip_text_at(x, y, move_no_at(x, y) if is_occupied(x, y) else 0)
 
 # ================= 定式高亮轨迹 =================
 
@@ -606,6 +622,10 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey:
 		var k := event as InputEventKey
 		if not k.pressed or k.echo:
+			return
+		# 修饰键一律不参与（R-GH-2）：`Ctrl+C` / `Shift+C` / `Alt+C` 都不是「看角」的意思——
+		# 这两个快捷键是**裸键**手势，带上修饰键多半是别处的组合键（复制 / 输入大写），与「不易误触」一致。
+		if k.ctrl_pressed or k.alt_pressed or k.meta_pressed or k.shift_pressed:
 			return
 		match k.keycode:
 			KEY_HOME:

@@ -104,8 +104,11 @@ func _run() -> void:
 
 	# R-F-2 #5：字符串分支与数值分支**共用同一套守卫**（`_clamp_rate`）——同一个值经 JSON 字符串 /
 	# 数字两条路读出来必须一致，尤其不许让字符串路径产出 NaN（那会被 save() 原样写回 config.json）。
+	# R-GH-2：大数用 `"1e308"`（double 内的合法值，夹到 1.0）而**不用 `"1e999"`**——后者会让引擎
+	# 自己打一行 `WARNING: Exponent too high`（门禁输出应当干净）。INF 的覆盖改由下面那条
+	# 直接用 `INF` 常量的断言承担（走数值分支，同样零警告）。
 	for pair in [["0.25", 0.25], ["0.5", 0.5], ["0.0", 0.0], ["1.0", 1.0], ["5", 1.0],
-			["nan", 0.5], ["inf", 0.5], ["-inf", 0.5], ["1e999", 1.0]]:
+			["nan", 0.5], ["inf", 0.5], ["-inf", 0.5], ["1e308", 1.0]]:
 		_write_raw({"joseki_rate": pair[0]})
 		var cstr := AzureConfig.load_config(TMP)
 		_check("joseki_rate 字符串 \"%s\" ⇒ %s（与数值分支同口径）" % [str(pair[0]), str(pair[1])],
