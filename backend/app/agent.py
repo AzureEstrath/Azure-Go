@@ -431,9 +431,10 @@ class AzureAgent:
         # —— 时间感知的采集（v3.9.0，设计 §5-H）：**单手用时的采集是纯后端的**（不要求前端配合）——
         #    ``session_start`` ＝ 本局开始时刻（本局第一手到达时置位）、``move_ts_list`` ＝ 玩家每一手
         #    的到达时刻；两者都是**局内内存**、``reset_game()`` 清空，**不进 GameState 快照**
-        #    （悔棋不回退——「这一手确实等了这么久」是既成事实）。打点由 ``main.py`` 的 ``/api/move``
-        #    在到达时调 ``mark_move_time()``；结算（间隔 / 均值 / 时长）在 ``time_ctx.facts``（纯函数），
-        #    本类只负责采集——不打点＝零成本，也**不新增任何 LLM / 引擎调用**。
+        #    （悔棋不回退——「这一手确实等了这么久」是既成事实）。打点由 ``player_move`` 自己在
+        #    ``is_legal`` 通过之后调 ``mark_move_time()``（修复轮 1 / I-1：被拒的落子不打点）；
+        #    结算（间隔 / 均值 / 时长）在 ``time_ctx.facts``（纯函数），本类只负责采集——不打点＝零成本，
+        #    也**不新增任何 LLM / 引擎调用**。
         self.session_start = None
         self.move_ts_list = []
 
@@ -1406,7 +1407,9 @@ class AzureAgent:
     def mark_move_time(self, now=None):
         """记一次「玩家这一手到达」的时刻（时间感知的**唯一采集点**，设计 §5-H）。
 
-        ``main.py`` 的 ``POST /api/move`` 在通过校验、真正驱动 ``player_move`` 之前调用它：
+        由 ``player_move`` 在 ``is_legal`` 通过、真正落子之前调用（修复轮 1 / I-1：打点从
+        ``main.py`` 的 ``/api/move`` 移到这里——坐标在盘内但 ``is_legal`` 不成立的落子同样是
+        「被拒的一手」，在那里打点会污染 ``move_ts_list`` 与 ``avg_move_sec``）：
         本局第一手把它同时记成 ``session_start``（＝本局开始时刻），之后每一手只追加。
         下一手到达时，``time_ctx.facts`` 用相邻两个时刻之差结算**单手用时**（首手无前一手 ⇒ 不计）。
 

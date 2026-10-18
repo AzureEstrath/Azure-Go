@@ -20,8 +20,10 @@
 ``merge`` **不做 EMA**——按「最近一次非空覆盖」，且**空 / 缺＝未知＝跳过不更新**
 （不会用一局没数据的棋把学到的值擦掉）。其余维都是 ``[0,1]`` 的数值维。
 
-**缺维 / 脏值一律当 0、绝不抛**：``extract_axes`` 对空 rec / 坏 JSON / 脏类型都能跑；
-``merge`` 对缺键（数值维当 0 参与融合）与脏值（非数字当 0）同样不抛。
+**缺维一律「原样带过」、脏值当 0、绝不抛**：``extract_axes`` 对空 rec / 坏 JSON / 脏类型都能跑；
+``merge`` 对**缺键**（``x`` 里没有这一维）**原样带过**——不衰减、不涨 ``n_games``、不改 ``confidence``
+（「本局没量到」≠「本局量到 0」；口径与 ``blunder.*`` / ``weak.*`` / ``persona.topic.*`` 统一），
+只有 ``x`` 里**有**的键才参与 EMA，脏值（非数字）当 0 参与、同样不抛。
 """
 
 import json
@@ -49,7 +51,9 @@ TOP_TYPE_AXIS = "blunder.top_type"
 ADDRESS_AXIS = "persona.address_pref"
 TOPIC_PREFIX = "persona.topic."
 
-# 一定产出的数值维（没数据＝0.0）：``merge`` 对它们**缺键＝当 0 参与融合**（任务书「缺维当 0」）。
+# 有信号时才产出的维（``extract_axes`` 的产出形状见那里；**缺键 ≠ 值为 0**）：
+# ``ALWAYS_AXES`` 是「有资格产出的数值维」全集（没占到角 / 没识别出族 / 玩家不足 2 手时**不产出**），
+# ``merge`` 对**任何缺键**一律原样带过（不衰减、不涨样本数）。
 ALWAYS_AXES = OPEN_AXES + (KAKARI_AXIS,) + STYLE_AXES
 # 只在**有逐手 ``drop`` 信号**时才产出的维（评审前修正：缺信号＝**不产出该键**，
 # 不把「不知道」写成 0）：失误率 + 薄弱方位 + 失误手型。
@@ -191,7 +195,7 @@ def _has_drop_data(rec) -> bool:
 # ================= 四维特征提取 =================
 
 def extract_axes(game_rec) -> dict:
-    """从一条对局记录里抠出**本局**的四维特征（spec §6.2 的键）；空 / 脏 rec 当 0、不抛。
+    """从一条对局记录里抠出**本局**的四维特征（spec §6.2 的键）；空 / 脏 rec 不抛（缺信号＝不产出该键）。
 
     返回 ``{axis: 值}``：数值维是 ``[0,1]`` 的 ``float``，``blunder.top_type`` /
     ``persona.address_pref`` 是**字符串**。产出形状分三类：
@@ -336,8 +340,8 @@ def extract_axes(game_rec) -> dict:
     # `ALWAYS_AXES` 上面被无条件初始化成 0.0，但「**没有信号**」与「真的量到 0」在存储里长成同一个
     # 0.0，渲染侧（Q3 的画像块）就会把前者念成后者：绝大多数对局识别不出任何挂角 / 守角族 ⇒ 从第二局
     # 起每条提示词都断言「他爱先守角」；只落 1 手就被总结的玩家 ⇒ 被断言「很少脱先」。**缺键 ≠ 值为 0**
-    # ——与 `blunder.*` / `weak.*` 的 `_has_drop_data` 同一做法（`merge` 对 `ALWAYS_AXES` 的缺键仍按 0
-    # 参与融合，只是不再凭空涨样本数；`tests/golden/prompts.json` 与既有输出不受影响）。
+    # ——与 `blunder.*` / `weak.*` 的 `_has_drop_data` 同一做法（`merge` 对**任何缺键**都原样带过、
+    # 不衰减也不涨样本数；`tests/golden/prompts.json` 与既有输出不受影响）。
     if not known:                                   # 玩家前 12 手没占到任何角：开局四类都没有信号
         for axis in OPEN_AXES:
             out.pop(axis, None)
@@ -495,13 +499,17 @@ def merge(prev, x, n_games, *, half_life: float = HALF_LIFE, alpha_cap: float = 
     一致（可直接 ``store.upsert_axes(merge(...))``）。规则：
 
     - 数值维：``v ← v*(1-α) + x*α``（首样本 α=1 ⇒ 直接取 ``x``），α 见 ``alpha_of``
-      （**评审前修正**：``n=0⇒1``；``n≥1`` 时 ``min(alpha_cap, max(1/(n+1), 半衰期稳态))``）；
-      值一律夹到 ``[0,1]``；``ALWAYS_AXES`` 里的键**缺键＝当 0 参与融合**（任务书「缺维当 0」），
-      脏值同样当 0；**其余键**（``DROP_AXES``＝失误与薄弱方位、``persona.topic.*``）
-      **缺键＝原样带过、不衰减、不涨样本数**（缺信号 ≠ 值为 0）。
+      （``n=0⇒1``；``n≥1`` 时 ``min(alpha_cap, max(1/(n+1), 半衰期稳态))``）；
+      值一律夹到 ``[0,1]``；
+    - **缺键一律「原样带过」**（控制者裁决，v3.9.0 收口）：``x`` 里没有这一维 ⇒ 不衰减、
+      不涨 ``n_games``、不改 ``confidence``，照原值带过；``x`` 里**有**的键才参与 EMA，
+      脏值（非数字 / ``None``）当 0 参与。理由：「本局没量到」≠「本局量到 0」——
+      ``extract_axes`` 已经不产出无信号的维（I-2），若这里再把缺键按 0 融合，
+      某维一旦有过信号（如 ``open.favorite_kakari=1.0``）就会被其后几局「没识别出族」逐局拉向 0，
+      渲染侧又会念出「更爱先守角」——I-2 的缺陷会经 ``merge`` 复发；
     - 非数值维（``blunder.top_type`` / ``persona.address_pref``）：**最近一次非空覆盖**，
       不做 EMA；空 / 缺＝未知＝**跳过不更新**（连 ``n_games`` 都不涨）。
-    - ``n_games`` 每融合一次 +1（只在真的更新了该维时）。
+    - ``n_games`` 每融合一次 +1（只在 ``x`` 里**有**这一维、真的更新了它时）。
     """
     prev_rec = _prev_records(prev)
     x_map = x if isinstance(x, dict) else {}
@@ -523,13 +531,13 @@ def merge(prev, x, n_games, *, half_life: float = HALF_LIFE, alpha_cap: float = 
         except Exception:               # noqa: BLE001
             base_n = old_n
         present = axis in x_map
-        if not present and axis not in ALWAYS_AXES and axis not in NON_NUMERIC_AXES:
-            if old:                     # 结构上可缺的维（DROP_AXES / persona.topic.*）：原样带过
+        if not present:                     # 缺键：原样带过（不衰减、不涨计数、不改置信度）
+            if old:
                 out[axis] = {"value": old_val, "confidence": confidence_of(old_n, half_life),
                              "n_games": old_n}
             continue
         if axis in NON_NUMERIC_AXES:
-            raw = x_map.get(axis) if present else None
+            raw = x_map.get(axis)
             text = raw.strip() if isinstance(raw, str) else ""
             if text == "":
                 if old:                 # 未知：不更新（值 / 计数 / 置信度都不动）
@@ -540,7 +548,7 @@ def merge(prev, x, n_games, *, half_life: float = HALF_LIFE, alpha_cap: float = 
             out[axis] = {"value": text, "confidence": confidence_of(new_n, half_life),
                          "n_games": new_n}
             continue
-        xv = _clamp01(x_map.get(axis))  # 缺维 / 脏值 ⇒ 0
+        xv = _clamp01(x_map.get(axis))  # 脏值 ⇒ 0（缺键在上面就带过、走不到这里）
         new_n = base_n + 1
         if old is None:
             value = xv
