@@ -1956,5 +1956,106 @@ class ProfileTimePromptWiringTest(unittest.TestCase):
             self.assertNotIn("【她眼中的你", x)
 
 
+# —— 以下为阶段四 · Q5（v3.9.0）追加：主动约战 / 提醒（连接时一次、零新增调用） ——
+
+
+class GreetLineTest(unittest.TestCase):
+    """``_greet_line``：模板句纯函数（三档 + 不打扰的四种情形），**零 LLM / 零磁盘**。"""
+
+    def test_tiers_by_gap(self):
+        self.assertIn("回来啦", AzureAgent._greet_line(1.0))
+        self.assertIn("回来啦", AzureAgent._greet_line(2.9))
+        self.assertIn("好几天", AzureAgent._greet_line(3.0))
+        self.assertIn("好几天", AzureAgent._greet_line(6.9))
+        self.assertIn("好久不见", AzureAgent._greet_line(7.0))
+        self.assertIn("好久不见", AzureAgent._greet_line(30))
+
+    def test_no_line_when_not_long_enough_or_dirty(self):
+        for bad in (None, "", "oops", [], {}, 0.0, 0.99, -3.0, float("nan"), float("inf")):
+            with self.subTest(bad=bad):
+                self.assertEqual(AzureAgent._greet_line(bad), "",
+                                 "不足一天 / 脏值 / NaN / inf ⇒ 不打扰")
+
+
+class GreetWithContextTest(unittest.TestCase):
+    """``greet_with_context``：**只在连接 / 首次交互触发一次**、跨重连不重复、零新增 LLM 调用。"""
+
+    @staticmethod
+    def _agent(last_ts):
+        agent, _eng, llm, bus = _mk()
+        agent.profile_store = _WiringStore(last_ts=last_ts)
+        return agent, llm, bus
+
+    def test_greets_once_and_never_calls_the_model(self):
+        agent, llm, bus = self._agent(time.time() - 3 * 86400.0)
+
+        async def run():
+            first = await agent.greet_with_context(now=time.time())
+            second = await agent.greet_with_context(now=time.time())     # 重连 / 二次交互
+            return first, second
+
+        first, second = asyncio.run(run())
+        self.assertIn("好几天", first, "三天没来 ⇒ 第二档模板")
+        self.assertEqual(second, "", "只触发一次：跨重连不再重复")
+        msgs = bus.messages(events.AI)
+        self.assertEqual(len(msgs), 1, "只推一条 message")
+        self.assertEqual(msgs[0]["text"], first)
+        self.assertEqual(llm.calls, [], "模板句：一条 LLM 调用都不新增")
+        self.assertFalse(agent.busy, "不碰 busy")
+
+    def test_no_greeting_without_history_or_when_too_soon(self):
+        # ① 没有历史对局（库是空的 / 未装配）
+        agent, llm, bus = self._agent(None)
+        self.assertEqual(asyncio.run(agent.greet_with_context()), "")
+        self.assertEqual(bus.messages(events.AI), [])
+        self.assertEqual(llm.calls, [])
+        # ② 距上次不足一天：刚下过，别打扰
+        agent2, _l2, bus2 = self._agent(time.time() - 3600.0)
+        self.assertEqual(asyncio.run(agent2.greet_with_context()), "")
+        self.assertEqual(bus2.messages(events.AI), [])
+
+    def test_no_greeting_when_a_game_is_already_on_the_board(self):
+        """不是「刚连上」（棋盘上已经有子）⇒ 不打扰，也不吃掉这次机会之外的东西。"""
+        agent, _llm, bus = self._agent(time.time() - 5 * 86400.0)
+        agent.st.add_move("B", "Q16")
+        self.assertEqual(asyncio.run(agent.greet_with_context()), "")
+        self.assertEqual(bus.messages(events.AI), [])
+
+    def test_store_failure_is_only_a_missing_greeting(self):
+        """库坏了 ⇒ 当作「没有上次」：不抛、不发、不卡。"""
+
+        class Boom(_WiringStore):
+            def last_game_ts(self):
+                raise RuntimeError("库坏了")
+
+        agent, _eng, llm, bus = _mk()
+        agent.profile_store = Boom(last_ts=time.time() - 9 * 86400.0)
+        self.assertEqual(asyncio.run(agent.greet_with_context()), "")
+        self.assertEqual(bus.messages(events.AI), [])
+        self.assertFalse(agent.busy)
+        self.assertEqual(llm.calls, [])
+
+    def test_reset_game_does_not_reset_the_greeted_mark(self):
+        """``reset_game`` **有意不重置**「已打过招呼」：跨重连 / 重开一局都不再补打。"""
+        agent, _llm, _bus = self._agent(time.time() - 9 * 86400.0)
+        self.assertIn("好久不见", asyncio.run(agent.greet_with_context()))
+        agent.reset_game()
+        self.assertEqual(asyncio.run(agent.greet_with_context()), "")
+
+    def test_no_extra_llm_or_engine_calls_in_a_move_turn(self):
+        """假 LLM / 假引擎的调用数与「没有这个提醒」时逐项一致（提醒零新增调用）。"""
+
+        async def run(with_greet):
+            agent, eng, llm, _bus = _mk()
+            agent.profile_store = _WiringStore(last_ts=time.time() - 3 * 86400.0)
+            if with_greet:
+                await agent.greet_with_context()
+            await agent.player_move(3, 3)
+            return len(llm.calls), len(eng.calls)
+
+        self.assertEqual(asyncio.run(run(True)), asyncio.run(run(False)))
+
+
+
 
 

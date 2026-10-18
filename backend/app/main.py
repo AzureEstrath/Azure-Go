@@ -29,7 +29,8 @@
     GET  /api/health                        引擎/LLM/长期记忆状态
 
 事件通道（WebSocket /ws）——后端把 10 类事件推给客户端，契约见 events.py：
-    message / state / info / busy / mood / joseki / tool / token / speech / memory（连接建立时先发一次 hello 同步）。
+    message / state / info / busy / mood / joseki / tool / token / speech / memory（连接建立时先发一次 hello 同步；
+    若距上次对局够久，紧随 hello 之后还会有一条**主动约战提醒**的 message——只触发一次、模板句、零 LLM 调用）。
     `token` 是可选流式增量（`stream_tokens` 开启时才有，默认关闭；最终内容以 `message` 为准）。
     `speech` 是每条台词的语音（`mode` 为 `openai` 时按 `id` 拉上面那条音频端点；`system` 时用 `text`，
     交给 Windows 系统语音；语音关闭时根本不发），与对应 `message` 同 `turn_id`、`seq` 递增配对。
@@ -536,6 +537,12 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         q = s.bus.subscribe()
         try:
             await sock.send_json(events.hello(s.st.payload(), s.mood_payload(), s.busy))
+            # v3.9.0（Q5）：玩家连上时的**主动约战提醒**——只读一次「距上次对局」挑一句模板台词
+            # （零 LLM 调用），实例上的标记保证**跨重连不重复**。任何故障都不影响这条连接。
+            try:
+                await s.greet_with_context()
+            except Exception as e:              # noqa: BLE001 —— 提醒失败绝不影响 WS
+                print("[WS] 主动约战提醒失败（已忽略）：%s" % e)
             while True:
                 event = await q.get()
                 await sock.send_json(event)

@@ -8,6 +8,7 @@ import copy
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,6 +20,7 @@ from app import events
 from app.config import AzureConfig, DRIFT_MAX_LIMIT
 from app.llm import LLMClient
 from app.main import create_app
+from app.profile_store import ProfileStore
 from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM, mk_agent
 
 
@@ -103,9 +105,15 @@ class ProfileTimeSwitchTest(unittest.TestCase):
     """``/api/config`` 透传两个开关（v3.9.0）：默认关、只认 JSON 的 true / false、脏值不生效。"""
 
     def test_config_forwards_profile_and_time_switches(self):
-        app = create_app(engine=StubEngine(), llm=StubLLM(), autostart=False)
+        # v3.9.0（Q1）：库路径指到临时目录——「空库 ⇒ 无画像」这一条不许依赖本机有没有
+        # ``backend/data/profile.db``（那是运行产物，开发机上有真实数据）。
+        tmp = tempfile.mkdtemp()
+        cfg = AzureConfig()
+        cfg.profile_db_path = os.path.join(tmp, "profile.db")
+        app = create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(), autostart=False)
         with TestClient(app) as client:
             s = app.state.agent
+            self.assertIsNotNone(s.profile_store, "画像库**无条件装配**（懒建库、零开销）")
             self.assertFalse(s.profile_enabled)
             self.assertFalse(s.time_aware_enabled)
             self.assertEqual(s.profile_facts(), {}, "关着 ⇒ 画像块素材为空（＝不注入）")
@@ -116,7 +124,7 @@ class ProfileTimeSwitchTest(unittest.TestCase):
             self.assertTrue(s.profile_enabled)
             self.assertTrue(s.time_aware_enabled)
             self.assertIn("date", s.time_facts(now=1792414980.0), "开着 ⇒ 时间事实真的有产出")
-            # 未装配画像库（lifespan 之后由 Q6/Q7 注入）⇒ 开着也是「无画像」，不抛
+            # 库装配着但**是空的** ⇒ 开着也是「无画像」，不抛（空库 ≠ 故障）
             self.assertEqual(s.profile_facts(), {})
 
             # 脏值不生效（`bool("false")` 会把脏值读成「开」，所以只认 bool）
@@ -864,6 +872,55 @@ class ReviewModeTest(unittest.TestCase):
         self.assertEqual(len(agent.st.moves), 2)
         self.assertEqual([n["move_no"] for n in agent.st.move_notes], [1, 2, 2])
         self.assertEqual([l["move_no"] for l in agent.st.losses], [2], "留到 len(st.moves)（含）为止")
+
+
+# —— 阶段四 · Q5（v3.9.0）追加：连上后端时的主动约战提醒 ——
+
+
+class ProfileGreetWsTest(unittest.TestCase):
+    """连上后端时，若「距上次对局」够久 ⇒ 紧随 ``hello`` 之后来一条主动约战提醒（只一次）。
+
+    用 ``cfg.profile_db_path`` 指到一个临时库（唯一可控的装配入口：注入的 agent 也会被 lifespan
+    覆盖成同一个 ``ProfileStore``），因此这条用例同时钉住「库路径可配」。
+    """
+
+    def _app(self, tmp, days):
+        db = os.path.join(tmp, "profile.db")
+        store = ProfileStore(db)
+        store.add_game({"ts": time.time() - days * 86400.0, "move_count": 10, "result": "旧局"})
+        cfg = AzureConfig()
+        cfg.profile_db_path = db
+        return create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(), autostart=False)
+
+    def test_greeting_follows_hello_only_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with TestClient(self._app(tmp, 3.0)) as client:
+                with client.websocket_connect("/ws") as ws:
+                    self.assertEqual(ws.receive_json()["type"], "hello")
+                    e = ws.receive_json()
+                    self.assertEqual(e["type"], "message", "紧跟 hello 的那条就是提醒")
+                    self.assertIn("好几天", e["text"])
+                # 重连（同一个 agent 实例）：标记还在 ⇒ 不再有第二条提醒
+                with client.websocket_connect("/ws") as ws2:
+                    self.assertEqual(ws2.receive_json()["type"], "hello")
+                    client.post("/api/config", json={"allow_pass": True})
+                    e2 = ws2.receive_json()             # set_allow_pass 先发它自己那条 message
+                    self.assertEqual(e2["type"], "message")
+                    self.assertNotIn("好几天", e2["text"], "重连不再补打：队头就是动作自己那条")
+                    self.assertIn("虚着", e2["text"])
+
+    def test_no_greeting_without_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = AzureConfig()
+            cfg.profile_db_path = os.path.join(tmp, "profile.db")   # 空库（连文件都还没有）
+            with TestClient(create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(),
+                                       autostart=False)) as client:
+                with client.websocket_connect("/ws") as ws:
+                    self.assertEqual(ws.receive_json()["type"], "hello")
+                    client.post("/api/config", json={"allow_pass": True})
+                    e = ws.receive_json()
+                    self.assertEqual(e["type"], "message")
+                    self.assertIn("虚着", e["text"], "没有历史对局 ⇒ 一条提醒都不发")
 
 
 if __name__ == "__main__":

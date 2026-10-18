@@ -44,6 +44,12 @@ LEN_TEACH_NOTE = ("\n\n【本次额外要求 · 优先遵守】\n"
                   "- 这是定式讲解：把名称与要点讲清楚，2~3 句即可，别长篇大论\n"
                   "- 不复述局面、不客套，直接开讲就好")
 
+# —— 主动约战 / 提醒（v3.9.0，设计 §5-E）——
+# 「好久没来」的门槛：距上次对局不足一天就不打扰（刚下过）。台词是**模板句**，零 LLM 调用；
+# 触发点只有一处（``main.py`` 的 WS 处理器在 ``hello`` 之后调 ``greet_with_context``），
+# 实例上的 ``_greeted`` 保证**跨重连不重复**。
+GREET_MIN_GAP_DAYS = 1.0
+
 # —— 发言侧工具（她自己决定要不要查资料）——
 # 计划 02 的规则是「工具只影响怎么说、不影响下哪里」；计划 04 有意放宽（S21）：工具/模型在预算内
 # 报出的落点可以成为候选，但必须过合法性边界（见 ``_resolve_ai_move``），默认仍回退
@@ -451,6 +457,10 @@ class AzureAgent:
         self.profile_enabled = bool(profile_enabled)
         self.time_aware_enabled = bool(time_aware_enabled)
         self.profile_store = None
+        # 主动约战 / 提醒（v3.9.0，设计 §5-E）：**本次进程只触发一次**的标记。跨重连不重复
+        # （WS 重连会再调 ``greet_with_context``，第二次直接返回）；``reset_game`` **有意不重置**
+        # ——「打过招呼」是这一次会话的事实，与「这一局」无关。
+        self._greeted = False
 
         self._mood_region = -1
         self._mood_ms = 0
@@ -661,6 +671,30 @@ class AzureAgent:
     def _idle_line() -> str:
         """闲置搭话的兜底短句（LLM 不可用时）。"""
         return str(IDLE_LINES[random.randrange(len(IDLE_LINES))])
+
+    @staticmethod
+    def _greet_line(gap_days) -> str:
+        """按「距上次对局」挑一句**主动约战 / 提醒**的模板（v3.9.0，设计 §5-E）。
+
+        **纯函数**（零 LLM、零磁盘、零随机）：不算「好久没来」（不足 ``GREET_MIN_GAP_DAYS`` 天 /
+        脏值 / ``NaN`` / ``inf``）⇒ 返回空串（＝这次不打招呼）。台词分三档（一两天 / 几天 / 一周以上），
+        每档一句固定模板——本功能一辈子只触发一次，不需要轮换文案。
+        """
+        try:
+            d = float(gap_days)
+        except (TypeError, ValueError):
+            return ""
+        if d != d or d < GREET_MIN_GAP_DAYS:        # NaN / 不足一天：刚下过，别打扰
+            return ""
+        try:
+            days = int(d)
+        except (OverflowError, ValueError):         # inf 之类
+            return ""
+        if days < 3:
+            return "你回来啦~ 上次那盘我还记着呢，要不要再来一局？"
+        if days < 7:
+            return "好几天没见你落子了，手痒没有？来一盘吧~"
+        return "好久不见啦…我都快记不清你下棋的样子了。要不要来一局，让我看看你有没有长进？"
 
     def _update_katago_brief(self, analysis, num_moves):
         """把 KataGo 形势数据整理成一段文字，存进 st.last_katago，供 Azure 上下文使用。"""
@@ -1464,6 +1498,47 @@ class AzureAgent:
         except Exception as e:                      # noqa: BLE001 —— 读画像失败＝无画像
             print("[Agent] 画像读取异常（按「无画像」降级）：%s" % e)
             return {}
+
+    # ================= 主动约战 / 提醒（v3.9.0，设计 §5-E） =================
+
+    async def greet_with_context(self, *, now=None) -> str:
+        """玩家连上 / 首次交互时的**主动约战提醒**：**本次进程只触发一次**，零新增 LLM 调用。
+
+        触发点只有一处——``main.py`` 的 WS 处理器在发出 ``hello`` 之后调它（连接即触发）；
+        实例上的 ``_greeted`` 保证**跨重连不重复**（``reset_game`` 有意不重置：打过招呼是这次
+        会话的事实）。它只读一次「距上次对局」（``ProfileStore.last_game_ts()``，阻塞读 ⇒
+        ``await asyncio.to_thread``），按天数挑一句**模板台词**（``_greet_line``）发一条 ``message``。
+
+        与 ``undo`` / ``reset_game`` 的短提示同一做法：**纯文字、不发 ``speech``**（同步方法那些
+        短提示的既有口径），前端按「她这一轮已结束」当场显示，不引入任何合成等待。
+
+        **不额外加开关**（控制者任务书只按「距上次对局」判）：没有历史对局 / 距上次不足一天 /
+        棋盘上已经有子（不是「刚连上」）⇒ 什么都不说；未装配画像库或读失败同样只是「这次不打招呼」。
+        任何故障都不抛、不碰 ``busy``、不调模型、不调引擎。返回发出去的台词（没发 ⇒ 空串）。
+        """
+        if self._greeted:
+            return ""
+        if self.st.moves:                           # 不是「刚连上」：这一局已经在下 / 下完了
+            return ""
+        self._greeted = True                        # 先置位：并发的第二次连接不再打第二遍
+        last_ts = None
+        store = self.profile_store
+        if store is not None:
+            try:
+                last_ts = await asyncio.to_thread(store.last_game_ts)
+            except Exception as e:                  # noqa: BLE001 —— 读不到就当「没有上次」
+                print("[Agent] 距上次对局读取失败（按「没有上次」降级）：%s" % e)
+                last_ts = None
+        try:
+            facts = time_ctx.facts(now=time.time() if now is None else now, last_game_ts=last_ts)
+        except Exception as e:                      # noqa: BLE001 —— 时间算不出来就不打招呼
+            print("[Agent] 时间事实计算失败（这次不打招呼）：%s" % e)
+            return ""
+        text = self._greet_line(facts.get("last_gap_days"))
+        if text == "":
+            return ""
+        self._emit(events.message(events.AI, text))
+        return text
 
     # ================= 玩家落子 =================
 
