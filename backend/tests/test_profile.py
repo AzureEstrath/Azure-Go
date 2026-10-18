@@ -139,7 +139,7 @@ class ExtractFeatureTest(unittest.TestCase):
         self.assertAlmostEqual(got3["style.aggression"], 0.0)
 
     def test_territory_vs_influence_is_mean_line_height(self):
-        """离最近边的线数 / 8 的均值：全在边上＝偏低（实地）、全在中腹＝偏高（势力）。"""
+        """离最近边的线数 / 18 的均值：全在边上＝偏低（实地）、全在中腹＝偏高（势力）。"""
         rec = {"moves": _seq(("B", "Q16"), ("W", "Q15"), ("B", "Q14"), ("W", "D4"),
                              ("B", "C3"))}
         got = extract_axes(rec)
@@ -178,7 +178,7 @@ class ExtractFeatureTest(unittest.TestCase):
         """I-1 / I-2 的口径钉死：**同一象限里 Azure 也落了子**时，分母仍只算玩家。
 
         左上角玩家只落 1 手（且真亏）、Azure 落 3 手 ⇒ 玩家口径 rate=1/1、weak_tl=1/1；
-        若分母混进 Azure 的落子会得到 1/4 与 1/4（这条用例就是为抓那个回归而加的）。
+        若分母混进 Azure 的落子会得到 1/5 与 1/4（这条用例就是为抓那个回归而加的）。
         """
         moves = [_mv("B", "D16", 0.40),      # 左上，真亏
                  _mv("W", "C17"), _mv("W", "D17"), _mv("W", "C16"),   # 左上：Azure 落 3 手

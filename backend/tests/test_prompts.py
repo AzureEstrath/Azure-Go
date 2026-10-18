@@ -11,9 +11,13 @@ import asyncio
 import json
 import os
 import re
+import sys
 import unittest
 
-from app import coords, prompts
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from app import coords, prompts, time_ctx
 
 _GOLDEN = os.path.join(os.path.dirname(__file__), "golden", "prompts.json")
 
@@ -487,6 +491,204 @@ class TestEventBlock(_Base):
         self.assertNotIn("本局记事", joined)        # 但没进任何台词
         self.assertNotIn("他和我聊了关于", joined)
         self.assertEqual([e for e in bus.of_type("speech")], [], "未接 TTS：一条 speech 都不发")
+
+
+# ===================== 阶段四 · Task Q3：时间块 / 画像块（v3.9.0）=====================
+#
+# 两块都插在**事件区块之后、铁律段之前**（时间在上、画像在下），空则逐字符不变；
+# 它们只喂给模型（user 消息），**永不进台词**。两个开关（`profile_enabled` /
+# `time_aware_enabled`）由调用方把关（关着就传空 dict ⇒ 与「没有这个功能」逐字符同构）。
+
+
+def _facts(**over):
+    """一份「有全部事实」的时间事实（形状＝``time_ctx.facts()`` 的返回）。"""
+    base = {"now": 1792414980.0, "date": "2026-10-19", "weekday": "周一", "clock": "21:03",
+            "session_sec": 7380.0, "avg_move_sec": 42.0, "last_gap_days": 3.0, "streak_days": 4}
+    base.update(over)
+    return base
+
+
+_PROFILE = {
+    "open.star": {"value": 0.8, "confidence": 0.9, "updated_ts": 5},
+    "style.aggression": {"value": 0.6, "confidence": 0.8, "updated_ts": 4},
+    "persona.topic.定式": {"value": 0.5, "confidence": 0.7, "updated_ts": 1},
+    "blunder.rate": {"value": 0.30, "confidence": 0.3, "updated_ts": 3},
+    "weak.corner_tl": {"value": 0.40, "confidence": 0.25, "updated_ts": 3},
+    "blunder.top_type": {"value": "无理", "confidence": 0.2, "updated_ts": 2},
+    "persona.address_pref": {"value": "主人", "confidence": 1.0, "updated_ts": 9},
+}
+
+
+class TestProfileTimeBlocks(_Base):
+    """`profile_note` / `time_note` 的空串、插入点、预算与「只在相关时提」。"""
+
+    def test_empty_blocks_keep_golden_identical(self):
+        """两块为空 ⇒ 空串，且 `context_block` 输出与 **golden**（三块都空的样本）逐字符一致。"""
+        self.assertEqual(prompts.time_note({}), "")
+        self.assertEqual(prompts.time_note(None), "")
+        self.assertEqual(prompts.time_note("不是 dict"), "")
+        self.assertEqual(prompts.profile_note({}, 40), "")
+        self.assertEqual(prompts.profile_note(None, 40), "")
+        self.assertEqual(prompts.profile_note("不是 dict", 40), "")
+
+        # 新增的 golden 用例：同一份输入 + 两块都空 ⇒ 与既有 context_block 样本**逐字符相等**
+        for c in self.data["context_block_profile_time_empty"]:
+            board = None if c["board"] == "null" else _board(c["board"])
+            base = prompts.context_block(
+                _moves(c["moves"]), _memory(c["memory"]), _chat(c["chat"]), c["phase"],
+                c["skip_last_chat"], c["katago"], board)
+            self.eq(base, c["result"], "三块都空 vs golden board=%s phase=%s" % (c["board"], c["phase"]))
+            for kwargs in ({"profile": {}, "time_facts": {}}, {"profile": None, "time_facts": None}):
+                got = prompts.context_block(
+                    _moves(c["moves"]), _memory(c["memory"]), _chat(c["chat"]), c["phase"],
+                    c["skip_last_chat"], c["katago"], board, **kwargs)
+                self.eq(got, c["result"],
+                        "%r 时 context_block 逐字符不变 board=%s" % (sorted(kwargs), c["board"]))
+            self.assertNotIn("时间事实", base)
+            self.assertNotIn("她眼中的你", base)
+
+        # 既有 golden 条目（不带这两个参数）仍逐字符一致
+        for c in self.data["context_block"]:
+            board = None if c["board"] == "null" else _board(c["board"])
+            self.eq(prompts.context_block(
+                _moves(c["moves"]), _memory(c["memory"]), _chat(c["chat"]), c["phase"],
+                c["skip_last_chat"], c["katago"], board),
+                c["result"], "既有 golden board=%s phase=%s" % (c["board"], c["phase"]))
+
+    def test_blocks_sit_between_events_and_ironclad(self):
+        """插入顺序固定：长期记忆 → 事件区块 → **时间块** → **画像块** → 铁律段。"""
+        ev = _ev(4, "player_good", "他在第4手下的这步棋方向不错")
+        out = prompts.context_block(MOVES_SHORT, [], [], "observe", long_term="他喜欢点三三",
+                                    events=[ev], profile=_PROFILE, time_facts=_facts())
+        self.assertLess(out.index("长期记忆"), out.index("本局记事"))
+        self.assertLess(out.index("本局记事"), out.index("时间事实"))
+        self.assertLess(out.index("时间事实"), out.index("她眼中的你"))
+        self.assertLess(out.index("她眼中的你"), out.index("铁律"))
+        self.assertIn("A→T 从左到右", out)          # 铁律段正文没被动过
+        # 两块真的进了提示词
+        self.assertIn("现在是 2026-10-19 周一 21:03", out)
+        self.assertIn("开局爱走「星位」", out)
+
+        # `with_context` 走同一条路（两块都在【现在】之前）
+        full = prompts.with_context(MOVES_SHORT, [], [], "继续下吧", "observe",
+                                    profile=_PROFILE, time_facts=_facts())
+        self.assertLess(full.index("她眼中的你"), full.index("【现在】"))
+
+    def test_time_note_drops_the_oldest_fact_first(self):
+        """超预算：**从最旧的事实开始丢**（连续天数 → 间隔 → 单手用时 → 本局时长 → 当前时间）。"""
+        full = prompts.time_note(_facts())
+        self.assertIn("现在是 2026-10-19 周一 21:03", full)
+        self.assertIn("本局已下 2 小时 3 分", full)
+        self.assertIn("他平均每手 42 秒", full)
+        self.assertIn("距上次对局 3 天", full)
+        self.assertIn("连续第 4 天在陪 Estarth", full)
+
+        # 只差「连续天数」那一行放不下 ⇒ 丢它，其余全留
+        out = prompts.time_note(_facts(), max_chars=len(full) - len("连续第 4 天在陪 Estarth") - 1)
+        self.assertEqual(out, full.replace("\n连续第 4 天在陪 Estarth", ""))
+        # 再收紧一行 ⇒ 「距上次对局」也先走，当前时间留住
+        out2 = prompts.time_note(_facts(), max_chars=len(out) - len("距上次对局 3 天") - 1)
+        self.assertNotIn("距上次对局", out2)
+        self.assertIn("现在是", out2)
+        self.assertIn("本局已下", out2)
+        # 预算连表头 + 说明句都放不下 ⇒ 空串（不留半截区块）
+        self.assertEqual(prompts.time_note(_facts(), max_chars=5), "")
+
+    def test_profile_note_drops_the_lowest_confidence_first(self):
+        """超预算：丢**最低置信 / 最旧维度**（渲染顺序＝置信度高 → 低）。"""
+        full = prompts.profile_note(_PROFILE, 40)
+        # 渲染顺序：置信度高 → 低
+        self.assertLess(full.index("开局爱走「星位」"), full.index("下得敢接触"))
+        self.assertLess(full.index("下得敢接触"), full.index("常聊的话题"))
+        self.assertLess(full.index("常聊的话题"), full.index("失误偏多"))
+        self.assertLess(full.index("失误偏多"), full.index("「左上角」"))
+        self.assertLess(full.index("「左上角」"), full.index("亏得最多的那一手"))
+
+        # 只放得下最高置信的那一条 ⇒ 最低置信的（blunder.top_type）先走
+        one = "开局爱走「星位」"
+        out = prompts.profile_note(_PROFILE, 40, max_chars=len(prompts._PROFILE_HEADER)
+                                   + len(prompts._PROFILE_TAIL) + len(one))
+        self.assertEqual(out, prompts._PROFILE_HEADER + one + prompts._PROFILE_TAIL)
+        self.assertNotIn("亏得最多的那一手", out)
+        # 连表头 + 说明句都放不下 ⇒ 空串
+        self.assertEqual(prompts.profile_note(_PROFILE, 40, max_chars=5), "")
+
+    def test_profile_note_early_game_hides_the_blunder_group(self):
+        """「失误与薄弱方位」只在这一局下够 ``PROFILE_BLUNDER_MIN_MOVE`` 手之后才提（只在相关时提）。"""
+        early = prompts.profile_note(_PROFILE, prompts.PROFILE_BLUNDER_MIN_MOVE - 1)
+        self.assertNotIn("失误", early)
+        self.assertNotIn("亏得最多的那一手", early)
+        self.assertNotIn("吃亏", early)
+        self.assertIn("开局爱走「星位」", early)
+        late = prompts.profile_note(_PROFILE, prompts.PROFILE_BLUNDER_MIN_MOVE)
+        self.assertIn("失误偏多", late)
+        self.assertIn("亏得最多的那一手", late)
+        self.assertIn("「左上角」", late)
+        # 手数脏值 ⇒ 当 0（不提这一组），不抛
+        self.assertNotIn("失误", prompts.profile_note(_PROFILE, "脏"))
+
+    def test_profile_note_ignores_unknown_keys_and_never_renders_address_pref(self):
+        """未知键忽略；``persona.address_pref`` **不留措辞位**（真实链路永不产出）。"""
+        self.assertEqual(prompts.profile_note({"not.an.axis": 0.9}, 40), "")
+        self.assertEqual(prompts.profile_note({"persona.address_pref": {"value": "主人"}}, 40), "")
+        self.assertNotIn("主人", prompts.profile_note(_PROFILE, 40))
+        # 扁平形状（只给值）也收；脏值不抛
+        flat = prompts.profile_note({"open.komoku": 0.5, "style.aggression": "脏"}, 40)
+        self.assertIn("开局爱走「小目」", flat)
+        self.assertNotIn("敢接触", flat)
+
+    def test_profile_note_uses_the_current_scales(self):
+        """Q2 收口后的刻度：``blunder.rate`` 是玩家口径（翻倍）、``territory_vs_influence`` ≈ [0, 0.5]。"""
+        def note(axis, value):
+            return prompts.profile_note({axis: value}, 40)
+
+        self.assertIn("失误偏多", note("blunder.rate", 0.25))
+        self.assertIn("偶尔会有明显亏损", note("blunder.rate", 0.15))
+        self.assertIn("很少下出明显亏损", note("blunder.rate", 0.05))
+        self.assertEqual(note("blunder.rate", 0.09), "", "中间地带不开口（只在相关时提）")
+
+        self.assertIn("更偏势力与模样", note("style.territory_vs_influence", 0.5))
+        self.assertIn("更偏实地", note("style.territory_vs_influence", 0.1))
+        self.assertEqual(note("style.territory_vs_influence", 0.3), "")
+
+        self.assertIn("敢接触", note("style.aggression", 0.5))
+        self.assertIn("下得偏稳", note("style.aggression", 0.1))
+        self.assertIn("常脱先", note("style.tenuki", 0.4))
+        self.assertIn("很少脱先", note("style.tenuki", 0.05))
+        self.assertIn("挂角比守角更主动", note("open.favorite_kakari", 0.7))
+        self.assertIn("更爱先守角", note("open.favorite_kakari", 0.3))
+        self.assertIn("孤军深入", note("blunder.top_type", "深入"))
+        self.assertIn("硬碰硬", note("blunder.top_type", "无理"))
+
+    def test_time_note_reads_only_the_keys_that_are_there(self):
+        """缺哪个事实就不说哪个（不补 0）；空壳 / 只有 ``now`` ⇒ 空串。"""
+        self.assertEqual(prompts.time_note({"now": 1.0}), "")
+        only_now = prompts.time_note({"date": "2026-10-19", "weekday": "周一", "clock": "21:03"})
+        self.assertIn("现在是 2026-10-19 周一 21:03", only_now)
+        for gone in ("本局", "平均每手", "距上次对局", "连续第"):
+            self.assertNotIn(gone, only_now)
+        # 直接吃 `time_ctx.facts()` 的产出（两端字段名必须对得上）
+        facts = time_ctx.facts(now=1792414980.0, session_start=1792414980.0 - 7380.0,
+                               last_game_ts=1792414980.0 - 3 * 86400.0,
+                               move_ts_list=[1792414980.0 - 84.0, 1792414980.0],
+                               game_ts_list=[1792414980.0])
+        out = prompts.time_note(facts)
+        self.assertIn("本局已下 2 小时 3 分", out)
+        self.assertIn("他平均每手 1 分 24 秒", out)
+        self.assertIn("距上次对局 3 天", out)
+        self.assertIn("连续第 1 天在陪 Estarth", out)
+
+    def test_blocks_carry_the_instruction_and_no_copyable_example(self):
+        """两块都必须带说明句（只在相关时提 / 别把数字当口头禅），且不放可照抄的示例句。"""
+        t = prompts.time_note(_facts())
+        p = prompts.profile_note(_PROFILE, 40)
+        self.assertIn("不必每句都说", t)
+        self.assertIn("口头禅", t)
+        self.assertIn("只在相关时", p)
+        self.assertIn("口头禅", p)
+        for out in (t, p):
+            for bad in ("例如", "%s", "%(", "（可选）"):
+                self.assertNotIn(bad, out)
 
 
 class TestGoldenFrozen(_Base):

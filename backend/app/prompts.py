@@ -14,6 +14,12 @@ from .board import GoBoard, SIZE as BOARD_SIZE
 # 它限制的是**注入层**——事件表本身存储完整、不截断；超预算时按「最旧 → 最低档」丢弃。
 EVENT_BLOCK_MAX_CHARS = 240
 
+# 时间块 / 画像块（v3.9.0，设计 §6.3）：同一套「空则逐字符不变」纪律，预算同样与
+# ``memory_max_inject_chars``（240）同量级。超预算的丢弃口径不同：时间块丢**最旧的事实**
+# （从渲染列表尾部往回丢），画像块丢**最低置信 / 最旧维度**（见各自函数）。
+TIME_MAX_CHARS = 240
+PROFILE_MAX_CHARS = 240
+
 # 身份底座（personality / reply_style / think_preference 三段）
 SYSTEM_PROMPT = "\r\n".join([
     "你是 Azure，永恒17岁的AI少女。主色调是青蓝色。",
@@ -328,14 +334,18 @@ def long_term_note(text):
 # | 区块 | 来源 | 插入点 | 上限 / 失效条件 |
 # | --- | --- | --- | --- |
 # | 事件区块（本函数） | `EventLog.all()` + `decay.level()` | **长期记忆段之后、铁律段之前** | `EVENT_BLOCK_MAX_CHARS`；超 `DECAY_DROP_AT`（12 手）失效 |
-# | 铁律段（逐字符锁定） | 本文件内联 | 原位置（事件区块之后） | `tests/golden/prompts.json` |
+# | 时间块（`time_note`，v3.9.0） | `time_ctx.facts()` | **事件区块之后、画像块之前** | `TIME_MAX_CHARS`；超限从**最旧的事实**开始丢 |
+# | 画像块（`profile_note`，v3.9.0） | `ProfileStore.get_profile()` | **时间块之后、铁律段之前** | `PROFILE_MAX_CHARS`；超限丢**最低置信 / 最旧维度** |
+# | 铁律段（逐字符锁定） | 本文件内联 | 原位置（画像块之后） | `tests/golden/prompts.json` |
 # | 棋谱 / 记忆 / 聊天（既有） | `board_map` / `memory_brief` / `chat_brief` | 原位置（事件区块之前） | 既有上限 |
 #
-# 三条不能回退的硬规则：
+# 四条不能回退的硬规则：
 #   ① **空则逐字符不变**——`events` 为空 / 全部超出衰减窗口时返回 `''`，`context_block` 里
-#      与没有这个参数时逐字符一致（golden 锁定）；
+#      与没有这个参数时逐字符一致（golden 锁定）；时间块 / 画像块同理（空 dict / `None` ⇒ `''`）；
 #   ② **事件原文永不进台词**——这里的文本只喂给模型（user 消息），不产生 `speech`、不进 `message`；
-#   ③ **存储完整、注入有界**——`EventLog` 只增不减、不截断；本函数是唯一的注入闸门（档位 + 预算）。
+#   ③ **存储完整、注入有界**——`EventLog` 只增不减、不截断；本函数是唯一的注入闸门（档位 + 预算）；
+#   ④ **时间与画像只在相关时提**——两块都带说明句（「不必每句都说」「别把数字当口头禅复述」），
+#      且块内**不放可被模型照抄的示例句**（守 AGENTS 的反目标「不许她变话多」）。
 
 # 各类事件「只剩类别」时的兜底说法（档 4 / 正文缺失时用），不放可被照抄的示例句。
 _KIND_WORD = {
@@ -464,8 +474,305 @@ def event_block(events, now_move_no, max_chars=EVENT_BLOCK_MAX_CHARS) -> str:
     return header + "\n".join(lines)
 
 
+# ================= 时间块 / 画像块（v3.9.0，设计 §6.3） =================
+#
+# 两块都插在**事件区块之后、铁律段之前**（时间在上、画像在下），空则**逐字符不变**：
+# 传空 dict / ``None`` 时返回 ``''``，``context_block`` 的输出与没有这两个参数时逐字符一致
+# （``tests/golden/prompts.json`` 锁定）。两块都是**纯函数**（零 LLM、零引擎、零磁盘）。
+#
+# 硬规则（spec §6.3 + AGENTS 反目标「不许她变话多」）：
+#   ① 时间与画像**只在相关时提**、不必每句都说；
+#   ② **禁止把数字当口头禅复述**（说明句写进块内，见 header / tail）；
+#   ③ 块内**不放可被模型照抄的示例句**——只有事实与要求。
+#
+# 两个开关（``profile_enabled`` / ``time_aware_enabled``，默认都关）**不在这里判**：它们由
+# 调用方（``agent.time_facts`` / ``agent.profile_facts``）把关——关着就传空 dict，于是
+# 「关掉＝现状」与「没有这个功能」逐字符同构。
+
+_TIME_HEADER = "\n\n【时间事实 · 供你自然提及，不必每句都说】\n"
+_TIME_TAIL = ("\n（这些只是让你心里有数的参考：别把上面的数字当口头禅复述，也别一次全念出来；"
+              "跟眼前这盘棋、或者他的话头无关时就别提。）")
+
+_PROFILE_HEADER = "\n\n【她眼中的你 · 跨局攒下的印象，只在相关时自然参考】\n"
+_PROFILE_TAIL = ("\n（这些是跨局攒下来的印象，不是眼前这盘棋：别逐条念、别把上面的说法当口头禅复述，"
+                 "也别提起这份印象本身；跟此刻无关就不提。）")
+
+# 开局四类 / 四个薄弱方位 / 亏手手型的人话（键名一律照 spec §6.2，不新增键）
+_OPEN_NAMES = (("open.star", "星位"), ("open.komoku", "小目"),
+               ("open.sansan", "三三"), ("open.mokuhazushi", "目外"))
+_CORNER_NAMES = (("weak.corner_tl", "左上角"), ("weak.corner_tr", "右上角"),
+                 ("weak.corner_bl", "左下角"), ("weak.corner_br", "右下角"))
+_BLUNDER_TYPE_WORDS = {"深入": "孤军深入", "无理": "硬碰硬地贴上去", "方向": "方向选错"}
+_TOPIC_PREFIX = "persona.topic."
+
+# 画像块里「失误与薄弱方位」那一组**只在这手数之后才提**：开局没几手就提历史失误是噪音
+# （spec §6.3「只在相关时提」）。手数脏值按 0 处理（＝不提这一组）。
+PROFILE_BLUNDER_MIN_MOVE = 10
+
+
+def _num(v, default=0.0) -> float:
+    """画像里的数值维容错：``bool`` / 非数值 → ``default``（不抛）。"""
+    if isinstance(v, bool) or v is None:
+        return float(default)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _dur_cn(sec) -> str:
+    """秒 → 人话时长：不到 1 分说秒、不到 1 小时说「x 分 y 秒」、否则「x 小时 y 分」；脏值返回 ``''``。"""
+    try:
+        s = int(round(float(sec)))
+    except (TypeError, ValueError):
+        return ""
+    if s < 0:
+        return ""
+    if s < 60:
+        return "%d 秒" % s
+    m, r = divmod(s, 60)
+    if m < 60:
+        return "%d 分" % m if r == 0 else "%d 分 %d 秒" % (m, r)
+    return "%d 小时 %d 分" % (m // 60, m % 60)
+
+
+def _gap_cn(days) -> str:
+    """距上次对局的天数 → 人话（不到 1 小时 / x 小时 / x 天）；脏值返回 ``''``。"""
+    try:
+        d = float(days)
+    except (TypeError, ValueError):
+        return ""
+    if d < 0:
+        return ""
+    if d < 1.0 / 24.0:
+        return "不到 1 小时"
+    if d < 1.0:
+        return "%d 小时" % max(1, int(round(d * 24.0)))
+    return "%d 天" % int(round(d))
+
+
+def _time_lines(t) -> list:
+    """时间事实 → 子句列表（**新 → 旧**：当前时间 → 本局时长 → 单手用时 → 间隔 → 连续天数）。
+
+    超预算时**从最旧的事实开始丢** ＝ 从这张列表的**尾部**往回丢（连续天数最先走、当前时间最后走）。
+    """
+    lines = []
+    date = str(t.get("date") or "")
+    clock = str(t.get("clock") or "")
+    if date != "" or clock != "":
+        wd = str(t.get("weekday") or "")
+        lines.append("现在是 " + " ".join([x for x in (date, wd, clock) if x != ""]))
+    if "session_sec" in t:
+        dur = _dur_cn(t.get("session_sec"))
+        if dur != "":
+            lines.append("本局才刚开局" if _num(t.get("session_sec"), 0.0) < 60.0
+                         else "本局已下 %s" % dur)
+    if "avg_move_sec" in t:
+        avg = _num(t.get("avg_move_sec"), -1.0)
+        if avg >= 0.0:
+            lines.append("他平均每手不到 1 秒" if avg < 1.0
+                         else "他平均每手 %s" % _dur_cn(avg))
+    if "last_gap_days" in t:
+        gap = _gap_cn(t.get("last_gap_days"))
+        if gap != "":
+            lines.append("距上次对局 %s" % gap)
+    streak = t.get("streak_days")
+    if streak is not None:
+        try:
+            n = int(streak)
+        except (TypeError, ValueError):
+            n = 0
+        if n >= 1:
+            lines.append("连续第 %d 天在陪 Estarth" % n)
+    return lines
+
+
+def time_note(t, max_chars=TIME_MAX_CHARS) -> str:
+    """时间事实 → 提示词里的**时间块**；空 / 脏 / 预算放不下 ⇒ 返回 ``''``（逐字符不变）。
+
+    事实来自 ``time_ctx.facts()``（键表见那个模块）；这里**只读已列出的键**，缺哪个就不说哪个
+    （不补 0、不瞎猜）。渲染顺序与丢弃口径见 ``_time_lines``。本函数是纯函数。
+    """
+    if not isinstance(t, dict) or not t:
+        return ""
+    lines = _time_lines(t)
+    if not lines:
+        return ""
+    return _budget_block(_TIME_HEADER, _TIME_TAIL, lines, max_chars)
+
+
+def _axis_of(rec):
+    """画像一维 → ``(值, 置信度, 更新时间)``；``{axis: 值}`` 与 ``{axis: {"value":…}}`` 两种形状都收。"""
+    if isinstance(rec, dict):
+        return rec.get("value"), _num(rec.get("confidence")), _num(rec.get("updated_ts"))
+    return rec, 0.0, 0.0
+
+
+def _profile_items(profile, now_move_no) -> list:
+    """画像 dict → 待渲染的维度条目 ``[{"axis","text","confidence","updated_ts"}]``（纯函数）。
+
+    只认 spec §6.2 的维度键；**未知键一律忽略**（不抛）。信号不明显的维度**不产出**——
+    画像块要短、要「只在相关时提」，不是把每个数字都念一遍。
+    ``persona.address_pref`` **不渲染**：``games`` 表里没有这一列，真实链路永不产出它
+    （不给它留固定措辞位）。``persona.topic.*`` 取占比最高的两个主题。
+    """
+    if not isinstance(profile, dict) or not profile:
+        return []
+    items = []
+
+    def add(axis, text, conf, ts):
+        if text != "":
+            items.append({"axis": axis, "text": text,
+                          "confidence": conf, "updated_ts": ts})
+
+    # —— 开局偏好：四类里占比最高的一类 ——
+    best = None
+    for axis, name in _OPEN_NAMES:
+        raw, conf, ts = _axis_of(profile.get(axis))
+        val = _num(raw, -1.0)
+        if raw is None or val <= 0.0:
+            continue
+        if best is None or val > best[0]:
+            best = (val, axis, name, conf, ts)
+    if best is not None:
+        add(best[1], "开局爱走「%s」" % best[2], best[3], best[4])
+
+    # —— 挂角 vs 守角（1.0＝全是挂角、0.0＝全是守角）——
+    raw, conf, ts = _axis_of(profile.get("open.favorite_kakari"))
+    if raw is not None:
+        val = _num(raw, -1.0)
+        if val >= 0.6:
+            add("open.favorite_kakari", "挂角比守角更主动", conf, ts)
+        elif 0.0 <= val <= 0.4:
+            add("open.favorite_kakari", "更爱先守角、把角上定形", conf, ts)
+
+    # —— 行棋风格（三档各自只在信号明显时开口）——
+    raw, conf, ts = _axis_of(profile.get("style.aggression"))
+    if raw is not None:
+        val = _num(raw, -1.0)
+        if val >= 0.45:
+            add("style.aggression", "下得敢接触、爱缠斗", conf, ts)
+        elif 0.0 <= val <= 0.15:
+            add("style.aggression", "下得偏稳，不爱贴身缠斗", conf, ts)
+    raw, conf, ts = _axis_of(profile.get("style.tenuki"))
+    if raw is not None:
+        val = _num(raw, -1.0)
+        if val >= 0.35:
+            add("style.tenuki", "常脱先，喜欢先抢大场", conf, ts)
+        elif 0.0 <= val <= 0.10:
+            add("style.tenuki", "很少脱先，多半跟着应", conf, ts)
+    raw, conf, ts = _axis_of(profile.get("style.territory_vs_influence"))
+    if raw is not None:                          # 值域约 [0, 0.5]（天元 ≈ 0.5）
+        val = _num(raw, -1.0)
+        if val >= 0.38:
+            add("style.territory_vs_influence", "更偏势力与模样", conf, ts)
+        elif 0.0 <= val <= 0.18:
+            add("style.territory_vs_influence", "更偏实地，爱先捞边角", conf, ts)
+
+    # —— 失误与薄弱方位：只在第 PROFILE_BLUNDER_MIN_MOVE 手之后才提 ——
+    if _move_no(now_move_no) >= PROFILE_BLUNDER_MIN_MOVE:
+        # 失误率是**玩家口径**（真亏手数 / 玩家手数；Q2 收口后数值比早期版本翻倍），
+        # 阈值按这个新刻度取。
+        raw, conf, ts = _axis_of(profile.get("blunder.rate"))
+        if raw is not None:
+            val = _num(raw, -1.0)
+            if val >= 0.25:
+                add("blunder.rate", "失误偏多：常有一手掉不少胜率", conf, ts)
+            elif 0.12 <= val < 0.25:
+                add("blunder.rate", "偶尔会有明显亏损的一手", conf, ts)
+            elif 0.0 <= val <= 0.06:
+                add("blunder.rate", "很少下出明显亏损的棋", conf, ts)
+        raw, conf, ts = _axis_of(profile.get("blunder.top_type"))
+        if isinstance(raw, str) and raw.strip() != "":
+            kind = raw.strip()
+            add("blunder.top_type", "亏得最多的那一手，多半是「%s」"
+                % _BLUNDER_TYPE_WORDS.get(kind, kind), conf, ts)
+        best = None
+        for axis, name in _CORNER_NAMES:
+            raw, conf, ts = _axis_of(profile.get(axis))
+            val = _num(raw, -1.0)
+            if raw is None or val < 0.25:
+                continue
+            if best is None or val > best[0]:
+                best = (val, axis, name, conf, ts)
+        if best is not None:
+            add(best[1], "「%s」一带比较容易吃亏" % best[2], best[3], best[4])
+
+    # —— 性格与话题：占比最高的两个主题 ——
+    topics = []
+    for axis in profile.keys():
+        name = str(axis or "")
+        if not name.startswith(_TOPIC_PREFIX):
+            continue
+        raw, conf, ts = _axis_of(profile.get(name))
+        val = _num(raw, -1.0)
+        if val >= 0.25:
+            topics.append((val, name[len(_TOPIC_PREFIX):], conf, ts))
+    if topics:
+        topics.sort(key=lambda x: (-x[0], x[1]))
+        top = topics[:2]
+        names = "「%s」" % "」「".join(t[1] for t in top)
+        add(_TOPIC_PREFIX + top[0][1], "常聊的话题偏%s" % names, top[0][2], top[0][3])
+    # ``persona.address_pref``：真实链路永不产出（``games`` 表没有该列）⇒ 不给它留措辞位。
+    return items
+
+
+def _move_no(v) -> int:
+    """手数容错：``bool`` / 非数值 → 0（不抛）。"""
+    if isinstance(v, bool):
+        return 0
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _budget_block(header, tail, lines, max_chars) -> str:
+    """按预算拼一块（``header + 行 + tail``）；超预算**从尾部往回丢**；放不下 ⇒ ``''``。
+
+    ``lines`` 是**新 → 旧**（时间块）或**高置信 → 低置信**（画像块）的顺序，所以「从尾部往回丢」
+    就是「先丢最旧的事实」/「先丢最低置信的维度」。预算连表头 + 说明句都放不下、或一条都留不住
+    ⇒ 返回 ``''``（不留半截区块——与 ``event_block`` 同一口径）。
+    """
+    try:
+        limit = int(max_chars)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        return ""
+    if len(header) + len(tail) > limit:
+        return ""
+
+    def _size(ls):
+        return len(header) + sum(len(x) for x in ls) + max(0, len(ls) - 1) + len(tail)
+
+    kept = list(lines)
+    while kept and _size(kept) > limit:
+        kept.pop()
+    if not kept:
+        return ""
+    return header + "\n".join(kept) + tail
+
+
+def profile_note(profile, now_move_no, max_chars=PROFILE_MAX_CHARS) -> str:
+    """画像 → 提示词里的**画像块**；空画像 / 信号不明显 / 预算放不下 ⇒ 返回 ``''``（逐字符不变）。
+
+    ``profile`` 是 ``ProfileStore.get_profile()`` 的形状（``{axis: {"value","confidence",…}}``），
+    扁平形状（``{axis: 值}``）也收；未知键忽略、脏值不抛。渲染顺序＝**置信度高 → 低**
+    （同置信度按 ``updated_ts`` 新 → 旧、再按键名），因此超预算时从尾部往回丢 ＝ 先丢
+    **最低置信 / 最旧维度**（控制者钉死的口径）。本函数是纯函数。
+    """
+    items = _profile_items(profile, now_move_no)
+    if not items:
+        return ""
+    # 丢弃优先级（升序）：最低置信 → 最旧 → 键名；渲染顺序是它的倒序。
+    items.sort(key=lambda it: (it["confidence"], it["updated_ts"], it["axis"]))
+    items.reverse()
+    return _budget_block(_PROFILE_HEADER, _PROFILE_TAIL, [it["text"] for it in items], max_chars)
+
+
 def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, katago="", board=None,
-                  long_term="", events=None, now_move_no=None):
+                  long_term="", events=None, now_move_no=None, profile=None, time_facts=None):
     """board：调用方已有的现成棋盘，给了就直接用。
 
     long_term：跨局长期记忆的召回文本，插在「【最近的对话】」之后、铁律段之前；
@@ -474,6 +781,12 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
     events / now_move_no：**事件区块**（v3.8.0）——插在长期记忆段之后、铁律段之前；
     ``events`` 为空 / 全部超出衰减窗口时区块为空串，输出逐字符不变。``now_move_no`` 缺省取
     ``len(moves)``（当前手数）。
+
+    profile / time_facts：**画像块 / 时间块**（v3.9.0，设计 §6.3）——插入顺序固定：
+    长期记忆段 → 事件区块 → **时间块** → **画像块** → 铁律段。两者传空 dict / ``None`` 时
+    返回空串，输出逐字符不变（``tests/golden/prompts.json`` 锁定）；两个开关
+    （``profile_enabled`` / ``time_aware_enabled``）由调用方把关（关着就传空）。
+    ``now_move_no`` 同时喂给画像块（它决定「失误与薄弱方位」这一组提不提）。
     """
     hist = chat_history
     if skip_last_chat and len(hist) > 0:
@@ -485,6 +798,8 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
         + "\n【最近的对话】\n%s"
         + "%s"                                   # 长期记忆段（空串时不留痕）
         + "%s"                                   # 事件区块（空串时不留痕，见上方区块表）
+        + "%s"                                   # 时间块（v3.9.0，空串时不留痕）
+        + "%s"                                   # 画像块（v3.9.0，空串时不留痕）
         + "\n（铁律 · 先核对再开口：\n"
         + "1) 只要这句话与棋局有关，动笔前先看【当前棋面】：要提到某片区域/某个点「有子、没子、模样、实地、厚薄」时，必须能在上面的「现有棋子」里找到依据；那里没有的子一律不许提，拿不准就只说方向、不点具体子，绝不凭印象编。凡说「左/右/上/下」必须先按坐标核对：字母是列（A→T 从左到右）、数字是行（19→1 从上到下）；两子字母相同只能说「上下」、数字相同才算「左右」；核对不上就别说方位词，改说「这一带」。\n"
         + "2) 与棋局有关的每一句都要扣住「最近一手」和当前盘面，接着此刻的形势、以及你上一句的感受往下说；用「我 / 你」的第一人称视角，别像解说员那样说「黑方 / 白棋」，也别复述、别自说自话。\n"
@@ -499,15 +814,18 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
         chat_brief(hist),
         long_term_note(long_term),
         event_block(events or [], len(moves) if now_move_no is None else now_move_no),
+        time_note(time_facts),
+        profile_note(profile, len(moves) if now_move_no is None else now_move_no),
     )
     return _t(block)
 
 
 def with_context(moves, memory_log, chat_history, prompt, phase, skip_last_chat=False, katago="", board=None,
-                 long_term="", events=None, now_move_no=None):
-    """在原提示词前附上对局全貌与回忆（原提示词本身不改动）；``long_term`` / ``events`` 原样转给 ``context_block``。"""
+                 long_term="", events=None, now_move_no=None, profile=None, time_facts=None):
+    """在原提示词前附上对局全貌与回忆（原提示词本身不改动）；``long_term`` / ``events`` /
+    ``profile`` / ``time_facts`` 原样转给 ``context_block``。"""
     return _t(context_block(moves, memory_log, chat_history, phase, skip_last_chat, katago, board, long_term,
-                            events, now_move_no)
+                            events, now_move_no, profile, time_facts)
               + "\n\n【现在】\n" + prompt)
 
 
