@@ -1,10 +1,15 @@
-"""局内事件表（带时刻、只增不减、去重）：不落盘、不进快照、不随悔棋回退。"""
+"""局内事件表（带时刻、只增不减、去重）：不落盘、不进快照、不随悔棋回退、新一局清空。"""
 
+import asyncio
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app import events
+from app.agent import AzureAgent
+from helpers import FixedRng, PvStubEngine, StubLLM, ZeroRng
 
 
 class EventLogTest(unittest.TestCase):
@@ -60,26 +65,41 @@ class EventLogTest(unittest.TestCase):
         # reset 之后同一条可以重新写（去重集合一并清空）
         self.assertIsNotNone(log.add("ai_bad", 2, "我在第2手下错了", {}))
 
-    def test_not_in_state_snapshot_and_survives_undo_reset(self):
-        """不进 ``GameState`` 快照、不随悔棋 / 重开回退（「发生过就是发生过」）。
+    def test_not_in_state_snapshot_survives_undo_but_reset_game_clears(self):
+        """不进 ``GameState`` 快照、不随悔棋回退；但**新一局清空**（设计 §5 E/F）。
 
-        ⚠ **占位门卫**：``EventLog`` 与 ``GameState`` 今天**零耦合**，所以这里断言的是「两不相干」
-        （结构上不会互相污染）。**P2/P6 把事件表接进编排之后，必须把它升级成真断言**——
-        那时要变成「写一条事件 → 悔棋 / 重开 → 事件仍在、快照里仍然没有它」，否则这条会静默变成
-        永真断言（后人会以为它在守什么）。
+        v3.8.0 起事件表**已接进编排**（走偏优解写 ``ai_bad``），所以这里是**真断言**而不是
+        「两不相干」的占位：跑一手真对局 → 事件表有内容、``payload()`` / 快照里没有它 →
+        悔棋（``undo``）不退回 → ``reset_game()`` 清空（新一局不带上一局的账）。
         """
-        from app.event_log import EventLog
-        from app.state import GameState
-        st = GameState()
-        log = EventLog()
-        log.add("player_bad", 2, "Estarth这手亏了", {})
-        st.add_move("B", "Q16")
-        st.snapshots.append(st.make_snapshot())
+        async def run():
+            # 情绪波动开着 + 恒掷中的 rng ⇒ 她这一手走偏，事件表因此必定有内容
+            agent = AzureAgent(PvStubEngine(), StubLLM(), events.RecordingBus(),
+                               joseki_rate=1.0, joseki_rng=ZeroRng(),
+                               emotion_drift=True, drift_rng=FixedRng(0.0))
+            await agent.player_move(3, 3)
+            return agent
+
+        agent = asyncio.run(run())
+        st, log = agent.st, agent.event_log
+        self.assertEqual(len(log.all()), 1, "跑一手真对局之后事件表有内容")
+        self.assertEqual(log.all()[0]["kind"], "ai_bad")
+
+        # 不进 GameState：payload() 与快照里都没有它
         self.assertNotIn("events", st.payload())
         self.assertNotIn("event_log", st.payload())
         self.assertNotIn("events", st.make_snapshot())
-        st.reset()                                  # 悔棋同义：只回滚对局状态
-        self.assertEqual(len(log.all()), 1, "事件表不随对局状态回退")
+        self.assertNotIn("event_log", st.make_snapshot())
+        self.assertFalse(hasattr(st, "event_log"), "事件表挂在 agent 上，不挂在 GameState 上")
+
+        # 悔棋：事件表**不退回**（「发生过就是发生过」，设计 §5 F）
+        agent.undo(0)
+        self.assertEqual(len(log.all()), 1, "事件表不随悔棋回退")
+
+        # 重开一局：**清空**（新一局不带上一局的账，设计 §5 E）
+        agent.reset_game()
+        self.assertEqual(log.all(), [], "reset_game 清空事件表")
+        self.assertEqual(len(st.moves), 0)
 
     def test_dirty_inputs_do_not_raise(self):
         from app.event_log import EventLog

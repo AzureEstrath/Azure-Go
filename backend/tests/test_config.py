@@ -116,5 +116,42 @@ class PvDepthConfigTest(unittest.TestCase):
             self.assertEqual(AzureConfig.load(p).pv_max_visits, 150, "脏值退回默认")
 
 
+class EmotionDriftConfigTest(unittest.TestCase):
+    """情绪波动（v3.8.0）：开关默认关，三个数值默认 / 往返 / 脏值口径（与 joseki_rate 同一套守卫）。"""
+
+    def test_defaults(self):
+        c = AzureConfig()
+        self.assertFalse(c.emotion_drift, "情绪波动必须默认关（关掉＝现状）")
+        self.assertAlmostEqual(c.drift_base, 0.03)
+        self.assertAlmostEqual(c.drift_max, 0.08)
+        self.assertAlmostEqual(c.pv_max_drop, 0.05)
+
+    def test_round_trip(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"emotion_drift": True, "drift_base": 0.05,
+                           "drift_max": 0.09, "pv_max_drop": 0.02}, f)
+            c = AzureConfig.load(p)
+            self.assertTrue(c.emotion_drift)
+            self.assertAlmostEqual(c.drift_base, 0.05)
+            self.assertAlmostEqual(c.drift_max, 0.09)
+            self.assertAlmostEqual(c.pv_max_drop, 0.02)
+
+    def test_dirty_and_out_of_range_fall_back(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"emotion_drift": False, "drift_base": "abc",
+                           "drift_max": 5, "pv_max_drop": -1}, f)
+            c = AzureConfig.load(p)
+            self.assertFalse(c.emotion_drift)
+            self.assertAlmostEqual(c.drift_base, 0.03, msg="脏值退回默认")
+            self.assertAlmostEqual(c.drift_max, 1.0, msg="越界夹到 [0,1]")
+            self.assertAlmostEqual(c.pv_max_drop, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

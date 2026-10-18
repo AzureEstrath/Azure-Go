@@ -8,7 +8,8 @@
     POST /api/summarize   {note}            对局总结
     POST /api/undo        {turn}            俗手回档
     POST /api/reset                         重开一局
-    POST /api/config      {allow_pass}      允许虚着开关（另见 limit_len / joseki_teach / joseki_rate / tools_enabled）
+    POST /api/config      {allow_pass}      允许虚着开关（另见 limit_len / joseki_teach / joseki_rate /
+                                            emotion_drift / drift_base / drift_max / pv_max_drop / tools_enabled）
     POST /api/reveal                        落子宣告语音开始（需要 round-trip 的客户端）
     POST /api/interaction {what}            玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话
@@ -96,6 +97,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                          tools_enabled=cfg.tools_enabled, max_tool_calls=cfg.max_tool_calls,
                                          stream_tokens=cfg.stream_tokens,
                                          pv_max_visits=cfg.pv_max_visits,
+                                         emotion_drift=cfg.emotion_drift,
+                                         drift_base=cfg.drift_base, drift_max=cfg.drift_max,
+                                         pv_max_drop=cfg.pv_max_drop,
                                          memory=mem, tts=tts_client,
                                          joseki_progress=joseki_progress)
             if autostart:
@@ -241,6 +245,15 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                 s.joseki_rate = max(0.0, min(1.0, float(body["joseki_rate"])))
             except (TypeError, ValueError):     # 脏值不生效：保留原值，不把端点打成 500
                 pass
+        if "emotion_drift" in body:             # 「情绪波动」开关：开启后她小概率走偏优解（默认关）
+            s.emotion_drift = bool(body["emotion_drift"])
+        # 情绪波动的三个数值（0~1）：脏值不生效、保留原值（与 joseki_rate 同一口径）
+        for key in ("drift_base", "drift_max", "pv_max_drop"):
+            if key in body:
+                try:
+                    setattr(s, key, max(0.0, min(1.0, float(body[key]))))
+                except (TypeError, ValueError):
+                    pass
         if "tools_enabled" in body:             # 发言侧工具开关：开启后她才会在提示/落子宣告里查资料
             s.tools_enabled = bool(body["tools_enabled"])
         return ok()

@@ -20,6 +20,11 @@ class AzureConfig:
         self.pv_max_visits = 150                    # 预测线 A/B/C 那一次分析的深度**下限**（只增不减，见 agent_graph._deep_visits）
         self.joseki_teach = True
         self.joseki_rate = 0.5                      # 定式提示频率（0~1）：与开关同一格；门控唯一路径 p=clamp(rate+adj,0,1)
+        # —— 情绪波动（v3.8.0）：开启后她小概率走偏优解（默认关，关闭时行为与现状逐项一致）——
+        self.emotion_drift = False
+        self.drift_base = 0.03                      # 基础偏航概率（平静时的 p_drift）
+        self.drift_max = 0.08                       # p_drift 上限
+        self.pv_max_drop = 0.05                     # 偏航线与最优线的胜率差上限（超了整条不用）
         self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
@@ -103,6 +108,13 @@ class AzureConfig:
             self.joseki_rate = max(0.0, min(1.0, float(d.get("joseki_rate", self.joseki_rate))))
         except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把启动搞崩
             self.joseki_rate = 0.5
+        # 情绪波动（v3.8.0）：开关默认关；三个数值夹到 [0,1]，脏值退回默认（同 joseki_rate 的口径）
+        self.emotion_drift = bool(d.get("emotion_drift", self.emotion_drift))
+        for key, fallback in (("drift_base", 0.03), ("drift_max", 0.08), ("pv_max_drop", 0.05)):
+            try:
+                setattr(self, key, max(0.0, min(1.0, float(d.get(key, getattr(self, key))))))
+            except (TypeError, ValueError):
+                setattr(self, key, fallback)
         self.llm_base_url = str(d.get("llm_base_url", self.llm_base_url))
         self.llm_model = str(d.get("llm_model", self.llm_model))
         self.llm_api_key = str(d.get("llm_api_key", self.llm_api_key))

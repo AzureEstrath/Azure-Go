@@ -15,13 +15,14 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import coords, events, joseki_gate, prompt_chains, prompts
+from . import coords, events, joseki_gate, prompt_chains, prompts, pv_lines
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, is_joseki_mistake, _emit_line,
 )
 from .board import GoBoard, SIZE as BOARD_SIZE
 from .emotion import EmotionModel
+from .event_log import EventLog
 from .joseki import JosekiRecognizer
 from .llm_chain import chunk_text_of, content_of
 from .state import GameState
@@ -156,6 +157,78 @@ def _clamp_rate(v):
         return JOSEKI_RATE_DEFAULT
 
 
+# —— 情绪波动（v3.8.0）：开启后她**小概率**走偏优解（设计 §6.2）——
+# 三个字段的代码默认与 ``config.AzureConfig`` 的同名字段一一对应（键缺失 / 脏值 → 用这些默认）。
+DRIFT_BASE_DEFAULT = 0.03        # 基础偏航概率（平静时的 p_drift）
+DRIFT_MAX_DEFAULT = 0.08         # p_drift 上限：再躁也不超过它，免得变成「乱下」
+PV_MAX_DROP_DEFAULT = 0.05       # 偏航线与最优线的胜率差上限（超了这条线整条不用）
+# 阶梯的切分：``p_drift`` 里 2/3 给 B、其余给 C ⇒ P(A) = 1-p > P(B) > P(C)（越偏越少，设计 §6.2）
+DRIFT_B_TO_C_SPLIT = 2.0 / 3.0
+# 情绪偏移的映射（设计 §八 把形状留给建造者）：
+#   基线（= ``EmotionModel.baseline``，即「平静」）⇒ 偏移 0；越偏离基线越容易走偏。
+#   三个权重只吃**既有 mood 三维**：愉悦度低（失落 / 难过）/ 好奇度高（好奇 / 兴致）/
+#   唤醒度高（激动 / 烦躁）各占一份；分数到 ``DRIFT_SCORE_FULL`` 就吃满 ``drift_max``。
+DRIFT_MOOD_BASELINE = (0.58, 0.55, 0.30)
+DRIFT_MOOD_WEIGHTS = (0.45, 0.20, 0.35)
+DRIFT_SCORE_FULL = 0.5
+
+
+def _clamp_unit(v, default):
+    """``[0, 1]`` 的安全取值：键缺失 / 脏值 → ``default``（不抛，不把 agent 构造搞崩）。"""
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _mood_dim(mood, key):
+    """取 mood 的一维（``v`` / ``c`` / ``a``）：非 dict / 缺失 / 脏值 → ``None``（「这一维取不到」）。
+
+    只读既有维度、绝不抛——情绪取不到就不偏航，不允许它把对局搞坏。
+    """
+    if not isinstance(mood, dict):
+        return None
+    try:
+        return max(0.0, min(1.0, float(mood[key])))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def emotion_bias(mood, drift_max=DRIFT_MAX_DEFAULT) -> float:
+    """情绪偏移：只吃既有 mood 三维（``v`` / ``c`` / ``a``），返回 ``[0, drift_max]``。
+
+    ``score = 0.45*(0.58-v) + 0.20*(c-0.55) + 0.35*(a-0.30)``——基线「平静」恰为 ``0``，
+    情绪越低落 / 越好奇 / 越激动，分数越高（三份权重见 ``DRIFT_MOOD_WEIGHTS``）；再按
+    ``DRIFT_SCORE_FULL`` 归一、夹到 ``[0, drift_max]``。
+
+    非 dict / 任一维缺失或脏值 ⇒ ``0.0``（**不是**负数：波动只往上加，平静时就是 ``drift_base``）。
+    """
+    v = _mood_dim(mood, "v")
+    c = _mood_dim(mood, "c")
+    a = _mood_dim(mood, "a")
+    if v is None or c is None or a is None:
+        return 0.0
+    base = DRIFT_MOOD_BASELINE
+    score = (DRIFT_MOOD_WEIGHTS[0] * (base[0] - v)
+             + DRIFT_MOOD_WEIGHTS[1] * (c - base[1])
+             + DRIFT_MOOD_WEIGHTS[2] * (a - base[2]))
+    if score <= 0.0:
+        return 0.0
+    try:
+        top = max(0.0, float(drift_max))
+    except (TypeError, ValueError):
+        top = DRIFT_MAX_DEFAULT
+    return top * min(1.0, score / DRIFT_SCORE_FULL)
+
+
+def _rng_random(rng) -> float:
+    """从注入的随机源取一个 ``[0, 1)`` 的数；取不到（``None`` / 脏替身）⇒ ``1.0``（安全侧：不偏航）。"""
+    try:
+        return float(rng.random())
+    except Exception:                   # noqa: BLE001 —— 随机源坏掉绝不抛，宁可恒走 A
+        return 1.0
+
+
 class AzureAgent:
     # 回合兜底看门狗（v3.7.0）：算式与取值见模块顶部的 ``WATCHDOG_SEC`` 注释。
     # 实例上另有 ``self.watchdog_sec``（可注入/可覆盖，测试用它把等待压到毫秒级）。
@@ -164,7 +237,9 @@ class AzureAgent:
     def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False,
                  tools_enabled=False, max_tool_calls=None, memory=None, stream_tokens=False,
                  tts=None, joseki_progress=None, joseki_rate=JOSEKI_RATE_DEFAULT, joseki_rng=None,
-                 pv_max_visits=PV_MAX_VISITS_DEFAULT):
+                 pv_max_visits=PV_MAX_VISITS_DEFAULT, emotion_drift=False,
+                 drift_base=DRIFT_BASE_DEFAULT, drift_max=DRIFT_MAX_DEFAULT,
+                 pv_max_drop=PV_MAX_DROP_DEFAULT, drift_rng=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -236,6 +311,22 @@ class AzureAgent:
             self.pv_max_visits = max(1, int(pv_max_visits))
         except (TypeError, ValueError):
             self.pv_max_visits = PV_MAX_VISITS_DEFAULT
+
+        # —— 情绪波动（v3.8.0）：小概率走偏优解，**默认关**（设计 §6.2）——
+        #    关闭时逐项与现状一致：不解析线、不掷骰、不记事件（``_drift_pick`` 第一行就返回）。
+        #    ``emotion_drift`` 是开关；``drift_base`` / ``drift_max`` 定 ``p_drift = clamp(base+bias, 0, max)``；
+        #    ``pv_max_drop`` 是偏航线与最优线的胜率差上限（超了整条不用）。三个数值都夹到 ``[0, 1]``，
+        #    脏值退回默认——与 ``config.AzureConfig`` 同口径。
+        #    ``drift_rng`` 是**注入的**随机源（生产用自带 ``random.Random()``，单测注入固定替身）。
+        self.emotion_drift = bool(emotion_drift)
+        self.drift_base = _clamp_unit(drift_base, DRIFT_BASE_DEFAULT)
+        self.drift_max = _clamp_unit(drift_max, DRIFT_MAX_DEFAULT)
+        self.pv_max_drop = _clamp_unit(pv_max_drop, PV_MAX_DROP_DEFAULT)
+        self.drift_rng = drift_rng if drift_rng is not None else random.Random()
+
+        # —— 局内事件表（v3.8.0，设计 §6.3）：**局内内存**、不进 GameState 快照、不随悔棋回退 ——
+        #    本批只有「走偏优解」一个写入点（``_record_drift``）；``reset_game`` 清空（新一局不带旧账）。
+        self.event_log = EventLog()
 
         self._mood_region = -1
         self._mood_ms = 0
@@ -1268,6 +1359,114 @@ class AzureAgent:
             return [coords.xy_to_gtp(best[0], best[1]), best[0], best[1]]
         return ["pass", -1, -1]
 
+    # ================= 情绪波动：小概率走偏优解（v3.8.0，默认关） =================
+
+    def _drift_pick(self, move_infos, pick) -> list:
+        """情绪波动的落点定案：**选出 A 之后、真正落子之前**（设计 §6.2）。
+
+        只吃**既有那一次**分析的 ``moveInfos``（``pv_lines.extract_lines`` 是纯函数，零引擎调用）；
+        **关闭（默认）时原样返回 ``pick``**——不解析线、不掷骰、不记事件，与没有这个功能时逐项一致。
+        走 B / C 时记一条 ``ai_bad`` 事件（设计 §6.3：她走了偏优解）；事件原文**永不进台词**。
+        """
+        if not self.emotion_drift:
+            return pick
+        lines = pv_lines.extract_lines(list(move_infos or []), max_drop=self.pv_max_drop)
+        mood = self.mood_payload()
+        letter = self._maybe_drift(lines, mood, self.drift_rng)
+        if letter == "a":
+            return pick
+        line = lines.get(letter) or {}
+        moves = list(line.get("moves") or [])
+        gtp = str(moves[0]) if moves else ""
+        xy = coords.gtp_to_xy(gtp)
+        # 二次核对（``_maybe_drift`` 已判过一次）：任何意外都回到既有落点，绝不下出非法手
+        if xy[0] < 0 or xy[1] < 0 or not self.st.board.is_legal(xy[0], xy[1], "white")["ok"]:
+            return pick
+        self._record_drift(letter, gtp, lines, mood)
+        return [gtp, xy[0], xy[1]]
+
+    def _maybe_drift(self, lines, mood, rng) -> str:
+        """按阶梯概率在 A / B / C 里挑一条线，返回线名 ``"a"`` / ``"b"`` / ``"c"``。
+
+        概率：``p = p_drift(mood)`` 里 ``2/3`` 给 B、其余给 C ⇒ ``P(A) > P(B) > P(C)``（越偏越少）。
+        **安全缺省**（宁可走 A 也不许下出烂棋，设计 §三）：开关关闭 / 线缺失 / 胜率差超
+        ``pv_max_drop`` / 首手不是当前棋盘的合法点 —— 一律**逐级回落**（``c → b → a``），
+        最终必是 ``"a"``（调用方随即保留既有 ``_pick_ai_move`` 的结果）。
+        """
+        if not self.emotion_drift:
+            return "a"
+        if not isinstance(lines, dict):
+            return "a"
+        a = lines.get("a")
+        if not self._line_usable(a):
+            return "a"                      # 连 A 都取不到：无从偏航
+        try:
+            drop = float(lines.get("drop") or 0.0)
+        except (TypeError, ValueError):
+            drop = 0.0
+        if drop > self.pv_max_drop:
+            return "a"                      # 偏得太远：这一批线整条不用
+        p = self._drift_probability(mood)
+        if p <= 0.0:
+            return "a"
+        r = _rng_random(rng)
+        if r < p * DRIFT_B_TO_C_SPLIT:
+            want = "b"
+        elif r < p:
+            want = "c"
+        else:
+            return "a"
+        for letter in (want, "b", "a"):     # C → B → A 逐级回落
+            if self._line_usable(lines.get(letter)):
+                return letter
+        return "a"
+
+    def _drift_probability(self, mood) -> float:
+        """``p_drift = clamp(drift_base + emotion_bias(mood), 0, drift_max)``（设计 §6.2）。"""
+        p = self.drift_base + emotion_bias(mood, self.drift_max)
+        if p < 0.0:
+            return 0.0
+        return self.drift_max if p > self.drift_max else p
+
+    def _line_usable(self, line) -> bool:
+        """该线首手在**当前棋盘**上可用（复用 ``_pick_ai_move`` 的既有合法性判据）。
+
+        虚着**不算**可用：偏航只挑实落点，宁可走 A（``_pick_ai_move`` 自己会在允许时虚着）。
+        """
+        moves = line.get("moves") if isinstance(line, dict) else None
+        if not isinstance(moves, (list, tuple)) or not moves:
+            return False
+        gtp = str(moves[0] or "")
+        if gtp == "" or gtp.lower() == "pass":
+            return False
+        xy = coords.gtp_to_xy(gtp)
+        if xy[0] < 0 or xy[1] < 0:
+            return False
+        return bool(self.st.board.is_legal(xy[0], xy[1], "white")["ok"])
+
+    def _record_drift(self, letter, gtp, lines, mood) -> None:
+        """走偏时记一条 ``ai_bad`` 事件（设计 §6.3「我下错了 / 走了偏优解」）。
+
+        事件原文是**给模型看的素材**：永不进台词、不产生 ``speech``。手数用她这一手落子后的
+        1 基序号（与 ``note_move`` 同义）；``move_no`` + 文本一起进表，去重键天然按手数区分。
+        """
+        a_moves = list((lines.get("a") or {}).get("moves") or [])
+        best = str(a_moves[0]) if a_moves else ""
+        try:
+            drop = float(lines.get("drop") or 0.0)
+        except (TypeError, ValueError):
+            drop = 0.0
+        move_no = len(self.st.moves) + 1
+        text = "我在第%d手自主偏航：没走最优的%s，选了%s（与最优的胜率差约%d%%）" % (
+            move_no, best or "（未知）", gtp, int(round(drop * 100.0)))
+        self.event_log.add("ai_bad", move_no, text, {
+            "line": letter,
+            "gtp": gtp,
+            "best": best,
+            "drop": drop,
+            "mood": str((mood or {}).get("name") or "") if isinstance(mood, dict) else "",
+        })
+
     def _candidate_from_text(self, text) -> dict | None:
         """从模型原话里认出它自己报出的落点候选（S21）：GTP 坐标或虚着；认不出返回 ``None``。
 
@@ -1447,6 +1646,9 @@ class AzureAgent:
         self.st.reset()
         self.st.allow_pass = keep_pass
         self._joseki_taught = {}                 # 新一局：门控的冷却表清空（手数从头数）
+        # v3.8.0：事件表是**局内内存**——新一局不带上一局的账（与「不随悔棋回退」是两回事，
+        # 设计 §5 E/F：悔棋＝「发生过就是发生过」，重开＝另起一局）
+        self.event_log.reset()
         self.mood.reset()                        # 新一局：情绪回到基线（平静）
         self.sync_mood(True)
         self._emit(events.state(self.st.payload()))

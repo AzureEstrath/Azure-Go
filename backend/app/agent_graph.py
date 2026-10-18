@@ -638,8 +638,14 @@ async def _decide_own_turn(agent, data):
     ``_pick_ai_move`` 是纯读操作；召回走 ``to_thread``（慢 embedding 不得冻住事件循环），
     与旧 ``_ai_turn`` 的先后顺序逐字一致。「用意」提示词依赖落点，所以只能在这里建。
     工具开着时，模型可以在工具轮里报出自己选的落点（``_resolve_ai_move`` 定案，见 S21）。
+
+    v3.8.0 情绪波动：**选出 A 之后、真正落子之前**再问一次 ``_drift_pick``（默认关 ⇒ 原样返回）——
+    它只吃既有 ``after_infos``（零引擎调用），所以必须在这里、早于「用意」提示词（那条提示词
+    里写着「你准备下在 %s」，落点定了才能建）。它**同步**执行且紧跟在 ``_pick_ai_move`` 之后
+    （中间没有 ``await``），所以节点入口那道 ``_alive`` 守卫已经把「旧一代不再写事件表」兜住了。
     """
     pick = agent._pick_ai_move(list(data.get("after_infos") or []))
+    pick = agent._drift_pick(list(data.get("after_infos") or []), pick)
     ai_gtp, ai_x, ai_y = pick[0], pick[1], pick[2]
     data["move"] = {"x": ai_x, "y": ai_y, "gtp": ai_gtp, "pass": ai_gtp == "pass"}
 

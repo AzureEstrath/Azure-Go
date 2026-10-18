@@ -6,6 +6,7 @@
 
 import asyncio
 import os
+import random
 import sys
 import tempfile
 import threading
@@ -17,6 +18,7 @@ from app import events
 from app.agent import AzureAgent
 from app.joseki_progress import JosekiProgress
 from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM, ZeroRng
+from helpers import FixedRng, PvStubEngine
 from helpers import mk_agent as _mk
 
 
@@ -1324,4 +1326,203 @@ class JosekiEventPayloadTest(unittest.TestCase):
         agent._joseki_emit({"kind": "formed", "corner": "左上", "points": [(3, 3)]})
         self.assertEqual(len(bus.of_type("joseki")), 1)
         self.assertIsNone(bus.of_type("joseki")[-1]["mistake"])
+
+
+# ================= 情绪波动：小概率走偏优解（v3.8.0，默认关） =================
+
+
+class DriftEngine(PvStubEngine):
+    """（见 ``helpers.PvStubEngine``：带 ``pv`` 的假引擎，三条预测线都凑得出来。）"""
+
+
+class BoomRng:
+    """一旦被掷就炸：证明某条路径**一次 rng 都没碰**。"""
+
+    def random(self):
+        raise AssertionError("这条路径不该掷 rng")
+
+
+def _drift_lines(drop=0.01):
+    """三条线都可用的一组预测线（A=Q16 / B=D4 / C=Q4，都落在空棋盘上）。"""
+    return {
+        "a": {"moves": ["Q16", "D4", "Q4"], "winrate": 0.5, "score": 0.0},
+        "b": {"moves": ["D4", "C3", "R14"], "winrate": 0.5, "score": 0.0, "diff_from_a": 3},
+        "c": {"moves": ["Q4", "R4", "C16"], "winrate": 0.5, "score": 0.0,
+              "diff_from_a": 3, "diff_from_b": 3},
+        "drop": drop,
+    }
+
+
+# 情绪最躁的一档：``p_drift`` 吃满 ``drift_max``（0.08）——阶梯两段因此固定在
+# [0, 0.0533) → B、[0.0533, 0.08) → C、其余 → A。
+_AGITATED = {"v": 0.0, "c": 1.0, "a": 1.0}
+_NEUTRAL = {"v": 0.58, "c": 0.55, "a": 0.30}
+
+
+class EmotionDriftTest(unittest.TestCase):
+    """``_maybe_drift`` 的阶梯 / 截断 / 可复现 / 回落，以及「默认关＝现状」的端到端证据。"""
+
+    def test_drift_off_always_a(self):
+        """``emotion_drift=false``（默认）⇒ 恒走 A：**不掷 rng**、不记事件、不解析线。
+
+        端到端同时钉死「关掉＝现状」：同一套装配下，关闭时落点＝A 首手、事件表为空、
+        引擎与 LLM 调用次数与「开着她也不多花一次调用」逐项一致。
+        """
+        agent, _eng, _llm, _bus = _mk()
+        self.assertFalse(agent.emotion_drift, "情绪波动必须默认关")
+        lines = _drift_lines()
+        for rng in (BoomRng(), ZeroRng(), FixedRng(0.0)):
+            self.assertEqual(agent._maybe_drift(lines, _AGITATED, rng), "a")
+        self.assertEqual(agent.event_log.all(), [])
+
+        async def run(drift, rng):
+            a = AzureAgent(DriftEngine(), StubLLM(), events.RecordingBus(),
+                           joseki_rate=1.0, joseki_rng=ZeroRng(),
+                           emotion_drift=drift, drift_rng=rng)
+            await a.player_move(3, 3)                    # 玩家 D16，不挡三条线
+            return a, a.bus
+
+        off, bus_off = asyncio.run(run(False, BoomRng()))
+        self.assertEqual(off.st.moves[-1][1], "Q16", "关闭时她仍走 A 的首手")
+        self.assertEqual(off.event_log.all(), [], "关闭时不记任何事件")
+        self.assertEqual(bus_off.messages(events.AI_MOVE)[0]["move"]["gtp"], "Q16")
+        self.assertEqual(len(off.katago.calls), 3,
+                         "第一回合仍是「落子前 + 落子后 + 她落子后复算」三次分析，一次不多")
+        self.assertEqual(len(off.llm.calls), 4,
+                         "第一回合仍是四条 LLM 调用（点评 / 用意 / 感想 + 一次情绪小调用），一条不多")
+
+        on, bus_on = asyncio.run(run(True, FixedRng(0.0)))   # 0.0 落在 B 段
+        self.assertEqual(len(on.katago.calls), len(off.katago.calls), "偏航零额外引擎调用")
+        self.assertEqual(len(on.llm.calls), len(off.llm.calls), "偏航零额外 LLM 调用")
+        self.assertEqual(on.st.moves[-1][1], "D4", "开启且掷中 B 时改走 B 的首手")
+        self.assertEqual(bus_on.messages(events.AI_MOVE)[0]["move"]["gtp"], "D4", "音画同步照旧带坐标")
+
+    def test_drift_probability_clamped(self):
+        """``p_drift = clamp(drift_base + emotion_bias(mood), 0, drift_max)``：两头都要夹住。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent.drift_base, agent.drift_max = 0.5, 0.08
+        self.assertAlmostEqual(agent._drift_probability(_AGITATED), 0.08, msg="base 超上限 ⇒ 夹到 drift_max")
+        agent.drift_base = -1.0
+        self.assertEqual(agent._drift_probability(_AGITATED), 0.0, "和为负 ⇒ 夹到 0（恒走 A）")
+        agent.drift_base = 0.03
+        self.assertAlmostEqual(agent._drift_probability(_NEUTRAL), 0.03, msg="平静 ⇒ 就是 drift_base")
+        self.assertAlmostEqual(agent._drift_probability(_AGITATED), 0.08, msg="最躁 ⇒ 吃满 drift_max")
+        for dirty in (None, "oops", [], {"v": 0.1}, {"v": "x", "c": 0.5, "a": 0.5}):
+            self.assertAlmostEqual(agent._drift_probability(dirty), 0.03, msg="缺失 / 脏值 ⇒ 偏移 0")
+        # 构造器同样夹取：越界夹到 [0,1]，脏值退回默认（绝不因一个旋钮把 agent 构造搞崩）
+        a2 = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus(),
+                        drift_base=5, drift_max=-3, pv_max_drop="x")
+        self.assertEqual(a2.drift_base, 1.0)
+        self.assertEqual(a2.drift_max, 0.0)
+        self.assertAlmostEqual(a2.pv_max_drop, 0.05)
+        self.assertEqual(a2._maybe_drift(_drift_lines(), _AGITATED, FixedRng(0.0)), "a",
+                         "drift_max=0 ⇒ 概率为 0，恒走 A")
+
+    def test_drift_rng_reproducible(self):
+        """注入 rng ⇒ 决策可复现：同种子同串、换种子不同串（说明确实在掷，而不是恒 A）。"""
+        lines, mood = _drift_lines(), _AGITATED
+
+        def seq(seed):
+            agent, _eng, _llm, _bus = _mk()
+            agent.emotion_drift = True
+            agent.drift_rng = random.Random(seed)
+            return [agent._maybe_drift(lines, mood, agent.drift_rng) for _ in range(200)]
+
+        self.assertEqual(seq(2026), seq(2026), "同一颗种子必须给出同一串结果")
+        self.assertNotEqual(seq(2026), seq(2027), "换种子应当给出不同串（确实在掷骰）")
+
+    def test_ladder_prefers_a_then_b_then_c(self):
+        """阶梯：``P(A) > P(B) > P(C)``（越偏越少），三段相加为 1。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent.emotion_drift = True
+        agent.drift_rng = random.Random(20261017)
+        lines, mood = _drift_lines(), _AGITATED
+        counts = {"a": 0, "b": 0, "c": 0}
+        for _ in range(20000):
+            counts[agent._maybe_drift(lines, mood, agent.drift_rng)] += 1
+        self.assertEqual(sum(counts.values()), 20000)
+        self.assertGreater(counts["a"], counts["b"], "A 是常态")
+        self.assertGreater(counts["b"], counts["c"], "越偏越少：B 多于 C")
+        self.assertGreater(counts["c"], 0, "C 真的会被走到（不是摆设）")
+        # 与理论值同量级（p = 0.08 ⇒ A ≈ 92%、B ≈ 5.33%、C ≈ 2.67%）
+        self.assertAlmostEqual(counts["b"] / 20000.0, 0.08 * 2.0 / 3.0, delta=0.01)
+        self.assertAlmostEqual(counts["c"] / 20000.0, 0.08 / 3.0, delta=0.01)
+
+    def test_illegal_first_move_falls_back(self):
+        """首手不是当前棋盘的合法点 ⇒ ``C → B → A`` 逐级回落，绝不下出非法手。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent.emotion_drift = True
+        lines, mood = _drift_lines(), _AGITATED
+        want_c, want_b = FixedRng(0.06), FixedRng(0.01)     # 0.06 在 C 段，0.01 在 B 段
+
+        agent.st.board.play(3, 15, "black")                 # D4（B 的首手）被占
+        self.assertEqual(agent._maybe_drift(lines, mood, want_c), "c", "C 合法就照 C 走")
+        self.assertEqual(agent._maybe_drift(lines, mood, want_b), "a", "想要 B 而 B 非法 ⇒ 退回 A")
+
+        agent2, _e2, _l2, _b2 = _mk()
+        agent2.emotion_drift = True
+        agent2.st.board.play(15, 15, "black")               # Q4（C 的首手）被占
+        self.assertEqual(agent2._maybe_drift(lines, mood, want_c), "b", "C 非法 ⇒ 逐级退到 B")
+        self.assertEqual(agent2._maybe_drift(lines, mood, want_b), "b")
+
+        agent3, _e3, _l3, _b3 = _mk()
+        agent3.emotion_drift = True
+        agent3.st.board.play(3, 15, "black")                # B 与 C 都不合法
+        agent3.st.board.play(15, 15, "black")
+        self.assertEqual(agent3._maybe_drift(lines, mood, want_c), "a")
+        self.assertEqual(agent3._maybe_drift(lines, mood, want_b), "a")
+
+        agent4, _e4, _l4, _b4 = _mk()
+        agent4.emotion_drift = True
+        agent4.st.board.play(15, 3, "black")                # Q16（A 的首手）被占 ⇒ 无从偏航
+        self.assertEqual(agent4._maybe_drift(lines, mood, want_b), "a")
+        for bad in (None, "oops", [], {"b": lines["b"]}, {"a": {"moves": []}}):
+            self.assertEqual(agent4._maybe_drift(bad, mood, want_b), "a", "取不到 A ⇒ 恒走 A")
+
+    def test_weak_line_never_taken(self):
+        """胜率差超 ``pv_max_drop`` ⇒ 这一批线整条不用；缺线 / 虚着同样不用（宁可走 A）。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent.emotion_drift = True
+        self.assertAlmostEqual(agent.pv_max_drop, 0.05)
+        self.assertEqual(agent._maybe_drift(_drift_lines(drop=0.2), _AGITATED, FixedRng(0.0)), "a",
+                         "drop 超上限 ⇒ 不偏航")
+        self.assertEqual(agent._maybe_drift(_drift_lines(drop=0.05), _AGITATED, FixedRng(0.0)), "b",
+                         "恰好等于上限 ⇒ 照旧可用（判据是「超」）")
+        agent.pv_max_drop = 0.0
+        self.assertEqual(agent._maybe_drift(_drift_lines(drop=0.0), _AGITATED, FixedRng(0.0)), "b")
+        missing = _drift_lines()
+        missing["b"] = None
+        self.assertEqual(agent._maybe_drift(missing, _AGITATED, FixedRng(0.0)), "a", "B 缺失 ⇒ 走 A")
+        passed = _drift_lines()
+        passed["b"] = {"moves": ["pass"], "winrate": 0.5, "score": 0.0}
+        self.assertEqual(agent._maybe_drift(passed, _AGITATED, FixedRng(0.0)), "a", "虚着不算可用偏航点")
+
+    def test_drift_records_an_ai_bad_event_end_to_end(self):
+        """走 B / C 时记一条 ``ai_bad`` 事件（可读文本 + 结构化 detail）；关闭时一条都不写。"""
+
+        async def run(drift, rng):
+            a = AzureAgent(DriftEngine(), StubLLM(), events.RecordingBus(),
+                           joseki_rate=1.0, joseki_rng=ZeroRng(),
+                           emotion_drift=drift, drift_rng=rng)
+            await a.player_move(3, 3)
+            return a
+
+        off = asyncio.run(run(False, FixedRng(0.0)))
+        self.assertEqual(off.event_log.all(), [])
+
+        on = asyncio.run(run(True, FixedRng(0.0)))
+        events_list = on.event_log.all()
+        self.assertEqual(len(events_list), 1)
+        ev = events_list[0]
+        self.assertEqual(ev["kind"], "ai_bad")
+        self.assertEqual(ev["move_no"], 2, "她这一手落子后的 1 基手数")
+        self.assertIn("自主偏航", ev["text"], "事件里要有可读文本")
+        self.assertIn("D4", ev["text"])
+        self.assertEqual(ev["detail"]["line"], "b")
+        self.assertEqual(ev["detail"]["gtp"], "D4")
+        self.assertEqual(ev["detail"]["best"], "Q16")
+        # 事件原文**永不进台词**：台词里不许出现这句事件文本
+        self.assertNotIn(ev["text"], " ".join(m["text"] for m in on.bus.messages()))
+        self.assertFalse(hasattr(on.st, "event_log"), "事件表不进 GameState")
+
 

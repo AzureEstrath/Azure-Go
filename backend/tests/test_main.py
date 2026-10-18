@@ -64,6 +64,28 @@ class RestTest(unittest.TestCase):
         with _client() as client:
             self.assertEqual(client.post("/api/peer", json={"fg_title": "x"}).status_code, 404)
 
+    def test_config_forwards_emotion_drift(self):
+        """``/api/config`` 透传情绪波动开关与参数（v3.8.0）：脏值不生效、越界夹取、绝不 500。"""
+        app = create_app(engine=StubEngine(), llm=StubLLM(), autostart=False)
+        with TestClient(app) as client:
+            r = client.post("/api/config", json={"emotion_drift": True, "drift_base": 0.05,
+                                                 "drift_max": 0.09, "pv_max_drop": 0.02})
+            self.assertTrue(r.json()["ok"])
+            s = app.state.agent
+            self.assertTrue(s.emotion_drift)
+            self.assertAlmostEqual(s.drift_base, 0.05)
+            self.assertAlmostEqual(s.drift_max, 0.09)
+            self.assertAlmostEqual(s.pv_max_drop, 0.02)
+
+            r = client.post("/api/config", json={"drift_base": "abc", "drift_max": 5, "pv_max_drop": -1})
+            self.assertTrue(r.json()["ok"])
+            self.assertAlmostEqual(s.drift_base, 0.05, msg="脏值不生效：保留原值")
+            self.assertAlmostEqual(s.drift_max, 1.0, msg="越界夹到 [0,1]")
+            self.assertAlmostEqual(s.pv_max_drop, 0.0)
+
+            client.post("/api/config", json={"emotion_drift": False})
+            self.assertFalse(s.emotion_drift, "开关能关回去（关掉＝现状）")
+
 
 class WebSocketTest(unittest.TestCase):
     def test_hello_on_connect(self):

@@ -46,6 +46,45 @@ class StubEngine:
         return ""
 
 
+class PvStubEngine(StubEngine):
+    """带 ``pv`` 的假引擎：预测线 A / B / C 都凑得出来（``StubEngine`` 没有 ``pv`` ⇒ 只有 A）。
+
+    前三个候选各配一条 5 手的 ``pv``：A = ``Q16`` 那条；B = ``D4`` 那条（与 A 逐手全不同）；
+    C = ``Q4`` 那条（与 A、B 也都不同）。三条线胜率相同（都取默认 0.5）⇒ ``drop == 0``，
+    不会被 ``pv_max_drop`` 挡掉。情绪波动（v3.8.0）与事件表（v3.8.0）的门卫都靠它做端到端。
+    """
+
+    PVS = {
+        "Q16": ["Q16", "D4", "Q4", "D16", "K10"],
+        "D4": ["D4", "C3", "R14", "F16", "J3"],
+        "Q4": ["Q4", "R4", "C16", "K10", "O16"],
+    }
+
+    async def analyze(self, moves, max_visits=None):
+        out = await super().analyze(moves, max_visits)
+        infos = []
+        for m in self.CAND:
+            info = {"move": m, "visits": 1, "winrate": 0.5, "scoreLead": 0.0}
+            if m in self.PVS:
+                info["pv"] = list(self.PVS[m])
+            infos.append(info)
+        out["moveInfos"] = infos
+        return out
+
+
+class FixedRng:
+    """固定随机源：``random()`` 恒返回同一个值（门卫用它把「落在哪一段」钉死）。
+
+    ``ZeroRng`` 是它 ``v=0.0`` 的特例（保留旧名：既有门卫按名字引用它）。
+    """
+
+    def __init__(self, v):
+        self.v = float(v)
+
+    def random(self):
+        return self.v
+
+
 class StubLLM:
     def __init__(self, text="嗯~ 这一步我看着挺顺。"):
         self.think_mode = 0
