@@ -214,6 +214,7 @@ func _build_board() -> void:
 	board.setup_font(_font)
 	board.intersection_clicked.connect(_on_intersection_clicked)
 	board.head_patted.connect(_on_head_patted)
+	board.view_changed.connect(func(t): _set_status(t))   # Home / C 动了视角：状态栏给一句反馈
 	if avatar != null:
 		avatar.gaze_source = board          # 化身视线：旋转视角时看玩家，平时看鼠标落点
 		board.pat_head = avatar             # 摸头触发区：左键点在头部附近即可摸头
@@ -1714,7 +1715,7 @@ func _greet() -> void:
 	else:
 		pairing.mark_text_only()              # 本地问候没有后端语音（预制欢迎语音缺失时）：文字直接显示
 		_add_msg("ai", greet)
-	_add_msg("system", "你执黑先行。左键落子，右键拖拽可旋转棋盘视角。")
+	_add_msg("system", "你执黑先行。左键落子，右键拖拽可旋转棋盘视角；Home 回正视角，C 依次看四个角。")
 
 func _on_intersection_clicked(x: int, y: int) -> void:
 	_allow_tts_fillers()
@@ -1722,6 +1723,7 @@ func _on_intersection_clicked(x: int, y: int) -> void:
 
 func _on_state_changed(p: Dictionary) -> void:
 	board.set_stones(p["stones"])
+	board.set_move_seq(p.get("move_seq", []))       # 悬停已有棋子时推手数用（后端 state 自带 GTP 手顺）
 	var mc := int(p["move_count"])
 	if mc > _last_move_count:                       # Azure 每落一子：先注视自己的落点，再交还鼠标跟随
 		var stone := _last_stone(p["stones"])
@@ -2396,6 +2398,7 @@ func _handle_cli() -> void:
 		])
 	if has_view:
 		board.set_view(yaw, pitch, dist)
+		board.capture_home_view()          # 调试参数就是「初始取景」：Home 键回到这里
 	if _shot_path == "":
 		return
 	await get_tree().create_timer(2.5).timeout

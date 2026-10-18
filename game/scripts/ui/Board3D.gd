@@ -1,8 +1,11 @@
 class_name Board3D
 extends Node3D
 ## 真实 3D 棋盘：棋盘面/侧厚/网格/星位/坐标、扁形棋子、射线拾取、右键拖拽旋转视角
+##
+## 键盘：`Home` 回初始取景，`C` 依次看四个角（都不与聊天输入框冲突——输入框有焦点时按键归它）。
 
 signal intersection_clicked(x: int, y: int)
+signal view_changed(desc: String)   # 视角便捷键动了视角：给状态栏一句话反馈（文案在 Main 的 _set_status）
 
 const CELL := 1.0
 const HALF := 9.0
@@ -21,6 +24,10 @@ const PANEL_W := 380.0
 const VIEW_LIFT := 3.0
 ## 旋转视角结束后的注视锁定：先看玩家 1 秒，再交回鼠标跟随
 const GAZE_LOCK_AFTER_ROTATE := 1.0
+## 四角轮转：0=西北(A19) 1=西南(A1) 2=东南(T1) 3=东北(T19)
+const CORNER_COUNT := 4
+const CORNER_NAMES := ["西北", "西南", "东南", "东北"]
+const CORNER_GTPS := ["A19", "A1", "T1", "T19"]
 ## 调试用：直接设定视角
 func set_view(yaw_deg: float, pitch_deg: float, dist := 0.0) -> void:
 	_yaw = deg_to_rad(yaw_deg)
@@ -28,6 +35,42 @@ func set_view(yaw_deg: float, pitch_deg: float, dist := 0.0) -> void:
 	if dist > 0.0:
 		_dist = clampf(dist, DIST_MIN, DIST_MAX)
 	_update_camera()
+
+# ================= 视角便捷（Home 回初始取景 / C 四角轮转） =================
+
+var _home_yaw := 0.0             # 启动时捕获的取景（reset_view 的目标）
+var _home_pitch := deg_to_rad(38.0)
+var _home_dist := 42.0
+var _corner := -1                # 上次看过的角（-1=还没看过；C 键从西北角开始轮转）
+
+## 把当前视角记成「初始取景」。`_ready` 里记一次；`Main._handle_cli` 应用完
+## `--yaw/--pitch/--dist` 再记一次——调试参数就是现成的目标值来源（spec B3）。
+func capture_home_view() -> void:
+	_home_yaw = _yaw
+	_home_pitch = _pitch
+	_home_dist = _dist
+
+## 一键回初始取景（yaw / pitch / dist 三项；棋盘没有「tilt」这个量——`--tilt=` 是化身的歪头）
+func reset_view() -> void:
+	_yaw = _home_yaw
+	_pitch = _home_pitch
+	_dist = _home_dist
+	_update_camera()
+
+## 四角的相机方位角（度）：角 0 在 45°（从东南看西北角），每 +1 顺时针走一个角。
+## 越界按 4 取模、负数也绕回来（脏值不越界）；纯函数、不碰场景树（门卫可直接断言）。
+static func corner_yaw_deg(corner: int) -> float:
+	return 45.0 + 90.0 * float(posmod(corner, CORNER_COUNT))
+
+## 看某个角：只转方位角，**不动俯仰与距离**（玩家的缩放/俯仰不被抢走）
+func look_at_corner(corner: int) -> void:
+	_corner = posmod(corner, CORNER_COUNT)
+	_yaw = deg_to_rad(corner_yaw_deg(_corner))
+	_update_camera()
+
+## 当前视角（度 / 距离）：门卫与调试核对用（纯读，不碰场景树）
+func view_state() -> Dictionary:
+	return {"yaw_deg": rad_to_deg(_yaw), "pitch_deg": rad_to_deg(_pitch), "dist": _dist}
 
 var locked := false              # Azure 思考中时禁止落子
 var readonly := false            # 复盘回看（v3.7.0）：棋盘整体只读——**落子与摸头都不接受**（与 locked 独立）
@@ -58,6 +101,7 @@ var _occupied := {}
 var _displayed: Array = []       # 当前显示的棋子（权威 + 乐观）
 var _optimistic: Array = []
 var _hover := Vector2i(-1, -1)
+var _move_seq: Array = []        # 后端 state 的 GTP 手顺（含 "pass"）：悬停已有棋子时用它推手数
 var _font: Font = null
 var _black_mat: StandardMaterial3D
 var _white_mat: StandardMaterial3D
@@ -86,6 +130,7 @@ func _ready() -> void:
 	_stones_root = Node3D.new()
 	add_child(_stones_root)
 	_build_ghost()
+	capture_home_view()              # 启动取景就是「初始视角」（Main._handle_cli 里应用完调试参数会再记一次）
 
 ## 生成一个小圆点贴图，供「最后一手」标记使用
 func _make_dot_texture() -> ImageTexture:
@@ -124,6 +169,8 @@ func set_panels(left_open: bool, right_open: bool) -> void:
 	_update_camera()
 
 func _update_camera() -> void:
+	if cam == null:
+		return                                   # 还没建相机（`Board3D.new()` 的门卫 / 视角便捷键的纯逻辑）
 	var vp := get_viewport().get_visible_rect().size
 	var vh := vp.y
 	var free_l := PANEL_W if _panel_left else 0.0
@@ -286,6 +333,40 @@ func _make_stone(x: int, y: int, color: String, last: bool) -> void:
 
 func is_occupied(x: int, y: int) -> bool:
 	return _occupied.has(Vector2i(x, y))
+
+# ================= 悬停提示：坐标 + 手数 =================
+
+## 后端 state 的 `move_seq`（GTP 手顺，含 "pass"）：每次 state 事件对齐一次
+func set_move_seq(seq) -> void:
+	_move_seq = (seq as Array).duplicate() if typeof(seq) == TYPE_ARRAY else []
+
+## 某交叉点在 `move_seq` 里的手数（1 基）：取**最后一次**出现——同一交叉点被提后再下时以最近一手为准；
+## 复盘快照的 `move_seq` 已截到当前回看手，天然对齐。不在序列里 / 脏值 / 盘外 ⇒ 0。
+## 纯函数、不碰场景树（门卫可直接断言）。
+static func move_no_in_seq(x: int, y: int, move_seq) -> int:
+	if typeof(move_seq) != TYPE_ARRAY or not Coords.valid(x, y):
+		return 0
+	var want := Coords.xy_to_gtp(x, y)
+	var found := 0
+	for i in (move_seq as Array).size():
+		var v = (move_seq as Array)[i]
+		if typeof(v) == TYPE_STRING and str(v).strip_edges().to_upper() == want:
+			found = i + 1
+	return found
+
+## 悬停文案的**纯逻辑核心**（静态、不碰场景树）：盘外 ⇒ 空串；`move_no > 0`（已有棋子）⇒
+## 「D4 · 第 3 手」；否则（空点）⇒ 既有措辞「D4 · 点击落子」（逐字符沿用，不许改）。
+static func tip_text_at(x: int, y: int, move_no: int) -> String:
+	if not Coords.valid(x, y):
+		return ""
+	var label := Coords.xy_to_gtp(x, y)
+	if move_no > 0:
+		return "%s · 第 %d 手" % [label, move_no]
+	return "%s · 点击落子" % label
+
+## 悬停文案（实例入口）：已有棋子给坐标 + 手数，空点给「点击落子」
+func tip_text(x: int, y: int) -> String:
+	return tip_text_at(x, y, move_no_in_seq(x, y, _move_seq) if is_occupied(x, y) else 0)
 
 # ================= 定式高亮轨迹 =================
 
@@ -521,14 +602,34 @@ func _unhandled_input(event: InputEvent) -> void:
 			_update_camera()
 			return
 		_update_hover(get_viewport().get_mouse_position())
+		return
+	if event is InputEventKey:
+		var k := event as InputEventKey
+		if not k.pressed or k.echo:
+			return
+		match k.keycode:
+			KEY_HOME:
+				reset_view()
+				view_changed.emit("视角：已回到初始取景")
+			KEY_C:
+				look_at_corner(_corner + 1)
+				view_changed.emit("视角：看%s角（%s）" % [CORNER_NAMES[_corner], CORNER_GTPS[_corner]])
+			_:
+				return
+		_rotate_hold = GAZE_LOCK_AFTER_ROTATE          # 视角动了：跟手动旋转一样先看玩家 1 秒
+		get_viewport().set_input_as_handled()
 
 func _update_hover(mouse_pos: Vector2) -> void:
 	_hover = pick(mouse_pos)
-	var valid := _hover.x >= 0 and not is_occupied(_hover.x, _hover.y) and placement_allowed() \
-			and not _in_head_zone(mouse_pos)   # 头部附近左键是摸头，不提示落子
-	_ghost.visible = valid
-	_tip.visible = valid
-	if valid:
+	var on_board := _hover.x >= 0 and not _in_head_zone(mouse_pos)   # 头部附近左键是摸头，不提示落子
+	var occupied := on_board and is_occupied(_hover.x, _hover.y)
+	var placeable := on_board and not occupied and placement_allowed()
+	# 提示分三种：已有棋子（任何状态下都给坐标 + 手数）、空点且真能落子（沿用既有「点击落子」）、
+	# 其余（盘外 / 她思考中 / 只读复盘的空点）不提示。
+	_ghost.visible = placeable
+	_tip.visible = on_board and (occupied or placement_allowed())
+	if placeable:
 		_ghost.position = _world(_hover.x, _hover.y, STONE_H * 0.5)
-		_tip.text = "%s%d · 点击落子" % [Coords.letter(_hover.x), 19 - _hover.y]
+	if _tip.visible:
+		_tip.text = tip_text(_hover.x, _hover.y)
 		_tip.position = _world(_hover.x, _hover.y, STONE_H + 0.55)
