@@ -7,10 +7,11 @@
 **控制者钉死的融合公式**（spec §五 A 的实现口径）：
 
 - 融合：``v ← v*(1-α) + x*α``，**每个维度各自维护 ``n_games``**（该维已有的样本数）；
-- **单局 α**：``α = max(alpha_cap, 1/(n_games + 1))``
-  ⇒ 首样本 α=1、第 2 次 0.5、第 3 次 1/3、**第 4 次起稳在 ``alpha_cap=0.25``**
-  （任务书逐字给出的那串数：1 / 0.5 / 1/3 / 0.25…；见 ``alpha_of`` 的注释——任务书写的是
-  ``min``，但 ``min`` 与「首样本 α=1、第 2 次 0.5」矛盾且恒等于 0.25，故按那串数实现成 ``max``）；
+- **单局 α**（评审前修正定稿）：``n = 0 ⇒ α = 1``（首样本＝**初始化**，此时没有既有画像
+  可被爆冷改写）；``n ≥ 1 ⇒ α = min(alpha_cap, max(1/(n+1), 1 - 0.5**(1/half_life)))``
+  ——**上限是真上限**（``n ≥ 1`` 时 α 恒 ≤ ``alpha_cap=0.25``），且 ``1/(n+1)`` 衰减到
+  **半衰期稳态步长** ``1 - 0.5**(1/half_life)``（``half_life=20`` ⇒ ≈0.0341）后**不再变小**
+  （＝真正的指数遗忘，有效窗口 ≈ 半衰期；见 ``alpha_of``）；
 - **置信度**：``confidence = 1 - 0.5 ** (n_games / half_life)``（随局数上升、渐近 1；
   ``n_games`` 取**融合后**的样本数）；
 - 数值维的值**归一化到 ``[0,1]``**（写进提示词的也是这个刻度）。
@@ -37,8 +38,6 @@ OPENING_MOVES = 12      # 「开局」＝玩家自己的前 12 手（此后的�
 CORNER_BOX = 6          # 角部区域＝每个角 6×6 的方框（够盖住星 / 小目 / 三三 / 目外）
 TENUKI_DIST = 4         # 与上一手的切比雪夫距离 ≥ 4 记一次「脱先」（就近应的手不会这么远）
 BLUNDER_DROP = 0.10     # 「真亏手」门槛：掉胜率 > 10%（与 ``state.record_loss`` 同口径）
-RUSH_RATIO = 0.30       # 「随手」代理：用时 < 本局中位数的 30%
-RUSH_MIN_SAMPLES = 5    # 少于 5 手样本不做时间代理（样本太少，中位数不稳）
 
 # —— 维度键（spec §6.2） ——
 OPEN_AXES = ("open.star", "open.komoku", "open.sansan", "open.mokuhazushi")
@@ -50,17 +49,20 @@ TOP_TYPE_AXIS = "blunder.top_type"
 ADDRESS_AXIS = "persona.address_pref"
 TOPIC_PREFIX = "persona.topic."
 
-# 数值维里「``extract_axes`` 一定会发」的那批：``merge`` 对它们**缺键＝当 0 参与融合**；
-# 其余键（``persona.topic.*`` 等）缺键＝**原样带过、不衰减**。
-CORE_AXES = OPEN_AXES + (KAKARI_AXIS,) + STYLE_AXES + (BLUNDER_AXIS,) + WEAK_AXES
+# 一定产出的数值维（没数据＝0.0）：``merge`` 对它们**缺键＝当 0 参与融合**（任务书「缺维当 0」）。
+ALWAYS_AXES = OPEN_AXES + (KAKARI_AXIS,) + STYLE_AXES
+# 只在**有逐手 ``drop`` 信号**时才产出的维（评审前修正：缺信号＝**不产出该键**，
+# 不把「不知道」写成 0）：失误率 + 薄弱方位 + 失误手型。
+DROP_AXES = (BLUNDER_AXIS,) + WEAK_AXES + (TOP_TYPE_AXIS,)
+# 数值维全集（ALWAYS + DROP 里的数值维；``TOP_TYPE_AXIS`` 的**值是字符串**，只是也归在失误组）
+CORE_AXES = ALWAYS_AXES + DROP_AXES
 # 非数值维（值＝字符串，不做 EMA）
 NON_NUMERIC_AXES = (TOP_TYPE_AXIS, ADDRESS_AXIS)
 
 # 失误手型（spec §二「常亏手型（深入 / 无理 / 方向 / 随手）」）
 BLUNDER_TYPES = ("深入", "无理", "方向", "随手")
 
-# 四个角的中心（切比雪夫距离最近者胜）——用于把真亏手归到「薄弱方位」
-_CORNER_CENTERS = ((3, 3), (15, 3), (3, 15), (15, 15))     # tl / tr / bl / br
+# 四个角的键（顺序＝ tl / tr / bl / br）——用于把真亏手归到「薄弱方位」的象限
 _CORNER_KEYS = ("weak.corner_tl", "weak.corner_tr", "weak.corner_bl", "weak.corner_br")
 
 
@@ -145,10 +147,9 @@ def _moves_of(rec) -> list:
 def _drops_of(rec) -> list:
     """本局**玩家真亏手**的 ``[(x, y, drop)]``（``drop > BLUNDER_DROP``）。
 
-    两个来源（任一存在即视为「本局有亏手数据」）：
-    1. ``moves`` 里带 ``drop`` 的条目（推荐：Q3 把真亏手账并进 ``moves`` 的 JSON）；
-    2. 可选的 ``rec["losses"]``（``[{"gtp":"Q16","drop":0.3},…]``，不在钉死的键表里、
-       有就用、没有就算）。
+    唯一来源（评审前修正定稿）：``moves`` 里每条可选的 ``drop`` 字段
+    （``{"color":"B","gtp":"Q16","drop":0.32}``，缺省 0）。**Q7 负责在写记录时把
+    ``st.losses`` 的真亏手填进 ``moves`` 的条目**——本模块只读、不碰 ``agent.py``。
     """
     out = []
     for it in _as_list(_load_json(rec.get("moves") if isinstance(rec, dict) else None, [])):
@@ -163,64 +164,17 @@ def _drops_of(rec) -> list:
             continue
         if drop > BLUNDER_DROP:
             out.append((x, y, drop))
-    for it in _as_list(_load_json(rec.get("losses") if isinstance(rec, dict) else None, [])):
-        if not isinstance(it, dict):
-            continue
-        x, y = coords.gtp_to_xy(str(it.get("gtp", "")))
-        if (x, y) == (-1, -1):
-            continue
-        try:
-            drop = float(it.get("drop", 0))
-        except Exception:               # noqa: BLE001
-            continue
-        if drop > BLUNDER_DROP:
-            out.append((x, y, drop))
     return out
 
 
 def _has_drop_data(rec) -> bool:
-    """本局是否带了「亏手」数据（有的话就不必退到时间代理）。"""
+    """本局是否带了**逐手 ``drop`` 信号**（没有就整组「失误与薄弱方位」不产出）。"""
     if not isinstance(rec, dict):
         return False
-    if "losses" in rec:
-        return True
     for it in _as_list(_load_json(rec.get("moves"), [])):
         if isinstance(it, dict) and "drop" in it:
             return True
     return False
-
-
-def _player_ms_of(rec, moves) -> list:
-    """玩家每手的用时（毫秒）；认不出来一律 ``[]``。
-
-    接受：与 ``moves`` **等长**的数组（按颜色挑出玩家的那几手）、
-    ``{"E":[…],"A":[…]}`（``E`` 就是玩家）、或**只含玩家手**的数组（原样用）。
-    """
-    raw = _load_json(rec.get("per_move_ms") if isinstance(rec, dict) else None, [])
-    n_all = len(moves)
-    n_player = sum(1 for c, _x, _y in moves if c == "B")
-    if isinstance(raw, dict):
-        raw = raw.get("E", raw.get("player", []))
-    vals = []
-    for v in _as_list(raw):
-        try:
-            vals.append(float(v))
-        except Exception:               # noqa: BLE001
-            vals.append(None)
-    if n_all and len(vals) == n_all:
-        vals = [v for v, (c, _x, _y) in zip(vals, moves) if c == "B"]
-    if len(vals) > n_player:
-        vals = vals[:n_player]
-    return vals
-
-
-def _median(vals) -> float:
-    """纯标准库中位数（空列表 → 0.0）。"""
-    xs = sorted(float(v) for v in vals if v is not None)
-    if not xs:
-        return 0.0
-    mid = len(xs) // 2
-    return xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2.0
 
 
 # ================= 四维特征提取 =================
@@ -229,9 +183,14 @@ def extract_axes(game_rec) -> dict:
     """从一条对局记录里抠出**本局**的四维特征（spec §6.2 的键）；空 / 脏 rec 当 0、不抛。
 
     返回 ``{axis: 值}``：数值维是 ``[0,1]`` 的 ``float``，``blunder.top_type`` /
-    ``persona.address_pref`` 是**字符串**（不知道就是 ``""``）。``CORE_AXES`` 里的键
-    **一定都在**（算不出来就是 0.0，形状稳定）；``persona.topic.*`` **只发本局出现过的主题**
-    （没聊到 / 没记录就不发这个键，``merge`` 会把它原样带过、不衰减）。
+    ``persona.address_pref`` 是**字符串**。产出形状分三类：
+
+    - ``ALWAYS_AXES``（开局四类 + 挂角 + 行棋风格三项）**一定都在**（算不出来就是 0.0）；
+    - ``DROP_AXES``（``blunder.rate`` / ``weak.corner_*`` / ``blunder.top_type``）
+      **只在 ``moves`` 带逐手 ``drop`` 信号时**才产出——缺信号＝**不发这些键**
+      （不把「不知道」写成 0；Q7 负责写记录时把 ``st.losses`` 填进 ``moves``）；
+    - ``persona.topic.*`` 只发本局出现过的主题；``persona.address_pref`` 目前**没有信号源**
+      （钉死的十个键里没有称呼信息），故默认**不发这个键**，等后续给源。
 
     提取规则（全部只看 ``rec`` 里钉死的那十个键；详见报告）：
 
@@ -246,25 +205,19 @@ def extract_axes(game_rec) -> dict:
       ≥ 4 的手数占比（首手没有上一手 ⇒ 不计）。
     - ``style.territory_vs_influence``：玩家每手「离最近边的线数 / 8」的均值
       （0＝全在一路（实地）、1＝全在天元（势力））。
-    - ``blunder.rate``：有亏手数据时＝``drop > 0.10`` 的手数 / 玩家手数；没有亏手数据但
-      ``per_move_ms`` 样本 ≥ 5 时退化为「随手」代理（用时 < 中位数 30% 的手数占比）；
-      两者都没有＝0。
-    - ``blunder.top_type``：亏手数据下按**亏得最多那一手**的几何分型
-      （与对方相邻→``无理``；两格内有两个以上对方子→``深入``；否则→``方向``）；
-      时间代理命中时＝``随手``；都没有＝``""``。
-    - ``weak.corner_tl|tr|bl|br``：把每条真亏手按切比雪夫距离归到最近的角，
-      值＝该角亏手数 / 本局亏手总数（没有亏手数据＝全 0）。
+    - ``blunder.rate``：``drop > 0.10`` 的**真亏手数 / 总手数**（评审前修正定稿）。
+    - ``blunder.top_type``：按**亏得最多那一手**的几何分型（与对方相邻→``无理``；
+      两格内有两个以上对方子→``深入``；否则→``方向``）；**没有真亏手就不发这个键**。
+    - ``weak.corner_tl|tr|bl|br``：真亏手按**所在象限**（19 路中心线分四块）计频率：
+      值＝**该象限真亏数 / 该象限落子数**（该象限没有落子＝0）。
     - ``persona.topic.*``：``chat_topics`` 里每个主题的段数占比（键名＝``persona.topic.<主题>``）。
-    - ``persona.address_pref``：可选键 ``rec["address_pref"]`` 的非空字符串（钉死的十个键里
-      **没有**称呼信号，故默认 ``""``＝未知）。
+    - ``persona.address_pref``：可选键 ``rec["address_pref"]`` 的非空字符串；没有就不发。
     """
     rec = game_rec if isinstance(game_rec, dict) else {}
     moves = _moves_of(rec)
     player = [(x, y) for c, x, y in moves if c == "B"]
 
-    out = {axis: 0.0 for axis in CORE_AXES}
-    out[TOP_TYPE_AXIS] = ""
-    out[ADDRESS_AXIS] = ""
+    out = {axis: 0.0 for axis in ALWAYS_AXES}      # 一定产出的维（没数据＝0.0）
 
     # —— 逐手几何：接触 / 与上一手的距离 / 线数（占位法，**不处理提子**，只作近似） ——
     occ = {}
@@ -345,31 +298,18 @@ def extract_axes(game_rec) -> dict:
         out["style.territory_vs_influence"] = _clamp01(
             sum(lines) / (len(lines) * float(coords.SIZE - 1)) if lines else 0.0)
 
-    # —— 失误与薄弱方位 ——
-    blunders = _drops_of(rec)
-    has_drops = _has_drop_data(rec)
-    if has_drops:
-        if n_player:
-            out[BLUNDER_AXIS] = _clamp01(len(blunders) / float(n_player))
+    # —— 失误与薄弱方位（评审前修正：**只在有逐手 drop 信号时**才产出这一组键） ——
+    if _has_drop_data(rec):
+        blunders = _drops_of(rec)
+        out[BLUNDER_AXIS] = _clamp01(len(blunders) / float(len(moves))) if moves else 0.0
         if blunders:
             out[TOP_TYPE_AXIS] = _blunder_type(occ, blunders)
-            counts = [0.0] * 4
-            for x, y, _drop in blunders:
-                counts[_nearest_corner(x, y)] += 1.0
-            for i, axis in enumerate(_CORNER_KEYS):
-                out[axis] = _clamp01(counts[i] / float(len(blunders)))
-    else:
-        times = _player_ms_of(rec, moves)
-        if len(times) >= RUSH_MIN_SAMPLES:
-            med = _median(times)
-            if med > 0:
-                rush = sum(1 for v in times if v is not None and v < RUSH_RATIO * med)
-                rate = _clamp01(rush / float(len(times)))
-                out[BLUNDER_AXIS] = rate
-                if rate > 0:
-                    out[TOP_TYPE_AXIS] = "随手"
+        for i, axis in enumerate(_CORNER_KEYS):                                 # 该象限真亏数 / 该象限落子数
+            placed = sum(1 for _c, x, y in moves if _corner_index(x, y) == i)
+            hit = sum(1 for x, y, _d in blunders if _corner_index(x, y) == i)
+            out[axis] = _clamp01(hit / float(placed)) if placed else 0.0
 
-    # —— 性格与话题 ——
+    # —— 性格与话题（``address_pref`` 现在没有信号源：推导不出来就**不产出该键**） ——
     out.update(_topic_axes(rec))
     pref = rec.get("address_pref")
     if isinstance(pref, str) and pref.strip() != "":
@@ -393,14 +333,13 @@ def _family_counts(rec) -> list:
     return out
 
 
-def _nearest_corner(x, y) -> int:
-    """离哪个角最近（切比雪夫距离，平手取靠前的角）。"""
-    best, best_d = 0, None
-    for i, (cx, cy) in enumerate(_CORNER_CENTERS):
-        d = max(abs(x - cx), abs(y - cy))
-        if best_d is None or d < best_d:
-            best, best_d = i, d
-    return best
+def _corner_index(x, y) -> int:
+    """点落在哪个**象限**（19 路按中心线分四块：``x ≤ 9`` 为左、``y ≤ 9`` 为上）。
+
+    返回下标对应 ``_CORNER_KEYS``：0=tl / 1=tr / 2=bl / 3=br（中心那一格 (9,9) 归 tl）。
+    """
+    half = (coords.SIZE - 1) // 2
+    return (0 if y <= half else 2) + (0 if x <= half else 1)
 
 
 def _blunder_type(occ, blunders) -> str:
@@ -466,29 +405,39 @@ def confidence_of(n_games, half_life: float = HALF_LIFE) -> float:
     return _clamp01(1.0 - 0.5 ** (n / hl))
 
 
-def alpha_of(n_games, alpha_cap: float = ALPHA_CAP) -> float:
-    """单局权重：``α = 1/(n_games+1)`` 但**不低于** ``alpha_cap``（``n_games`` ＝该维已有样本数）。
+def steady_alpha(half_life: float = HALF_LIFE) -> float:
+    """半衰期对应的**稳态单局步长** ``1 - 0.5**(1/half_life)``（``half_life=20`` ⇒ ≈0.0341）。
 
-    ⇒ 首样本 α=1（直接取 ``x``）、第 2 次 0.5、第 3 次 1/3、**第 4 次起稳在 ``alpha_cap=0.25``**
-    （任务书里逐字给出的那串数：1 / 0.5 / 1/3 / 0.25…）。
+    含义：样本多到 ``1/(n+1)`` 已经小于它之后，α 就**不再变小**——每局固定挪这么多，
+    效果就是「有效窗口 ≈ 半衰期」的指数遗忘（而不是越挪越小的滑动平均）。
+    ``half_life <= 0``（脏值）⇒ 稳态步长按 1.0（＝每局都按 ``alpha_cap`` 挪，无遗忘）。
+    """
+    try:
+        hl = float(half_life)
+    except Exception:                   # noqa: BLE001
+        hl = HALF_LIFE
+    if hl <= 0:
+        return 1.0
+    return _clamp01(1.0 - 0.5 ** (1.0 / hl))
 
-    **注意（任务书里两句话打架，这里按「那串数」实现）**：任务书写的是
-    ``α = min(alpha_cap, 1/(n_games + 1))``，但 ``min`` 与它紧接着写的
-    「首样本 α=1、第 2 次 0.5」互相矛盾——``min(0.25, 1/(n+1))`` 对任何 ``n`` 都恒等于 0.25
-    （第 1 局就取不到 ``x``，``1/(n+1)`` 这一项形同虚设，新画像永远只有真实值的 25%）。
-    本实现取 ``max``：它**恰好**给出任务书列出的 1 / 0.5 / 1/3 / 0.25… 这串数，
-    也守住了门卫「单局 α 上限」的稳态口径（``n ≥ 3`` 起单局最多挪 25%）。
-    若控制者确认要 ``min``（首样本 0.25、此后恒 0.25），把下面的 ``max`` 改回 ``min`` 即可，
-    门卫用例 ``test_alpha_of_matches_pinned_formula`` 同步改。
+
+def alpha_of(n_games, alpha_cap: float = ALPHA_CAP, half_life: float = HALF_LIFE) -> float:
+    """单局权重（**评审前修正定稿**）：``n = 0 ⇒ 1.0``（首样本＝初始化，没有既有画像可被爆冷改写）；
+
+    ``n ≥ 1 ⇒ α = min(alpha_cap, max(1/(n_games + 1), 1 - 0.5**(1/half_life)))``。
+
+    - **上限是真上限**：``n ≥ 1`` 时 ``α ≤ alpha_cap``（默认 0.25）＝「防一局爆冷改写画像」；
+    - **随样本增多单调不增**，且 ``1/(n+1)`` 衰减到**半衰期稳态步长** ``steady_alpha``
+      后不再变小 ⇒ 真正的指数遗忘（``half_life=20``、``alpha_cap=0.25`` 时：
+      ``n=1/2/3→0.25``、``n=4→0.2``、``n=9→0.1``、``n=28→≈0.0345``、``n=100→≈0.0341``）。
     """
     try:
         n = int(n_games)
     except Exception:                   # noqa: BLE001
         n = 0
-    if n < 0:
-        n = 0
-    cap = _clamp01(alpha_cap)
-    return max(cap, 1.0 / (n + 1))
+    if n <= 0:
+        return 1.0
+    return min(_clamp01(alpha_cap), max(1.0 / (n + 1), steady_alpha(half_life)))
 
 
 def merge(prev, x, n_games, *, half_life: float = HALF_LIFE, alpha_cap: float = ALPHA_CAP) -> dict:
@@ -503,9 +452,11 @@ def merge(prev, x, n_games, *, half_life: float = HALF_LIFE, alpha_cap: float = 
     返回 ``{axis: {"value", "confidence", "n_games"}}``，形状与 ``upsert_axes`` 的「记录形状」
     一致（可直接 ``store.upsert_axes(merge(...))``）。规则：
 
-    - 数值维：``v ← v*(1-α) + x*α``（首样本 α=1 ⇒ 直接取 ``x``），α 见 ``alpha_of``；
-      值一律夹到 ``[0,1]``；``CORE_AXES`` 里的键**缺键＝当 0 参与融合**（任务书「缺维当 0」），
-      脏值同样当 0；其余键（``persona.topic.*``）**缺键＝原样带过、不衰减**。
+    - 数值维：``v ← v*(1-α) + x*α``（首样本 α=1 ⇒ 直接取 ``x``），α 见 ``alpha_of``
+      （**评审前修正**：``n=0⇒1``；``n≥1`` 时 ``min(alpha_cap, max(1/(n+1), 半衰期稳态))``）；
+      值一律夹到 ``[0,1]``；``ALWAYS_AXES`` 里的键**缺键＝当 0 参与融合**（任务书「缺维当 0」），
+      脏值同样当 0；**其余键**（``DROP_AXES``＝失误与薄弱方位、``persona.topic.*``）
+      **缺键＝原样带过、不衰减、不涨样本数**（缺信号 ≠ 值为 0）。
     - 非数值维（``blunder.top_type`` / ``persona.address_pref``）：**最近一次非空覆盖**，
       不做 EMA；空 / 缺＝未知＝**跳过不更新**（连 ``n_games`` 都不涨）。
     - ``n_games`` 每融合一次 +1（只在真的更新了该维时）。
@@ -530,8 +481,8 @@ def merge(prev, x, n_games, *, half_life: float = HALF_LIFE, alpha_cap: float = 
         except Exception:               # noqa: BLE001
             base_n = old_n
         present = axis in x_map
-        if not present and axis not in CORE_AXES and axis not in NON_NUMERIC_AXES:
-            if old:                     # 结构上可缺的维（persona.topic.*）：原样带过
+        if not present and axis not in ALWAYS_AXES and axis not in NON_NUMERIC_AXES:
+            if old:                     # 结构上可缺的维（DROP_AXES / persona.topic.*）：原样带过
                 out[axis] = {"value": old_val, "confidence": confidence_of(old_n, half_life),
                              "n_games": old_n}
             continue
@@ -552,7 +503,7 @@ def merge(prev, x, n_games, *, half_life: float = HALF_LIFE, alpha_cap: float = 
         if old is None:
             value = xv
         else:
-            alpha = alpha_of(base_n, alpha_cap)
+            alpha = alpha_of(base_n, alpha_cap, half_life)
             value = _clamp01(_clamp01(old_val) * (1.0 - alpha) + xv * alpha)
         out[axis] = {"value": value, "confidence": confidence_of(new_n, half_life),
                      "n_games": new_n}

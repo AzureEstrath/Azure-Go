@@ -1,12 +1,17 @@
 """``app.profile``：四维特征提取（``extract_axes``）与指数衰减融合（``merge``）。
 
-门卫（任务书 Q2 + spec §7）：EMA 正确性；**单局 α 上限**（首样本 1 / 第 2 次 0.5 /
-第 4 次起 0.25）；**置信度随局数上升**；缺维 / 脏值当 0、不抛；``merge`` 对同一输入
-幂等可复现、不改入参；``n_games`` 逐维累加正确；非数值维（``top_type`` / ``address_pref``）
-按「最近一次非空覆盖」、不做 EMA。
+门卫（任务书 Q2 + spec §7 + **评审前修正**）：
+- **α（裁决 1 的 5 条）**：① ``n=0 ⇒ α=1``（初始化）；② ``n≥1 ⇒ α ≤ alpha_cap``（上限是真上限）；
+  ③ 随 ``n`` **单调不增**且收敛到**半衰期稳态** ``1-0.5**(1/half_life)``（不是继续变小、也不是卡在 0.25）；
+  ④ 半衰期越大 ⇒ 稳态 ``α`` 越小；⑤ 置信度随局数单调上升；
+- **`blunder` / `weak.corner_*`（裁决 2）**：有逐手 ``drop`` ⇒ 算出这两组键；
+  **缺 ``drop`` ⇒ 不产出这组键**（不把「不知道」写成 0）；
+- **`persona.address_pref`（裁决 3）**：推导不出来就**不产出该键**；
+- 通用：缺维 / 脏值当 0、不抛；``merge`` 对同一输入幂等可复现、不改入参；``n_games`` 逐维累加。
 """
 
 import copy
+import json
 import os
 import sys
 import tempfile
@@ -15,33 +20,44 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # backend/（app.*）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))                     # tests/（helpers）
 
-from app.profile import (ADDRESS_AXIS, ALPHA_CAP, BLUNDER_TYPES, CORE_AXES, HALF_LIFE,
-                         NON_NUMERIC_AXES, TOP_TYPE_AXIS, TOPIC_PREFIX, alpha_of,
-                         confidence_of, extract_axes, merge)
-from app.profile_store import ProfileStore
 from app import coords
+from app.profile import (ADDRESS_AXIS, ALWAYS_AXES, ALPHA_CAP, BLUNDER_AXIS, BLUNDER_TYPES,
+                         CORE_AXES, DROP_AXES, HALF_LIFE, NON_NUMERIC_AXES, TOP_TYPE_AXIS,
+                         TOPIC_PREFIX, WEAK_AXES, alpha_of, confidence_of, extract_axes, merge,
+                         steady_alpha)
+from app.profile_store import ProfileStore
 
-STABLE_KEYS = set(CORE_AXES) | set(NON_NUMERIC_AXES)
+STABLE_KEYS = set(ALWAYS_AXES)
 
 
 def _seq(*items):
-    """``["B","Q16"], …`` → ``moves`` 的 JSON 形状（``[["B","Q16"], …]``）。"""
+    """``["B","Q16"], …`` → ``moves`` 的 JSON 形状（``[["B","Q16"], …]``，**无 drop 信号**）。"""
     return [[c, g] for c, g in items]
+
+
+def _mv(color, gtp, drop=None):
+    """一条带（可选）``drop`` 的 ``moves`` 条目——裁决 2 定稿的形状。"""
+    it = {"color": color, "gtp": gtp}
+    if drop is not None:
+        it["drop"] = drop
+    return it
 
 
 class ExtractShapeTest(unittest.TestCase):
     """形状稳定 + 缺维 / 脏值当 0、绝不抛。"""
 
-    def test_empty_rec_is_all_zero_with_stable_shape(self):
+    def test_empty_rec_produces_only_always_axes(self):
+        """空 rec：只有 ``ALWAYS_AXES``（全 0）——失误 / 称呼 / 主题一组键**都不产出**。"""
         for rec in ({}, None, "不是字典", 42, []):
             with self.subTest(rec=rec):
                 got = extract_axes(rec)
-                self.assertEqual(set(got), STABLE_KEYS, "核心维的形状必须稳定")
-                for axis in CORE_AXES:
+                self.assertEqual(set(got), STABLE_KEYS, "一定产出的维只有 ALWAYS_AXES")
+                for axis in ALWAYS_AXES:
                     self.assertEqual(got[axis], 0.0, axis)
-                self.assertEqual(got[TOP_TYPE_AXIS], "")
-                self.assertEqual(got[ADDRESS_AXIS], "")
-                self.assertFalse([k for k in got if k.startswith(TOPIC_PREFIX)])
+                for axis in DROP_AXES:
+                    self.assertNotIn(axis, got, "没有 drop 信号 ⇒ 不产出 %s" % axis)
+                self.assertNotIn(ADDRESS_AXIS, got, "没有信号源 ⇒ 不产出 address_pref")
+                self.assertEqual([k for k in got if k.startswith(TOPIC_PREFIX)], [])
 
     def test_dirty_rec_never_raises_and_stays_in_range(self):
         dirty = {"ts": object(), "move_count": "x", "final_black_wr": None, "final_score": [1],
@@ -49,14 +65,16 @@ class ExtractShapeTest(unittest.TestCase):
                  "per_move_ms": "x", "joseki_families": object(),
                  "chat_topics": [None, {}, 7, ["", ""]], "summary": None}
         got = extract_axes(dirty)
-        for axis in CORE_AXES:
+        for axis in ALWAYS_AXES:
             self.assertTrue(0.0 <= got[axis] <= 1.0, "%s=%r" % (axis, got[axis]))
-        self.assertIn(got[TOP_TYPE_AXIS], ("",) + BLUNDER_TYPES)
-        # 条目级脏值：坏条目跳过、好条目照算
-        got2 = extract_axes({"moves": [None, 42, {"gtp": 5}, {"color": "B", "gtp": "Q16"}],
-                             "per_move_ms": ["a", None, 1.0]})
+        # 条目级脏值：坏条目跳过、好条目照算；脏 drop 当「没亏」但**信号仍在**
+        got2 = extract_axes({"moves": [None, 42, {"gtp": 5}, {"color": "B", "gtp": "Q16"},
+                                       {"color": "B", "gtp": "D16", "drop": "abc"}]})
         self.assertTrue(0.0 <= got2["style.aggression"] <= 1.0)
         self.assertTrue(0.0 <= got2["style.territory_vs_influence"] <= 1.0)
+        self.assertIn(BLUNDER_AXIS, got2, "有条目带 drop 键（哪怕是脏值）就算「有信号」")
+        self.assertEqual(got2[BLUNDER_AXIS], 0.0)
+        self.assertNotIn(TOP_TYPE_AXIS, got2, "没有真亏手 ⇒ 分不出手型、不产出")
 
 
 class ExtractFeatureTest(unittest.TestCase):
@@ -129,66 +147,59 @@ class ExtractFeatureTest(unittest.TestCase):
         # 「线数」＝离四条边的**最小**距离：(9,9) 是 9、(9,10) 离下边只有 8
         self.assertAlmostEqual(high["style.territory_vs_influence"], (9 + 8) / (2 * 18))
 
-    def test_blunder_rate_and_weak_corner_from_drop_data(self):
-        """有亏手数据：rate＝真亏手 / 玩家手数；薄弱方位＝亏手按最近角分账。"""
-        moves = [{"color": "B", "gtp": "D16", "drop": 0.30},        # 左上，亏得多
-                 {"color": "W", "gtp": "Q4"},
-                 {"color": "B", "gtp": "Q16", "drop": 0.02},        # 不算真亏
-                 {"color": "W", "gtp": "D4"},
-                 {"color": "B", "gtp": "C3"},
-                 {"color": "W", "gtp": "C4"},
-                 {"color": "B", "gtp": "K10"}]
+    # —— 裁决 2：blunder.rate / weak.corner_* 读逐手 drop ——
+
+    def test_drop_signal_produces_blunder_rate_and_weak_corners(self):
+        """有 drop：rate＝真亏手数 / **总手数**；weak＝该象限真亏数 / 该象限落子数。"""
+        moves = [_mv("B", "D16", 0.30),      # 左上，真亏（>0.10）
+                 _mv("W", "Q4"),             # 右下
+                 _mv("B", "Q16", 0.02),      # 右上，不算真亏
+                 _mv("W", "D4"),             # 左下
+                 _mv("B", "C3"),             # 左下（无 drop 键 ⇒ 当 0）
+                 _mv("W", "C4"),             # 左下
+                 _mv("B", "K10")]            # 左上（(9,9)：x≤9 且 y≤9）
         got = extract_axes({"moves": moves})
-        self.assertAlmostEqual(got["blunder.rate"], 0.25)           # 1 / 4
-        self.assertAlmostEqual(got["weak.corner_tl"], 1.0)
-        self.assertAlmostEqual(got["weak.corner_tr"], 0.0)
-        self.assertAlmostEqual(got["weak.corner_bl"], 0.0)
-        self.assertAlmostEqual(got["weak.corner_br"], 0.0)
+        self.assertAlmostEqual(got[BLUNDER_AXIS], 1 / 7)                 # 1 条真亏 / 7 手
+        self.assertAlmostEqual(got["weak.corner_tl"], 0.5)               # 左上：1 亏 / 2 手
+        self.assertAlmostEqual(got["weak.corner_tr"], 0.0)               # 右上：0 / 1
+        self.assertAlmostEqual(got["weak.corner_bl"], 0.0)               # 左下：0 / 3
+        self.assertAlmostEqual(got["weak.corner_br"], 0.0)               # 右下：0 / 1
         self.assertIn(got[TOP_TYPE_AXIS], BLUNDER_TYPES)
+
+    def test_no_drop_signal_means_no_blunder_keys(self):
+        """裁决 2：**缺 drop ⇒ 这一组键一个都不产出**（不把「不知道」写成 0）。"""
+        got = extract_axes({"moves": _seq(("B", "D16"), ("W", "Q4"), ("B", "C3"))})
+        for axis in DROP_AXES:
+            self.assertNotIn(axis, got, axis)
+        # 只有别的手带 drop 键也算「有信号」（该手自己的 drop 缺省 0）
+        got2 = extract_axes({"moves": [_mv("B", "D16"), _mv("W", "Q4", 0.0)]})
+        self.assertIn(BLUNDER_AXIS, got2)
+        self.assertEqual(got2[BLUNDER_AXIS], 0.0)
+
+    def test_drop_signal_without_real_blunder_emits_zero(self):
+        """有信号但没有真亏手：rate / weak 照产出（值 0），**手型不产出**（分不出来）。"""
+        got = extract_axes({"moves": [_mv("B", "D16", 0.10), _mv("W", "Q4", 0.0)]})
+        self.assertEqual(got[BLUNDER_AXIS], 0.0)                 # 0.10 不算真亏（要 > 0.10）
+        self.assertEqual([got[a] for a in WEAK_AXES], [0.0, 0.0, 0.0, 0.0])
+        self.assertNotIn(TOP_TYPE_AXIS, got)
 
     def test_blunder_type_contact_is_unreasonable(self):
         """与对方相邻的真亏手 → 「无理」；孤零零的 → 「方向」。"""
-        contact = extract_axes({"moves": [{"color": "B", "gtp": "Q16"},
-                                          {"color": "W", "gtp": "Q15"},
-                                          {"color": "B", "gtp": "Q14", "drop": 0.4}]})
+        contact = extract_axes({"moves": [_mv("B", "Q16"), _mv("W", "Q15"),
+                                          _mv("B", "Q14", 0.4)]})
         self.assertEqual(contact[TOP_TYPE_AXIS], "无理")
-        alone = extract_axes({"moves": [{"color": "B", "gtp": "D16", "drop": 0.4},
-                                        {"color": "W", "gtp": "Q4"}]})
+        alone = extract_axes({"moves": [_mv("B", "D16", 0.4), _mv("W", "Q4")]})
         self.assertEqual(alone[TOP_TYPE_AXIS], "方向")
 
-    def test_blunder_from_optional_losses_key(self):
-        """可选键 ``losses``：钉死的十个键之外、有就用。"""
-        got = extract_axes({"moves": _seq(("B", "D16"), ("W", "Q4"), ("B", "C3"), ("W", "C4")),
-                            "losses": [{"gtp": "D16", "drop": 0.5}]})
-        self.assertAlmostEqual(got["blunder.rate"], 0.5)
-        self.assertAlmostEqual(got["weak.corner_tl"], 1.0)
+    def test_weak_corner_zero_when_quadrant_has_no_moves(self):
+        """「无落子则 0」：该象限没落子时那个键**照样产出**、值为 0。"""
+        got = extract_axes({"moves": [_mv("B", "D16", 0.4), _mv("W", "D4")]})
+        self.assertAlmostEqual(got["weak.corner_tl"], 1.0)       # 1 亏 / 1 手
+        self.assertAlmostEqual(got["weak.corner_tr"], 0.0)       # 右上没人落子
+        self.assertAlmostEqual(got["weak.corner_br"], 0.0)
+        self.assertEqual(set(WEAK_AXES) - set(got), set())
 
-    def test_rush_proxy_when_no_drop_data(self):
-        """没有亏手数据但有 5 手以上用时：退化为「随手」代理（用时 < 中位数 30%）。"""
-        moves, ms = [], []
-        for i in range(5):
-            moves += [["B", "K%d" % (10 + i)], ["W", "L%d" % (10 + i)]]
-            ms += [1000, 1000]
-        ms[8] = 100                              # 第 5 手玩家落子只用 0.1 秒
-        got = extract_axes({"moves": moves, "per_move_ms": ms})
-        self.assertAlmostEqual(got["blunder.rate"], 0.2)
-        self.assertEqual(got[TOP_TYPE_AXIS], "随手")
-        # 样本不足 5 手：不做代理
-        short = extract_axes({"moves": moves[:4], "per_move_ms": [1000, 1000, 100, 1000]})
-        self.assertEqual(short["blunder.rate"], 0.0)
-        self.assertEqual(short[TOP_TYPE_AXIS], "")
-        # 中位数为 0（没有用时数据）：不做代理
-        self.assertEqual(extract_axes({"moves": moves})["blunder.rate"], 0.0)
-
-    def test_per_move_ms_accepts_player_only_and_dict_shapes(self):
-        moves = []
-        for i in range(6):
-            moves += [["B", "K%d" % (10 + i)], ["W", "L%d" % (10 + i)]]
-        player_only = [1000, 1000, 1000, 1000, 1000, 100]            # 只含玩家手
-        got = extract_axes({"moves": moves, "per_move_ms": player_only})
-        self.assertAlmostEqual(got["blunder.rate"], 1 / 6)
-        got2 = extract_axes({"moves": moves, "per_move_ms": {"E": player_only, "A": [1] * 6}})
-        self.assertAlmostEqual(got2["blunder.rate"], 1 / 6)
+    # —— 性格与话题 ——
 
     def test_topic_axes_are_shares_of_this_game(self):
         rec = {"chat_topics": [["定式", "他说到定式"], ["定式", "又说了一次"],
@@ -199,80 +210,104 @@ class ExtractFeatureTest(unittest.TestCase):
         self.assertAlmostEqual(sum(v for k, v in got.items() if k.startswith(TOPIC_PREFIX)), 1.0)
         self.assertEqual([k for k in extract_axes({}) if k.startswith(TOPIC_PREFIX)], [])
 
-    def test_address_pref_is_optional_and_empty_by_default(self):
-        self.assertEqual(extract_axes({})[ADDRESS_AXIS], "")
+    def test_address_pref_is_not_produced_without_signal(self):
+        """裁决 3：推导不出来就**不产出该键**（不恒发空串占位）；给了显式信号才带出来。"""
+        for rec in ({}, {"address_pref": ""}, {"address_pref": "   "},
+                    {"address_pref": None}, {"address_pref": 42}):
+            with self.subTest(rec=rec):
+                self.assertNotIn(ADDRESS_AXIS, extract_axes(rec))
         self.assertEqual(extract_axes({"address_pref": "  教练  "})[ADDRESS_AXIS], "教练")
-        self.assertEqual(extract_axes({"address_pref": 42})[ADDRESS_AXIS], "")
-        self.assertEqual(extract_axes({"address_pref": None})[ADDRESS_AXIS], "")
 
     def test_pretty_json_strings_are_accepted(self):
         """``profile_store`` 交回来的就是 JSON 文本——文本 / 已解析对象两种都要能跑。"""
-        raw = '{"moves": [["B","Q16"],["W","Q4"]], "chat_topics": [["定式","x"]],' \
-              ' "joseki_families": {"star_kakari_small": 1}}'
-        parsed = {"moves": [["B", "Q16"], ["W", "Q4"]], "chat_topics": [["定式", "x"]],
-                  "joseki_families": {"star_kakari_small": 1}}
-        import json
+        raw = '{"moves": [{"color":"B","gtp":"Q16","drop":0.4},["W","Q4"]],' \
+              ' "chat_topics": [["定式","x"]], "joseki_families": {"star_kakari_small": 1}}'
+        parsed = {"moves": [{"color": "B", "gtp": "Q16", "drop": 0.4}, ["W", "Q4"]],
+                  "chat_topics": [["定式", "x"]], "joseki_families": {"star_kakari_small": 1}}
         self.assertEqual(extract_axes(json.loads(raw)), extract_axes(parsed))
+        self.assertAlmostEqual(extract_axes(parsed)[BLUNDER_AXIS], 0.5)
 
 
-class MergeFormulaTest(unittest.TestCase):
-    """α 与 confidence 的公式逐条钉死（控制者给的算式）。"""
+class AlphaFormulaTest(unittest.TestCase):
+    """裁决 1 的 5 条门卫（α 的上限是真上限 + 半衰期稳态收敛）。"""
 
-    def test_alpha_of_matches_pinned_formula(self):
-        """任务书逐字给出的那串数：1 / 0.5 / 1/3 / 0.25…（见 ``alpha_of`` 的取舍注释）。"""
-        self.assertEqual(alpha_of(0), 1.0)                  # 首样本：α=1（直接取 x）
-        self.assertEqual(alpha_of(1), 0.5)                  # 第 2 次：0.5
-        self.assertAlmostEqual(alpha_of(2), 1 / 3)          # 第 3 次：1/3
-        self.assertEqual(alpha_of(3), ALPHA_CAP)            # 第 4 次起：稳在 0.25
-        self.assertEqual(alpha_of(10), ALPHA_CAP)
-        self.assertEqual(alpha_of(1000), ALPHA_CAP)
-        self.assertEqual(alpha_of(-5), 1.0)                 # 脏输入当 0
+    def test_first_sample_initializes_with_alpha_one(self):
+        """① ``n=0 ⇒ α=1``：首样本＝初始化，直接取 x。"""
+        self.assertEqual(alpha_of(0), 1.0)
+        self.assertEqual(alpha_of(-3), 1.0)                 # 脏输入当 0
+        got = merge({}, {"open.star": 0.8}, 0)
+        self.assertAlmostEqual(got["open.star"]["value"], 0.8)
+        self.assertEqual(got["open.star"]["n_games"], 1)
 
-    def test_single_game_alpha_is_capped_in_steady_state(self):
-        """门卫「单局 α 上限」：有 3 局以上样本后，一局最多挪 25%（防一局爆冷）。"""
-        for n in (3, 4, 10, 50, 1000):
+    def test_alpha_is_capped_for_every_nonzero_sample(self):
+        """② ``n ≥ 1 ⇒ α ≤ alpha_cap``（上限是真上限，不是下限）。"""
+        for n in range(1, 300):
             with self.subTest(n=n):
                 self.assertLessEqual(alpha_of(n), ALPHA_CAP)
-                prev = {"open.star": {"value": 0.0, "n_games": n}}
-                got = merge(prev, {"open.star": 1.0}, {})
-                self.assertLessEqual(got["open.star"]["value"], ALPHA_CAP + 1e-9)
-
-    def test_alpha_cap_is_never_exceeded_in_merge(self):
-        """防一局爆冷：不管 x 多极端、样本多少，单局最多挪 α_cap。"""
-        prev = {"open.star": {"value": 0.0, "n_games": 50}}
+        prev = {"open.star": {"value": 0.0, "n_games": 1}}
         got = merge(prev, {"open.star": 1.0}, {})
-        self.assertAlmostEqual(got["open.star"]["value"], ALPHA_CAP)
-        got2 = merge({"open.star": 0.0}, {"open.star": 1.0}, 50)
-        self.assertAlmostEqual(got2["open.star"]["value"], ALPHA_CAP)
+        self.assertLessEqual(got["open.star"]["value"], ALPHA_CAP + 1e-12)
 
-    def test_confidence_of_matches_pinned_formula(self):
+    def test_alpha_matches_the_pinned_self_check_table(self):
+        """裁决 1 给的数值自查表（``alpha_cap=0.25``、``half_life=20``）。"""
+        self.assertAlmostEqual(alpha_of(1), 0.25)
+        self.assertAlmostEqual(alpha_of(2), 0.25)
+        self.assertAlmostEqual(alpha_of(3), 0.25)
+        self.assertAlmostEqual(alpha_of(4), 0.2)
+        self.assertAlmostEqual(alpha_of(9), 0.1)
+        self.assertAlmostEqual(alpha_of(28), 0.0345, places=4)     # 1/29 = 0.03448
+        self.assertAlmostEqual(alpha_of(100), 0.0341, places=4)    # 半衰期稳态 0.03406
+
+    def test_alpha_is_monotonic_and_converges_to_steady_state(self):
+        """③ 随 n **单调不增**，且**收敛到半衰期稳态**（不是继续变小、也不是卡在 0.25）。"""
+        vals = [alpha_of(n) for n in range(1, 400)]
+        self.assertEqual(vals, sorted(vals, reverse=True), "α 必须单调不增")
+        steady = steady_alpha(HALF_LIFE)
+        self.assertAlmostEqual(steady, 1 - 0.5 ** (1 / 20), places=12)
+        self.assertAlmostEqual(alpha_of(2000), steady, places=12)
+        self.assertAlmostEqual(alpha_of(10000), steady, places=12)
+        self.assertLess(alpha_of(10000), ALPHA_CAP, "大样本时不该卡在 alpha_cap")
+        self.assertGreater(alpha_of(10000), 0.0)
+
+    def test_larger_half_life_means_smaller_steady_alpha(self):
+        """④ 半衰期越大 ⇒ 稳态 α 越小（遗忘越慢）。"""
+        steadies = [steady_alpha(hl) for hl in (5, 10, 20, 50, 100)]
+        self.assertEqual(steadies, sorted(steadies, reverse=True))
+        self.assertAlmostEqual(steady_alpha(10), 1 - 0.5 ** 0.1, places=12)
+        self.assertAlmostEqual(alpha_of(500, half_life=10), steady_alpha(10), places=12)
+        self.assertGreater(alpha_of(500, half_life=10), alpha_of(500, half_life=50))
+        self.assertEqual(alpha_of(0, half_life=10), 1.0, "首样本与半衰期无关")
+        self.assertEqual(steady_alpha(0), 1.0)                     # 脏 half_life：不炸
+
+    def test_confidence_rises_with_games(self):
+        """⑤ 置信度随局数单调上升、渐近 1。"""
+        vals = [confidence_of(n) for n in (1, 3, 10, 20, 40, 100, 500)]
+        self.assertEqual(vals, sorted(vals))
+        self.assertTrue(all(0.0 <= v < 1.0 for v in vals))
         self.assertEqual(confidence_of(0), 0.0)
         self.assertAlmostEqual(confidence_of(1), 1 - 0.5 ** (1 / 20))
         self.assertAlmostEqual(confidence_of(HALF_LIFE), 0.5)
         self.assertAlmostEqual(confidence_of(10, half_life=10), 0.5)
-        self.assertEqual(confidence_of(5, half_life=0), 1.0)        # 脏 half_life：不炸
+        self.assertEqual(confidence_of(5, half_life=0), 1.0)       # 脏 half_life：不炸
         self.assertEqual(confidence_of("x"), 0.0)
 
-    def test_confidence_rises_with_games(self):
-        vals = [confidence_of(n) for n in (1, 3, 10, 20, 40, 100, 500)]
-        self.assertEqual(vals, sorted(vals))
-        self.assertTrue(all(0.0 <= v < 1.0 for v in vals))
+
+class MergeFormulaTest(unittest.TestCase):
+    """EMA 的步进值、逐维计数、缺维当 0、可选维带过。"""
 
     def test_merge_follows_ema_step_by_step(self):
-        """v ← v*(1-α) + x*α：首样本取 x、第 2 次 0.5、第 3 次 1/3、第 4 次起 0.25。"""
+        """``v ← v*(1-α) + x*α``：首样本取 x；``n≥1`` 起 α = 0.25/0.25/0.25/0.2…"""
         out = merge({}, {"open.star": 1.0}, 0)
         self.assertAlmostEqual(out["open.star"]["value"], 1.0)
         self.assertEqual(out["open.star"]["n_games"], 1)
-        out = merge(out, {"open.star": 0.0}, {})
-        self.assertAlmostEqual(out["open.star"]["value"], 0.5)      # 1*0.5 + 0*0.5
-        self.assertEqual(out["open.star"]["n_games"], 2)
-        out = merge(out, {"open.star": 0.0}, {})
-        self.assertAlmostEqual(out["open.star"]["value"], 1 / 3)    # 0.5*(1-1/3)
-        self.assertEqual(out["open.star"]["n_games"], 3)
-        out = merge(out, {"open.star": 1.0}, {})
-        self.assertAlmostEqual(out["open.star"]["value"], (1 / 3) * 0.75 + 0.25)
-        self.assertEqual(out["open.star"]["n_games"], 4)
-        self.assertAlmostEqual(out["open.star"]["confidence"], confidence_of(4))
+        for base_n in (1, 2, 3):                        # α = alpha_cap = 0.25
+            out = merge(out, {"open.star": 0.0}, {})
+            self.assertAlmostEqual(out["open.star"]["value"], 1.0 * 0.75 ** base_n)
+            self.assertEqual(out["open.star"]["n_games"], base_n + 1)
+        out = merge(out, {"open.star": 1.0}, {})        # base_n = 4 ⇒ α = 0.2
+        self.assertAlmostEqual(out["open.star"]["value"], 0.75 ** 3 * 0.8 + 0.2)
+        self.assertEqual(out["open.star"]["n_games"], 5)
+        self.assertAlmostEqual(out["open.star"]["confidence"], confidence_of(5))
 
     def test_n_games_accumulates_per_axis(self):
         """每个维度各自维护 n_games：互不串味、只在自己被更新时 +1。"""
@@ -280,22 +315,21 @@ class MergeFormulaTest(unittest.TestCase):
                 "style.tenuki": {"value": 0.4, "n_games": 2}}
         got = merge(prev, {"open.star": 1.0}, {})
         self.assertEqual(got["open.star"]["n_games"], 8)
-        self.assertAlmostEqual(got["open.star"]["value"], 0.2 * 0.75 + 0.25)   # α=0.25
-        self.assertEqual(got["style.tenuki"]["n_games"], 3, "缺键的核心维＝当 0 也计一次")
-        self.assertAlmostEqual(got["style.tenuki"]["value"], 0.4 * (1 - 1 / 3))  # α=1/3
+        self.assertAlmostEqual(got["open.star"]["value"], 0.2 * 0.875 + 0.125)   # α = 1/8
+        self.assertEqual(got["style.tenuki"]["n_games"], 3, "缺键的 ALWAYS 维＝当 0 也计一次")
+        self.assertAlmostEqual(got["style.tenuki"]["value"], 0.4 * 0.75)          # α = 0.25
         # 按维给 n_games：优先于 prev 里记的
         got2 = merge(prev, {"open.star": 1.0}, {"open.star": 9})
-        self.assertAlmostEqual(got2["open.star"]["value"], 0.2 * 0.75 + 0.25)
+        self.assertAlmostEqual(got2["open.star"]["value"], 0.2 * 0.9 + 0.1)       # α = 1/10
         self.assertEqual(got2["open.star"]["n_games"], 10)
 
     def test_missing_or_dirty_numeric_axis_counts_as_zero(self):
-        """任务书：缺维 / 脏值 → 当 0、不抛。"""
-        got = merge({"open.star": {"value": 1.0, "n_games": 1}}, {}, {})
-        self.assertAlmostEqual(got["open.star"]["value"], 0.5)
-        got2 = merge({"open.star": {"value": 1.0, "n_games": 1}}, {"open.star": "abc"}, {})
-        self.assertAlmostEqual(got2["open.star"]["value"], 0.5)
-        got3 = merge({"open.star": {"value": 1.0, "n_games": 1}}, {"open.star": None}, {})
-        self.assertAlmostEqual(got3["open.star"]["value"], 0.5)
+        """任务书：``ALWAYS_AXES`` 缺维 / 脏值 → 当 0、不抛。"""
+        for x in ({}, {"open.star": "abc"}, {"open.star": None}, {"open.star": []}):
+            with self.subTest(x=x):
+                got = merge({"open.star": {"value": 1.0, "n_games": 1}}, x, {})
+                self.assertAlmostEqual(got["open.star"]["value"], 0.75)     # α = 0.25
+                self.assertEqual(got["open.star"]["n_games"], 2)
 
     def test_values_are_clamped_to_unit_interval(self):
         self.assertAlmostEqual(merge({}, {"open.star": 5.0}, 0)["open.star"]["value"], 1.0)
@@ -304,25 +338,53 @@ class MergeFormulaTest(unittest.TestCase):
             merge({"open.star": {"value": 9.0, "n_games": 1}}, {"open.star": 1.0}, {}
                   )["open.star"]["value"], 1.0)
 
-    def test_optional_axis_is_carried_over_not_decayed(self):
+    def test_drop_axes_are_carried_over_when_absent(self):
+        """裁决 2 的下游：本局没有 drop 信号（x 里没有这几个键）⇒ **原样带过、不衰减、不涨计数**。"""
+        prev = {BLUNDER_AXIS: {"value": 0.2, "n_games": 4},
+                "weak.corner_tl": {"value": 0.5, "n_games": 4}}
+        got = merge(prev, {"open.star": 1.0}, {})
+        self.assertAlmostEqual(got[BLUNDER_AXIS]["value"], 0.2)
+        self.assertEqual(got[BLUNDER_AXIS]["n_games"], 4)
+        self.assertAlmostEqual(got["weak.corner_tl"]["value"], 0.5)
+        self.assertEqual(got["weak.corner_tl"]["n_games"], 4)
+        self.assertAlmostEqual(got[BLUNDER_AXIS]["confidence"], confidence_of(4))
+        # 有信号（x 里带着）：照常 EMA + 计数
+        got2 = merge(prev, {BLUNDER_AXIS: 1.0}, {})
+        self.assertAlmostEqual(got2[BLUNDER_AXIS]["value"], 0.2 * 0.8 + 0.2)   # base_n=4 ⇒ α=0.2
+        self.assertEqual(got2[BLUNDER_AXIS]["n_games"], 5)
+
+    def test_optional_topic_axis_is_carried_over_not_decayed(self):
         """``persona.topic.*`` 这类「结构上可缺」的维：本局没聊到就原样带过、不衰减。"""
         prev = {TOPIC_PREFIX + "定式": {"value": 0.9, "n_games": 3}}
         got = merge(prev, {}, {})
         self.assertAlmostEqual(got[TOPIC_PREFIX + "定式"]["value"], 0.9)
         self.assertEqual(got[TOPIC_PREFIX + "定式"]["n_games"], 3)
-        self.assertAlmostEqual(got[TOPIC_PREFIX + "定式"]["confidence"], confidence_of(3))
-        # 聊到了：照常 EMA + 计数
         got2 = merge(prev, {TOPIC_PREFIX + "定式": 0.1}, {})
         self.assertAlmostEqual(got2[TOPIC_PREFIX + "定式"]["value"], 0.9 * 0.75 + 0.1 * 0.25)
         self.assertEqual(got2[TOPIC_PREFIX + "定式"]["n_games"], 4)
 
+    def test_half_life_parameter_reaches_the_merge_step(self):
+        """``half_life`` 越大 ⇒ 样本多时单局挪得越少（真正的指数遗忘）。"""
+        prev = {"open.star": {"value": 0.0, "n_games": 500}}
+        fast = merge(prev, {"open.star": 1.0}, {}, half_life=5)["open.star"]["value"]
+        slow = merge(prev, {"open.star": 1.0}, {}, half_life=50)["open.star"]["value"]
+        self.assertAlmostEqual(fast, steady_alpha(5))
+        self.assertAlmostEqual(slow, steady_alpha(50))
+        self.assertGreater(fast, slow)
+
     def test_merge_accepts_flat_prev_and_none_x(self):
         got = merge({"open.star": 0.5}, None, 1)
-        self.assertAlmostEqual(got["open.star"]["value"], 0.5 * 0.5)     # α=0.5，x 缺＝0
+        self.assertAlmostEqual(got["open.star"]["value"], 0.5 * 0.75)     # α=0.25，x 缺＝0
         self.assertEqual(got["open.star"]["n_games"], 2)
         self.assertEqual(merge({}, {}, 0), {})
         self.assertEqual(merge(None, None, None), {})
         self.assertEqual(merge("脏", {"open.star": 1.0}, {})["open.star"]["value"], 1.0)
+
+    def test_axis_constants_are_consistent(self):
+        self.assertEqual(set(ALWAYS_AXES) | set(DROP_AXES), set(CORE_AXES))
+        self.assertTrue(set(ALWAYS_AXES).isdisjoint(set(DROP_AXES)))
+        self.assertIn(BLUNDER_AXIS, DROP_AXES)
+        self.assertTrue(set(WEAK_AXES) <= set(DROP_AXES))
 
 
 class MergeNonNumericTest(unittest.TestCase):
@@ -361,6 +423,7 @@ class MergePurityTest(unittest.TestCase):
     def test_same_input_gives_same_output_and_no_mutation(self):
         prev = {"open.star": {"value": 0.4, "n_games": 3},
                 TOP_TYPE_AXIS: {"value": "随手", "n_games": 1},
+                BLUNDER_AXIS: {"value": 0.2, "n_games": 2},
                 TOPIC_PREFIX + "定式": {"value": 0.5, "n_games": 2}}
         x = {"open.star": 0.9, TOP_TYPE_AXIS: "方向", TOPIC_PREFIX + "定式": 0.2,
              "style.tenuki": 0.1}
@@ -370,15 +433,15 @@ class MergePurityTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(prev, prev_before, "不得改 prev")
         self.assertEqual(x, x_before, "不得改 x")
-        # 输出键顺序确定（可复现的另一个侧面）
-        self.assertEqual(list(first), sorted(first))
+        self.assertEqual(list(first), sorted(first), "输出键顺序确定（可复现）")
+        self.assertAlmostEqual(first[BLUNDER_AXIS]["value"], 0.2, msg="没信号就带过")
 
     def test_merge_is_associative_in_the_expected_way(self):
-        """逐局融合的结果与「一局一局来」一致（增量式：同一条记录融两次＝按公式算两次）。"""
+        """逐局融合的结果与「一局一局来」一致（同一条记录融两次＝按公式算两次）。"""
         x = {"open.star": 0.8}
         a = merge({}, x, 0)
         b = merge(a, x, {})
-        self.assertAlmostEqual(b["open.star"]["value"], 0.8 * 0.5 + 0.8 * 0.5)
+        self.assertAlmostEqual(b["open.star"]["value"], 0.8)
         self.assertEqual(b["open.star"]["n_games"], 2)
 
 
@@ -389,23 +452,29 @@ class PipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             store = ProfileStore(os.path.join(d, "profile.db"))
             recs = [
-                {"ts": 100.0, "moves": _seq(("B", "Q16"), ("W", "Q4"), ("B", "D16")),
+                {"ts": 100.0, "moves": [_mv("B", "Q16"), _mv("W", "Q4"), _mv("B", "D16", 0.4)],
                  "joseki_families": {"star_kakari_small": 1}, "chat_topics": [["定式", "x"]]},
-                {"ts": 200.0, "moves": _seq(("B", "Q16"), ("W", "Q4"), ("B", "Q16")),
+                {"ts": 200.0, "moves": _seq(("B", "Q16"), ("W", "Q4"), ("B", "R17")),
                  "chat_topics": [["定式", "y"], ["闲聊", "z"]]},
             ]
             for rec in recs:
                 self.assertGreater(store.add_game(rec), 0)
             profile = store.get_profile()
-            for rec in store.games():
+            # ``games()`` 是**最新在前**；融合要按时间正序（旧 → 新），所以调用方 ``reversed()``
+            for rec in reversed(store.games()):
                 profile = merge(profile, extract_axes(rec), {})
             self.assertEqual(store.upsert_axes(profile), len(profile))
             back = store.get_profile()
             self.assertEqual(set(back), set(profile))
             self.assertEqual(back["open.star"]["n_games"], 2)
             self.assertAlmostEqual(back["open.star"]["value"], 1.0, places=6)
-            self.assertAlmostEqual(back["persona.topic.定式"]["value"], 0.75)
+            self.assertAlmostEqual(back["persona.topic.定式"]["value"], 0.875)
             self.assertEqual(back["persona.topic.定式"]["n_games"], 2)
+            # 第一局带 drop、第二局没有：失误维**只被第一局更新过一次**（第二局原样带过）
+            self.assertAlmostEqual(back[BLUNDER_AXIS]["value"], 1 / 3)
+            self.assertEqual(back[BLUNDER_AXIS]["n_games"], 1)
+            self.assertEqual(back[TOP_TYPE_AXIS]["value"], "方向")
+            self.assertAlmostEqual(back["weak.corner_tl"]["value"], 1.0)
             # 幂等：同一批记录再融一次，值按公式再走一步（可复现），不是随机
             again = merge(back, extract_axes(store.games()[0]), {})
             self.assertAlmostEqual(again["open.star"]["n_games"], 3)
