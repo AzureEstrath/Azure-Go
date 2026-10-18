@@ -113,6 +113,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                          time_aware_enabled=cfg.time_aware_enabled,
                                          memory=mem, tts=tts_client,
                                          joseki_progress=joseki_progress)
+            app.state.agent.profile_store = profile_store   # v3.9.0：画像库无条件接上（懒建库、零开销）
             if autostart:
                 ok = await eng.start()
                 if not ok:
