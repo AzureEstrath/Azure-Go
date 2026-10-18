@@ -114,9 +114,9 @@ var _status_bad := false                       # 状态栏当前是不是错误�
 var _tool_active := false                      # 工具进度是否在跑（start/end 成对，避免重复记原文案）
 var _chk_pass: CheckBox
 var _joseki_opt: OptionButton                     # 定式导学＝「开关 + 频率」一格（关闭 / 低 25% / 中 50% / 高 75%）
-var _drift_opt: OptionButton                      # 情绪波动＝「开关 + 基础概率」一格（关闭 / 低 3% / 中 5% / 高 8%；在 ⚙ 设置抽屉里）
+var _drift_opt: OptionButton                      # 情绪波动＝「开关 + 基础概率」一格（关闭 / 低 3% / 中 5% / 高 6%；在 ⚙ 设置抽屉里）
 var _btn_settings: Button                         # ⚙ 设置抽屉的开关
-var _settings_box: PanelContainer                 # ⚙ 设置抽屉本体（情绪波动 / 同步说话 / 整段合成 / 长句合并，默认收起）
+var _settings_box: PanelContainer                 # ⚙ 设置抽屉本体（情绪波动 / 同步说话 / 整段合成 / 长句合并 / 聊天摘要用 LLM，默认收起）
 var _bad_box: HBoxContainer
 var _chat_input: LineEdit
 var _lbl_queue: Label                           # 右下角那行「排队中 N 条 · 队头前几个字」（队列空则隐藏）
@@ -429,7 +429,7 @@ func _build_right_panel(root: Control) -> void:
 	drawer.add_theme_constant_override("separation", 6)
 	_settings_box.add_child(drawer)
 	# 情绪波动（v3.8.0）：**开关与参数同占一格**（spec 第五节 K：不新增右栏控件位）——一个下拉框
-	# 同时表达「关 / 低 3% / 中 5% / 高 8%」。改动即时写回 config.json 并推给后端（同 joseki 那条通道）。
+	# 同时表达「关 / 低 3% / 中 5% / 高 6%」。改动即时写回 config.json 并推给后端（同 joseki 那条通道）。
 	_drift_opt = OptionButton.new()
 	_drift_opt.add_item("情绪波动：关闭", 0)
 	_drift_opt.add_item("情绪波动：低 3%", 1)
@@ -451,6 +451,11 @@ func _build_right_panel(root: Control) -> void:
 	_acc_check(drawer, "长句合并", cfg.tts_long_chunk, "chunk",
 		"单次 TTS 合成字数上限：关=100（更快出第一句，默认）；开=160（长句一次合成、但首句更慢）。"
 		+ "改完重启后端才生效（分块在后端做）")
+	# 聊天摘要用 LLM（v3.8.0）：**默认关**——聊天摘要走规则式（纯函数分段 + 模板摘要）、零额外 LLM 调用；
+	# 开启后只在**局末 / 空闲**用 LLM 补做分段总结（落子回合内绝不加调用）。写回 config.json 并即时生效。
+	_acc_check(drawer, "聊天摘要用 LLM", cfg.chat_digest_llm, "digest",
+		"默认关：聊天摘要走规则式、**零额外 LLM 调用**；开启：只在**局末 / 空闲**用 LLM 分段总结"
+		+ "（落子回合内绝不加调用）→ 立即生效")
 
 	# 聊天区
 	_chat_scroll = ScrollContainer.new()
@@ -861,7 +866,16 @@ func _on_acc_toggled(on: bool, which: String) -> void:
 		"chunk":
 			cfg.tts_long_chunk = on
 			# 分块已归后端：这个开关只写配置，后端按其 config.json 决定单块字数（重启后端后生效）
+		"digest":
+			cfg.chat_digest_llm = on
+			if agent != null:
+				# 原子入口（v3.8.0）：单字段也只推一次 `/api/config`（与 set_drift / set_joseki 同一形状）
+				agent.set_digest(on)
 	cfg.save()
+	if which == "digest":
+		# 它不是语音项：只进底部状态栏——`_tts_status` 是左栏「语音朗读」的状态行，别写串
+		_set_status("聊天摘要用 LLM 已%s（立即生效）" % ("开启" if on else "关闭"))
+		return
 	var nm := "短回复" if which == "len" else ("同步说话" if which == "sync" else ("整段合成" if which == "batch" else "长句合并"))
 	var scope := "（重启后端后生效）" if which == "chunk" else "（立即生效）"
 	_tts_status.text = "%s：%s%s" % [nm, "开" if on else "关", scope]
@@ -1590,6 +1604,7 @@ func _build_services() -> void:
 	agent.joseki_rate = cfg.joseki_rate         # 定式提示频率（与开关同一格）：同一通道推给后端
 	agent.emotion_drift = cfg.emotion_drift
 	agent.drift_base = cfg.drift_base           # 情绪波动的基础概率（与开关同一格）：同一通道推给后端
+	agent.chat_digest_llm = cfg.chat_digest_llm  # 聊天摘要用 LLM（默认关）：同一通道推给后端（连上后自动补发）
 	_wire_agent()
 	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
 

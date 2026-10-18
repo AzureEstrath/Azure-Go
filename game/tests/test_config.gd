@@ -206,6 +206,25 @@ func _run() -> void:
 	_check("save() 写回 emotion_drift=true", bool(out5.get("emotion_drift", false)))
 	_check("save() 未改动的 drift_base 原值不变", is_equal_approx(float(out5.get("drift_base", -1.0)), 0.03))
 
+	# —— 6) 聊天摘要用 LLM（chat_digest_llm，v3.8.0）——
+	# 口径与 `emotion_drift` 完全一致：键缺失 ⇒ 默认 false；**只认 JSON 的 true / false**（脏值 ⇒ 默认，
+	# `bool("false")` 是 true 的坑同样要挡）；往返读写与未知键原样保留照旧。
+	_write_raw({})
+	var c10 := AzureConfig.load_config(TMP)
+	_check("chat_digest_llm 键缺失 ⇒ 默认 false", not c10.chat_digest_llm)
+	for bad in ["false", "true", 1, 0, null]:
+		_write_raw({"chat_digest_llm": bad})
+		var cdg := AzureConfig.load_config(TMP)
+		_check("chat_digest_llm 脏值 %s ⇒ 默认 false（不把脏值读成「开」）" % str(bad), not cdg.chat_digest_llm)
+	_write_raw({"chat_digest_llm": true, "future_unknown_key": "保留我"})
+	var c11 := AzureConfig.load_config(TMP)
+	_check("chat_digest_llm 读入 true", c11.chat_digest_llm)
+	c11.chat_digest_llm = false
+	_check("save() 写回 chat_digest_llm 改动成功", c11.save())
+	var out6 := _read_raw()
+	_check("save() 写回 chat_digest_llm=false", not bool(out6.get("chat_digest_llm", true)))
+	_check("save() 写回 chat_digest_llm 时仍保留未知键", out6.get("future_unknown_key", "") == "保留我")
+
 	var da := DirAccess.open("user://")
 	if da != null:
 		da.remove("test_config_tmp.json")
@@ -277,6 +296,17 @@ func _run() -> void:
 	_check("drift_level_index：越界 / 脏值不越界（0.0 ⇒ 1、5.0 ⇒ 3、NaN ⇒ 1，恒在 1..3）",
 			m.drift_level_index(true, 0.0) == 1 and m.drift_level_index(true, 5.0) == 3
 			and m.drift_level_index(true, NAN) == 1)
+
+	# —— 5) 聊天摘要用 LLM 原子推送（v3.8.0，与 `set_drift` / `set_joseki` 同一条做法） ——
+	var ne := CountingNetClient.new()
+	ne.set_digest(true)
+	_check("一次切聊天摘要只推一次 /api/config（原子入口）", ne.pushes == 1)
+	_check("原子入口落定后字段生效", ne.chat_digest_llm)
+	var ne2 := CountingNetClient.new()
+	ne2.chat_digest_llm = true
+	_check("单独赋 chat_digest_llm 仍推一次（setter 语义与既有开关一致）", ne2.pushes == 1)
+	ne2.free()
+	ne.free()
 
 	if _fail == 0:
 		print("[config] PASS：", _total, " 项断言全部通过")

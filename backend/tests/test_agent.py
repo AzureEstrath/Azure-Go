@@ -1477,6 +1477,21 @@ class ChatDigestFailureTest(unittest.TestCase):
         self.assertEqual(agent._record_digest_lines("定式：聊了点三三"), 1)
         self.assertEqual(len(agent.event_log.all()), 1)
 
+    def test_record_digest_lines_keeps_only_the_legal_line(self):
+        """第二道闸门的**单行** topic 判据：合法首行照写，失败次行**只丢它自己**（不是整段丢）。
+
+        整段闸门看 `startswith("调用出错")`，所以「首行合法 + 次行是失败文案」不会被整段挡下——
+        这一例正好单独钉住单行闸门：若不挡，失败文案会按「：」切成 `topic="调用出错"` 落进事件表，
+        再经事件区块注入后续每一条提示词。
+        """
+        agent = self._seeded()
+        n = agent._record_digest_lines("定式：聊了点三三\n调用出错：HTTP 401")
+        self.assertEqual(n, 1, "只该落表合法的那条")
+        evs = [e for e in agent.event_log.all() if e["kind"] == "chat"]
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["detail"].get("topic"), "定式")
+        self.assertNotIn("调用出错", evs[0]["text"])
+
     def test_digest_llm_has_its_own_timeout(self):
         """Minor #4：补做路径自带单次超时，不等满 LLM 的 120s。"""
         from app import agent as agent_mod

@@ -57,6 +57,9 @@ var _chat_in_flight := false
 var _joseki_batch := false
 ## 情绪波动「开关 + 基础概率」批量写入中（v3.8.0）：与 `_joseki_batch` 同理。
 var _drift_batch := false
+## 聊天摘要用 LLM（单字段）原子入口的批量写入中（v3.8.0）：与 `_drift_batch` 同理——单字段本可只靠
+## setter 推一次，这里保持与 `set_drift` / `set_joseki` 同一形状，将来加字段不会退回「两次 setter 各推一次」。
+var _digest_batch := false
 var limit_len := false:
 	set(v):
 		limit_len = v
@@ -80,6 +83,11 @@ var drift_base := 0.03:
 	set(v):
 		drift_base = v
 		if not _drift_batch:
+			_push_settings()
+var chat_digest_llm := false:
+	set(v):
+		chat_digest_llm = v
+		if not _digest_batch:
 			_push_settings()
 
 var _ws: WebSocketPeer = null
@@ -349,12 +357,20 @@ func set_drift(on: bool, base: float) -> void:
 	_drift_batch = false
 	_push_settings()
 
+## 聊天摘要用 LLM **原子入口**（v3.8.0）：与 `set_drift` / `set_joseki` 同一个理由与同一个做法——
+## 一次落定、**只推一次** `/api/config`（默认关：摘要走规则式、零额外 LLM 调用；开启后只在局末 / 空闲补做）。
+func set_digest(on: bool) -> void:
+	_digest_batch = true
+	chat_digest_llm = on
+	_digest_batch = false
+	_push_settings()
+
 func _flush_settings() -> void:
 	if not _settings_dirty:
 		return
 	_settings_dirty = false
 	_post("/api/config", {"limit_len": limit_len, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate,
-		"emotion_drift": emotion_drift, "drift_base": drift_base})
+		"emotion_drift": emotion_drift, "drift_base": drift_base, "chat_digest_llm": chat_digest_llm})
 
 func _post(path: String, body: Dictionary = {}) -> void:
 	var req := HTTPRequest.new()
