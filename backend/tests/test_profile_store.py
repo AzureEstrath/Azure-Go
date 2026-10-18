@@ -161,18 +161,20 @@ class BasicTest(unittest.TestCase):
         self.assertEqual(prof["open.star"]["value"], 1.0)
 
     def test_default_path_is_data_profile_db(self):
-        """默认库路径＝``backend/data/profile.db``（已 gitignore），且**读路径不建目录**。"""
+        """默认库路径＝``backend/data/profile.db``（已 gitignore），且**读路径不建目录**。
+
+        **不再碰默认路径**（修复轮 1 / M-4）：``ProfileStore()`` 的读路径会 ``sqlite3.connect``
+        到真实数据目录、顺手留一个空 ``profile.db``——跑一次单测就在仓库里建库，Q3 落真数据后
+        这条用例还会读到开发者的真实画像。只断言路径常量，行为验证走临时目录。
+        """
         self.assertEqual(DEFAULT_DB_PATH, os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "profile.db"))
-        data_dir = os.path.dirname(DEFAULT_DB_PATH)
-        dir_existed = os.path.isdir(data_dir)
-        ProfileStore().get_profile()                        # 只读路径：不建目录、不抛
-        self.assertEqual(os.path.isdir(data_dir), dir_existed, "读路径不得创建 backend/data/")
-        # 父目录不存在时，读路径**什么都不建**（写路径才建目录，见 ``_open(create=True)``）；
-        # 父目录存在时 ``sqlite3.connect`` 会顺手留一个空库文件，这是既有行为（同 joseki_progress）。
+        # 父目录不存在时，读路径**什么都不建**（写路径才建目录，见 ``_open(create=True)``）
         with tempfile.TemporaryDirectory() as d:
             missing = os.path.join(d, "nope", "profile.db")
             self.assertEqual(ProfileStore(missing).get_profile(), {})
+            self.assertEqual(ProfileStore(missing).games(3), [])
+            self.assertIsNone(ProfileStore(missing).last_game_ts())
             self.assertFalse(os.path.isdir(os.path.join(d, "nope")), "读路径不得建目录")
 
 

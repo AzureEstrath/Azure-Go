@@ -75,6 +75,14 @@ class ExtractShapeTest(unittest.TestCase):
         self.assertIn(BLUNDER_AXIS, got2, "有条目带 drop 键（哪怕是脏值）就算「有信号」")
         self.assertEqual(got2[BLUNDER_AXIS], 0.0)
         self.assertNotIn(TOP_TYPE_AXIS, got2, "没有真亏手 ⇒ 分不出手型、不产出")
+        # DROP 组（有信号时）也要在 [0,1] 内
+        for axis in (BLUNDER_AXIS,) + WEAK_AXES:
+            self.assertTrue(0.0 <= got2[axis] <= 1.0, "%s=%r" % (axis, got2[axis]))
+        # 脏值但**数值**的 drop：照样落进 [0,1]
+        got3 = extract_axes({"moves": [_mv("B", "D16", 5.0), _mv("B", "Q16", -1),
+                                       _mv("W", "Q4", 0.9)]})
+        self.assertTrue(0.0 <= got3[BLUNDER_AXIS] <= 1.0)
+        self.assertTrue(all(0.0 <= got3[a] <= 1.0 for a in WEAK_AXES))
 
 
 class ExtractFeatureTest(unittest.TestCase):
@@ -150,7 +158,7 @@ class ExtractFeatureTest(unittest.TestCase):
     # —— 裁决 2：blunder.rate / weak.corner_* 读逐手 drop ——
 
     def test_drop_signal_produces_blunder_rate_and_weak_corners(self):
-        """有 drop：rate＝真亏手数 / **总手数**；weak＝该象限真亏数 / 该象限落子数。"""
+        """有 drop：rate＝真亏手数 / **玩家手数**；weak＝该象限真亏数 / **玩家**在该象限落子数。"""
         moves = [_mv("B", "D16", 0.30),      # 左上，真亏（>0.10）
                  _mv("W", "Q4"),             # 右下
                  _mv("B", "Q16", 0.02),      # 右上，不算真亏
@@ -159,12 +167,36 @@ class ExtractFeatureTest(unittest.TestCase):
                  _mv("W", "C4"),             # 左下
                  _mv("B", "K10")]            # 左上（(9,9)：x≤9 且 y≤9）
         got = extract_axes({"moves": moves})
-        self.assertAlmostEqual(got[BLUNDER_AXIS], 1 / 7)                 # 1 条真亏 / 7 手
-        self.assertAlmostEqual(got["weak.corner_tl"], 0.5)               # 左上：1 亏 / 2 手
+        self.assertAlmostEqual(got[BLUNDER_AXIS], 1 / 4)                 # 1 条真亏 / 4 手玩家手
+        self.assertAlmostEqual(got["weak.corner_tl"], 0.5)               # 左上：1 亏 / 2 手玩家手
         self.assertAlmostEqual(got["weak.corner_tr"], 0.0)               # 右上：0 / 1
-        self.assertAlmostEqual(got["weak.corner_bl"], 0.0)               # 左下：0 / 3
-        self.assertAlmostEqual(got["weak.corner_br"], 0.0)               # 右下：0 / 1
+        self.assertAlmostEqual(got["weak.corner_bl"], 0.0)               # 左下：0 / 1（玩家只落了 C3）
+        self.assertAlmostEqual(got["weak.corner_br"], 0.0)               # 右下：玩家没落子 ⇒ 0
         self.assertIn(got[TOP_TYPE_AXIS], BLUNDER_TYPES)
+
+    def test_blunder_denominators_count_the_player_only(self):
+        """I-1 / I-2 的口径钉死：**同一象限里 Azure 也落了子**时，分母仍只算玩家。
+
+        左上角玩家只落 1 手（且真亏）、Azure 落 3 手 ⇒ 玩家口径 rate=1/1、weak_tl=1/1；
+        若分母混进 Azure 的落子会得到 1/4 与 1/4（这条用例就是为抓那个回归而加的）。
+        """
+        moves = [_mv("B", "D16", 0.40),      # 左上，真亏
+                 _mv("W", "C17"), _mv("W", "D17"), _mv("W", "C16"),   # 左上：Azure 落 3 手
+                 _mv("W", "Q4")]             # 右下
+        got = extract_axes({"moves": moves})
+        self.assertAlmostEqual(got[BLUNDER_AXIS], 1.0)                   # 1 真亏 / 1 手玩家手
+        self.assertAlmostEqual(got["weak.corner_tl"], 1.0)               # 1 真亏 / 1 手玩家手
+        self.assertAlmostEqual(got["weak.corner_tr"], 0.0)
+        self.assertAlmostEqual(got["weak.corner_bl"], 0.0)
+        self.assertAlmostEqual(got["weak.corner_br"], 0.0)               # 玩家没去过右下
+
+    def test_azure_drop_is_not_counted_as_the_player_blunder(self):
+        """第三个面：``_drops_of`` **只认玩家（黑）的 drop**——Azure 条目带 drop 也不计。"""
+        got = extract_axes({"moves": [_mv("B", "D16"), _mv("W", "Q4", 0.9)]})
+        self.assertIn(BLUNDER_AXIS, got, "有 drop 键就算「有信号」")
+        self.assertEqual(got[BLUNDER_AXIS], 0.0, "Azure 的亏手不算玩家的")
+        self.assertNotIn(TOP_TYPE_AXIS, got)
+        self.assertEqual([got[a] for a in WEAK_AXES], [0.0, 0.0, 0.0, 0.0])
 
     def test_no_drop_signal_means_no_blunder_keys(self):
         """裁决 2：**缺 drop ⇒ 这一组键一个都不产出**（不把「不知道」写成 0）。"""
@@ -225,7 +257,7 @@ class ExtractFeatureTest(unittest.TestCase):
         parsed = {"moves": [{"color": "B", "gtp": "Q16", "drop": 0.4}, ["W", "Q4"]],
                   "chat_topics": [["定式", "x"]], "joseki_families": {"star_kakari_small": 1}}
         self.assertEqual(extract_axes(json.loads(raw)), extract_axes(parsed))
-        self.assertAlmostEqual(extract_axes(parsed)[BLUNDER_AXIS], 0.5)
+        self.assertAlmostEqual(extract_axes(parsed)[BLUNDER_AXIS], 1.0)   # 1 真亏 / 1 手玩家手
 
 
 class AlphaFormulaTest(unittest.TestCase):
@@ -385,6 +417,9 @@ class MergeFormulaTest(unittest.TestCase):
         self.assertTrue(set(ALWAYS_AXES).isdisjoint(set(DROP_AXES)))
         self.assertIn(BLUNDER_AXIS, DROP_AXES)
         self.assertTrue(set(WEAK_AXES) <= set(DROP_AXES))
+        # M-2：本批口径下只支持 3 类手型（「随手」需要时间信号源，词表里不留死枚举）
+        self.assertEqual(BLUNDER_TYPES, ("深入", "无理", "方向"))
+        self.assertNotIn("随手", BLUNDER_TYPES)
 
 
 class MergeNonNumericTest(unittest.TestCase):
@@ -471,7 +506,7 @@ class PipelineTest(unittest.TestCase):
             self.assertAlmostEqual(back["persona.topic.定式"]["value"], 0.875)
             self.assertEqual(back["persona.topic.定式"]["n_games"], 2)
             # 第一局带 drop、第二局没有：失误维**只被第一局更新过一次**（第二局原样带过）
-            self.assertAlmostEqual(back[BLUNDER_AXIS]["value"], 1 / 3)
+            self.assertAlmostEqual(back[BLUNDER_AXIS]["value"], 1 / 2)   # 1 真亏 / 2 手玩家手
             self.assertEqual(back[BLUNDER_AXIS]["n_games"], 1)
             self.assertEqual(back[TOP_TYPE_AXIS]["value"], "方向")
             self.assertAlmostEqual(back["weak.corner_tl"]["value"], 1.0)

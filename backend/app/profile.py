@@ -59,8 +59,10 @@ CORE_AXES = ALWAYS_AXES + DROP_AXES
 # 非数值维（值＝字符串，不做 EMA）
 NON_NUMERIC_AXES = (TOP_TYPE_AXIS, ADDRESS_AXIS)
 
-# 失误手型（spec §二「常亏手型（深入 / 无理 / 方向 / 随手）」）
-BLUNDER_TYPES = ("深入", "无理", "方向", "随手")
+# 失误手型（spec §二「常亏手型（深入 / 无理 / 方向 / 随手）」）：本批口径下**只支持 3 类**
+# ——「随手」需要**时间信号源**（每手用时对比），而「失误与薄弱方位」这一组的唯一信号源
+# 是逐手 ``drop``，故词表里不留永远不出现的枚举值（免得 Q6 / Q7 以为它存在）。
+BLUNDER_TYPES = ("深入", "无理", "方向")
 
 # 四个角的键（顺序＝ tl / tr / bl / br）——用于把真亏手归到「薄弱方位」的象限
 _CORNER_KEYS = ("weak.corner_tl", "weak.corner_tr", "weak.corner_bl", "weak.corner_br")
@@ -118,12 +120,11 @@ def _xy_of_item(it):
     return coords.gtp_to_xy(str(it))
 
 
-def _moves_of(rec) -> list:
-    """把 ``rec["moves"]`` 解析成 ``[(颜色, x, y)]``（pass / 认不出来的条目**丢掉**）。
+def _items_with_colors(rec) -> list:
+    """``moves`` 的原始条目 + 解析出来的 ``(颜色, (x, y))``：``[(item, color, (x, y))]``（坏条目跳过）。
 
-    接受四种形状（``profile_store`` 存的是 JSON 文本，调用方也可能给已解析对象）：
-    ``[["B","Q16"],…]`` / ``[{"color":"B","gtp":"Q16","drop":0.2},…]`` /
-    ``["Q16","D4",…]``（无颜色信息 ⇒ 按「黑先、黑白交替」推）。
+    ``_moves_of`` 与 ``_drops_of`` 共用这一处解析：**颜色推定只此一份**——没有颜色信息的
+    条目（``["Q16", …]`` / 无 ``color`` 的 dict）按「黑先、黑白交替」推；坏坐标的条目直接丢掉。
     """
     items = _load_json(rec.get("moves") if isinstance(rec, dict) else None, [])
     out = []
@@ -140,8 +141,18 @@ def _moves_of(rec) -> list:
                 auto = "B"
             color = auto
             auto = "W" if auto == "B" else "B"
-        out.append((color, int(pos[0]), int(pos[1])))
+        out.append((it, color, pos))
     return out
+
+
+def _moves_of(rec) -> list:
+    """把 ``rec["moves"]`` 解析成 ``[(颜色, x, y)]``（pass / 认不出来的条目**丢掉**）。
+
+    接受四种形状（``profile_store`` 存的是 JSON 文本，调用方也可能给已解析对象）：
+    ``[["B","Q16"],…]`` / ``[{"color":"B","gtp":"Q16","drop":0.2},…]`` /
+    ``["Q16","D4",…]``（无颜色信息 ⇒ 按「黑先、黑白交替」推）。
+    """
+    return [(color, int(pos[0]), int(pos[1])) for _it, color, pos in _items_with_colors(rec)]
 
 
 def _drops_of(rec) -> list:
@@ -150,20 +161,20 @@ def _drops_of(rec) -> list:
     唯一来源（评审前修正定稿）：``moves`` 里每条可选的 ``drop`` 字段
     （``{"color":"B","gtp":"Q16","drop":0.32}``，缺省 0）。**Q7 负责在写记录时把
     ``st.losses`` 的真亏手填进 ``moves`` 的条目**——本模块只读、不碰 ``agent.py``。
+
+    **只认玩家（黑）的 ``drop``**（修复轮 1：与分母同源）——Azure 的条目即使带了 ``drop``
+    也一律不计，免得契约一变就把她的亏手算成「玩家的失误」。
     """
     out = []
-    for it in _as_list(_load_json(rec.get("moves") if isinstance(rec, dict) else None, [])):
-        if not (isinstance(it, dict) and "drop" in it):
-            continue
-        x, y = _xy_of_item(it)
-        if (x, y) == (-1, -1):
+    for it, color, pos in _items_with_colors(rec):
+        if color != "B" or not (isinstance(it, dict) and "drop" in it):
             continue
         try:
             drop = float(it["drop"])
         except Exception:               # noqa: BLE001
             continue
         if drop > BLUNDER_DROP:
-            out.append((x, y, drop))
+            out.append((int(pos[0]), int(pos[1]), drop))
     return out
 
 
@@ -192,7 +203,10 @@ def extract_axes(game_rec) -> dict:
     - ``persona.topic.*`` 只发本局出现过的主题；``persona.address_pref`` 目前**没有信号源**
       （钉死的十个键里没有称呼信息），故默认**不发这个键**，等后续给源。
 
-    提取规则（全部只看 ``rec`` 里钉死的那十个键；详见报告）：
+    提取规则（**只读 spec §6.1 的那十个列** —— ``ts / move_count / final_black_wr /
+    final_score / result / moves / per_move_ms / joseki_families / chat_topics / summary``
+    —— **外加一个可选键 ``address_pref``**：``games`` 表里没有这一列，所以真实链路下
+    ``persona.address_pref`` **永远不产出**，留着只是给后续的信号源一个入口；详见报告）：
 
     - ``open.star|komoku|sansan|mokuhazushi``：把每个角 6×6 方框里**玩家最早的那一手**
       按离角点的偏移分类（``(3,3)`` 星 / ``(2,3)|(3,2)`` 小目 / ``(2,2)`` 三三 /
@@ -203,13 +217,14 @@ def extract_axes(game_rec) -> dict:
     - ``style.aggression``：玩家落子时**与对方棋子正交相邻**（接触战）的手数占比。
     - ``style.tenuki``：玩家落子与**上一手**（任一方的最近一手有坐标的手）切比雪夫距离
       ≥ 4 的手数占比（首手没有上一手 ⇒ 不计）。
-    - ``style.territory_vs_influence``：玩家每手「离最近边的线数 / 8」的均值
-      （0＝全在一路（实地）、1＝全在天元（势力））。
-    - ``blunder.rate``：``drop > 0.10`` 的**真亏手数 / 总手数**（评审前修正定稿）。
+    - ``style.territory_vs_influence``：玩家每手「离四条边的**最小**距离 **/ 18**」的均值
+      （0＝全在一路（实地）、天元 (9,9) ≈ 0.5（势力）；**值域实际约 ``[0, 0.5]``**——
+      19 路的天元离边 9 格、除以 ``coords.SIZE - 1 = 18``，这就是 Q6 写提示词要用的刻度）。
+    - ``blunder.rate``：``drop > 0.10`` 的**真亏手数 / 玩家手数**（分子分母同源：都只算玩家）。
     - ``blunder.top_type``：按**亏得最多那一手**的几何分型（与对方相邻→``无理``；
       两格内有两个以上对方子→``深入``；否则→``方向``）；**没有真亏手就不发这个键**。
     - ``weak.corner_tl|tr|bl|br``：真亏手按**所在象限**（19 路中心线分四块）计频率：
-      值＝**该象限真亏数 / 该象限落子数**（该象限没有落子＝0）。
+      值＝**该象限真亏数 / 玩家在该象限的落子数**（玩家在该象限没有落子＝0）。
     - ``persona.topic.*``：``chat_topics`` 里每个主题的段数占比（键名＝``persona.topic.<主题>``）。
     - ``persona.address_pref``：可选键 ``rec["address_pref"]`` 的非空字符串；没有就不发。
     """
@@ -299,13 +314,16 @@ def extract_axes(game_rec) -> dict:
             sum(lines) / (len(lines) * float(coords.SIZE - 1)) if lines else 0.0)
 
     # —— 失误与薄弱方位（评审前修正：**只在有逐手 drop 信号时**才产出这一组键） ——
+    # 口径收口（修复轮 1）：这一组的**分子与分母同源、都只算玩家**——真亏手来自玩家的
+    # ``drop``，那么分母也必须是**玩家自己的手数 / 玩家在该象限的落子数**；混进 Azure 的
+    # 落子会把玩家的失误率系统性压低（这个值会经 Q6 进提示词给模型看）。
     if _has_drop_data(rec):
         blunders = _drops_of(rec)
-        out[BLUNDER_AXIS] = _clamp01(len(blunders) / float(len(moves))) if moves else 0.0
+        out[BLUNDER_AXIS] = _clamp01(len(blunders) / float(n_player)) if n_player else 0.0
         if blunders:
             out[TOP_TYPE_AXIS] = _blunder_type(occ, blunders)
-        for i, axis in enumerate(_CORNER_KEYS):                                 # 该象限真亏数 / 该象限落子数
-            placed = sum(1 for _c, x, y in moves if _corner_index(x, y) == i)
+        for i, axis in enumerate(_CORNER_KEYS):               # 该象限真亏数 / **玩家**在该象限落子数
+            placed = sum(1 for x, y in player if _corner_index(x, y) == i)
             hit = sum(1 for x, y, _d in blunders if _corner_index(x, y) == i)
             out[axis] = _clamp01(hit / float(placed)) if placed else 0.0
 
