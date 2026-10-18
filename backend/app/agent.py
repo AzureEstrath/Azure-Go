@@ -999,12 +999,11 @@ class AzureAgent:
         except (TypeError, ValueError):
             return 0
 
-    def _joseki_mistake_of(self, jk, mistake, warn=True) -> bool:
+    def _joseki_mistake_of(self, jk, mistake) -> bool:
         """按 ``is_joseki_mistake`` 的口径重算「走错」（**不**直接采信 ``mistake["is_mistake"]``）。
 
         与卡片门禁同一口径：``kind != deviated`` 或 ``mistake`` 形状不对 ⇒ ``False``；判定抛异常
-        （脏 ``drop``）⇒ ``False`` + 一行日志，绝不把这一回合打挂。``warn=False`` 供「同一回合里
-        第二次问同一件事」时用（不重复刷日志）。
+        （脏 ``drop``）⇒ ``False`` + 一行日志，绝不把这一回合打挂。
         """
         if str((jk or {}).get("kind", "")) != "deviated":
             return False
@@ -1017,21 +1016,33 @@ class AzureAgent:
         except Exception as e:                  # noqa: BLE001 —— 脏 mistake 绝不许把这一回合打挂
             # 保守取向（与整条链一致）：判不出来就**当没走错**——既不误判「走错」、也不额外打扰玩家；
             # 只留一行日志，对局照常。
-            if warn:
-                print("[Joseki] 走错判定失败（按「不算走错」保守处理，不影响对局）：%s" % e)
+            print("[Joseki] 走错判定失败（按「不算走错」保守处理，不影响对局）：%s" % e)
             return False
+
+    async def _joseki_eligibility(self, jk, mistake):
+        """资格层一次算完：返回 ``(该不该教, seen, is_mistake)``。
+
+        **同一手只读一次族计数、只判一次走错**（修复轮 1 / 评审 Minor #2）：``joseki_show_card`` 与
+        ``joseki_gate_show`` 都从这里取结论，真库下每手只多一次 SQLite 读（识别链路不在热路径上多做东西）。
+        读序与以前一致：先 ``seen`` 再判走错；脏 ``mistake`` 的那一行日志也仍然只打一次。
+        """
+        seen = await self._joseki_seen(jk.get("family"))
+        is_mistake = self._joseki_mistake_of(jk, mistake)
+        return (joseki_gate.eligible(seen, str(jk.get("kind", "")), is_mistake,
+                                     bool(self.joseki_teach)), seen, is_mistake)
 
     async def joseki_show_card(self, jk, mistake=None) -> bool:
         """**资格层**（T5 / v3.7.0）：这条定式**该不该教**（只读：不改 ``st``、不碰计数）。
 
-        判定并入 ``joseki_gate.eligible``：同一族历史出现次数（跨局）``seen < 3`` ⇒ 有资格；
+        判定并入 ``joseki_gate.eligible``：同一族**已教过**次数（跨局）``seen < 3`` ⇒ 有资格；
         第 4 次起只有「走错」（``kind == "deviated"`` 且 ``is_joseki_mistake(...)``：真亏**且**不在
         库线上）才有资格；``joseki_teach=false`` ⇒ 一律无资格。``joseki_progress`` 未接线 / 族 id 缺失
         （旧库、异常形状）⇒ **保守地有资格**（宁可多教一次）；次数读不出来时 ``JosekiProgress.seen``
         自己降到 ``0``（当成第 1 次），所以坏库的表现就是「每次都教」，绝不影响对局。
 
-        顺序固定「**先问后记**」——自增在 ``joseki_count_entry`` 里；若先自增再问，第一次出现时
-        ``seen`` 已是 1，``seen < 3`` 只在第 1、2 次成立，与「前 3 次都有资格」矛盾。
+        顺序固定「**先问后记**」——自增在 ``joseki_count_entry`` 里（且只在真的讲了时才记，见
+        ``agent_graph`` 的两个调用点）；若先自增再问，第一次出现时 ``seen`` 已是 1，「前 3 次」就只
+        成立 2 次。
 
         ``mistake`` 是 ``data["jk_mistake"]`` 那个 dict（键 ``is_mistake/on_line/gtp/x/y/drop/rank_ok``）
         ——这里按 ``is_joseki_mistake`` 的口径重算，而不是直接采信 ``is_mistake``。
@@ -1041,11 +1052,7 @@ class AzureAgent:
         """
         if not jk:
             return False
-        return joseki_gate.eligible(
-            await self._joseki_seen(jk.get("family")),
-            str(jk.get("kind", "")),
-            self._joseki_mistake_of(jk, mistake),
-            bool(self.joseki_teach))
+        return (await self._joseki_eligibility(jk, mistake))[0]
 
     async def joseki_gate_show(self, jk, mistake=None, epoch=None) -> bool:
         """**门控总出口**（T5 / v3.7.0）：这一手该不该讲（资格层 + 频率层；只读，不改任何状态）。
@@ -1067,12 +1074,11 @@ class AzureAgent:
             return False
         kind = str(jk.get("kind", ""))
         family = str(jk.get("family") or "")
-        if not await self.joseki_show_card(jk, mistake):        # 资格层（旧卡片门禁＝同一件事）
+        # 资格层一次算完（修复轮 1 / Minor #2）：族计数只读一次、走错只判一次，供下面复用
+        ok, seen, is_mistake = await self._joseki_eligibility(jk, mistake)
+        if not ok:
             return False
         move_no = len(self.st.moves)
-        # 走错是「必讲」的唯一绕过口；再判一次只为拿这个布尔（``warn=False``：同一回合不重复刷日志）
-        is_mistake = self._joseki_mistake_of(jk, mistake, warn=False)
-        seen = await self._joseki_seen(family)
         sk = joseki_gate.skill_adj(list(self.st.player_ranks), seen)
         md = joseki_gate.mood_adj(self.mood_payload())
         d = joseki_gate.decision(
@@ -1090,7 +1096,12 @@ class AzureAgent:
         return bool(d["show"])
 
     async def joseki_count_entry(self, jk, epoch=None) -> None:
-        """记一次「这一族被走到了」（**同族同局最多计 1 次**；只写计数，不发事件、不决定卡片）。
+        """记一次「这一族**被讲了**」（**同族同局最多计 1 次**；只写计数，不发事件、不决定卡片）。
+
+        **只在门控命中（真的讲了）时调用**（修复轮 1 / 评审 Important #1）：资格层的 ``seen < 3``
+        语义是「**教过**几次」而不是「遇到几次」——按遭遇计数会让频率层把「前 3 次」的教学预算
+        静默吃掉（默认 0.5 下前 3 次遭遇期望只讲约 1.5 次，之后除走错就再也不讲）。走错那条路
+        （必讲、绕过频率层）也是一次讲解，照旧计数。
 
         先把族落进 ``st.joseki_counted``（并把它从 ``st.joseki_dropped`` 里摘掉——新的一集开始），
         再 ``bump``。磁盘 IO 走 ``to_thread``（慢库不得冻住事件循环）；失败也只是丢这一次记忆——

@@ -249,16 +249,19 @@ async def _prepare_after_player(agent, data):
     }
 
     # ④‴′ 定式提示门控（T5 / v3.7.0）：**资格层**（族计数 / 走错 / 总开关）+ **频率层**
-    #      （rate + 画像 / 情绪 ±10% + 冷却）。**先问后记**：``seen < 3`` 必须在自增之前读
-    #      （否则第一次出现时 seen 已是 1，前 3 次就只成立 2 次）。
+    #      （rate + 画像 / 情绪 ±10% + 冷却）。**先问后记**：``seen`` 必须在自增之前读
+    #      （否则第一次出现时 seen 已是 1，「前 3 次」就只成立 2 次）。
     #      命中 ⇒ 讲解 + 卡片 + ``joseki`` 事件；未命中 ⇒ 与「没识别到定式」逐字段同构（只点评这一手）。
-    #      结论只落进本轮 data 交给下游消费：门控不新增 / 不删除任何事件，也不碰 ``busy``。
+    #      **族计数只在真的讲了的时候记**（修复轮 1 / 评审 Important #1）：资格层的 ``seen < 3`` 语义是
+    #      「**教过**几次」而不是「遇到几次」——按遭遇计数会让频率层把「前 3 次」的教学预算静默吃掉
+    #      （默认 0.5 下前 3 次遭遇期望只讲约 1.5 次，之后除走错就再也不讲）。走错那条路照旧计入
+    #      （它就是一次讲解）。结论只落进本轮 data 交给下游消费：门控不新增 / 不删除任何事件，也不碰 ``busy``。
     if jk:
         data["jk_show_card"] = await agent.joseki_gate_show(jk, data.get("jk_mistake"),
                                                             epoch=data.get("epoch"))
         if _alive(agent, data):                     # 看门狗守卫：门控查询 ``await`` 过
-            await agent.joseki_count_entry(jk, epoch=data.get("epoch"))
             if data.get("jk_show_card"):
+                await agent.joseki_count_entry(jk, epoch=data.get("epoch"))
                 agent._joseki_emit(jk, True, data.get("jk_mistake"), epoch=data.get("epoch"))
     # 门控命中才换讲解模板 / 上卡片；未命中与「没识别到定式」同一条出口（T5）
     jk_teach = bool(data.get("jk_show_card"))
@@ -350,7 +353,8 @@ async def _joseki_own_move(agent, data):
     ② ``_prepare_just_moved`` 的表头（兜底：本回合没跑过 ``own_turn`` 就直接驱动 ``just_moved``）。
 
     ``data`` 里已有 ``jk2`` 就立刻返回——``_joseki_check()`` 会消耗去重键，**绝不能调第二次**
-    （同角同族第二次必然返回 ``{}``）。``joseki_count_entry`` 同族同局只计一次，重复调用是 no-op。
+    （同角同族第二次必然返回 ``{}``）。``joseki_count_entry`` 只在**门控命中**时调用（计数＝讲解次数），
+    同族同局只计一次，重复调用是 no-op。
 
     **F1：她这一手的入围结论必须按她自己那一手重算。** ``data["jk_show_card"]`` 里若已有值，那
     是**玩家**那一手的结论（``_prepare_after_player`` 定的），照搬会把她的 ``joseki`` 事件写成玩家
@@ -372,7 +376,9 @@ async def _joseki_own_move(agent, data):
             return
     elif "jk_show_card" not in data:
         data["jk_show_card"] = False
-    await agent.joseki_count_entry(jk2, epoch=data.get("epoch"))
+    # 族计数与玩家那一侧同一口径（修复轮 1）：**只在真的讲了的时候记**——「教过几次」而不是「遇到几次」。
+    if jk2 and data.get("jk_show_card"):
+        await agent.joseki_count_entry(jk2, epoch=data.get("epoch"))
 
 
 async def _prepare_just_moved(agent, data):

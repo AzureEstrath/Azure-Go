@@ -380,6 +380,68 @@ class CountEntryTest(unittest.TestCase):
         self.assertEqual(agent.st.joseki_dropped, ["san_san"])
 
 
+class CountOnlyWhenTaughtTest(unittest.TestCase):
+    """修复轮 1（评审 Important #1）：族计数＝**教过几次**，不是「遇到几次」。
+
+    端到端走 ``after_player``（门控 → 计数 → ``joseki`` 事件全在图里），固定 rng 让每一次遭遇的
+    命中 / 未命中完全确定，**一条断言都不依赖真随机**。
+
+    回归拦截：把 ``agent_graph`` 的两个调用点改回「门控未命中也无条件计数」（修复前的样子）时，
+    本用例必须变红——它断言「**计数的次数 == 实际讲解的次数**」且「未命中的那几次一次都没记」，
+    而不是「遭遇几次就记几次」。回归版下 ``seen`` 会被频率层静默吃掉教学预算：默认 0.5 的前 3 次
+    遭遇期望只讲约 1.5 次，之后除走错就再也不讲。
+    """
+
+    # 白小目 D17，玩家再落 F17(5,2) ⇒ entered（与 GateWiringTest.ENTER_SEED 同一局面）。
+    ENTER_SEED = [["W", "D17"]]
+
+    # 六次遭遇的掷点：0.0 必命中、0.99 必未命中——``p = clamp(0.5 + skill + mood, 0, 1)`` 恒在
+    # ``[0.3, 0.7]``（画像 / 情绪各自最多 ±0.10），两个掷点都远离边界、逐次确定。
+    ROLLS = [0.0, 0.99, 0.0, 0.99, 0.0, 0.99]
+
+    def _encounter(self, progress, roll):
+        """一局里遭遇这一族一次，返回 ``(data, bus)``。
+
+        每局一个新 agent ⇒ ``st.joseki_counted`` 的同局去重不跨局，``_joseki_taught`` 冷却也从头开始，
+        于是六次遭遇共享的只有跨局的那个 ``progress``。
+        """
+        bus = events.RecordingBus()
+        agent = AzureAgent(StubEngine(), StubLLM(), bus, joseki_progress=progress,
+                           joseki_rate=0.5, joseki_rng=_FixedRng(roll))
+        _seed(agent, self.ENTER_SEED)
+        agent._new_turn()
+        state = asyncio.run(agent._turn(PHASE_AFTER_PLAYER, {"x": 5, "y": 2}))
+        return state["data"], bus
+
+    def test_family_counts_only_when_it_was_actually_taught(self):
+        progress = _FakeProgress()
+        taught, families = [], []
+        for i, roll in enumerate(self.ROLLS):
+            data, bus = self._encounter(progress, roll)
+            jk = data["jk"]
+            with self.subTest(round=i + 1):
+                self.assertEqual(str(jk.get("kind") or ""), "entered",
+                                 "每一轮都真的识别到了定式（排除「没识别」那条路）")
+                families.append(str(jk.get("family") or ""))
+                taught.append(bool(data.get("jk_show_card")))
+                self.assertEqual(len(bus.of_type("joseki")), 1 if taught[-1] else 0,
+                                 "讲了才有 joseki 事件（结论与讲解 / 卡片一致）")
+
+        self.assertTrue(families[0], "族 id 非空")
+        self.assertEqual(set(families), {families[0]}, "六次遭遇都是同一族")
+
+        # —— 核心断言：计数的次数 == 实际讲解的次数（不是遭遇次数）——
+        # 回归版（未命中也计数）这里会是 6，修复版是 3；先把这条放在最前面，失败信息一眼可读。
+        self.assertEqual(len(progress.bumps), sum(taught),
+                         "计数的次数必须等于讲解次数（回归版会等于遭遇次数）")
+        self.assertEqual(progress.bumps, [families[0]] * sum(taught),
+                         "未命中的那几次一次都没记")
+        self.assertEqual(progress.seen(families[0]), sum(taught), "seen 也等于讲解次数")
+        self.assertEqual(sum(taught), 3, "六次遭遇里真的讲了 3 次（固定 rng 交替）")
+        # 固定 rng 的契约：命中 / 未命中交替；第 6 次 ``seen`` 已到 3 ⇒ 资格层拦下（连掷都不掷）。
+        self.assertEqual(taught, [True, False, True, False, True, False])
+
+
 # ================= ③ 真库端到端 + 配置透传 =================
 
 class RealStoreGateTest(unittest.TestCase):

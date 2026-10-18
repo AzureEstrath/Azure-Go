@@ -1137,7 +1137,9 @@ class JosekiCardGateTest(unittest.TestCase):
         state = self._entered_entry(agent)
         self.assertEqual(str(state["data"]["jk"]["family"]), "star_33")
         self.assertIs(state["data"]["jk_show_card"], False, "第 4 次进入这一族：不再上卡片")
-        self.assertEqual(self.progress.seen("star_33"), 4)
+        # 修复轮 1（评审 Important #1）：计数＝**教过几次**，不是「遇到几次」——第 4 次没讲 ⇒ 也不计数，
+        # 所以 ``seen`` 停在 3（回归版「门控未命中也无条件计数」会给出 4）。
+        self.assertEqual(self.progress.seen("star_33"), 3, "没讲就不计数（计数＝讲解次数）")
 
     def test_deviated_mistake_gets_the_card_after_the_third_time(self):
         for _ in range(3):

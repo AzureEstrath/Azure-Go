@@ -18,7 +18,7 @@ class AzureConfig:
         self.katago_timeout_ms = 30000              # 单次 /analyze 超时
         self.max_visits = 500
         self.joseki_teach = True
-        self.joseki_rate = 0.5                      # 定式提示频率（0~1）：与开关同一格；门控未接线时按「每次都讲」
+        self.joseki_rate = 0.5                      # 定式提示频率（0~1）：与开关同一格；门控唯一路径 p=clamp(rate+adj,0,1)
         self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
