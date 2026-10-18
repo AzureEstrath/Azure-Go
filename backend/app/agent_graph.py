@@ -50,6 +50,7 @@
 
 import asyncio
 import random
+import sys
 import uuid
 from typing import TypedDict
 
@@ -1220,6 +1221,22 @@ async def _emit_line(agent, kind, text, move=None, epoch=None):
     await _emit_speech(agent, text)
 
 
+def _log_safe(text) -> str:
+    """日志安全化：**控制台编码装不下的字符**（emoji 等）换成 ``?``——绝不因为一个字符把回合打挂。
+
+    中文 Windows 的控制台 / 重定向文件是 cp936（``errors="strict"``），而台词里可能有 emoji
+    （例如总结那条的 ``📋``）。``print`` 抛 ``UnicodeEncodeError`` 会把整个回合打挂：异常被
+    ``summarize()`` 的 ``except`` 兜住（``busy`` 归位），但这条台词**既不显示、也不写记录**
+    （修复轮 1 / I1 的复现与修法）。**只改日志副本，不改台词本身**：``text`` 照原样发事件。
+    """
+    s = str(text if text is not None else "")
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        return s.encode(enc, "replace").decode(enc, "replace")
+    except Exception:                       # noqa: BLE001 —— 认不出的编码名：退到 ASCII 兜底
+        return s.encode("ascii", "replace").decode("ascii")
+
+
 async def _emit_deduped(agent, kind, text, epoch=None):
     """发一条**非落子宣告**的 ``message`` 事件：窗口内一字不差的原话不再推给前端。
 
@@ -1228,6 +1245,9 @@ async def _emit_deduped(agent, kind, text, epoch=None):
     被抑制的那句照常入窗（S27，与前端 ``_recent_ai_texts`` 一致）。
     ``ai_move`` 落子宣告不走这里（在 ``_speak_own_turn`` 里直发），永不受判重。
 
+    抑制时的那行日志走 ``_log_safe``（修复轮 1 / I1）：台词原文里的 emoji 在 GBK 控制台下会让
+    ``print`` 抛 ``UnicodeEncodeError``，从而把整回合打挂（含本批新增的「写对局记录 + 画像」）。
+
     ``epoch``（v3.7.0）：看门狗守卫——带了它且已经不属于当前这一代时，整条（含 ``speech``）
     一条都不发，也**不入去重窗口**（旧一代的话不该影响新一代的判重）。
     """
@@ -1235,7 +1255,8 @@ async def _emit_deduped(agent, kind, text, epoch=None):
     if epoch is not None and not agent.epoch_ok(epoch):
         return
     if agent._is_repeat(text):
-        print("[Agent] 原话去重（最近 %d 条内一字不差）已抑制：%s" % (AI_DEDUP_WINDOW, text))
+        print("[Agent] 原话去重（最近 %d 条内一字不差）已抑制：%s"
+              % (AI_DEDUP_WINDOW, _log_safe(text)))
     else:
         await _emit_line(agent, kind, text, epoch=epoch)
     agent._note_line(text)

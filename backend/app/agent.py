@@ -460,7 +460,10 @@ class AzureAgent:
         # 主动约战 / 提醒（v3.9.0，设计 §5-E）：**本次进程只触发一次**的标记。跨重连不重复
         # （WS 重连会再调 ``greet_with_context``，第二次直接返回）；``reset_game`` **有意不重置**
         # ——「打过招呼」是这一次会话的事实，与「这一局」无关。
+        # ``_greet_busy`` 只挡**并发**（两个连接同时进来时只有一个能发）；修复轮 1 / Minor #1 起
+        # ``_greeted`` **只在真的发了台词之后**才置位——「这次没说成」（没历史 / 不足一天）不吃掉机会。
         self._greeted = False
+        self._greet_busy = False
 
         self._mood_region = -1
         self._mood_ms = 0
@@ -531,7 +534,7 @@ class AzureAgent:
         self.epoch += 1
         self._set_busy(False)
         print("[Agent] 回合兜底超时（%g 秒）：已解锁棋盘，这一回合的后续写入一律作废。" % float(self.watchdog_sec))
-        self._emit(events.message(events.AI, "唔…这一手我算得太久了，先接着下吧。"))
+        self._emit(events.message(events.AI_NOTICE, "唔…这一手我算得太久了，先接着下吧。"))
 
     async def _turn_guard(self, coro):
         """最外层看门狗：跑完一次公开编排；超时则解锁 + 前推一代，本回合余下的写入全部作废。
@@ -1630,36 +1633,48 @@ class AzureAgent:
         会话的事实）。它只读一次「距上次对局」（``ProfileStore.last_game_ts()``，阻塞读 ⇒
         ``await asyncio.to_thread``），按天数挑一句**模板台词**（``_greet_line``）发一条 ``message``。
 
-        与 ``undo`` / ``reset_game`` 的短提示同一做法：**纯文字、不发 ``speech``**（同步方法那些
-        短提示的既有口径），前端按「她这一轮已结束」当场显示，不引入任何合成等待。
+        与 ``undo`` / ``reset_game`` 的短提示同一做法：**纯文字、不发 ``speech``**——但它是**推送型**
+        （前端无从预知），所以走 ``events.AI_NOTICE``：**由推送方声明「这条没有语音」**，前端据此
+        **不登记语音配对记录**（修复轮 1 / C1）。前端仍按「她这一轮已结束」当场显示，不引入合成等待。
 
-        **不额外加开关**（控制者任务书只按「距上次对局」判）：没有历史对局 / 距上次不足一天 /
-        棋盘上已经有子（不是「刚连上」）⇒ 什么都不说；未装配画像库或读失败同样只是「这次不打招呼」。
+        「这一次机会」只在**真的发了台词**之后才用掉（修复轮 1 / Minor #1）：没有历史对局 /
+        距上次不足一天 / 棋盘上已经有子（不是「刚连上」）⇒ 什么都不说，**下次连接还能再说**；
+        ``_greet_busy`` 只挡**并发**（同一时刻两个连接同时进来时只有一个能发），不是「用过就没了」。
+
+        **不额外加开关**（控制者裁决保留：主动约战是独立延伸；代价与「关掉画像会连带让提醒消失」
+        的隐式耦合由 Q8 文档写明）：未装配画像库或读失败同样只是「这次不打招呼」。
         任何故障都不抛、不碰 ``busy``、不调模型、不调引擎。返回发出去的台词（没发 ⇒ 空串）。
         """
-        if self._greeted:
+        if self._greeted or self._greet_busy:      # 已经发过 / 正在算：都不再打第二遍
             return ""
         if self.st.moves:                           # 不是「刚连上」：这一局已经在下 / 下完了
             return ""
-        self._greeted = True                        # 先置位：并发的第二次连接不再打第二遍
-        last_ts = None
-        store = self.profile_store
-        if store is not None:
-            try:
-                last_ts = await asyncio.to_thread(store.last_game_ts)
-            except Exception as e:                  # noqa: BLE001 —— 读不到就当「没有上次」
-                print("[Agent] 距上次对局读取失败（按「没有上次」降级）：%s" % e)
-                last_ts = None
+        self._greet_busy = True                     # 只挡**并发**：两个连接同时进来时只有一个能发
         try:
-            facts = time_ctx.facts(now=time.time() if now is None else now, last_game_ts=last_ts)
-        except Exception as e:                      # noqa: BLE001 —— 时间算不出来就不打招呼
-            print("[Agent] 时间事实计算失败（这次不打招呼）：%s" % e)
-            return ""
-        text = self._greet_line(facts.get("last_gap_days"))
-        if text == "":
-            return ""
-        self._emit(events.message(events.AI, text))
-        return text
+            last_ts = None
+            store = self.profile_store
+            if store is not None:
+                try:
+                    last_ts = await asyncio.to_thread(store.last_game_ts)
+                except Exception as e:              # noqa: BLE001 —— 读不到就当「没有上次」
+                    print("[Agent] 距上次对局读取失败（按「没有上次」降级）：%s" % e)
+                    last_ts = None
+            try:
+                facts = time_ctx.facts(now=time.time() if now is None else now, last_game_ts=last_ts)
+            except Exception as e:                  # noqa: BLE001 —— 时间算不出来就不打招呼
+                print("[Agent] 时间事实计算失败（这次不打招呼）：%s" % e)
+                return ""
+            text = self._greet_line(facts.get("last_gap_days"))
+            if text == "":
+                return ""                           # 没有历史 / 不足一天：**不吃掉**这次机会（修复轮 1 / Minor #1）
+            self._greeted = True                    # 确实发了台词，才把这一次机会用掉
+            # `ai_notice`＝**推送方声明「这条没有语音」**（修复轮 1 / C1）：它不发 `speech`，
+            # 前端据此**不登记语音配对记录**——否则它会占掉配对位，把连接后第一回合的三条真语音
+            # 整体错位（点评等到落子宣告的音频才显示、揭示被推后、最后一条没声音）。
+            self._emit(events.message(events.AI_NOTICE, text))
+            return text
+        finally:
+            self._greet_busy = False
 
     # ================= 玩家落子 =================
 

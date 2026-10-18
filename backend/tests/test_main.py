@@ -174,7 +174,8 @@ class ProfileApiTest(unittest.TestCase):
                 self.assertAlmostEqual(body["axes"]["open.star"]["value"], 0.9)
                 self.assertAlmostEqual(body["axes"]["open.star"]["confidence"], 0.4)
                 self.assertEqual(body["axes"]["open.star"]["n_games"], 8)
-                self.assertEqual(len(body["games"]), 1, "来源局：games 表只增不减 ⇒ 可追溯")
+                self.assertEqual(len(body["games"]), 1,
+                                 "最近 N 局记录（全局最近，不是每维各自的来源）")
                 self.assertEqual(set(body["games"][0]), {"id", "ts", "move_count", "result"})
                 self.assertEqual(body["games"][0]["result"], "黑方胜")
                 # 开关打开后面板能区分「开着但还没攒下」与「关着」
@@ -984,6 +985,9 @@ class ProfileGreetWsTest(unittest.TestCase):
                     self.assertEqual(ws.receive_json()["type"], "hello")
                     e = ws.receive_json()
                     self.assertEqual(e["type"], "message", "紧跟 hello 的那条就是提醒")
+                    # 修复轮 1 / C1：**推送方声明「这条没有语音」**——前端据此不登记语音配对记录，
+                    # 否则它会占掉配对位、把连接后第一回合的三条真语音整体错位。
+                    self.assertEqual(e["kind"], "ai_notice")
                     self.assertIn("好几天", e["text"])
                 # 重连（同一个 agent 实例）：标记还在 ⇒ 不再有第二条提醒
                 with client.websocket_connect("/ws") as ws2:

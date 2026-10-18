@@ -17,7 +17,13 @@
 
 事件统一为 dict，``type`` 字段走对应构造器；客户端按 type 分发。
 message.kind 取值与前端 message 信号一致：
-    ai / ai_comment / ai_move / ai_idle / user / system
+    ai / ai_notice / ai_comment / ai_move / ai_idle / user / system
+
+``ai_notice``（v3.9.0 修复轮 1）＝**推送方声明「这条没有语音」**：与 ``ai`` 同样是她的普通台词
+（前端的气泡样式 / 打字节奏 / 流式收口 / 思考占位替换一律按同一套走），**区别只有一个**——
+它**不发** ``speech``，所以前端**不许**为它登记语音配对记录（登记了就会占掉配对位、
+把后面几条真语音整体错位）。主动约战提醒与看门狗可读提示用它；
+其余「后端只发文字」的提示都是**同步方法**的返回，由前端调用点 ``pairing.mark_text_only()`` 兜住。
 
 ``ai_move`` 额外带 ``move`` 字段（{x, y, gtp, pass}）；客户端在落子宣告语音开始时
 ``POST /api/reveal`` 让后端把这一手推到棋盘（round-trip：语音开始才揭示那一手）。
@@ -40,6 +46,9 @@ Task 8）绘制。新字段**全部有安全缺省**（缺字段 / 脏值不抛�
 
 # —— message.kind ——
 AI = "ai"                    # 一般台词（提示/分析/总结/虚着说明等）
+AI_NOTICE = "ai_notice"      # **推送方声明「这条没有语音」**的普通台词（v3.9.0 修复轮 1 / C1）：
+                             # 主动约战提醒、看门狗可读提示——它们**不发** ``speech``，前端据此
+                             # **不登记语音配对记录**（否则会占掉配对位、把后面三条真语音整体错位）
 AI_COMMENT = "ai_comment"    # 重要点评（导演层据此加犹豫节拍）
 AI_MOVE = "ai_move"          # 落子宣告（带坐标；语音开始时揭示）
 AI_IDLE = "ai_idle"          # 闲置搭话（玩家一回来可整句作废）

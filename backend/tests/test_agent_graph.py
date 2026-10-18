@@ -1131,7 +1131,9 @@ class BusyWatchdogTest(unittest.TestCase):
         hints = self._hints(bus)
         self.assertEqual(len(hints), 1, "超时只发一条可读提示（走既有 message 通道）")
         self.assertEqual(str(hints[0].get("type")), "message")
-        self.assertEqual(str(hints[0].get("kind")), events.AI)
+        # 修复轮 1 / C1：这条提示**不发 speech**，所以必须是推送方声明的「无语音」kind
+        # （`ai_notice`）——否则前端会为它登记配对记录，吃掉连接后第一回合的第一条真语音。
+        self.assertEqual(str(hints[0].get("kind")), events.AI_NOTICE)
         self.assertEqual(len(hang.calls), 2, "僵尸那一代的两次引擎分析都已跑完（不是「还没轮到」）")
         # 旧一代恢复后什么都没发出来：整回合只有那一条提示
         self.assertEqual(len(bus.messages()), 1)

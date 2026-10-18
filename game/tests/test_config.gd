@@ -310,10 +310,30 @@ func _run() -> void:
 	_check("profile_panel_text：非数值维原样显示（手型）", panel.contains("常亏手型：深入"))
 	_check("profile_panel_text：persona.topic.* 走前缀族标签", panel.contains("常聊·定式：60%"))
 	_check("profile_panel_text：未知维忽略（不渲染、不抛）", not panel.contains("unknown.axis"))
-	_check("profile_panel_text：脏值不抛（缺 value / 脏 confidence）",
-		not mp.profile_panel_text({"ok": true, "enabled": true,
-			"axes": {"open.star": {"confidence": "abc"}, "style.tenuki": {"value": 0.2}},
-			"games": []}).is_empty())
+	var dirty := mp.profile_panel_text({"ok": true, "enabled": true,
+		"axes": {"open.star": {"confidence": "abc"}, "style.tenuki": {"value": 0.2}},
+		"games": []})
+	_check("profile_panel_text：缺 value 的维整条不渲染（不抛、不留半行）",
+		not dirty.contains("开局·星位"))
+	_check("profile_panel_text：脏 confidence 当 0%（把握 0%）",
+		dirty.contains("常脱先：20%（把握 0%，0 局）"))
+
+	# —— 6⁗) 「这条没有语音」的判定（修复轮 1 / C1，纯函数 `Main.message_needs_speech`） ——
+	# 推送方声明（`ai_notice`）与本地标记（`mark_text_only`）都**不登记**语音配对记录；
+	# 普通台词照旧登记。登记错一条就会占掉配对位、把后面三条真语音整体错位。
+	_check("message_needs_speech：`ai` ⇒ 登记（她的话默认有语音）",
+		mp.message_needs_speech("ai"))
+	_check("message_needs_speech：`ai_notice` ⇒ **不登记**（推送方声明「这条没有语音」）",
+		not mp.message_needs_speech(mp.AI_NOTICE))
+	_check("message_needs_speech：`ai_notice` 的字面量与后端 `events.AI_NOTICE` 同名（跨端契约）",
+		mp.AI_NOTICE == "ai_notice")
+	_check("message_needs_speech：本地 text_only 标记 ⇒ 不登记（既有语义不变）",
+		not mp.message_needs_speech("ai", true))
+	_check("message_needs_speech：点评 / 落子宣告 / 走神搭话 ⇒ 登记（三条真语音的管线不变）",
+		mp.message_needs_speech("ai_comment") and mp.message_needs_speech("ai_move")
+		and mp.message_needs_speech("ai_idle"))
+	_check("message_needs_speech：玩家 / 系统消息 ⇒ 不登记",
+		not mp.message_needs_speech("user") and not mp.message_needs_speech("system"))
 
 	# —— 7) 定式「开关 + 频率」原子推送（v3.7.0 修复波 / 跨任务发现 #2） ——
 	# 一次改档位必须**只推一次** `/api/config`：分两次赋 setter 会各推一条 POST（`_post` 每次

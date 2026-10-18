@@ -68,9 +68,10 @@ def _int(v, d=-1):
         return d
 
 
-# 画像面板（``GET /api/profile``）随各维一起带回来的**来源局**条数（v3.9.0，设计 §6.4 / O20）。
-# ``games`` 表只增不减 ⇒ 每维都能追溯到「凭什么这么说」；这里只带最近若干局的可读字段，
-# 不带 ``moves`` / ``per_move_ms`` 两列（面板不画棋谱，没必要传长 JSON）。
+# 画像面板（``GET /api/profile``）随各维一起带回来的**最近对局记录**条数（v3.9.0，设计 §6.4 / O20）。
+# 口径（修复轮 1 / Minor #2 降级，别说成「每维的来源」）：这是**全局最近 N 局**——``profile`` 表
+# 没有局 id 列，**逐维**溯源本来就做不到；面板据此只显示「这份画像基于最近哪几局」。
+# 只带可读字段，不带 ``moves`` / ``per_move_ms`` 两列（面板不画棋谱，没必要传长 JSON）。
 PROFILE_SOURCE_GAMES = 20
 
 
@@ -185,7 +186,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
 
     @app.get("/api/profile")
     async def get_profile():
-        """玩家棋风画像（**只读**，v3.9.0，设计 §6.4 / O20）：各维值 + 置信度 + 来源局。
+        """玩家棋风画像（**只读**，v3.9.0，设计 §6.4 / O20）：各维值 + 置信度 + **最近 N 局记录**。
 
         与记忆管理面同一套口径：**画像功能关着 / 未装配库 / 库不可用 ⇒ 空结果，绝不 500**；
         两次库读都走 ``asyncio.to_thread``（同步 SQLite 不得冻住事件循环）。返回形状：
@@ -193,6 +194,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         ``{"ok": True, "enabled": bool, "axes": {axis: {value, confidence, n_games, updated_ts}},
         "games": [{id, ts, move_count, result}]}``
 
+        ``games`` 是**全局最近 ``PROFILE_SOURCE_GAMES`` 局**（面板据此显示「这份画像基于最近哪几局」），
+        **不是每维各自的来源**——``profile`` 表没有局 id 列，逐维溯源做不到（修复轮 1 / Minor #2）。
         ``enabled`` 报的是当前开关（关着也照常可读——面板据此提示「打开开关」）。
         """
         s = a()

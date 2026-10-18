@@ -945,6 +945,7 @@ func _add_msg(kind: String, text: String) -> void:
 	var is_ai := kind.begins_with("ai")
 	var speak_kind := "idle" if kind == "ai_idle" else ""
 	var text_only := pairing.take_text_only_mark(kind) if is_ai else false
+	var wants_speech := message_needs_speech(kind, text_only)
 	if kind == "ai_idle" and _idle_muted:
 		_register_tomb(speak_kind)           # 本地作废：留个占位吃掉它自己那条 speech
 		return                               # 玩家已经回来继续下棋：这句走神搭话作废（不出声也不显示）
@@ -958,22 +959,44 @@ func _add_msg(kind: String, text: String) -> void:
 		var norm := text.strip_edges()
 		if kind != "ai_move" and _recent_ai_texts.has(norm):
 			print("[chat] 防复读（最近 %d 条内一字不差）已抑制：%s" % [_recent_ai_texts.size(), norm])
-			_register_tomb(speak_kind)       # 同上：后端这条会带 speech 来，得有人吃掉它
-			return                           # 兜底判据：后端已去重，这里只兜 WS 重连后乱序到达的重复句（含隔了几条的原样复读）
+			# 兜底判据：后端已去重，这里只兜 WS 重连后乱序到达的重复句（含隔了几条的原样复读）。
+			# 占位（tomb）是用来「吃掉它自己那条 speech」的——**无语音的台词不许留占位**，
+			# 否则它会吃掉**下一条**真语音（修复轮 1 / C1）。
+			if wants_speech:
+				_register_tomb(speak_kind)
+			return
 		_recent_ai_texts.append(norm)
 		while _recent_ai_texts.size() > AI_DEDUP_WINDOW:
 			_recent_ai_texts.pop_front()
 	# 所有消息统一入队、单协程顺序投递：ai_comment 前由导演层加犹豫节拍，延迟期间顺序不乱
 	# 要由后端朗读的 AI 台词在这里就登记配对记录（登记顺序 = 与 speech 事件的配对顺序）；
-	# `text_only`（本地问候 / 后端同步方法的纯文字提示）不登记——它没有语音，也就没什么可配的。
+	# 无语音的台词（推送方声明的 `AI_NOTICE` / 本地 `text_only` 标记）**不登记**——它没有语音，
+	# 登记了会占掉配对位、把后面几条真语音整体错位（修复轮 1 / C1）。
 	_msg_seq += 1
 	var rec := {}
-	if is_ai and not text_only:
+	if wants_speech:
 		rec = _speech_register(text, kind == "ai_move", speak_kind)
 	_msg_queue.append({"kind": kind, "text": text, "tone": tone, "seq": _msg_seq, "rec": rec})
 	if not is_ai:
 		_queue_rush_seq = _msg_seq           # 玩家/系统消息：把当前积压的投递全部快进
 	_pump_msg_queue()
+
+## 推送方声明「这条没有语音」的 kind（后端 `events.AI_NOTICE`，v3.9.0 修复轮 1 / C1）：
+## 主动约战提醒与看门狗可读提示**不发** `speech`。前端**无从预知**它们，所以必须由推送方声明；
+## 否则它们会被当成普通台词登记配对记录，占掉配对位、把后面三条真语音整体错位
+## （点评等到落子宣告的音频才显示、揭示被推后、最后一条没声音）。
+## 与 `mark_text_only()` 是同一语义，区别只在于「谁来声明」。
+const AI_NOTICE := "ai_notice"
+
+## 这条 `message` 要不要登记语音配对记录？（**纯函数**，headless 门卫直接断言）
+## 三种「没有语音」的来源：① 推送方声明（`AI_NOTICE`）；② 调用点本地标记（undo / reset /
+## 允许虚着 / 本地开场问候，走 `pairing.mark_text_only()`）；③ 不是她的话（玩家 / 系统消息）。
+static func message_needs_speech(kind: String, text_only := false) -> bool:
+	if not kind.begins_with("ai"):
+		return false
+	if kind == AI_NOTICE:
+		return false
+	return not text_only
 
 ## 流式增量（后端 `stream_tokens` 开启时才有；默认关闭时这个回调一次都不会被调用到）：
 ## 增量直接追加到本轮的流式气泡；气泡的最终内容一律由随后的 `message` 收口（见 _add_msg_now）
@@ -2048,7 +2071,7 @@ static func profile_panel_text(payload) -> String:
 		return "还没有攒下画像——下完一局并点「🏁 结束」之后就会有一条。"
 	var games = p.get("games", [])
 	var n_games := (games as Array).size() if typeof(games) == TYPE_ARRAY else 0
-	return "她眼中的你（画像来源：%d 局记录）" % n_games + lines
+	return "她眼中的你（最近 %d 局记录）" % n_games + lines
 
 ## 「🪞 她眼中的你」按钮：只读拉一次 `/api/profile` 并把结果铺到下面那块文本上（无副作用）。
 func _on_profile_panel() -> void:

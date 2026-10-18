@@ -5,6 +5,8 @@
 """
 
 import asyncio
+import contextlib
+import io
 import os
 import random
 import sys
@@ -1929,7 +1931,11 @@ class ProfileTimePromptWiringTest(unittest.TestCase):
             self.assertLess(joined.index("【她眼中的你"), joined.index("（铁律 · 先核对再开口："))
 
     def test_switches_off_keep_the_prompt_byte_identical(self):
-        """两个开关都关 ⇒ 提示词与「没有这两个功能」**逐字符一致**，且一次盘都不碰。"""
+        """两个开关都关 ⇒ 提示词与「没有这两个功能」**逐字符一致**，且一次盘都不碰。
+
+        六个公开入口**全覆盖**（修复轮 1 / Minor #9）：`player_move` 覆盖三格，`hint` / `analyze` /
+        `chat` / `idle` / `summarize` 各一格——8 个装配点一个不漏。
+        """
 
         async def run(with_store):
             agent, _eng, llm, _bus = _mk()
@@ -1940,7 +1946,9 @@ class ProfileTimePromptWiringTest(unittest.TestCase):
             # 两个开关保持默认（都关）
             await agent.player_move(3, 3)
             await agent.hint()
+            await agent.analyze_position()
             await agent.chat("聊两句")
+            await agent.idle_remark()
             await agent.summarize("")
             return llm, store
 
@@ -1950,7 +1958,7 @@ class ProfileTimePromptWiringTest(unittest.TestCase):
         a = self._ctx_calls(llm_on)
         b = self._ctx_calls(llm_off)
         self.assertEqual(len(a), len(b))
-        self.assertTrue(a, "对照组必须真的装配了上下文（否则这条断言是空的）")
+        self.assertEqual(len(a), 8, "六个入口覆盖 8 个装配点（少一个就说明那条没被对照到）")
         for i, (x, y) in enumerate(zip(a, b)):
             self.assertEqual(x, y, "第 %d 条上下文与没有画像 / 时间功能时逐字符一致" % i)
             self.assertNotIn("【时间事实", x)
@@ -1998,29 +2006,70 @@ class GreetWithContextTest(unittest.TestCase):
         first, second = asyncio.run(run())
         self.assertIn("好几天", first, "三天没来 ⇒ 第二档模板")
         self.assertEqual(second, "", "只触发一次：跨重连不再重复")
-        msgs = bus.messages(events.AI)
+        msgs = bus.of_type("message")                       # kind 是 `ai_notice`（见下一条用例）
         self.assertEqual(len(msgs), 1, "只推一条 message")
         self.assertEqual(msgs[0]["text"], first)
         self.assertEqual(llm.calls, [], "模板句：一条 LLM 调用都不新增")
         self.assertFalse(agent.busy, "不碰 busy")
 
+    def test_the_greeting_declares_it_has_no_speech(self):
+        """修复轮 1 / C1：提醒**不发 ``speech``**，所以必须走 ``ai_notice``（推送方声明「无语音」）。
+
+        否则前端会为它登记配对记录、占掉配对位，把连接后第一回合的三条真语音整体错位
+        （点评等到落子宣告的音频才显示、揭示被推后、最后一条没声音）。
+        """
+        agent, _llm, bus = self._agent(time.time() - 3 * 86400.0)
+        asyncio.run(agent.greet_with_context())
+        got = bus.of_type("message")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["kind"], events.AI_NOTICE, "必须声明「这条没有语音」")
+        self.assertEqual(bus.of_type("speech"), [], "它一条 speech 都不发（与声明一致）")
+
+    def test_a_missed_greeting_does_not_use_up_the_chance(self):
+        """修复轮 1 / Minor #1：**只有真的发了台词**才用掉这次机会。
+
+        「这次没说成」（没有历史对局 / 距上次不足一天）⇒ 下次连接还能再说。
+        """
+        agent, _llm, bus = self._agent(None)                 # ① 没有历史对局
+        self.assertEqual(asyncio.run(agent.greet_with_context()), "")
+        self.assertEqual(bus.of_type("message"), [])
+        agent.profile_store = _WiringStore(last_ts=time.time() - 9 * 86400.0)
+        self.assertIn("好久不见", asyncio.run(agent.greet_with_context()),
+                      "上一次没说成，机会还在")
+
+        # ② 距上次不足一天（刚下过）同样不吃掉机会
+        agent2, _l2, bus2 = self._agent(time.time() - 3600.0)
+        self.assertEqual(asyncio.run(agent2.greet_with_context()), "")
+        agent2.profile_store = _WiringStore(last_ts=time.time() - 5 * 86400.0)
+        self.assertIn("好几天", asyncio.run(agent2.greet_with_context()))
+        self.assertEqual(len(bus2.of_type("message")), 1)
+
+        # ③ 棋盘上已经有子（不是「刚连上」）同样不吃掉机会
+        agent3, _l3, bus3 = self._agent(time.time() - 5 * 86400.0)
+        agent3.st.add_move("B", "Q16")
+        self.assertEqual(asyncio.run(agent3.greet_with_context()), "")
+        agent3.reset_game()                                  # 它自己会发一条「重新来吧」提示
+        bus3.clear()
+        self.assertIn("好几天", asyncio.run(agent3.greet_with_context()))
+        self.assertEqual(len(bus3.of_type("message")), 1)
+
     def test_no_greeting_without_history_or_when_too_soon(self):
         # ① 没有历史对局（库是空的 / 未装配）
         agent, llm, bus = self._agent(None)
         self.assertEqual(asyncio.run(agent.greet_with_context()), "")
-        self.assertEqual(bus.messages(events.AI), [])
+        self.assertEqual(bus.of_type("message"), [])
         self.assertEqual(llm.calls, [])
         # ② 距上次不足一天：刚下过，别打扰
         agent2, _l2, bus2 = self._agent(time.time() - 3600.0)
         self.assertEqual(asyncio.run(agent2.greet_with_context()), "")
-        self.assertEqual(bus2.messages(events.AI), [])
+        self.assertEqual(bus2.of_type("message"), [])
 
     def test_no_greeting_when_a_game_is_already_on_the_board(self):
         """不是「刚连上」（棋盘上已经有子）⇒ 不打扰，也不吃掉这次机会之外的东西。"""
         agent, _llm, bus = self._agent(time.time() - 5 * 86400.0)
         agent.st.add_move("B", "Q16")
         self.assertEqual(asyncio.run(agent.greet_with_context()), "")
-        self.assertEqual(bus.messages(events.AI), [])
+        self.assertEqual(bus.of_type("message"), [])
 
     def test_store_failure_is_only_a_missing_greeting(self):
         """库坏了 ⇒ 当作「没有上次」：不抛、不发、不卡。"""
@@ -2032,7 +2081,7 @@ class GreetWithContextTest(unittest.TestCase):
         agent, _eng, llm, bus = _mk()
         agent.profile_store = Boom(last_ts=time.time() - 9 * 86400.0)
         self.assertEqual(asyncio.run(agent.greet_with_context()), "")
-        self.assertEqual(bus.messages(events.AI), [])
+        self.assertEqual(bus.of_type("message"), [])
         self.assertFalse(agent.busy)
         self.assertEqual(llm.calls, [])
 
@@ -2263,6 +2312,59 @@ class GameRecordWriteTest(unittest.TestCase):
             self.assertEqual(len(games), 1, "总结失败也是「这一局结束了」：记录照写")
             self.assertEqual(games[0]["summary"], "", "兜底台词不写进记录")
             self.assertGreater(games[0]["move_count"], 0)
+
+
+class DedupLogEncodingTest(unittest.TestCase):
+    """修复轮 1 / I1：去重命中时的那行日志**不许**因为控制台编码把整回合打挂。
+
+    复现：台词里带 emoji（总结那条是 ``📋 对局总结\\n…``），而那行 ``print`` 打的是**台词原文**。
+    中文 Windows 的控制台 / 重定向文件是 cp936（``errors="strict"``）⇒ ``print`` 抛
+    ``UnicodeEncodeError``：异常被 ``summarize()`` 的 ``except`` 兜住（``busy`` 归位），但这条总结
+    **既不显示、也不写记录**——本批新增的「写对局记录 + 融合画像」正好在那之后，所以后果是**丢数据**。
+
+    这里把 stdout 换成**真正的 GBK 流**（`errors="strict"`），把触发条件钉死；断言「两局都照常完成、
+    两条记录都落盘」，并断言那行日志**确实打过**（否则这条用例是空的）。
+    """
+
+    EMOJI = "嗯~ 这一步我看着挺顺。😀"       # cp936 装不下：正是触发条件
+
+    def _run_with_gbk_stdout(self, factory) -> str:
+        """在 GBK（strict）的 stdout 下跑一段协程，返回捕获到的日志文本。"""
+        raw = io.BytesIO()
+        gbk = io.TextIOWrapper(raw, encoding="gbk", errors="strict", newline="")
+        try:
+            with contextlib.redirect_stdout(gbk):
+                asyncio.run(factory())
+            gbk.flush()
+        finally:
+            gbk.detach()                    # 别让 wrapper 关掉 BytesIO（我们要读它）
+        return raw.getvalue().decode("gbk", "replace")
+
+    def test_dedup_hit_keeps_the_turn_and_the_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(os.path.join(tmp, "profile.db"))
+            agent, _eng, llm, _bus = _mk()
+            agent.katago = _LossEngine()
+            agent.profile_store = store
+            agent.profile_enabled = True
+            llm.text = self.EMOJI            # 每条台词都带 emoji（点评 / 用意 / 感想 / 总结）
+
+            async def run():
+                await agent.player_move(3, 3)     # 同文三条 ⇒ 去重命中（那行 print 在这儿）
+                await agent.summarize("")         # 第一局的总结入窗
+                agent.reset_game()
+                await agent.player_move(3, 3)
+                await agent.summarize("")         # 第二局的总结**原话一字不差** ⇒ 去重命中（触发点）
+
+            log = self._run_with_gbk_stdout(run)
+            self.assertIn("原话去重", log, "去重确实命中（否则这条用例是空的）")
+            self.assertIn("?", log, "emoji 被降级成 '?'：日志安全化真的生效")
+            self.assertFalse(agent.busy, "回合照常结束（不许把棋盘锁死）")
+            self.assertEqual(len(store.games()), 2,
+                             "两局都照常落盘——去重命中只是不打这句台词，不许打挂回合（丢记录）")
+            self.assertTrue(all(g["summary"] == self.EMOJI for g in store.games()),
+                            "记录里的总结仍是**原文**（只降级日志副本，不动台词）")
+
 
 
 
