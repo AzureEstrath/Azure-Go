@@ -25,6 +25,7 @@
     POST /api/memory/write  {tag?, text}    手动写一条长期记忆（关闭 / 空文本时被拒）
     GET  /api/memory/stats                  长期记忆体量（行数 / 归档数 / 向量数 / 库路径）
     POST /api/memory/forget {ids?}/{all}    忘掉指定或全部长期记忆
+    GET  /api/profile                       玩家棋风画像（只读：各维值 + 置信度 + 来源局）
     GET  /api/state                         当前棋盘权威快照
     GET  /api/health                        引擎/LLM/长期记忆状态
 
@@ -65,6 +66,12 @@ def _int(v, d=-1):
         return int(v)
     except (TypeError, ValueError):
         return d
+
+
+# 画像面板（``GET /api/profile``）随各维一起带回来的**来源局**条数（v3.9.0，设计 §6.4 / O20）。
+# ``games`` 表只增不减 ⇒ 每维都能追溯到「凭什么这么说」；这里只带最近若干局的可读字段，
+# 不带 ``moves`` / ``per_move_ms`` 两列（面板不画棋谱，没必要传长 JSON）。
+PROFILE_SOURCE_GAMES = 20
 
 
 def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=True, memory=None):
@@ -175,6 +182,40 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     @app.get("/api/state")
     async def get_state():
         return a().st.payload()
+
+    @app.get("/api/profile")
+    async def get_profile():
+        """玩家棋风画像（**只读**，v3.9.0，设计 §6.4 / O20）：各维值 + 置信度 + 来源局。
+
+        与记忆管理面同一套口径：**画像功能关着 / 未装配库 / 库不可用 ⇒ 空结果，绝不 500**；
+        两次库读都走 ``asyncio.to_thread``（同步 SQLite 不得冻住事件循环）。返回形状：
+
+        ``{"ok": True, "enabled": bool, "axes": {axis: {value, confidence, n_games, updated_ts}},
+        "games": [{id, ts, move_count, result}]}``
+
+        ``enabled`` 报的是当前开关（关着也照常可读——面板据此提示「打开开关」）。
+        """
+        s = a()
+        store = getattr(s, "profile_store", None)
+        axes = {}
+        games = []
+        if store is not None:
+            try:
+                axes = dict(await asyncio.to_thread(store.get_profile) or {})
+            except Exception as e:              # noqa: BLE001 —— 读不到就当作「无画像」
+                print("[Profile] 画像读取失败（返回空结果）：%s" % e)
+                axes = {}
+            try:
+                rows = list(await asyncio.to_thread(store.games, PROFILE_SOURCE_GAMES) or [])
+                games = [{"id": _int(r.get("id"), 0), "ts": float(r.get("ts", 0.0) or 0.0),
+                          "move_count": _int(r.get("move_count"), 0),
+                          "result": str(r.get("result") or "")}
+                         for r in rows if isinstance(r, dict)]
+            except Exception as e:              # noqa: BLE001 —— 来源局读不到不影响各维
+                print("[Profile] 来源局读取失败（返回空列表）：%s" % e)
+                games = []
+        return {"ok": True, "enabled": bool(getattr(s, "profile_enabled", False)),
+                "axes": axes, "games": games}
 
     @app.post("/api/move")
     async def move(body: dict):

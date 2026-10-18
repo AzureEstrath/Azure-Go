@@ -116,7 +116,8 @@ var _chk_pass: CheckBox
 var _joseki_opt: OptionButton                     # 定式导学＝「开关 + 频率」一格（关闭 / 低 25% / 中 50% / 高 75%）
 var _drift_opt: OptionButton                      # 情绪波动＝「开关 + 基础概率」一格（关闭 / 低 3% / 中 5% / 高 6%；在 ⚙ 设置抽屉里）
 var _btn_settings: Button                         # ⚙ 设置抽屉的开关
-var _settings_box: PanelContainer                 # ⚙ 设置抽屉本体（情绪波动 / 同步说话 / 整段合成 / 长句合并 / 聊天摘要用 LLM，默认收起）
+var _settings_box: PanelContainer                 # ⚙ 设置抽屉本体（情绪波动 / 同步说话 / 整段合成 / 长句合并 / 聊天摘要用 LLM / 画像，默认收起）
+var _lbl_profile: Label                           # 画像面板的只读文本（v3.9.0：与开关同一格，不占右栏常驻位）
 var _bad_box: HBoxContainer
 var _chat_input: LineEdit
 var _lbl_queue: Label                           # 右下角那行「排队中 N 条 · 队头前几个字」（队列空则隐藏）
@@ -456,6 +457,26 @@ func _build_right_panel(root: Control) -> void:
 	_acc_check(drawer, "聊天摘要用 LLM", cfg.chat_digest_llm, "digest",
 		"默认关：聊天摘要走规则式、**零额外 LLM 调用**；开启：只在**局末 / 空闲**用 LLM 分段总结"
 		+ "（落子回合内绝不加调用）→ 立即生效")
+	# 玩家棋风画像 + 时间感知（v3.9.0）：两个开关与只读面板**同一件事**，一起放在这一格
+	# （控制者倾向：与 emotion_drift / chat_digest_llm 同形；两个开关**一次推一次** `/api/config`）。
+	_acc_check(drawer, "玩家棋风画像", cfg.profile_enabled, "profile",
+		"默认关。开启后，每次点「🏁 结束」会把这局记进后端的 profile.db，并跨局攒出「她眼中的你」"
+		+ "（开局偏好 / 行棋风格 / 常见失误 / 常聊话题）；她只在相关时自然参考这份印象 → 立即生效")
+	_acc_check(drawer, "时间感知", cfg.time_aware_enabled, "time_aware",
+		"默认关。开启后她知道现在几点、这一局下了多久、你多久没来、连续第几天——只在相关时提，"
+		+ "不会把数字当口头禅 → 立即生效")
+	# 只读面板：一个按钮 + 一块文本（**不新增右栏常驻控件位**，与 joseki / drift / digest 同风格）。
+	# 不并进 `_buttons`：它是只读 GET，复盘期间也允许看（冻结清单只锁「会改动局面 / 会让她开口」的控件）。
+	var prof_row := HBoxContainer.new()
+	prof_row.add_theme_constant_override("separation", 6)
+	drawer.add_child(prof_row)
+	_button(prof_row, "🪞 她眼中的你", _on_profile_panel)
+	_lbl_profile = Label.new()
+	_lbl_profile.add_theme_font_size_override("font_size", 11)
+	_lbl_profile.add_theme_color_override("font_color", PANEL_TEXT_DARK)
+	_lbl_profile.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_lbl_profile.visible = false
+	drawer.add_child(_lbl_profile)
 
 	# 聊天区
 	_chat_scroll = ScrollContainer.new()
@@ -871,10 +892,20 @@ func _on_acc_toggled(on: bool, which: String) -> void:
 			if agent != null:
 				# 原子入口（v3.8.0）：单字段也只推一次 `/api/config`（与 set_drift / set_joseki 同一形状）
 				agent.set_digest(on)
+		"profile":
+			cfg.profile_enabled = on
+			if agent != null:
+				# 原子入口（v3.9.0）：画像 / 时间感知两个开关**一次推一次** `/api/config`
+				agent.set_profile(cfg.profile_enabled, cfg.time_aware_enabled)
+		"time_aware":
+			cfg.time_aware_enabled = on
+			if agent != null:
+				agent.set_profile(cfg.profile_enabled, cfg.time_aware_enabled)
 	cfg.save()
-	if which == "digest":
-		# 它不是语音项：只进底部状态栏——`_tts_status` 是左栏「语音朗读」的状态行，别写串
-		_set_status("聊天摘要用 LLM 已%s（立即生效）" % ("开启" if on else "关闭"))
+	if which in ["digest", "profile", "time_aware"]:
+		# 它们不是语音项：只进底部状态栏——`_tts_status` 是左栏「语音朗读」的状态行，别写串
+		var nm2 := "聊天摘要用 LLM" if which == "digest" else ("玩家棋风画像" if which == "profile" else "时间感知")
+		_set_status("%s 已%s（立即生效）" % [nm2, "开启" if on else "关闭"])
 		return
 	var nm := "短回复" if which == "len" else ("同步说话" if which == "sync" else ("整段合成" if which == "batch" else "长句合并"))
 	var scope := "（重启后端后生效）" if which == "chunk" else "（立即生效）"
@@ -1606,6 +1637,7 @@ func _build_services() -> void:
 	# ——「开关 + 基础概率」一次落定、只推一次 `/api/config`（单字段的 `set_digest` 同一形状）。
 	agent.set_drift(cfg.emotion_drift, cfg.drift_base)
 	agent.set_digest(cfg.chat_digest_llm)
+	agent.set_profile(cfg.profile_enabled, cfg.time_aware_enabled)   # v3.9.0：画像 / 时间感知两个开关
 	_wire_agent()
 	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
 
@@ -1931,6 +1963,110 @@ func _on_settings_toggled(on: bool) -> void:
 		_settings_box.visible = on
 	if _btn_settings != null:
 		_btn_settings.text = "⚙ 设置 ▾" if on else "⚙ 设置 ▸"
+
+# ================= 画像面板（只读，v3.9.0 / Q6） =================
+
+## 面板里各维的人话标签（键名照 spec §6.2；未列出的键一律不渲染——未知键忽略、不抛）。
+## `persona.topic.*` 是前缀族，走 `_profile_axis_label` 里的前缀分支。
+const PROFILE_AXIS_LABELS := {
+	"open.star": "开局·星位", "open.komoku": "开局·小目",
+	"open.sansan": "开局·三三", "open.mokuhazushi": "开局·目外",
+	"open.favorite_kakari": "挂角倾向", "style.aggression": "爱缠斗",
+	"style.tenuki": "常脱先", "style.territory_vs_influence": "势力倾向",
+	"blunder.rate": "失误率", "blunder.top_type": "常亏手型",
+	"weak.corner_tl": "左上易亏", "weak.corner_tr": "右上易亏",
+	"weak.corner_bl": "左下易亏", "weak.corner_br": "右下易亏",
+}
+
+## 一维的显示名；未知键 / 空的 `persona.topic.` ⇒ 空串（＝不渲染）。
+static func _profile_axis_label(axis: String) -> String:
+	if PROFILE_AXIS_LABELS.has(axis):
+		return str(PROFILE_AXIS_LABELS[axis])
+	if axis.begins_with("persona.topic."):
+		var t := axis.substr("persona.topic.".length()).strip_edges()
+		return ("常聊·" + t) if t != "" else ""
+	return ""
+
+## 数值容错（与 `AzureConfig` 的守卫同一口径）：非数值 / NaN / 脏字符串 ⇒ `default`。
+static func _profile_num(v, default := 0.0) -> float:
+	match typeof(v):
+		TYPE_INT, TYPE_FLOAT:
+			var f := float(v)
+			return default if is_nan(f) else f
+		TYPE_STRING:
+			var s := (v as String).strip_edges()
+			return s.to_float() if s.is_valid_float() else default
+		_:
+			return default
+
+## 一维的值 → 一行可读文本：数值维按百分比（画像块的刻度就是 `[0,1]`），非数值维（手型）原样显示。
+static func _profile_value_text(v) -> String:
+	if typeof(v) == TYPE_STRING:
+		return (v as String).strip_edges()
+	if typeof(v) == TYPE_INT or typeof(v) == TYPE_FLOAT:
+		var f := _profile_num(v, -1.0)
+		if f < 0.0:
+			return "?"
+		return "%d%%" % int(round(f * 100.0))
+	return "?"
+
+## 画像面板文本（**纯函数**，headless 门卫直接调它）：把 `GET /api/profile` 的返回渲染成只读文本。
+## 四种退化都要有可读文案：后端没返回 / 请求被拒 / 功能关着 / 还没攒下画像。未知维忽略、脏值不抛。
+static func profile_panel_text(payload) -> String:
+	if typeof(payload) != TYPE_DICTIONARY:
+		return "读取失败：后端没有返回可用数据（先确认后端已启动）"
+	var p: Dictionary = payload
+	if not bool(p.get("ok", false)):
+		return "读取失败：后端拒绝了这次请求"
+	if not bool(p.get("enabled", false)):
+		return "画像功能关着。打开上面的「玩家棋风画像」，下完一局并点「🏁 结束」之后，这里就会有内容。"
+	var axes = p.get("axes", {})
+	var lines := ""
+	var n_axes := 0
+	if typeof(axes) == TYPE_DICTIONARY:
+		var keys: Array = (axes as Dictionary).keys()
+		keys.sort()                                  # 键名排序：面板顺序稳定、可断言
+		for key in keys:
+			var label := _profile_axis_label(str(key))
+			if label == "":
+				continue
+			var rec = (axes as Dictionary)[key]
+			var value = rec
+			var conf := 0.0
+			var n := 0
+			if typeof(rec) == TYPE_DICTIONARY:
+				value = (rec as Dictionary).get("value")
+				conf = _profile_num((rec as Dictionary).get("confidence", 0.0))
+				n = int(_profile_num((rec as Dictionary).get("n_games", 0)))
+			if value == null:
+				continue
+			var row := "%s：%s（把握 %d%%，%d 局）" % [label, _profile_value_text(value),
+				int(round(clampf(conf, 0.0, 1.0) * 100.0)), n]
+			lines += ("\n" if lines != "" else "") + row
+			n_axes += 1
+	if n_axes == 0:
+		return "还没有攒下画像——下完一局并点「🏁 结束」之后就会有一条。"
+	var games = p.get("games", [])
+	var n_games := (games as Array).size() if typeof(games) == TYPE_ARRAY else 0
+	return "她眼中的你（画像来源：%d 局记录）" % n_games + lines
+
+## 「🪞 她眼中的你」按钮：只读拉一次 `/api/profile` 并把结果铺到下面那块文本上（无副作用）。
+func _on_profile_panel() -> void:
+	if _lbl_profile == null:
+		return
+	_lbl_profile.visible = true
+	if agent == null:
+		_lbl_profile.text = "读取失败：后端还没连上（状态栏会提示连接情况）"
+		return
+	_lbl_profile.text = "读取中…"
+	agent.fetch_profile(func(ok: bool, code: int, body: PackedByteArray) -> void:
+		if _lbl_profile == null:
+			return
+		if not ok:
+			_lbl_profile.text = "读取失败（后端没连上或返回了 %d）" % code
+			return
+		var d = JSON.parse_string(body.get_string_from_utf8())
+		_lbl_profile.text = profile_panel_text(d))
 
 ## 定式导学「开关 + 频率」下拉（右侧栏）：写回 config.json，再走既有 `_flush_settings` 通道推给后端，
 ## 并对当前对局立即生效。「关闭」只关开关、**不动 joseki_rate**（重新开启时频率能回来）。

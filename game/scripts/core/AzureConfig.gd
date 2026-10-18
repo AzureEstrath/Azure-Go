@@ -26,6 +26,12 @@ const DRIFT_BASE_LIMIT := 0.08
 ## 聊天摘要用 LLM（v3.8.0）：默认关——聊天摘要走**规则式**（纯函数分段 + 模板摘要）、**零额外 LLM 调用**；
 ## 开启后**只在局末 / 空闲**用 LLM 分段总结（落子回合内绝不加调用）。开关在 ⚙ 设置抽屉里。
 var chat_digest_llm := false
+## 玩家棋风画像（v3.9.0）：跨局攒「她眼中的你」，手动结束对局时写进后端的 profile.db。
+## 默认关；关掉=行为零变化（不注入画像块、不写记录、不攒画像）。开关与只读面板同在 ⚙ 设置抽屉的一格里。
+var profile_enabled := false
+## 时间感知（v3.9.0）：让她知道现在几点、这一局下了多久、你多久没来、连续第几天。
+## 默认关；关掉=行为零变化（不注入时间块）。与画像开关同一格、**一次推一次** `/api/config`。
+var time_aware_enabled := false
 # —— 前后端架构 ——
 # 编排（KataGo / LLM / 定式 / 情绪）全部在后端服务进程，游戏只做渲染与语音，经 REST + WebSocket 通信
 var backend_url := "http://127.0.0.1:8000"   # 后端服务地址（WS 地址由其推导）
@@ -82,6 +88,8 @@ static func load_config(path := "") -> AzureConfig:
 			c.emotion_drift = _normalize_flag(d.get("emotion_drift"), c.emotion_drift)
 			c.drift_base = _normalize_drift_base(d.get("drift_base", c.drift_base))
 			c.chat_digest_llm = _normalize_flag(d.get("chat_digest_llm"), c.chat_digest_llm)
+			c.profile_enabled = _normalize_flag(d.get("profile_enabled"), c.profile_enabled)
+			c.time_aware_enabled = _normalize_flag(d.get("time_aware_enabled"), c.time_aware_enabled)
 			c.backend_url = str(d.get("backend_url", c.backend_url))
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
@@ -193,6 +201,8 @@ func save() -> bool:
 	d["emotion_drift"] = emotion_drift
 	d["drift_base"] = drift_base                   # 与开关同一格：关闭档也写回（重新开启时概率能回来）
 	d["chat_digest_llm"] = chat_digest_llm        # 聊天摘要用 LLM（默认关）：单字段开关，写回即生效
+	d["profile_enabled"] = profile_enabled        # 玩家棋风画像（默认关）：与下面的时间感知同一格
+	d["time_aware_enabled"] = time_aware_enabled  # 时间感知（默认关）：两个字段一起原子推一次 `/api/config`
 	d.erase("backend_mode")                       # 只剩「连后端」一条路径：旧配置里的 backend_mode 不再写回
 	d["backend_url"] = backend_url
 	d["llm_base_url"] = llm_base_url

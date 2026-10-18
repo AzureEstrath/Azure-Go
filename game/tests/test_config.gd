@@ -239,7 +239,83 @@ func _run() -> void:
 	if da != null:
 		da.remove("test_config_tmp.json")
 
-	# —— 2) 定式「开关 + 频率」原子推送（v3.7.0 修复波 / 跨任务发现 #2） ——
+	# —— 6′) 玩家棋风画像 / 时间感知（profile_enabled / time_aware_enabled，v3.9.0）——
+	# 口径与 `chat_digest_llm` 完全一致：键缺失 ⇒ 默认 false；**只认 JSON 的 true / false**
+	# （`bool("false")` 是 true 的坑同样要挡）；往返读写与未知键原样保留照旧。
+	_write_raw({})
+	var c12 := AzureConfig.load_config(TMP)
+	_check("profile_enabled 键缺失 ⇒ 默认 false", not c12.profile_enabled)
+	_check("time_aware_enabled 键缺失 ⇒ 默认 false", not c12.time_aware_enabled)
+	for bad in ["false", "true", 1, 0, null]:
+		_write_raw({"profile_enabled": bad, "time_aware_enabled": bad})
+		var cpf := AzureConfig.load_config(TMP)
+		_check("两个画像开关脏值 %s ⇒ 默认 false（不把脏值读成「开」）" % str(bad),
+			not cpf.profile_enabled and not cpf.time_aware_enabled)
+	_write_raw({"profile_enabled": true, "time_aware_enabled": true, "future_unknown_key": "保留我"})
+	var c13 := AzureConfig.load_config(TMP)
+	_check("profile_enabled 读入 true", c13.profile_enabled)
+	_check("time_aware_enabled 读入 true", c13.time_aware_enabled)
+	c13.profile_enabled = false
+	c13.time_aware_enabled = false
+	_check("save() 写回画像开关成功", c13.save())
+	var out7 := _read_raw()
+	_check("save() 写回 profile_enabled=false", not bool(out7.get("profile_enabled", true)))
+	_check("save() 写回 time_aware_enabled=false", not bool(out7.get("time_aware_enabled", true)))
+	_check("save() 写回画像开关时仍保留未知键", out7.get("future_unknown_key", "") == "保留我")
+
+	# —— 6″) 画像 / 时间感知两个开关的**原子推送**（v3.9.0，与 set_drift / set_joseki 同一条做法） ——
+	var nf := CountingNetClient.new()
+	nf.set_profile(true, true)
+	_check("一次改画像 / 时间感知只推一次 /api/config（原子入口）", nf.pushes == 1)
+	_check("原子入口落定后两个字段都生效", nf.profile_enabled and nf.time_aware_enabled)
+	var nf2 := CountingNetClient.new()
+	nf2.profile_enabled = true
+	_check("单独赋 profile_enabled 仍推一次（setter 语义与既有开关一致）", nf2.pushes == 1)
+	var nf3 := CountingNetClient.new()
+	nf3.time_aware_enabled = true
+	_check("单独赋 time_aware_enabled 仍推一次（setter 语义与既有开关一致）", nf3.pushes == 1)
+	var nf4 := CountingNetClient.new()
+	nf4.profile_enabled = true
+	nf4.time_aware_enabled = true
+	_check("对照：分两次赋 setter 会推两次（原子入口因此必要）", nf4.pushes == 2)
+	nf4.free()
+	nf3.free()
+	nf2.free()
+	nf.free()
+
+	# —— 6‴) 画像面板文本（纯函数 `Main.profile_panel_text`，v3.9.0 / Q6） ——
+	# 四种退化都要有可读文案；有画像时逐维渲染（数值按百分比 + 把握 + 局数），未知键忽略、脏值不抛。
+	var mp := preload("res://scripts/ui/Main.gd")
+	_check("profile_panel_text：后端没返回 ⇒ 可读失败文案",
+		mp.profile_panel_text(null).contains("读取失败"))
+	_check("profile_panel_text：ok=false ⇒ 可读失败文案",
+		mp.profile_panel_text({"ok": false}).contains("读取失败"))
+	_check("profile_panel_text：功能关着 ⇒ 提示去打开开关",
+		mp.profile_panel_text({"ok": true, "enabled": false, "axes": {}, "games": []}).contains("关着"))
+	_check("profile_panel_text：开着但没画像 ⇒ 提示还没攒下",
+		mp.profile_panel_text({"ok": true, "enabled": true, "axes": {}, "games": []}).contains("还没有攒下"))
+	var panel := mp.profile_panel_text({
+		"ok": true, "enabled": true,
+		"axes": {
+			"open.star": {"value": 0.75, "confidence": 0.5, "n_games": 8},
+			"blunder.top_type": {"value": "深入", "confidence": 0.25, "n_games": 4},
+			"persona.topic.定式": {"value": 0.6, "confidence": 0.1, "n_games": 2},
+			"unknown.axis": {"value": 0.9, "confidence": 1.0, "n_games": 9},
+		},
+		"games": [{"id": 1}, {"id": 2}],
+	})
+	_check("profile_panel_text：标题带来源局数", panel.contains("2 局记录"))
+	_check("profile_panel_text：数值维按百分比 + 把握 + 局数",
+		panel.contains("开局·星位：75%（把握 50%，8 局）"))
+	_check("profile_panel_text：非数值维原样显示（手型）", panel.contains("常亏手型：深入"))
+	_check("profile_panel_text：persona.topic.* 走前缀族标签", panel.contains("常聊·定式：60%"))
+	_check("profile_panel_text：未知维忽略（不渲染、不抛）", not panel.contains("unknown.axis"))
+	_check("profile_panel_text：脏值不抛（缺 value / 脏 confidence）",
+		not mp.profile_panel_text({"ok": true, "enabled": true,
+			"axes": {"open.star": {"confidence": "abc"}, "style.tenuki": {"value": 0.2}},
+			"games": []}).is_empty())
+
+	# —— 7) 定式「开关 + 频率」原子推送（v3.7.0 修复波 / 跨任务发现 #2） ——
 	# 一次改档位必须**只推一次** `/api/config`：分两次赋 setter 会各推一条 POST（`_post` 每次
 	# `HTTPRequest.new()`，到达顺序无保证），极端情况下后端留下「新开关 + 旧频率」，直到下次改配置才自纠。
 	var nc := CountingNetClient.new()

@@ -89,6 +89,19 @@ var chat_digest_llm := false:
 		chat_digest_llm = v
 		if not _digest_batch:
 			_push_settings()
+## 玩家棋风画像 / 时间感知（v3.9.0）：两个开关**一次落定、只推一次** `/api/config`
+## （与 `set_joseki` / `set_drift` 同一个理由与同一个做法）。
+var _profile_batch := false
+var profile_enabled := false:
+	set(v):
+		profile_enabled = v
+		if not _profile_batch:
+			_push_settings()
+var time_aware_enabled := false:
+	set(v):
+		time_aware_enabled = v
+		if not _profile_batch:
+			_push_settings()
 
 var _ws: WebSocketPeer = null
 var _opened_once := false
@@ -365,12 +378,28 @@ func set_digest(on: bool) -> void:
 	_digest_batch = false
 	_push_settings()
 
+## 玩家棋风画像 / 时间感知两个开关的**原子入口**（v3.9.0）：与 `set_drift` / `set_joseki` 同一个理由与
+## 同一个做法——两个字段一次落定、**只推一次** `/api/config`（分两次赋 setter 会各推一条 POST，
+## 到达顺序无保证）。两个开关在界面上属于同一件事（画像面板那一格），所以一起推。
+func set_profile(profile_on: bool, time_on: bool) -> void:
+	_profile_batch = true
+	profile_enabled = profile_on
+	time_aware_enabled = time_on
+	_profile_batch = false
+	_push_settings()
+
+## 画像面板（**只读**，v3.9.0 / Q6）：`GET /api/profile` → 回调 `(ok, code, body)`。
+## 只读、无副作用（不写库、不改任何开关）；连不上后端时回调 `ok=false`（与 `fetch_bytes` 同一套收账）。
+func fetch_profile(callback: Callable) -> void:
+	fetch_bytes("/api/profile", HTTPClient.METHOD_GET, {}, callback)
+
 func _flush_settings() -> void:
 	if not _settings_dirty:
 		return
 	_settings_dirty = false
 	_post("/api/config", {"limit_len": limit_len, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate,
-		"emotion_drift": emotion_drift, "drift_base": drift_base, "chat_digest_llm": chat_digest_llm})
+		"emotion_drift": emotion_drift, "drift_base": drift_base, "chat_digest_llm": chat_digest_llm,
+		"profile_enabled": profile_enabled, "time_aware_enabled": time_aware_enabled})
 
 func _post(path: String, body: Dictionary = {}) -> void:
 	var req := HTTPRequest.new()

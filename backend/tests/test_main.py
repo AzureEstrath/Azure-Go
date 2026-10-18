@@ -145,6 +145,64 @@ class ProfileTimeSwitchTest(unittest.TestCase):
         with TestClient(app):
             self.assertTrue(agent.profile_enabled)
             self.assertTrue(agent.time_aware_enabled)
+            self.assertIsNotNone(agent.profile_store, "注入的 agent 也接上同一个画像库实例")
+
+
+class ProfileApiTest(unittest.TestCase):
+    """``GET /api/profile``（v3.9.0 / Q6）：**只读**，各维值 + 置信度 + 来源局；无画像 ⇒ 空结果、不 500。"""
+
+    def _app(self, tmp, seed=True):
+        db = os.path.join(tmp, "profile.db")
+        cfg = AzureConfig()
+        cfg.profile_db_path = db
+        if seed:
+            store = ProfileStore(db)
+            store.add_game({"ts": time.time() - 86400.0, "move_count": 20, "result": "黑方胜"})
+            store.upsert_axes({"open.star": {"value": 0.9, "confidence": 0.4, "n_games": 8}})
+        return create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(), autostart=False)
+
+    def test_reads_axes_and_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._app(tmp)
+            with TestClient(app) as client:
+                r = client.get("/api/profile")
+                self.assertEqual(r.status_code, 200)
+                body = r.json()
+                self.assertEqual(set(body), {"ok", "enabled", "axes", "games"})
+                self.assertTrue(body["ok"])
+                self.assertFalse(body["enabled"], "开关默认关——关着也照常可读")
+                self.assertAlmostEqual(body["axes"]["open.star"]["value"], 0.9)
+                self.assertAlmostEqual(body["axes"]["open.star"]["confidence"], 0.4)
+                self.assertEqual(body["axes"]["open.star"]["n_games"], 8)
+                self.assertEqual(len(body["games"]), 1, "来源局：games 表只增不减 ⇒ 可追溯")
+                self.assertEqual(set(body["games"][0]), {"id", "ts", "move_count", "result"})
+                self.assertEqual(body["games"][0]["result"], "黑方胜")
+                # 开关打开后面板能区分「开着但还没攒下」与「关着」
+                client.post("/api/config", json={"profile_enabled": True})
+                self.assertTrue(client.get("/api/profile").json()["enabled"])
+
+    def test_empty_profile_is_not_a_500(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with TestClient(self._app(tmp, seed=False)) as client:
+                r = client.get("/api/profile")
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.json()["axes"], {}, "空库 ⇒ 空画像（不是 500）")
+                self.assertEqual(r.json()["games"], [])
+
+    def test_broken_store_still_returns_an_empty_result(self):
+        """库不可用（父路径是个文件 ⇒ sqlite 打不开）⇒ 照旧 200 + 空结果（与记忆管理面同一套口径）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "afile")            # 普通文件：拿它当目录用必然打不开库
+            with open(bad, "w", encoding="utf-8") as f:
+                f.write("not a dir")
+            cfg = AzureConfig()
+            cfg.profile_db_path = os.path.join(bad, "profile.db")
+            with TestClient(create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(),
+                                       autostart=False)) as client:
+                r = client.get("/api/profile")
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.json()["axes"], {})
+                self.assertEqual(r.json()["games"], [])
 
 
 class WebSocketTest(unittest.TestCase):
