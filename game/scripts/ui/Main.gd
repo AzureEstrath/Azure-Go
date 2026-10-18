@@ -5,6 +5,9 @@ extends Node3D
 const PANEL_W := 380
 const TEAL := Color(0.306, 0.804, 0.769)
 const TEAL_DARK := Color(0.173, 0.620, 0.620)
+## 白底面板上的深色文字（手数 / 勾选项等）：与 TEAL_DARK 同一深色系。
+## 两处曾各写一遍同一个字面量（v3.7.0 修复波收口），行为不变。
+const PANEL_TEXT_DARK := Color(0.13, 0.30, 0.30)
 const BUBBLE_AI := Color(0.878, 0.957, 0.957)
 const BUBBLE_SYS := Color(1.0, 0.953, 0.804)
 
@@ -358,7 +361,7 @@ func _build_right_panel(root: Control) -> void:
 	vb.add_child(info)
 	_lbl_moves = Label.new()
 	_lbl_moves.text = "手数: 0"
-	_lbl_moves.add_theme_color_override("font_color", Color(0.13, 0.30, 0.30))  # 面板是白底：默认主题白字看不见（R-GH-1）
+	_lbl_moves.add_theme_color_override("font_color", PANEL_TEXT_DARK)  # 面板是白底：默认主题白字看不见（R-GH-1）
 	info.add_child(_lbl_moves)
 	_lbl_wr = Label.new()
 	_lbl_wr.text = "黑胜率: --"
@@ -675,7 +678,7 @@ func _field_label(text: String) -> Label:
 func _style_check(chk: CheckBox, txt := "") -> void:
 	if txt != "":
 		chk.text = txt
-	var dark := Color(0.13, 0.30, 0.30)
+	var dark := PANEL_TEXT_DARK
 	chk.add_theme_font_size_override("font_size", 12)
 	for k in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color"]:
 		chk.add_theme_color_override(k, dark)
@@ -1882,8 +1885,9 @@ func _on_joseki_level_selected(i: int) -> void:
 	cfg.joseki_rate = rate
 	cfg.save()
 	if agent != null:
-		agent.joseki_teach = teach
-		agent.joseki_rate = rate
+		# 原子入口（v3.7.0 修复波）：开关与频率**一次推一次** `/api/config`。分两次赋 setter 会各推
+		# 一条 POST、到达顺序无保证，极端情况下后端留下「新开关 + 旧频率」。
+		agent.set_joseki(teach, rate)
 	var names := ["关闭", "低 25%", "中 50%", "高 75%"]
 	_set_status("定式导学：%s" % names[lvl])
 

@@ -52,6 +52,9 @@ var _chat_retry_ms := 0                  # 发送失败后的重试闸：`CHAT_R
 ## 刚发出去一条聊天：等她这一轮**真的结束**（收到 `busy=false`）之前不再发下一条。
 ## 「一条接一条」不能只看 `busy`——`busy` 事件有网络往返，本机可能刚好赶不上，远端后端就会两条并排发出去。
 var _chat_in_flight := false
+## 定式「开关 + 频率」批量写入中（v3.7.0 修复波）：期间两个 setter 都不各自推送，
+## 由 `set_joseki()` 收尾统一推一次（见那里的注释）。
+var _joseki_batch := false
 var limit_len := false:
 	set(v):
 		limit_len = v
@@ -59,11 +62,13 @@ var limit_len := false:
 var joseki_teach := true:
 	set(v):
 		joseki_teach = v
-		_push_settings()
+		if not _joseki_batch:
+			_push_settings()
 var joseki_rate := 0.5:
 	set(v):
 		joseki_rate = v
-		_push_settings()
+		if not _joseki_batch:
+			_push_settings()
 
 var _ws: WebSocketPeer = null
 var _opened_once := false
@@ -310,6 +315,18 @@ func _push_settings() -> void:
 	_settings_dirty = true
 	if _ws != null and _ws.get_ready_state() == WebSocketPeer.STATE_OPEN:
 		_flush_settings()
+
+## 定式导学「开关 + 频率」**原子入口**（v3.7.0 修复波）：两个字段一次落定，**只推一次** `/api/config`。
+##
+## 分别赋 `joseki_teach` / `joseki_rate` 会各触发一次 setter → 两次 `_push_settings`；`_post` 每次
+## `HTTPRequest.new()` 各开一条连接，**到达顺序无保证**——极端情况下后端会留下「新开关 + 旧频率」，
+## 直到下次改配置才自纠。这里先落两个字段、再统一推一次，载荷与 `_flush_settings()` 完全一致。
+func set_joseki(teach: bool, rate: float) -> void:
+	_joseki_batch = true
+	joseki_teach = teach
+	joseki_rate = rate
+	_joseki_batch = false
+	_push_settings()
 
 func _flush_settings() -> void:
 	if not _settings_dirty:

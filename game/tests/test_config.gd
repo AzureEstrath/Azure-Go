@@ -21,6 +21,15 @@ const DEAD_KEYS := [
 var _total := 0
 var _fail := 0
 
+## 注入式替身（修复波 #2 的门卫）：只数 `_push_settings` 被调用几次（不触网、不建 WS）。
+## `NetClient` 是 `class_name`，headless 下 `new()` 不会 `_ready`（不连 WS）；`_push_settings` 是唯一
+## 推送入口——覆写它即可把「推了几次」变成可断言的事实（真实 POST 只在 WS 打开时由 `_flush_settings` 发出）。
+class CountingNetClient extends NetClient:
+	var pushes := 0
+
+	func _push_settings() -> void:
+		pushes += 1
+
 func _initialize() -> void:
 	_run()
 
@@ -145,6 +154,29 @@ func _run() -> void:
 	var da := DirAccess.open("user://")
 	if da != null:
 		da.remove("test_config_tmp.json")
+
+	# —— 2) 定式「开关 + 频率」原子推送（v3.7.0 修复波 / 跨任务发现 #2） ——
+	# 一次改档位必须**只推一次** `/api/config`：分两次赋 setter 会各推一条 POST（`_post` 每次
+	# `HTTPRequest.new()`，到达顺序无保证），极端情况下后端留下「新开关 + 旧频率」，直到下次改配置才自纠。
+	var nc := CountingNetClient.new()
+	nc.set_joseki(true, 0.75)
+	_check("一次改档位只推一次 /api/config（原子入口）", nc.pushes == 1)
+	_check("原子入口落定后两个字段都生效",
+			nc.joseki_teach and is_equal_approx(nc.joseki_rate, 0.75))
+	var nc2 := CountingNetClient.new()
+	nc2.joseki_teach = false
+	_check("单独赋 joseki_teach 仍推一次（既有 setter 语义不变）", nc2.pushes == 1)
+	var nc3 := CountingNetClient.new()
+	nc3.joseki_rate = 0.25
+	_check("单独赋 joseki_rate 仍推一次（既有 setter 语义不变）", nc3.pushes == 1)
+	var nc4 := CountingNetClient.new()
+	nc4.joseki_teach = true
+	nc4.joseki_rate = 0.75
+	_check("对照：分两次赋 setter 会推两次（这正是原子入口要避免的）", nc4.pushes == 2)
+	nc4.free()
+	nc3.free()
+	nc2.free()
+	nc.free()
 
 	if _fail == 0:
 		print("[config] PASS：", _total, " 项断言全部通过")
