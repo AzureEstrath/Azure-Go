@@ -9,10 +9,64 @@
 **Tech Stack:** Python 3 / FastAPI / LangChain + LangGraph（`backend/`）；Godot 4.6 工程、用 4.7.1 本机验证（`game/`，GDScript）；KataGo 由独立的 `katago_service/` 提供；测试用标准库 `unittest`（后端）与 Godot headless 脚本（前端）。
 
 **Spec:**
-- `docs/superpowers/specs/2026-10-17-joseki-active-teaching-design.md`（阶段一）
-- `docs/superpowers/specs/2026-10-17-ux-and-reliability-batch-design.md`（阶段二）
+- [`specs/2026-10-17-joseki-active-teaching-design.md`](specs/2026-10-17-joseki-active-teaching-design.md)（阶段一）
+- [`specs/2026-10-17-ux-and-reliability-batch-design.md`](specs/2026-10-17-ux-and-reliability-batch-design.md)（阶段二）
+- [`specs/2026-10-17-strategy-lines-and-event-log-design.md`](specs/2026-10-17-strategy-lines-and-event-log-design.md)（阶段三）
+- [`specs/2026-10-17-player-profile-and-time-awareness-design.md`](specs/2026-10-17-player-profile-and-time-awareness-design.md)（阶段四）
 
-两个阶段**各自独立可发布**：阶段一完成后是一个能跑、能测、能玩的 v3.6.0；阶段二在它之上做 v3.7.0。**不要**为了「一起做完」而让阶段一的验收拖着阶段二。
+四个阶段**各自独立可发布**：阶段一 = v3.6.0（定式教学），阶段二 = v3.7.0（体验与可靠性），阶段三 = v3.8.0（策略线与事件表），阶段四 = v3.9.0（棋风画像与时间感知）。**不要**为了「一起做完」而让先做的验收拖着后做的。
+
+---
+
+## 决策摘要（一页看懂）
+
+- **做什么**：阶段一（v3.6.0）把定式教学从「走完才说一句」改成「主动识别 + 结构点开口 + 棋盘浮层参考图卡片」；阶段二（v3.7.0）收拾 6 件日常体验与可靠性的事。
+- **核心新增（2026-10-17 追加）**：定式提示**不再每手都触发**，改成**可开关 + 频率可调**；实际提示概率 = 基础频率 ± （棋力画像 / 情绪，各 ±10%）；**没触发就只点评这一手、不讲定式**。见下一节。
+- **不做什么**：不考你、不做回放器、不做双棋盘对照、不给大棋盘加手顺编号、不动语音链路；阶段二不合并两栏、不做 CI。
+- **顺序**：先机制（含门控）、后扩库；**各阶段独立可发布**。
+- **阶段三（v3.8.0，2026-10-17 追加）**：预测线 **A / B / C（三条，两两 ≥2~3 步不同）** + 情绪波动开关（A/B/C 阶梯）+ 事件表（带时刻）+ 提示词事件区块。**第一条红线：零额外引擎调用、默认零额外 LLM 调用**。**已实测（2026-10-17）：`moveInfos[].pv` 存在；200 visits 下 pv 6~10 手，三线都凑得出**，详见 spec 6.1。
+- **阶段四（v3.9.0，2026-10-17 追加）**：**玩家棋风画像**（独立 `profile.db`、四维、指数衰减增量）+ **时间感知**（四项）+ 三个延伸（主动约战 / 画像面板 / 局末进步报告）。**第一条纪律：写入只在 `summarize()`（手动结束）里、回合内零新增调用**。
+
+---
+
+## 核心机制：定式提示门控（可开关 · 频率可调）
+
+> 用户诉求（2026-10-17 追加）：**不必每手都做定式提示**。要「可开关 + 可调频率」；例如提示概率 50% 时，实际是否提示**结合棋力画像与情绪上下浮动 ±10%**；**没触发提示时，就不讲定式，照常只点评这一手**。
+
+**两层结构（全篇最重要的简化）**
+
+| 层 | 决定什么 | 规则 |
+| --- | --- | --- |
+| **资格层** | 这条定式**该不该教** | 族计数 `< 3` → 有资格；`≥ 3` → 只有「走错」（真亏且偏离库线）时才有资格；总开关 `joseki_teach=false` → 一律无资格 |
+| **频率层** | 这次**说不说** | 有资格时掷一次概率 `p`：命中 → 讲解 + 卡片；未命中 → **与「没识别到定式」逐字段同构**（只点评这一手） |
+
+**概率公式（可调 + 画像/情绪波动）**
+
+```
+p = clamp( joseki_rate + skill_adj + mood_adj, 0, 1 )
+  joseki_rate ∈ [0,1]            # 基础频率，用户可调（默认 0.5）
+  skill_adj   ∈ [-0.10, +0.10]   # 棋力画像：生疏 / 没见过 → 正；熟练 → 负
+  mood_adj    ∈ [-0.10, +0.10]   # 情绪：好奇 / 兴奋 → 正；疲惫 / 低落 → 负
+```
+
+**优先级（不许被概率压过）**
+
+1. **走错**（真亏且偏离库线）→ **必讲**（纠错时刻，绕过频率层）。
+2. 结构点（进入 / 分岔 / 收尾）→ 走频率层（这才是「可调」的部分）。
+3. 中间推进 → 一律不讲（沿用既有）。
+
+**边界（硬规则）**
+
+- 门控**只决定文本与卡片**：不改棋子、**绝不改 `speech` 配对与 `busy`**。
+- 未命中路径必须与「未识别」路径**逐字段同构**（同一出口、同一事件集合）——这是可测性的关键，也是「关掉定式＝纯点评」的验收口径。
+- 掷概率用**可注入的 rng**（默认系统随机），便于单测复现。
+- 画像 / 情绪取不到 → `adj = 0`，不抛错、不影响对局。
+- **冷却**：同一族在最近 `N` 手（建议 `N=8`，与 `AI_DEDUP_WINDOW` 同口径）内已讲过 → 本次直接按「未命中」处理，避免连手讲同一个。
+
+**新增配置与开关**
+
+- `joseki_rate: float`（0~1，默认 0.5）。「定式导学」由单个 bool 升级为「**开关 + 频率**」两件，UI 用**一格**承载（下拉：关闭 / 低 25% / 中 50% / 高 75%，或滑条），**不新增右栏控件位**（守住反目标「界面更挤」）。
+- 仍走 `POST /api/config` 透传（新增 `joseki_rate`），客户端 `NetClient.joseki_rate`。
 
 **工作区（执行前先确认这一条）：** 唯一工作区是
 
@@ -21,6 +75,8 @@ G:\GodotProject\Azure-Go
 ```
 
 分支 `main`，起点提交 `1f412d1`（v3.5.2）。下文的路径全部相对这个目录。
+
+> ⚠️ **本机核对**：这台机器上 **`G:` 盘不存在**；本 `superpowers/` 文件夹是从别处拷来的设计稿。本机可运行的代码是 `AzureGo-v3`（**v3.3.0**，GitHub 线），与本文档的 v3.5.2 起点**不是同一条线**。执行前先确认工作区，别在本机照搬（见附录 A · O11）。
 
 **已废弃的两个位置，不要用、也不要试图还原：**
 
@@ -49,6 +105,9 @@ G:\GodotProject\Azure-Go
 - **异步纪律**：同步的磁盘 / 数据库调用**不得直接放进 `async def`**，一律 `await asyncio.to_thread(...)`；任何存储故障只打日志、绝不影响对局。
 - **`tests/golden/prompts.json` 锁定** `context_block`：`long_term` 为空串时输出**逐字符不变**；新内容只能插在铁律段之前，铁律段本身不许动。提示词里**不得**放可被模型照抄的示例句。
 - **既有常量不许放宽**：`MAX_LLM_CALLS_PER_TURN = 4`、`AI_DEDUP_WINDOW = 8`。
+- **门控只改文本与卡片**：`joseki_gate` 的决策**不得**改动棋子、事件配对（`message`/`speech`）、`busy` 与状态机；**未命中 == 未识别**，两条路径必须逐字段同构。
+- **概率必须可复现**：`joseki_gate` 一律接收**注入的 rng**（默认系统随机），单测不得依赖真随机。
+- **门控不得新增持久化**：棋力画像只从**局内既有信号**（玩家 rank / 亏损手比例 / 族计数）推，不新建数据库（可推翻，见附录 A · O9）。
 - **配置读取顺序**：可执行文件同目录 `config.json` → `res://config.json`；CLI 覆盖记进 `cli_locked` 且只影响本次运行。
 - **平台**：Windows 单平台。PowerShell 读写文本用 `[IO.File]::ReadAllLines/WriteAllLines` + `[Text.UTF8Encoding]::new($false)`。
 - **`server/` 目录**：288/370 个文件是上游 CosyVoice 代码，**不要顺手重排 / 美化**。
@@ -64,6 +123,7 @@ G:\GodotProject\Azure-Go
 3. **复盘模式下的并发与边界**：复盘进行中收到落子 / 聊天 / 闲置，或前端断开重连（`hello` 同步）→ 期望：一律被拒且状态自洽；退出复盘后回到进入前的局面。测试在 **Task C**、**Task D**。
 4. **兜底超时的误伤与半写**：正常偏慢的一回合（KataGo 超时后重试 + 思考档位 + 两轮工具轮）**不得**被打断；真正卡死的回合超时后**不得**留下半写状态。测试在 **Task E**。
 5. **前端在旧后端 / 事件缺字段下不崩**：`joseki` 事件缺字段、`bad_moves` 为空、`move_seq` 里含 `pass`、`score` 为 `null` → 期望：忽略未知字段、`pass` 不画子、不抛错。测试在 **Task 8**、**Task D**、**Task H**。
+6. **门控的频率与浮动被玩家误读**：`joseki_rate` 设成 0 或 1、画像/情绪取不到、冷却期内同一族连出、走错与随机撞车 → 期望：`p=0` 必不说、`p=1` 必说、缺失值 `adj=0` 不抛、冷却按「未命中」处理、**走错永远优先**。测试在 **Task 5**。
 
 ---
 
@@ -77,6 +137,7 @@ G:\GodotProject\Azure-Go
 | --- | --- |
 | `backend/app/joseki.py`（改） | 定式库 + 识别器。库条目补 `family`；`scan()` 输出扩成统一结构（进入 / 分岔 / 收尾两种形态 / 偏离） |
 | `backend/app/joseki_progress.py`（新） | 族计数的持久化读写（SQLite）。**只有这一处碰盘** |
+| `backend/app/joseki_gate.py`（新） | **定式提示门控**（纯函数 + 可注入 rng）：开关 / 频率 / 画像·情绪 ±10% / 冷却 / 走错优先。**只有这一处决定「这次说不说」** |
 | `backend/app/agent_graph.py`（改） | 结构点开口的分流、并进既有发言位、走错判定、计数接线、悔棋退回 |
 | `backend/app/agent.py`（改） | `_joseki_check` / `_joseki_emit` 适配新结构；持有 `joseki_progress` |
 | `backend/app/events.py`（改） | `joseki` 事件扩字段（**旧字段不动**） |
@@ -326,50 +387,55 @@ git commit -m "feat(joseki,memory): 族计数持久化，任何存储故障只�
 
 ---
 
-### Task 5: 入围规则接线（前 3 次都上卡片，第 4 次起只在走错时上）
+### Task 5: 定式提示门控（开关 + 频率 + 画像/情绪 ±10% + 冷却 + 走错优先）
 
 **Files:**
-- Modify: `backend/app/agent.py`（`_joseki_check` / `_joseki_emit` 与 `undo` 附近）
+- Create: `backend/app/joseki_gate.py`（纯函数 + 可注入 rng）
+- Modify: `backend/app/agent.py`（`_joseki_check` / `_joseki_emit` 与 `undo` 附近接门控）
 - Modify: `backend/app/agent_graph.py`
-- Modify: `backend/app/main.py`（把 `JosekiProgress` 注进 agent）
-- Test: `backend/tests/test_joseki_progress.py`、`backend/tests/test_agent.py`
+- Modify: `backend/app/main.py`（装配 `JosekiProgress` + `/api/config` 透传 `joseki_rate`）
+- Modify: `game/scripts/core/AzureConfig.gd`、`game/scripts/net/NetClient.gd`、`game/scripts/ui/Main.gd`（「开关 + 频率」合一格）
+- Test: `backend/tests/test_joseki_gate.py`（新）、`backend/tests/test_joseki_progress.py`、`backend/tests/test_agent.py`、`game/tests/test_config.gd`
 
 **Interfaces:**
 - Consumes: Task 2 的 `scan()`、Task 3 的 `is_joseki_mistake`、Task 4 的 `JosekiProgress`
-- Produces:
-  - `AzureAgent.joseki_progress: JosekiProgress | None`
-  - `AzureAgent.joseki_show_card(jk: dict) -> bool` —— 是否该上卡片：
-    - 进入时：`await asyncio.to_thread(self.joseki_progress.seen, family) < 3` → True
-    - 第 4 次起：只有 `jk["kind"] == "deviated"` 且 `is_joseki_mistake(...)` → True
-    - `joseki_progress is None` → 一律 True（降级＝每次都教）
-  - `GameState` 新增 `joseki_counted: list[str]` —— **本局已计过数的族**（随快照回滚）
-  - `GameState` 新增 `joseki_dropped: list[str]` —— 本局已被退回计数的族（供 `undo` 用）
+- Produces（`joseki_gate.py`，纯函数 / 无副作用 / rng 注入）：
+  - `eligible(seen: int, kind: str, mistake: bool, teach_on: bool) -> bool` —— 资格层
+  - `probability(rate: float, skill_adj: float, mood_adj: float) -> float` —— `clamp(rate+skill_adj+mood_adj, 0, 1)`
+  - `should_show(*, rng, rate, skill_adj, mood_adj, seen, kind, mistake, teach_on, last_taught_move, move_no, cooldown=8) -> bool` —— 最终决策（含冷却、走错优先）
+  - `skill_adj(ranks: list[int], seen_count: int) -> float`、`mood_adj(mood: dict) -> float` —— 各自截断到 ±0.10；缺失 → 0.0
+- 原有接口保留：`AzureAgent.joseki_progress: JosekiProgress | None`；`GameState.joseki_counted` / `joseki_dropped`（随快照回滚，供 `undo` 退回计数）
 
 - [ ] **Step 1: 写失败测试**
 
 ```python
-def test_first_three_show_always(self):
-    # count 0/1/2 → 进入即上卡片
-def test_fourth_onward_only_on_mistake(self):
-    # count 3 → entered 不上卡片；deviated+亏 才上
-def test_same_family_counts_once_per_game(self):
-    # 同一局里第二次进入同族，计数不再 +1
-def test_undo_returns_the_count(self):
-    # bump 后 undo 到那一手之前 → seen 回到原值
-def test_missing_progress_degrades_to_always_show(self):
-    # joseki_progress is None → True
+def test_rate_zero_never_shows(self):            # p=0 → 必不说（走错除外）
+def test_rate_one_always_shows(self):            # p=1 → 必说
+def test_adj_clamped_to_plus_minus_10pct(self):  # skill_adj / mood_adj 各自截断到 ±0.10
+def test_rng_is_reproducible(self):              # 注入固定 rng → 决策可复现
+def test_miss_is_identical_to_no_match(self):    # 未命中与「未识别」事件集合逐项相等
+def test_teach_off_is_silent(self):              # joseki_teach=false → 无 joseki / 讲解 / 卡片
+def test_cooldown_suppresses_repeat(self):       # 同族 N 手内不重复讲
+def test_mistake_bypasses_frequency(self):       # 走错 → 必讲
+def test_missing_profile_or_mood_degrades(self): # 画像 / 情绪缺失 → adj=0，不抛
+def test_same_family_counts_once_per_game(self): # 同一局第二次进同族，计数不再 +1
+def test_undo_returns_the_count(self):           # bump 后 undo → seen 回原值
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cd backend && python -m unittest tests.test_agent -v`
-Expected: FAIL —— `AttributeError: 'AzureAgent' object has no attribute 'joseki_show_card'`
+Expected: FAIL —— `ModuleNotFoundError: No module named 'app.joseki_gate'`
 
 - [ ] **Step 3: 实现**
 
-- `bump` 只在**本局首次进入该族**时执行一次（`joseki_counted` 去重），且必须 `await asyncio.to_thread(...)`。
-- `joseki_counted` / `joseki_dropped` 加入 `GameState.make_snapshot()` 与 `_rollback`（与现有 `joseki_log` 同一处），这样悔棋回档会连计数一起退回；回档时对**被回滚掉**的族调 `unbump`。
-- `undo` 是**同步方法**（无法 `await`）→ 退回计数走 `asyncio.to_thread` 的同步包装，或把退回放进一个不阻塞事件循环的线程调用里；**不得**让磁盘 IO 直接跑在事件循环上。
+- **资格层**：族计数 `< 3` 有资格；`≥ 3` 只在「走错」时有资格——原 Task 5 的「前 3 次 / 第 4 次起」并入资格层，**取消那两条独立规则**。
+- **频率层**：`should_show(...)` 掷 `p`；未命中 → 走**与未识别完全相同的出口**（不 emit `joseki`、不换讲解模板、不上卡片）。
+- **走错优先**：`mistake=True` → 直接 True，不进概率。
+- **冷却**：维护「族 → 最近讲过的手数」（`last_taught_move`），窗口内按未命中处理。
+- **画像 / 情绪**：`skill_adj(ranks, seen_count)` 用局内最近若干手的 `player_rank` + 该族计数；`mood_adj(mood)` 用现有 `mood` 区域（好奇 / 兴奋 ↑，疲惫 / 低落 ↓）。取不到 → `0.0`。
+- `bump` 只在**本局首次进入该族**时执行一次（`joseki_counted` 去重），且必须 `await asyncio.to_thread(...)`；`joseki_counted` / `joseki_dropped` 加入 `make_snapshot()` 与 `_rollback`，悔棋回档时对被回滚的族 `unbump`。
+- 决策留**一行日志**（rate / adj / roll / 命中），便于调参与事后归因。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -379,8 +445,8 @@ Expected: 全绿
 - [ ] **Step 5: 提交**
 
 ```bash
-git add backend/app/agent.py backend/app/agent_graph.py backend/app/main.py backend/tests/
-git commit -m "feat(joseki,teach): 前 3 次都上卡片、第 4 次起只在走错时上，同局同族只计一次、悔棋退回（v3.6.0）"
+git add backend/app/joseki_gate.py backend/app/agent.py backend/app/agent_graph.py backend/app/main.py backend/tests/ game/scripts/core/AzureConfig.gd game/scripts/net/NetClient.gd game/scripts/ui/Main.gd
+git commit -m "feat(joseki,teach): 定式提示门控（开关+频率+画像/情绪±10%+冷却），走错优先、未命中只点评（v3.6.0）"
 ```
 
 ---
@@ -565,8 +631,8 @@ git commit -m "feat(game,joseki): 棋盘浮层参考图卡片，跟对局同步�
 
 - [ ] **Step 1: 改 `README.md`**
 
-- 「九、更新」加 v3.6.0 一段（主动识别 / 结构点开口 / 浮层卡片 / 前 3 次规则 / 扩库）。
-- 第三节与 2.3 的界面表格补上卡片的位置、避让行为与「📖 复盘」之外**不新增**的内容。
+- 「九、更新」加 v3.6.0 一段（主动识别 / 结构点开口 / 浮层卡片 / **提示门控：开关 + 频率 + 画像·情绪 ±10%、未命中只点评** / 扩库）。
+- 第三节字段表补 `joseki_rate`（0~1，默认 0.5）与「定式导学 = 开关 + 频率」；2.3 的界面表格补上卡片的位置、避让行为与「📖 复盘」之外**不新增**的内容。
 - **顺手更正「远程后端」的表述**（设计文档 `2026-10-17-joseki-active-teaching-design.md` 第九节末表）：导语与「读取方」口径改为「后端是本机进程；只有 LLM 走可自定义的 OpenAI 兼容 API」。
 
 - [ ] **Step 2: 改 `AGENTS.md`**
@@ -1050,9 +1116,271 @@ git commit -m "docs(readme,agents): 复盘、设置抽屉、视角与目差说�
 
 ---
 
-## 收尾（两个阶段都完成后）
+# 阶段三 · 策略线与事件表（v3.8.0）
+
+> **Spec**：[`specs/2026-10-17-strategy-lines-and-event-log-design.md`](specs/2026-10-17-strategy-lines-and-event-log-design.md)。
+> 本阶段独立于阶段一 / 二，可单独实施与发布。
+> **本阶段第一条纪律：零额外引擎调用、默认零额外 LLM 调用**；**提示词事件区块为空时必须逐字符不变**。
+> **实测已完成（2026-10-17）**：`pv` 存在、200 visits 够五步、三线可凑；代价是**那一次已有分析要更深**（`maxVisits` 100→200，单线程 ≈9.8s），且部署侧**必须显式设 `analysisPVLen`**。
+
+## 文件结构（先锁定职责）
+
+| 文件 | 职责 |
+| --- | --- |
+| `backend/app/pv_lines.py`（新） | 从既有 `moveInfos` 提取**线 A / B / C**（纯函数，**零引擎调用**） |
+| `backend/app/event_log.py`（新） | **事件表**：带时刻、只增不减、去重（局内内存） |
+| `backend/app/decay.py`（新） | **遗忘权重 → 4 档淡化**（纯函数） |
+| `backend/app/agent.py`（改） | 接线：偏航决策、事件写入（我下错 / 玩家好评·坏评 / 聊天） |
+| `backend/app/prompts.py`（改） | `event_block()`；**插在铁律段之前** |
+| `backend/app/prompt_chains.py`（改） | 区块接线（区块表见 spec 6.5） |
+| `backend/app/main.py`（改） | `/api/config` 透传 `emotion_drift` / `chat_digest_llm` |
+| `game/scripts/core/AzureConfig.gd`、`net/NetClient.gd`、`ui/Main.gd`（改） | 设置抽屉里**一格**开关 |
+| `backend/tests/test_pv_lines.py`、`test_event_log.py`、`test_decay.py`（新） | 门卫 |
+
+---
+
+### Task P1: 预测线 A / B / C（纯函数，零引擎调用）
+
+**Files:** Create `backend/app/pv_lines.py`；Test `backend/tests/test_pv_lines.py`
+**Interfaces:** `extract_lines(move_infos, *, pv_len=5, diverge_min=2, max_drop=0.05, candidates=10) -> dict`——返回 `a` / `b` / `c` 三条线（形状见 spec 6.1）
+- [ ] **Step 1: 写失败测试**
+```python
+def test_a_is_top_candidate_pv(self):        # A = moveInfos[0] 的首手 + pv 前 4 手
+def test_short_pv_degrades(self):            # pv 不足 5 手 → 用可用长度，不抛
+def test_b_differs_from_a(self):             # B 与 A 不同手数 ≥ diverge_min
+def test_c_differs_from_a_and_b(self):       # C 与 A、B 都 ≥ diverge_min；凑不齐 → c=None
+def test_candidates_rejected_when_too_weak(self):  # 胜率差 > max_drop 的候选不入选
+def test_no_engine_call(self):               # 断言只消费传入的 move_infos（不触 engine）
+```
+- [ ] **Step 2: 跑测试确认失败** → `python -m unittest tests.test_pv_lines -v`，FAIL `ModuleNotFoundError`
+- [ ] **Step 3: 实现** —— 只读 `move_infos` 的 `move` / `pv` / `winrate` / `scoreLead`，**不新增任何 `katago.analyze`**；**依次**凑 B、C（spec 第五节 B 条）；`pv` 不足五步时用可用长度、只做做得到的线
+- [ ] **Step 4: 跑测试确认通过** → `python -m unittest discover -s tests` 全绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(agent,pv): 预测线 A/B/C 提取，零额外引擎调用（v3.8.0）"`
+
+---
+
+### Task P2: 情绪波动开关 + 走偏优解
+
+**Files:** Modify `backend/app/agent.py`、`backend/app/main.py`、`game/scripts/core/AzureConfig.gd`、`game/scripts/net/NetClient.gd`、`game/scripts/ui/Main.gd`；Test `backend/tests/test_agent.py`
+**Interfaces:** `AzureAgent._maybe_drift(lines, mood, rng) -> str`（返回 `"a"` / `"b"` / `"c"`）；配置 `emotion_drift`(bool，默认 **false**)、`drift_base`(0.03)、`drift_max`(0.08)、`pv_max_drop`(0.05)
+- [ ] **Step 1: 写失败测试**
+```python
+def test_drift_off_always_a(self):           # emotion_drift=false → 恒走 A（与现状同构）
+def test_drift_probability_clamped(self):    # p_drift 截断到 [0, drift_max]
+def test_drift_rng_reproducible(self):       # 注入 rng → 决策可复现
+def test_ladder_prefers_a_then_b_then_c(self):  # P(走A) > P(走B) > P(走C)
+def test_illegal_first_move_falls_back(self):   # C→B→A 逐级回落
+def test_weak_line_never_taken(self):        # drop > pv_max_drop → 该线不用
+```
+- [ ] **Step 2: 跑测试确认失败** → FAIL（无 `_maybe_drift`）
+- [ ] **Step 3: 实现** —— 决策插在**选出 A 之后、真正落子之前**；阶梯概率选线、首手**复用既有合法性检查**、**C→B→A 逐级回落**；走 B/C 时**记一条事件**（Task P3）
+- [ ] **Step 4: 跑测试确认通过** → 全绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(agent,emotion): 情绪波动开关，小概率走偏优解（默认关）（v3.8.0）"`
+
+---
+
+### Task P3: 事件表（带时刻、只增不减、去重）
+
+**Files:** Create `backend/app/event_log.py`；Modify `backend/app/agent.py`（四个写入点）；Test `backend/tests/test_event_log.py`
+**Interfaces:** `EventLog.add(kind, move_no, text, detail)` / `all()` / `reset()`；`kind ∈ {ai_bad, player_bad, player_good, chat, joseki}`；**去重键 = `kind` + 归一化 `text`**；形状见 spec 6.3
+- [ ] **Step 1: 写失败测试**（重复不写；`all()` 覆盖从开局到当前；`reset` 清空；**不进快照**、悔棋不回退）
+- [ ] **Step 2-4:** 失败 → 实现 → 全量绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(state,events): 局内事件表（带时刻、只增不减、去重）（v3.8.0）"`
+
+---
+
+### Task P4: 遗忘权重 → 4 档淡化（纯函数）
+
+**Files:** Create `backend/app/decay.py`；Test `backend/tests/test_decay.py`
+**Interfaces:** `DECAY_SPAN = [1, 3, 6]`、`DECAY_DROP_AT = 12`、`level(event_move_no, now_move_no) -> int`（1..4）；文案模板见 spec 6.4
+- [ ] **Step 1: 写失败测试**（`[1,3,6]` 边界；`DECAY_DROP_AT` 之后失效；方位词按坐标核对，核不上不说）
+- [ ] **Step 2-4:** 失败 → 实现 → 全量绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(prompts,decay): 事件遗忘权重与 4 档淡化（v3.8.0）"`
+
+---
+
+### Task P5: 提示词事件区块（增量翻新）
+
+**Files:** Modify `backend/app/prompts.py`、`backend/app/prompt_chains.py`；Test `backend/tests/test_prompts.py`
+**Interfaces:** `prompts.event_block(events: list[dict], now_move_no: int, max_chars: int = EVENT_BLOCK_MAX_CHARS) -> str`
+- [ ] **Step 1: 写失败测试**
+```python
+def test_empty_block_keeps_golden_identical(self):  # events 为空 → ""，prompts.json 逐字符一致
+def test_block_sits_before_ironclad(self):          # 只能插在铁律段之前
+def test_over_budget_drops_oldest_and_lowest(self): # 超 max_chars → 丢【最旧 → 最低档】
+def test_injected_events_do_not_enter_reply(self):  # 事件原文永不进台词
+```
+- [ ] **Step 2: 跑测试确认失败** → FAIL
+- [ ] **Step 3: 实现** —— 组织成**区块表**（来源 / 插入点 / 上限 / 失效条件，见 spec 6.5）
+- [ ] **Step 4: 跑测试确认通过** → 全绿（含 `tests/golden/prompts.json`）
+- [ ] **Step 5: 提交** → `git commit -m "feat(prompts,events): 事件区块（插铁律段之前，空则逐字符不变）（v3.8.0）"`
+
+---
+
+### Task P6: 聊天事件写入（主题裁切 + 去重，默认零 LLM）
+
+**Files:** Modify `backend/app/agent.py`（`chat()` 之后；`chat_digest_llm=true` 时在 `summarize()` / `idle` 补做）；Test `backend/tests/test_agent.py`
+**Interfaces:** 规则式 `chat_topics(history) -> list[(主题, 摘要)]`；可选 LLM 版只在**局末 / 空闲**跑
+- [ ] **Step 1: 写失败测试**（默认**零 LLM**：用假 LLM 断言调用数不变；重复主题不写；覆盖从开局起）
+- [ ] **Step 2-4:** 失败 → 实现 → 全量绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(agent,chat): 聊天按主题分段入事件表，默认零额外 LLM（v3.8.0）"`
+
+---
+
+### Task P7: 文档与版本（v3.8.0）
+
+**Files:** Modify `README.md`、`AGENTS.md`
+- [ ] **Step 1: 改 `README.md`** —— 第三节字段表补 `emotion_drift` / `chat_digest_llm` 与常量（`pv_diverge_min` / `pv_max_drop` / `DECAY_SPAN`）；**部署说明补两条硬要求**：引擎配置**必须显式设 `analysisPVLen`**、**三线需要更高 `maxVisits`（默认 100 → 建议 200）**；界面说明补开关位置；「九、更新」加 v3.8.0。
+- [ ] **Step 2: 改 `AGENTS.md`** —— 补三条硬规则：**线 A/B/C 只用既有 `moveInfos`、不得新增引擎调用**；**事件表存储完整、注入有界**；**事件区块为空必须逐字符不变、事件原文永不进台词**。
+- [ ] **Step 3: 全量门卫 + 联动冒烟**（后端全量 + `katago_service` 全量 + 三个前端 headless 脚本 + `--headless --quit`）。
+- [ ] **Step 4: 提交** → `git commit -m "docs(readme,agents): 策略线、情绪波动与事件表说明（v3.8.0）"`
+
+---
+
+# 阶段四 · 玩家棋风画像 + 时间感知（v3.9.0）
+
+> **Spec**：[`specs/2026-10-17-player-profile-and-time-awareness-design.md`](specs/2026-10-17-player-profile-and-time-awareness-design.md)。
+> 独立于阶段一 / 二 / 三，可单独实施与发布。
+> **第一条纪律：写入只在 `summarize()`（手动结束）里、回合内零新增调用；画像块 / 时间块为空必须逐字符不变。**
+
+## 文件结构（先锁定职责）
+
+| 文件 | 职责 |
+| --- | --- |
+| `backend/app/profile_store.py`（新） | `profile.db` 读写（`games` / `profile` 两表）。**只有这一处碰盘** |
+| `backend/app/profile.py`（新） | 四维特征提取 + **EMA 衰减融合**（纯函数，可注入系数） |
+| `backend/app/time_ctx.py`（新） | 时间事实（now / 星期 / 本局时长 / 单手用时 / 上次间隔 / 连续天数），**时钟可注入** |
+| `backend/app/prompts.py`（改） | `profile_note()` / `time_note()`；**插在铁律段之前** |
+| `backend/app/prompt_chains.py`（改） | 区块接线 |
+| `backend/app/agent.py`（改） | `summarize()` 后写记录 + 更新画像；单手用时打点 |
+| `backend/app/main.py`（改） | 装配 + `GET /api/profile`（只读）+ `/api/config` 透传两个开关 |
+| `game/scripts/core/AzureConfig.gd`、`net/NetClient.gd`、`ui/Main.gd`（改） | 面板一格 + 两个开关 |
+| `backend/tests/test_profile_store.py`、`test_profile.py`、`test_time_ctx.py`（新） | 门卫 |
+
+### Task Q1: 对局记录 + 存储层（`profile.db`）
+
+**Files:** Create `backend/app/profile_store.py`；Test `backend/tests/test_profile_store.py`
+**Interfaces:** `ProfileStore(db_path)`：`add_game(rec) -> int` / `last_game_ts() -> float|None` / `games(n=…) -> list` / `get_profile() -> dict` / `upsert_axes(dict)`；表结构见 spec 6.1
+- [ ] **Step 1: 写失败测试**（库被删 / 只读 / 目录不存在 → **降级为「无画像」不抛**；`games` 只增不减；空库 `last_game_ts` → `None`）
+- [ ] **Step 2-4:** 失败 → 实现（SQLite；只在 `summarize()` 调用、一律 `asyncio.to_thread`）→ 全量绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(profile,store): 对局记录与 profile.db 存储层（v3.9.0）"`
+
+### Task Q2: 画像四维 + EMA 融合
+
+**Files:** Create `backend/app/profile.py`；Test `backend/tests/test_profile.py`
+**Interfaces:** `extract_axes(game_rec) -> dict[str,float]`（四组维度键见 spec 6.2）；`merge(prev, x, n_games, *, half_life=20, alpha_cap=0.25) -> dict`
+- [ ] **Step 1: 写失败测试**（EMA 正确；**单局 α 上限**；置信度随局数上升；缺维当 0、不抛）
+- [ ] **Step 2-4:** 失败 → 实现 → 全量绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(profile,core): 四维特征与指数衰减融合（v3.9.0）"`
+
+### Task Q3: 画像 / 时间区块注入
+
+**Files:** Modify `backend/app/prompts.py`、`backend/app/prompt_chains.py`；Test `backend/tests/test_prompts.py`
+**Interfaces:** `prompts.profile_note(profile, now_move_no, max_chars=PROFILE_MAX_CHARS) -> str`、`prompts.time_note(t, max_chars=TIME_MAX_CHARS) -> str`
+- [ ] **Step 1: 写失败测试**（**两块为空 → `''` 且 `golden/prompts.json` 逐字符不变**；**只能插在铁律段之前**；超预算丢「最低置信 / 最旧维度」）
+- [ ] **Step 2-4:** 失败 → 实现 → 全量绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(prompts,profile): 画像与时间区块（插铁律段之前，空则逐字符不变）（v3.9.0）"`
+
+### Task Q4: 时间感知（采集 + 注入）
+
+**Files:** Create `backend/app/time_ctx.py`；Modify `backend/app/agent.py`（单手用时打点）、`backend/app/main.py`；Test `backend/tests/test_time_ctx.py`
+**Interfaces:** `time_ctx.facts(*, now, session_start, last_game_ts, move_ts_list) -> dict`（字段见 spec 6.3 的例子）
+- [ ] **Step 1: 写失败测试**（**首手无前一手 → 单手用时不计**；跨日 / 跨时区边界；连续天数计算）
+- [ ] **Step 2-4:** 失败 → 实现 → 全量绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(agent,time): 时间感知（当前时间 / 本局时长 / 单手用时 / 间隔 / 连续天数）（v3.9.0）"`
+
+### Task Q5: 主动约战 / 提醒（连接时一次）
+
+**Files:** Modify `backend/app/agent.py`、`backend/app/main.py`；Test `backend/tests/test_agent.py`
+**Interfaces:** `AzureAgent.greet_with_context()` —— 玩家连上 / 首次交互时读「距上次对局」决定是否邀请；**模板句，不新增 LLM 调用**
+- [ ] **Step 1: 写失败测试**（**只在连接 / 首次交互触发一次**；假 LLM **断言调用数不变**）
+- [ ] **Step 2-4:** 失败 → 实现 → 全量绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(agent,time): 主动约战提醒（连接时一次，零新增调用）（v3.9.0）"`
+
+### Task Q6: 画像可视化面板（只读）
+
+**Files:** Modify `backend/app/main.py`（`GET /api/profile`）、`game/scripts/net/NetClient.gd`、`game/scripts/ui/Main.gd`；Test `game/tests/test_config.gd`（保持 24/24）
+- [ ] **Step 1: 写失败测试**（`GET /api/profile` 返回各维 + 置信度 + **来源局**；无画像 → 空结果、**不 500**）
+- [ ] **Step 2-4:** 实现 + 前端一格（只读、无副作用）→ 前端门卫全绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(api,ui): 画像可视化面板（只读）（v3.9.0）"`
+
+### Task Q7: 局末进步报告（并进现有总结）
+
+**Files:** Modify `backend/app/agent.py`（`summarize()` 提示词）、`backend/app/prompts.py`；Test `backend/tests/test_agent.py`
+- [ ] **Step 1: 写失败测试**（把「上一版画像 + 本局记录」喂进**现有** summarize 提示词；**LLM 调用数与改动前一致**）
+- [ ] **Step 2-4:** 失败 → 实现 → 全量绿
+- [ ] **Step 5: 提交** → `git commit -m "feat(agent,summary): 局末进步报告并进现有总结，不新增调用（v3.9.0）"`
+
+### Task Q8: 文档与版本（v3.9.0）
+
+**Files:** Modify `README.md`、`AGENTS.md`
+- [ ] **Step 1: 改 `README.md`** —— 第三节字段表补 `profile_enabled` / `time_aware_enabled`；说明画像四维、面板入口、「只在相关时提」的用法；「九、更新」加 v3.9.0。
+- [ ] **Step 2: 改 `AGENTS.md`** —— 补硬规则：**写入只在 `summarize()`**；**画像 / 时间块空则逐字符不变**；**时间与画像只在相关时提、禁止把数字当口头禅复述**；**`profile.db` 只是运行产物**。
+- [ ] **Step 3: 全量门卫 + 联动冒烟**。
+- [ ] **Step 4: 提交** → `git commit -m "docs(readme,agents): 棋风画像与时间感知说明（v3.9.0）"`
+
+---
+
+## 收尾（各阶段完成后）
 
 1. **一并验证**：后端全量 + `katago_service` 全量 + 三个前端 headless 脚本 + `--headless --quit`；整体联动冒烟（起后端 + 起 KataGo 服务（缺引擎也行）+ 前端 headless 连上 WS）。
-2. **两份 spec 的验收 grep**：两份设计文档里每一条「必须 / 不许 / 不得回退」都要能指到一处代码或一个测试。
+2. **四份 spec 的验收 grep**：四份设计文档里每一条「必须 / 不许 / 不得回退」都要能指到一处代码或一个测试。
 3. **parked Minor 清单**：把评审留下的次要项汇成一张表交用户分诊。
 4. **合入决策**：① 本地合回 `main` ② 推送开 PR ③ 继续保留分支——问用户。注意 `docs/`、`AGENTS.md` 与全部计划只在分支上，合并时务必带上。
+
+---
+
+## 附录 A · 优化点（本轮追加，供分诊）
+
+| # | 优化点 | 为什么 | 落点 |
+| --- | --- | --- | --- |
+| O1 | 门控做成**纯函数 + 注入 rng** | 概率逻辑最难测；注入 rng 才能复现 | Task 5 |
+| O2 | 用**频率层统一**「前 3 次」与「第 4 次起」 | 两条规则合成「资格层 + 频率层」，规则更少、更一致 | Task 5（取代旧 Task 5） |
+| O3 | **走错绕过概率、永远优先** | 纠错时刻不该被随机吞掉 | Task 5 用例 |
+| O4 | **冷却窗口**（同族 N 手内不重复讲） | 防连手讲同一个，守住「她变话多」反目标 | Task 5 |
+| O5 | 门控**只改文本 / 卡片**，事件配对与 `busy` 不碰 | 守住音画同步与 busy 硬规则 | Task 5 + Global Constraints |
+| O6 | **未命中 == 未识别**同一条出口 | 少一条分支、少一类 bug；「关掉定式＝纯点评」可直接验收 | Task 5 |
+| O7 | UI 用**一格**（开关 + 频率合一）放 v3.7 设置抽屉 | 守住「界面更挤」反目标，不新增控件位 | Task F（D1）+ Task 5 |
+| O8 | 门控决策留**一行日志**（rate / adj / roll / 命中） | 便于调参、事后归因 | Task 5 |
+| O9 | 画像**复用局内既有信号**，不新建持久化 | 减复杂度、少一个运行产物 | Task 5（可推翻） |
+| O10 | `joseki_rate` 进 `config.json` 字段表 + `/api/config` 透传 | 与既有开关同一条通道，不新造 | Task 9 |
+| O11 | **文档链接与本机工作区核对**：Spec 链接改为相对本文件夹；`G:\GodotProject\Azure-Go` 本机不存在 | 计划自洽、执行时能找到入口 | 本文档头部 + 附录 B |
+| O12 | **口径统一**：定式 spec 里其余「必说 / 开口」表述（第二节目标 1 / 2、第八节 8.2）与第五节第 5 条（频率可调）冲突，需加同一限定词「结构点走频率层，走错必说」 | 免得实现时两处口径打架（第五节第 2 条已修） | 定式 spec 第二 / 八节 |
+| O13 | **线 A/B/C 只吃既有 `moveInfos`**（含 `pv`），**不新增任何引擎分析** | 这是阶段三能否「不拖慢对局」的胜负手 | Task P1 |
+| O14 | **事件表「存储完整 / 注入有界」分离** | 「包含每个事件」与「提示词预算」本是对立；分离两者才同时成立 | Task P3 + P5 |
+| O15 | 聊天摘要**默认规则式**，LLM 版只在**局末 / 空闲**补做 | 守住「落子回合内零额外 LLM 调用」 | Task P6 |
+| O16 | 情绪波动**默认关 + 概率/胜率差双上限 + 注入 rng** | 关掉＝现状；开启也不下烂棋；可复现可测 | Task P2 |
+| O17 | **三线共用同一次分析**，代价是**更深的搜索**（`maxVisits` 100→200）；部署侧**必须显式设 `analysisPVLen`** | 实测结论：三线可行，但 `pv` 长度由 visits 决定；不增加调用次数 | Task P1 + P7 |
+| O18 | 画像用**指数衰减 EMA + 单局 α 上限** | 「微增量」的字面实现；防一局爆冷改写画像 | Task Q2 |
+| O19 | **画像块 / 时间块空则逐字符不变** + 字符预算 | 守住 `golden/prompts.json` 与提示词预算 | Task Q3 |
+| O20 | 每维**可追溯到来源局**（`games` 表只增不减） | 面板与进步报告都要「凭什么这么说」 | Task Q1 + Q6 |
+| O21 | 库被删 / 只读 / 目录不存在 → **当「无画像」**、绝不影响对局 | 沿用长期记忆那套降级纪律 | Task Q1 |
+| O22 | 时间与画像**只在相关时提**、**禁止把数字当口头禅** | 守住「她变话多」反目标 | Task Q3 + Q8 |
+| O23 | 写入走 `asyncio.to_thread`；**只在 `summarize()`** | 异步纪律；回合内**零新增调用** | Task Q1 + Q7 |
+| O24 | 进步报告**并进现有 `summarize()` 提示词** | 不新增 LLM 调用、不碰 `MAX_LLM_CALLS_PER_TURN` | Task Q7 |
+| O25 | `profile.db` 与 `memory.db` **解耦**（memory 关闭时画像照常） | 两个功能互不牵连 | Task Q1 |
+
+---
+
+## 附录 B · 结构一览（逻辑主线）
+
+```
+定式识别（Task 2：scan 统一结构）
+  └─ 资格层（Task 4 族计数 + Task 3 走错判定）        ← 该不该教
+       └─ 频率层（Task 5 门控：rate ± 画像/情绪 ±10%，冷却，走错优先）  ← 这次说不说
+            ├─ 命中 → 结构点开口（Task 7）+ 浮层卡片（Task 8）+ 事件扩字段（Task 6）
+            └─ 未命中 → 与「未识别」同一条出口：只做普通点评
+
+阶段三（v3.8.0）：
+既有 after_infos ──> 线 A / B / C（P1，零引擎调用）
+                     └─ 情绪波动开关（P2）→ A/B/C 阶梯，越偏越少；C→B→A 逐级回落
+对局事件 ──────────> 事件表（P3：带时刻、只增不减、去重）
+                     └─ 遗忘权重 → 4 档淡化（P4）→ 事件区块（P5：插铁律段之前，空则逐字符不变）
+聊天回复 ──────────> 按主题裁切入表（P6：默认零额外 LLM）
+
+阶段四（v3.9.0）：
+手动结束（summarize）──> 对局记录（Q1：games 表）──> 四维特征 + EMA 融合（Q2）──> profile
+提示词 ──────────────> 时间块 + 画像块（Q3 / Q4：插铁律段之前，空则逐字符不变）
+玩家连上 ────────────> 主动约战提醒（Q5：一次、零新增调用）
+面板 / 总结 ─────────> GET /api/profile（Q6，只读）· 进步报告并进 summarize（Q7）
+```
