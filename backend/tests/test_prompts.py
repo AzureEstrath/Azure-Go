@@ -7,8 +7,10 @@
 仅 to_black_perspective 返回浮点数用 1e-9 容差比较。
 """
 
+import asyncio
 import json
 import os
+import re
 import unittest
 
 from app import coords, prompts
@@ -389,6 +391,93 @@ class TestJosekiActiveTemplates(_Base):
         self.assertIn("Azure", azure)
         self.assertNotIn("Estarth", azure)
         self.assertNotEqual(player, azure)
+
+
+# ===================== 阶段三 · Task P5：提示词事件区块（v3.8.0）=====================
+#
+# 事件区块是**给模型看的素材**：插在长期记忆段之后、铁律段之前，空则逐字符不变；
+# 事件原文**永不进台词**。四个门卫用例名逐字照用（task-P5-brief）。
+
+
+def _ev(move_no, kind="chat", text="他和我聊过天", detail=None):
+    return {"move_no": move_no, "ts": 0.0, "kind": kind, "text": text, "detail": detail or {}}
+
+
+class TestEventBlock(_Base):
+    """`prompts.event_block` 的形状 / 预算 / 插入点，以及「原文不进台词」。"""
+
+    def test_empty_block_keeps_golden_identical(self):
+        """空 / 全部超出衰减窗口 → 空串；`context_block` 输出与没有事件时逐字符一致。"""
+        self.assertEqual(prompts.event_block([], 10), "")
+        self.assertEqual(prompts.event_block(None, 10), "")
+        # 全部超出衰减窗口（> DECAY_DROP_AT = 12 手）→ 不进提示词
+        self.assertEqual(prompts.event_block([_ev(1, text="很早的事")], 20), "")
+        self.assertEqual(prompts.event_block([{"move_no": "脏", "kind": "chat"}], 0), "")
+        self.assertEqual(prompts.event_block(["不是 dict"], 0), "")
+
+        base = prompts.context_block(MOVES_SHORT, [], [], "observe")
+        self.eq(prompts.context_block(MOVES_SHORT, [], [], "observe", events=[]), base,
+                "events=[] 时 context_block 逐字符不变")
+        self.eq(prompts.context_block(MOVES_SHORT, [], [], "observe", False, "", None, "", [], None), base,
+                "events/now_move_no 缺省与显式空值都逐字符不变")
+        # 空区块不产生任何表头
+        self.assertNotIn("本局记事", base)
+
+    def test_block_sits_before_ironclad(self):
+        """只能插在**长期记忆段之后、铁律段之前**。"""
+        ev = _ev(4, "ai_bad",
+                 "我在第4手自主偏航：没走最优的Q16，选了D4（与最优的胜率差约3%）",
+                 {"line": "b", "gtp": "D4", "best": "Q16", "drop": 0.03, "mood": "平静"})
+        out = prompts.context_block(MOVES_SHORT, [], [], "observe",
+                                    long_term="他喜欢点三三", events=[ev])
+        self.assertIn("本局记事", out)
+        self.assertIn("自主偏航", out)              # P2 留白的「自主偏航」标注已接上
+        self.assertIn("D4", out)
+        self.assertIn("Q16", out)
+        self.assertLess(out.index("长期记忆"), out.index("本局记事"))
+        self.assertLess(out.index("本局记事"), out.index("铁律"))
+        self.assertIn("A→T 从左到右", out)          # 铁律段正文没被动过
+
+        # `with_context` 走同一条路（事件区块在【现在】之前）
+        full = prompts.with_context(MOVES_SHORT, [], [], "继续下吧", "observe",
+                                    long_term="他喜欢点三三", events=[ev])
+        self.assertLess(full.index("本局记事"), full.index("【现在】"))
+
+    def test_over_budget_drops_oldest_and_lowest(self):
+        """超 `max_chars` → 丢【最旧 → 最低档】：最新的留住，最旧的先走。"""
+        evs = [_ev(i, "player_good", "他在第%d手下的这步棋方向不错、形状也好、值得记一笔" % i)
+               for i in range(1, 9)]
+        out = prompts.event_block(evs, 12, max_chars=80)
+        self.assertNotEqual(out, "")
+        nums = [int(m) for m in re.findall(r"第(\d+)手", out)]
+        self.assertIn(8, nums, "最新的一条必须留住")
+        self.assertNotIn(1, nums, "最旧的一条先被丢")
+        self.assertEqual(nums, sorted(nums, reverse=True), "渲染顺序：新 → 旧")
+        self.assertEqual(len(nums) < len(evs), True, "确实发生了丢弃")
+        # 丢掉的都是「更旧 ⇒ 档位更低」的那些：留住的手数全部大于被丢的手数
+        self.assertGreater(min(nums), 1)
+
+        # 预算连表头都放不下 → 空串（不留半截区块）
+        self.assertEqual(prompts.event_block(evs, 12, max_chars=5), "")
+
+    def test_injected_events_do_not_enter_reply(self):
+        """事件原文只进提示词（user 消息），**永不进台词**、不产生 `speech`。"""
+        from helpers import mk_agent
+
+        async def run():
+            agent, _eng, llm, bus = mk_agent()
+            agent.event_log.add("chat", 0, "他和我聊了关于「定式」的话题", {"topic": "定式"})
+            await agent.chat("这手定式不错")
+            return llm, bus
+
+        llm, bus = asyncio.run(run())
+        prompt_text = " ".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertIn("本局记事", prompt_text)      # 素材进了提示词
+        self.assertIn("定式", prompt_text)
+        joined = " ".join(str(e.get("text", "")) for e in bus.messages())
+        self.assertNotIn("本局记事", joined)        # 但没进任何台词
+        self.assertNotIn("他和我聊了关于", joined)
+        self.assertEqual([e for e in bus.of_type("speech")], [], "未接 TTS：一条 speech 都不发")
 
 
 class TestGoldenFrozen(_Base):

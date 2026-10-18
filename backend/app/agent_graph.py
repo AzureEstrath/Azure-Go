@@ -358,7 +358,8 @@ async def _prepare_after_player(agent, data):
     return agent._phase_messages(
         "after_player",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
-                             eval_prompt, "after_player", False, agent.st.last_katago, agent.st.board),
+                             eval_prompt, "after_player", False, agent.st.last_katago, agent.st.board,
+                             events=agent.event_log.all()),
         len_note=agent._len_note(teach=(jk_teach and jk_kind in ("entered", "branch", "formed"))),
     )
 
@@ -456,7 +457,7 @@ async def _prepare_just_moved(agent, data):
         "just_moved",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
                              ai_eval_prompt, "just_moved", False, agent.st.last_katago, agent.st.board,
-                             data.get("lt")),
+                             data.get("lt"), events=agent.event_log.all()),
     )
 
 
@@ -484,7 +485,8 @@ async def _prepare_observe(agent, data):
     return agent._phase_messages(
         "observe",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
-                             prompt, "observe", False, agent.st.last_katago, agent.st.board),
+                             prompt, "observe", False, agent.st.last_katago, agent.st.board,
+                             events=agent.event_log.all()),
     )
 
 
@@ -513,7 +515,8 @@ async def _prepare_analyze(agent, data):
     return agent._phase_messages(
         "analyze",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
-                             prompt, "analyze", False, agent.st.last_katago, agent.st.board),
+                             prompt, "analyze", False, agent.st.last_katago, agent.st.board,
+                             events=agent.event_log.all()),
     )
 
 
@@ -529,7 +532,7 @@ async def _prepare_chat(agent, data):
         msgs = [
             agent._sys_msg(),
             agent._user_msg(prompts.context_block(agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True, agent.st.last_katago, agent.st.board,
-                                                  long_term=lt)),
+                                                  long_term=lt, events=agent.event_log.all())),
         ]
         hist = agent.st.chat_history
         upto = len(hist) - 1            # 最后一条是刚追加的这句，下面单独发，避免重复
@@ -549,7 +552,8 @@ async def _prepare_idle(agent, data):
     prompt = "Estarth 已经有一段时间没有动静了，你有点好奇他在做什么。主动对他说一句很短的话（20字以内）：问问他还在不在、在忙什么，或要不要继续下棋、聊聊天。慵懒、亲切，1句。"
     return [
         agent._sys_msg(),
-        agent._user_msg(prompts.context_block(agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True, agent.st.last_katago, agent.st.board)),
+        agent._user_msg(prompts.context_block(agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True, agent.st.last_katago, agent.st.board,
+                                              events=agent.event_log.all())),
         {"role": "user", "content": prompt},
     ]
 
@@ -584,7 +588,8 @@ async def _prepare_summary(agent, data):
     return agent._phase_messages(
         "summary",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
-                             prompt, "summary", False, agent.st.last_katago, agent.st.board),
+                             prompt, "summary", False, agent.st.last_katago, agent.st.board,
+                             events=agent.event_log.all()),
     )
 
 
@@ -664,7 +669,8 @@ async def _decide_own_turn(agent, data):
     return agent._phase_messages(
         "own_turn",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
-                             think_prompt, "own_turn", False, agent.st.last_katago, agent.st.board, lt),
+                             think_prompt, "own_turn", False, agent.st.last_katago, agent.st.board, lt,
+                             events=agent.event_log.all()),
     )
 
 

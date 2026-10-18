@@ -7,8 +7,12 @@
 是后端长期记忆新增的，Godot 版没有；``long_term`` 为空串时输出仍与 Godot 版逐字符一致。
 """
 
-from . import coords
+from . import coords, decay
 from .board import GoBoard, SIZE as BOARD_SIZE
+
+# 事件区块的字符预算（设计 §5-I / §6.5）：与 ``memory_max_inject_chars``（240）同量级。
+# 它限制的是**注入层**——事件表本身存储完整、不截断；超预算时按「最旧 → 最低档」丢弃。
+EVENT_BLOCK_MAX_CHARS = 240
 
 # 身份底座（personality / reply_style / think_preference 三段）
 SYSTEM_PROMPT = "\r\n".join([
@@ -317,12 +321,156 @@ def long_term_note(text):
         + "只在与眼前盘面不冲突时自然参考，拿不准就按眼前这盘棋来。") % t
 
 
+# ================= 事件区块（v3.8.0，设计 §6.5） =================
+#
+# **组装位置（区块表）**——这张表就是「整条提示词怎么拼」的权威说明，改区块先改这里：
+#
+# | 区块 | 来源 | 插入点 | 上限 / 失效条件 |
+# | --- | --- | --- | --- |
+# | 事件区块（本函数） | `EventLog.all()` + `decay.level()` | **长期记忆段之后、铁律段之前** | `EVENT_BLOCK_MAX_CHARS`；超 `DECAY_DROP_AT`（12 手）失效 |
+# | 铁律段（逐字符锁定） | 本文件内联 | 原位置（事件区块之后） | `tests/golden/prompts.json` |
+# | 棋谱 / 记忆 / 聊天（既有） | `board_map` / `memory_brief` / `chat_brief` | 原位置（事件区块之前） | 既有上限 |
+#
+# 三条不能回退的硬规则：
+#   ① **空则逐字符不变**——`events` 为空 / 全部超出衰减窗口时返回 `''`，`context_block` 里
+#      与没有这个参数时逐字符一致（golden 锁定）；
+#   ② **事件原文永不进台词**——这里的文本只喂给模型（user 消息），不产生 `speech`、不进 `message`；
+#   ③ **存储完整、注入有界**——`EventLog` 只增不减、不截断；本函数是唯一的注入闸门（档位 + 预算）。
+
+# 各类事件「只剩类别」时的兜底说法（档 4 / 正文缺失时用），不放可被照抄的示例句。
+_KIND_WORD = {
+    "ai_bad": "我走过一手偏",
+    "player_bad": "他下过一手不太好的棋",
+    "player_good": "他下过一手好棋",
+    "chat": "他和我聊过天",
+    "joseki": "这一片走过定式",
+}
+
+
+def _one_line(text, limit):
+    """折叠空白 + 超长截断（事件正文进提示词前统一过这一道）。"""
+    t = " ".join(str(text if text is not None else "").split())
+    if limit <= 0 or len(t) <= limit:
+        return t
+    return t[:limit] + "…"
+
+
+def _kind_word(kind):
+    return _KIND_WORD.get(str(kind or ""), "本局有过一件事")
+
+
+def _as_move_key(v):
+    """手数排序键：转不出数字的一律排在最旧一侧（``-1``），不抛。"""
+    if isinstance(v, bool):
+        return -1
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _ai_bad_line(ev, lv):
+    """``ai_bad``（自主偏航）按档位渲染：档 1 带最优/所选/胜率差，档 4 只留方位。
+
+    数据源＝P2 写的事件（``detail.line/gtp/best/drop``）；这里**只读**，缺字段就降级到信息更少的那一档，
+    绝不拼半句话（与 ``decay.bad_move_phrase`` 同一口径）。
+    """
+    detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
+    n = ev.get("move_no")
+    gtp = str(detail.get("gtp") or "")
+    best = str(detail.get("best") or "")
+    if lv <= 1:
+        s = "我在第%s手自主偏航" % n
+        if best and gtp:
+            s += "：没走最优的%s，选了%s" % (best, gtp)
+        elif gtp:
+            s += "，选了%s" % gtp
+        try:
+            d = float(detail.get("drop"))
+            s += "（与最优的胜率差约%d%%）" % int(round(d * 100.0))
+        except (TypeError, ValueError):
+            pass
+        return s
+    if lv <= 2 and gtp:
+        return "我在第%s手自主偏航，选了%s" % (n, gtp)
+    if lv <= 3:
+        return "我在第%s手自主偏航了一手" % n
+    where = decay.corner_word(*coords.gtp_to_xy(gtp)) if gtp else ""
+    if where:
+        return "我在%s自主偏航过一手" % where
+    return "我自主偏航过一手"
+
+
+def _event_line(ev, lv):
+    """单条事件按档位渲染成一行（信息量随档位递减，档 1→4）。"""
+    if str(ev.get("kind") or "") == "ai_bad":
+        return _ai_bad_line(ev, lv)
+    text = _one_line(ev.get("text"), 48 if lv <= 2 else 24)
+    if lv <= 3 and text != "":
+        return text
+    return _kind_word(ev.get("kind"))
+
+
+def event_block(events, now_move_no, max_chars=EVENT_BLOCK_MAX_CHARS) -> str:
+    """把事件表渲染成一段给模型看的素材；``events`` 为空 / 全部超出衰减窗口 → 返回 ``''``。
+
+    - 渲染顺序：**新 → 旧**（最近发生的排在最前）；
+    - 档位：``decay.level(事件手数, now_move_no)``，返回 ``DECAY_DROPPED``(0) 的事件**不进**区块；
+    - 超预算：丢【**最旧 → 最低档**】——先丢手数最小的（最旧），同龄（同一手）里先丢档位最低
+      （信息量最少，档 4）的那条；丢到放得下为止，一条都不剩时返回 ``''``。
+
+    本函数是**纯函数**（O(事件数) 比较与拼接），不调引擎、不调 LLM、不发事件——事件原文只进提示词。
+    """
+    items = []
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+        lv = decay.level(ev.get("move_no"), now_move_no)
+        if lv <= 0:                                     # 超出衰减窗口 / 脏时刻：不进提示词
+            continue
+        line = _event_line(ev, lv)
+        if line == "":
+            continue
+        items.append({"move_no": ev.get("move_no"), "level": lv, "line": line})
+    if not items:
+        return ""
+    header = "\n\n【本局记事 · 发生过的事，只作回忆，别照抄、也别主动提起】\n"
+
+    # 渲染顺序：新 → 旧（手数大的在前）；同手数保持写入顺序（Python 排序稳定）
+    order = sorted(range(len(items)), key=lambda i: _as_move_key(items[i]["move_no"]), reverse=True)
+    lines = [items[i]["line"] for i in order]
+
+    def _size(ls):
+        return len(header) + sum(len(x) for x in ls) + max(0, len(ls) - 1)
+
+    if len(header) > max_chars:
+        return ""                                       # 预算连表头都放不下：不留半截区块
+    if _size(lines) > max_chars:
+        # 丢弃优先级：最旧优先；同龄里档位最低（信息量最少）优先
+        drop_order = sorted(range(len(lines)),
+                            key=lambda j: (_as_move_key(items[order[j]]["move_no"]),
+                                           -items[order[j]]["level"]))
+        dropped = set()
+        for j in drop_order:
+            if _size([lines[k] for k in range(len(lines)) if k not in dropped]) <= max_chars:
+                break
+            dropped.add(j)
+        lines = [lines[k] for k in range(len(lines)) if k not in dropped]
+    if not lines:
+        return ""
+    return header + "\n".join(lines)
+
+
 def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, katago="", board=None,
-                  long_term=""):
+                  long_term="", events=None, now_move_no=None):
     """board：调用方已有的现成棋盘，给了就直接用。
 
     long_term：跨局长期记忆的召回文本，插在「【最近的对话】」之后、铁律段之前；
     空串＝不注入，此时输出与没有这个参数时逐字符一致。
+
+    events / now_move_no：**事件区块**（v3.8.0）——插在长期记忆段之后、铁律段之前；
+    ``events`` 为空 / 全部超出衰减窗口时区块为空串，输出逐字符不变。``now_move_no`` 缺省取
+    ``len(moves)``（当前手数）。
     """
     hist = chat_history
     if skip_last_chat and len(hist) > 0:
@@ -333,6 +481,7 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
         + "\n【落子评定存档（E=Estarth黑 / A=Azure白）· 只作回忆参考，别照抄、别改写里面的句子】\n%s"
         + "\n【最近的对话】\n%s"
         + "%s"                                   # 长期记忆段（空串时不留痕）
+        + "%s"                                   # 事件区块（空串时不留痕，见上方区块表）
         + "\n（铁律 · 先核对再开口：\n"
         + "1) 只要这句话与棋局有关，动笔前先看【当前棋面】：要提到某片区域/某个点「有子、没子、模样、实地、厚薄」时，必须能在上面的「现有棋子」里找到依据；那里没有的子一律不许提，拿不准就只说方向、不点具体子，绝不凭印象编。凡说「左/右/上/下」必须先按坐标核对：字母是列（A→T 从左到右）、数字是行（19→1 从上到下）；两子字母相同只能说「上下」、数字相同才算「左右」；核对不上就别说方位词，改说「这一带」。\n"
         + "2) 与棋局有关的每一句都要扣住「最近一手」和当前盘面，接着此刻的形势、以及你上一句的感受往下说；用「我 / 你」的第一人称视角，别像解说员那样说「黑方 / 白棋」，也别复述、别自说自话。\n"
@@ -346,14 +495,16 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
         memory_brief(memory_log),
         chat_brief(hist),
         long_term_note(long_term),
+        event_block(events or [], len(moves) if now_move_no is None else now_move_no),
     )
     return _t(block)
 
 
 def with_context(moves, memory_log, chat_history, prompt, phase, skip_last_chat=False, katago="", board=None,
-                 long_term=""):
-    """在原提示词前附上对局全貌与回忆（原提示词本身不改动）；``long_term`` 原样转给 ``context_block``。"""
-    return _t(context_block(moves, memory_log, chat_history, phase, skip_last_chat, katago, board, long_term)
+                 long_term="", events=None, now_move_no=None):
+    """在原提示词前附上对局全貌与回忆（原提示词本身不改动）；``long_term`` / ``events`` 原样转给 ``context_block``。"""
+    return _t(context_block(moves, memory_log, chat_history, phase, skip_last_chat, katago, board, long_term,
+                            events, now_move_no)
               + "\n\n【现在】\n" + prompt)
 
 
