@@ -10,6 +10,7 @@ import random
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1427,6 +1428,74 @@ class ChatEventTest(unittest.TestCase):
             return len(llm.calls), len(agent.katago.calls)
 
         self.assertEqual(asyncio.run(run(False)), asyncio.run(run(True)))
+
+
+class SlowLLM:
+    """`chat` 慢返回（用于验证补做路径自带超时）。"""
+
+    think_mode = 0
+    base_url = "https://api.example.com/v1"
+
+    async def chat(self, messages, max_tokens=300, no_think=False):
+        await asyncio.sleep(1.0)
+        return "定式：聊了点三三"
+
+
+class ChatDigestFailureTest(unittest.TestCase):
+    """修复轮 1 / Important #1：LLM **失败文案**（不抛异常）绝不许落进事件表。"""
+
+    def _seeded(self):
+        agent, _eng, _llm, _bus = _mk()
+        agent.chat_digest_llm = True
+        agent.st.chat_history = [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "嗯~ 你好呀"},
+        ]
+        return agent
+
+    def test_llm_failure_text_never_enters_event_log(self):
+        """假 LLM 返回「调用出错：…」⇒ 事件表零新增，提示词里也不出现该文案。"""
+        from app import prompts
+
+        agent = self._seeded()
+        agent.llm = ErrLLM()                        # chat 返回「调用出错：HTTP 401（…）」，不抛
+        n = asyncio.run(agent._digest_chat_llm())
+        self.assertEqual(n, 0)
+        self.assertEqual([e for e in agent.event_log.all() if e["kind"] == "chat"], [],
+                         "失败文案绝不许落表")
+        out = prompts.context_block(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
+                                    "chat", events=agent.event_log.all())
+        self.assertNotIn("调用出错", out)
+        self.assertNotIn("llm_base_url", out)
+
+    def test_record_digest_lines_rejects_failure_lines(self):
+        """第二道闸门：即便有人绕过 `_digest_chat_llm` 直接喂失败文案，也不写。"""
+        agent = self._seeded()
+        self.assertEqual(agent._record_digest_lines("调用出错：未配置 LLM 地址（llm_base_url）"), 0)
+        self.assertEqual(agent.event_log.all(), [])
+        # 正常行照旧能写（闸门不能把好行也挡掉）
+        self.assertEqual(agent._record_digest_lines("定式：聊了点三三"), 1)
+        self.assertEqual(len(agent.event_log.all()), 1)
+
+    def test_digest_llm_has_its_own_timeout(self):
+        """Minor #4：补做路径自带单次超时，不等满 LLM 的 120s。"""
+        from app import agent as agent_mod
+
+        async def run():
+            agent = self._seeded()
+            agent.llm = SlowLLM()
+            old = agent_mod.CHAT_DIGEST_TIMEOUT_SEC
+            agent_mod.CHAT_DIGEST_TIMEOUT_SEC = 0.05
+            try:
+                t0 = time.monotonic()
+                n = await agent._digest_chat_llm()
+                return n, time.monotonic() - t0
+            finally:
+                agent_mod.CHAT_DIGEST_TIMEOUT_SEC = old
+
+        n, dt = asyncio.run(run())
+        self.assertEqual(n, 0)
+        self.assertLess(dt, 0.9, "超时必须自己兜住（慢 LLM 睡 1 秒，补做不该等它）")
 
 
 # ================= 情绪波动：小概率走偏优解（v3.8.0，默认关） =================

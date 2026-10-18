@@ -9,7 +9,8 @@
     POST /api/undo        {turn}            俗手回档
     POST /api/reset                         重开一局
     POST /api/config      {allow_pass}      允许虚着开关（另见 limit_len / joseki_teach / joseki_rate /
-                                            emotion_drift / drift_base / drift_max / pv_max_drop / tools_enabled）
+                                            emotion_drift / drift_base / drift_max / pv_max_drop /
+                                            chat_digest_llm / tools_enabled）
     POST /api/reveal                        落子宣告语音开始（需要 round-trip 的客户端）
     POST /api/interaction {what}            玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话

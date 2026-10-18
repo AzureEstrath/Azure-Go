@@ -370,17 +370,20 @@ def _as_move_key(v):
 
 
 def _ai_bad_line(ev, lv):
-    """``ai_bad``（自主偏航）按档位渲染：档 1 带最优/所选/胜率差，档 4 只留方位。
+    """``ai_bad``（自主偏航）按档位渲染：档 1 带线号/最优/所选/胜率差，档 4 只留方位。
 
     数据源＝P2 写的事件（``detail.line/gtp/best/drop``）；这里**只读**，缺字段就降级到信息更少的那一档，
-    绝不拼半句话（与 ``decay.bad_move_phrase`` 同一口径）。
+    绝不拼半句话（与 ``decay.bad_move_phrase`` 同一口径）。``detail.line`` 是偏航选的**线号**
+    （``b`` / ``c``，见 ``pv_lines``），档 1 / 档 2 里渲染成「走的是 B 线」，让模型知道她这次没走 A。
     """
     detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
     n = ev.get("move_no")
     gtp = str(detail.get("gtp") or "")
     best = str(detail.get("best") or "")
+    letter = str(detail.get("line") or "").strip().upper()
+    tag = "（走的是%s线）" % letter if letter in ("A", "B", "C") else ""
     if lv <= 1:
-        s = "我在第%s手自主偏航" % n
+        s = "我在第%s手自主偏航%s" % (n, tag)
         if best and gtp:
             s += "：没走最优的%s，选了%s" % (best, gtp)
         elif gtp:
@@ -392,7 +395,7 @@ def _ai_bad_line(ev, lv):
             pass
         return s
     if lv <= 2 and gtp:
-        return "我在第%s手自主偏航，选了%s" % (n, gtp)
+        return "我在第%s手自主偏航%s，选了%s" % (n, tag, gtp)
     if lv <= 3:
         return "我在第%s手自主偏航了一手" % n
     where = decay.corner_word(*coords.gtp_to_xy(gtp)) if gtp else ""

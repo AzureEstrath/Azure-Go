@@ -407,13 +407,21 @@ class TestEventBlock(_Base):
     """`prompts.event_block` 的形状 / 预算 / 插入点，以及「原文不进台词」。"""
 
     def test_empty_block_keeps_golden_identical(self):
-        """空 / 全部超出衰减窗口 → 空串；`context_block` 输出与没有事件时逐字符一致。"""
+        """空 / 全部超出衰减窗口 → 空串；`context_block` 输出与 **golden** 逐字符一致。"""
         self.assertEqual(prompts.event_block([], 10), "")
         self.assertEqual(prompts.event_block(None, 10), "")
         # 全部超出衰减窗口（> DECAY_DROP_AT = 12 手）→ 不进提示词
         self.assertEqual(prompts.event_block([_ev(1, text="很早的事")], 20), "")
         self.assertEqual(prompts.event_block([{"move_no": "脏", "kind": "chat"}], 0), "")
         self.assertEqual(prompts.event_block(["不是 dict"], 0), "")
+
+        # 真的读 golden（`tests/golden/prompts.json` 的 context_block 样本）：事件为空时逐字符相等
+        for c in self.data["context_block"]:
+            board = None if c["board"] == "null" else _board(c["board"])
+            self.eq(prompts.context_block(
+                _moves(c["moves"]), _memory(c["memory"]), _chat(c["chat"]), c["phase"],
+                c["skip_last_chat"], c["katago"], board, events=[]),
+                c["result"], "events=[] vs golden board=%s phase=%s" % (c["board"], c["phase"]))
 
         base = prompts.context_block(MOVES_SHORT, [], [], "observe")
         self.eq(prompts.context_block(MOVES_SHORT, [], [], "observe", events=[]), base,
@@ -432,6 +440,7 @@ class TestEventBlock(_Base):
                                     long_term="他喜欢点三三", events=[ev])
         self.assertIn("本局记事", out)
         self.assertIn("自主偏航", out)              # P2 留白的「自主偏航」标注已接上
+        self.assertIn("走的是B线", out)             # 偏航选的线号（detail.line）也进区块
         self.assertIn("D4", out)
         self.assertIn("Q16", out)
         self.assertLess(out.index("长期记忆"), out.index("本局记事"))

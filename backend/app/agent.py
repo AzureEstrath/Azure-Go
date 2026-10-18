@@ -132,6 +132,7 @@ CHAT_TOPIC_WINDOW = 6           # 主题裁切的时间窗：只看最近 6 条�
 CHAT_TOPIC_SUMMARY_CHARS = 40   # 单段摘要上限（进事件表前截断）
 CHAT_DIGEST_MAX_MSGS = 12       # LLM 补做时喂进去的聊天条数上限（可选路径，默认不走）
 CHAT_DIGEST_MAX_TOKENS = 200    # LLM 补做的输出上限
+CHAT_DIGEST_TIMEOUT_SEC = 10    # LLM 补做的单次超时：它跑在 `_turn_guard` 之外，必须自带上限
 # 主题关键词表（按序优先：一条消息命中多类时取最靠前的那一类）；核不上归「闲聊」。
 # 这里只是**分类用词**，不进提示词，也不放可被模型照抄的示例句。
 CHAT_TOPIC_RULES = (
@@ -147,7 +148,7 @@ CHAT_TOPIC_DEFAULT = "闲聊"
 
 
 def _chat_topic_of(text):
-    """一条玩家发言的主题：命中 ``CHAT_TOPIC_RULES`` 里最靠前的一类，返回 ``(主题, 命中的词)``。"""
+    """一条消息的主题：命中 ``CHAT_TOPIC_RULES`` 里最靠前的一类，返回 ``(主题, 命中的词)``。"""
     t = str(text or "")
     for topic, words in CHAT_TOPIC_RULES:
         for w in words:
@@ -159,39 +160,41 @@ def _chat_topic_of(text):
 def chat_topics(history, window=CHAT_TOPIC_WINDOW):
     """规则式主题裁切：把最近聊天按关键词分段，返回 ``[(主题, 摘要)]``（旧 → 新）。
 
-    - **时间窗**：``chat_history`` 里没有墙钟，用「最近 ``window`` 条玩家发言」当窗口
-      （与 ``chat_brief`` 的 6 条同量级）；窗口取的是**从开局起**那段历史的尾部，所以覆盖不止这一轮；
-    - **关键词 / 相似度**：命中 ``CHAT_TOPIC_RULES`` 里最靠前的一类即为该条的主题，核不上归「闲聊」；
-      主题相同的连续玩家发言并成一段（相似度＝同类关键词）；
-    - **摘要**：由该段命中的关键词用模板拼出（非 LLM），同关键词集合 ⇒ 摘要稳定 ⇒ 去重命中；
+    - **时间窗**：``chat_history`` 里没有墙钟，用「最近 ``window`` 条**玩家**发言（连同其后的回复）」
+      当窗口（与 ``chat_brief`` 的 6 条同量级）；窗口取的是**从开局起**那段历史的尾部，覆盖不止这一轮；
+    - **关键词 / 相似度**：玩家发言命中 ``CHAT_TOPIC_RULES`` 里最靠前的一类即为该段的主题，
+      核不上归「闲聊」；主题相同的连续玩家发言并成一段（相似度＝同类关键词）；
+    - **两侧都用**（设计 §6.6：输入＝这轮玩家消息 **+ 她的回复**）：主题由玩家发言定，
+      但段的摘要同时收两侧命中的关键词 ——「他说到 X」用玩家那侧、「我聊到 Y」用她那侧；
+      她没回关键词时写成「我回应了」（**与有没有她的回复无关地稳定**，故去重不会被回合数打散）；
     - **纯函数、零 LLM**：不碰 ``self``，可直接在事件写入路径上调用。
     """
-    msgs = [str(m.get("content", "")) for m in (history or [])
-            if isinstance(m, dict) and str(m.get("role", "")) == "user"]
-    if window and window > 0:
-        msgs = msgs[-int(window):]
-    segs = []                                   # [主题, [命中的关键词]]
-    for t in msgs:
-        topic, kw = _chat_topic_of(t)
-        if segs and segs[-1][0] == topic:
-            if kw and kw not in segs[-1][1]:
-                segs[-1][1].append(kw)
-        else:
-            segs.append([topic, [kw] if kw else []])
+    msgs = [m for m in (history or [])
+            if isinstance(m, dict) and str(m.get("role", "")) in ("user", "assistant")]
+    uidx = [i for i, m in enumerate(msgs) if str(m.get("role", "")) == "user"]
+    if window and window > 0 and len(uidx) > window:
+        msgs = msgs[uidx[-int(window)]:]          # 窗口从「第 window 近的玩家发言」起，带上其后回复
+    segs = []                                     # [主题, [他那侧的关键词], [她那侧的关键词]]
+    for m in msgs:
+        role = str(m.get("role", ""))
+        topic, kw = _chat_topic_of(str(m.get("content", "")))
+        if role == "user":
+            if segs and segs[-1][0] == topic:
+                if kw and kw not in segs[-1][1]:
+                    segs[-1][1].append(kw)
+            else:
+                segs.append([topic, [kw] if kw else [], []])
+        else:                                     # 她的回复：并进当前段（段还没起就从「闲聊」起）
+            if not segs:
+                segs.append([CHAT_TOPIC_DEFAULT, [], []])
+            if kw and kw not in segs[-1][2]:
+                segs[-1][2].append(kw)
     out = []
-    for topic, kws in segs:
-        summary = ("聊到%s" % "、".join(kws)) if kws else "随便聊了几句"
-        out.append((topic, _one_line_text(summary, CHAT_TOPIC_SUMMARY_CHARS)))
+    for topic, his, mine in segs:
+        his_s = ("他说到%s" % "、".join(his)) if his else "他随口聊了几句"
+        mine_s = ("我聊到%s" % "、".join(mine)) if mine else "我回应了"
+        out.append((topic, prompts._one_line("%s，%s" % (his_s, mine_s), CHAT_TOPIC_SUMMARY_CHARS)))
     return out
-
-
-def _one_line_text(text, limit):
-    """折叠空白 + 截断（与 ``prompts._one_line`` 同口径，事件表侧自带一份，避免跨模块耦合）。"""
-    t = " ".join(str(text if text is not None else "").split())
-    if limit <= 0 or len(t) <= limit:
-        return t
-    return t[:limit] + "…"
-
 
 
 def _discard_task(task):
@@ -1598,7 +1601,10 @@ class AzureAgent:
         - **去重**：交给事件表（``kind`` + 归一化 ``text``）——主题 + 摘要命中已存在时 ``add`` 返回
           ``None``，因此重复主题不会反复写入（设计 §6.6「不要反复写入同一内容」）；
         - 事件原文是**给模型看的素材**：永不进台词、不产生 ``speech``；
-        - 手数取当前 ``len(st.moves)``；任何异常只打日志，绝不影响对局。
+        - **补写段用当前手数**（Minor #1，有意保留）：窗口里未写过的旧段这次一并补上，手数一律取
+          ``len(st.moves)``（当前手数）——事件表只增不减、不随悔棋回退，用「补写时刻」比用「原始手数」
+          更简单也不会造出比当前还新的时刻；代价是旧段的手数不精确，但衰减只按「从现在往回数」用，够用；
+        - 任何异常只打日志，绝不影响对局。
         """
         try:
             segs = chat_topics(self.st.chat_history)
@@ -1615,7 +1621,14 @@ class AzureAgent:
         return n
 
     def _record_digest_lines(self, out) -> int:
-        """把 LLM 补做的「主题：摘要」逐行写进事件表（解析不出的行直接丢，绝不抛）。"""
+        """把 LLM 补做的「主题：摘要」逐行写进事件表（解析不出的行直接丢，绝不抛）。
+
+        **失败文案闸门**（Important #1）：``LLMClient.chat`` 失败时**不抛异常**，返回「调用出错：…」/
+        「唔...我脑子有点转不过来了」这类文案；整段与单行都再挡一次——否则「调用出错」会被按「：」
+        切成 ``topic``、当成一条 ``chat`` 事件落表，再经事件区块注入后续每一条提示词。
+        """
+        if self._llm_failed(out):                   # 整段就是失败文案：一条都不写
+            return 0
         move_no = len(self.st.moves)
         n = 0
         for raw in str(out or "").splitlines():
@@ -1629,9 +1642,9 @@ class AzureAgent:
             else:
                 continue
             topic = " ".join(topic.split())
-            summary = _one_line_text(summary, CHAT_TOPIC_SUMMARY_CHARS)
-            if topic == "" or summary == "":
-                continue
+            summary = prompts._one_line(summary, CHAT_TOPIC_SUMMARY_CHARS)
+            if topic == "" or summary == "" or self._llm_failed(topic):
+                continue                            # 单行 topic 像失败文案（「调用出错」等）：跳过
             ev = self.event_log.add("chat", move_no, "%s：%s" % (topic, summary),
                                     {"topic": topic, "summary": summary, "source": "llm"})
             if ev is not None:
@@ -1642,7 +1655,9 @@ class AzureAgent:
         """可选（``chat_digest_llm=true``）：用 LLM 分段总结聊天并写进事件表。
 
         **只在局末 ``summarize()`` 与空闲 ``idle_remark()`` 补做**——落子 / 聊天回合内一次都不调
-        （性能红线）。未启用 / 没聊过 / LLM 报错 / 解析不出都只打日志并返回 0，绝不影响对局。
+        （性能红线）。它跑在 ``_turn_guard`` 之外，所以自带 ``CHAT_DIGEST_TIMEOUT_SEC`` 单次超时
+        （Minor #4：不给端点留两分钟的尾巴）；未启用 / 没聊过 / LLM 失败 / 超时 / 解析不出都只打日志
+        并返回 0，绝不影响对局，也不动 ``busy`` 的归位位置。
         """
         if not self.chat_digest_llm or self.llm is None:
             return 0
@@ -1660,9 +1675,17 @@ class AzureAgent:
                   "格式为「主题：一句话摘要」，主题用两到四个字，摘要不超过二十字；"
                   "不要复述原话，不要输出别的解释。\n\n" + "\n".join(lines))
         try:
-            out = await self.llm.chat([{"role": "user", "content": prompt}], CHAT_DIGEST_MAX_TOKENS)
+            out = await asyncio.wait_for(
+                self.llm.chat([{"role": "user", "content": prompt}], CHAT_DIGEST_MAX_TOKENS),
+                CHAT_DIGEST_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            print("[Agent] 聊天 LLM 摘要超时（%d 秒，已忽略）" % CHAT_DIGEST_TIMEOUT_SEC)
+            return 0
         except Exception as e:                      # noqa: BLE001
             print("[Agent] 聊天 LLM 摘要异常（已忽略）：%s" % e)
+            return 0
+        if self._llm_failed(out):                   # 失败文案**不抛异常**，必须在这里挡一次
+            print("[Agent] 聊天 LLM 摘要失败（返回错误文案，已忽略）")
             return 0
         return self._record_digest_lines(out)
 
