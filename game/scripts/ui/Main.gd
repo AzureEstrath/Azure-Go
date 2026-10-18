@@ -110,6 +110,8 @@ var _status_bad := false                       # 状态栏当前是不是错误�
 var _tool_active := false                      # 工具进度是否在跑（start/end 成对，避免重复记原文案）
 var _chk_pass: CheckBox
 var _chk_joseki: CheckBox
+var _btn_settings: Button                         # ⚙ 设置抽屉的开关
+var _settings_box: PanelContainer                 # ⚙ 设置抽屉本体（同步说话 / 整段合成 / 长句合并，默认收起）
 var _bad_box: HBoxContainer
 var _chat_input: LineEdit
 var _lbl_queue: Label                           # 右下角那行「排队中 N 条 · 队头前几个字」（队列空则隐藏）
@@ -377,18 +379,31 @@ func _build_right_panel(root: Control) -> void:
 	_style_check(_chk_joseki, "定式导学")
 	info.add_child(_chk_joseki)
 
-	# 语音开关（短回复、同步说话、整段合成、长句合并，均立即生效）
-	var acc := GridContainer.new()
-	acc.columns = 2
-	acc.add_theme_constant_override("h_separation", 12)
+	# 语音开关：短回复（对局常用，留外面）；同步说话 / 整段合成 / 长句合并进 ⚙ 设置抽屉（默认收起，均立即生效）
+	var acc := HBoxContainer.new()
+	acc.add_theme_constant_override("separation", 12)
 	vb.add_child(acc)
 	_acc_check(acc, "短回复", cfg.tts_limit_len, "len",
 		"限制 Azure 每次只说 1~2 句：语音等待时间随字数下降（立即生效）")
-	_acc_check(acc, "同步说话", cfg.tts_sync_speak, "sync",
+	_btn_settings = Button.new()
+	_btn_settings.text = "⚙ 设置 ▸"
+	_btn_settings.toggle_mode = true
+	_btn_settings.tooltip_text = "一次性设置：同步说话 / 整段合成 / 长句合并（都立即生效，改完写回 config.json）"
+	_btn_settings.toggled.connect(_on_settings_toggled)
+	acc.add_child(_btn_settings)
+
+	_settings_box = PanelContainer.new()
+	_settings_box.visible = false                  # 默认收起：右栏只留对局常用项
+	_settings_box.add_theme_stylebox_override("panel", _style(Color(0.965, 0.98, 0.98), 6, 10))
+	vb.add_child(_settings_box)
+	var drawer := VBoxContainer.new()
+	drawer.add_theme_constant_override("separation", 6)
+	_settings_box.add_child(drawer)
+	_acc_check(drawer, "同步说话", cfg.tts_sync_speak, "sync",
 		"开启：Azure 的文字等语音就绪后一起显示（消除文字先出、声音晚到的割裂感）；关闭：文字立即显示")
-	_acc_check(acc, "整段合成", cfg.tts_batch_speak, "batch",
+	_acc_check(drawer, "整段合成", cfg.tts_batch_speak, "batch",
 		"开启：Azure 连发的多条消息合并成一段、连续朗读；关闭：逐句合成，第一句播完等第二句合成（想边听边等选它）")
-	_acc_check(acc, "长句合并", cfg.tts_long_chunk, "chunk",
+	_acc_check(drawer, "长句合并", cfg.tts_long_chunk, "chunk",
 		"单次 TTS 合成字数上限：关=100（更快出第一句，默认）；开=160（长句一次合成、但首句更慢）")
 
 	# 聊天区
@@ -1739,6 +1754,13 @@ func _on_busy_changed(busy: bool) -> void:
 func _on_allow_pass_toggled(pressed: bool) -> void:
 	pairing.mark_text_only()                 # 这条提示只有文字（后端同步方法，T20②）
 	agent.set_allow_pass(pressed)
+
+## ⚙ 设置抽屉：只切可见性，不改任何开关的值（抽屉里的开关仍各自写回 config.json）
+func _on_settings_toggled(on: bool) -> void:
+	if _settings_box != null:
+		_settings_box.visible = on
+	if _btn_settings != null:
+		_btn_settings.text = "⚙ 设置 ▾" if on else "⚙ 设置 ▸"
 
 ## 定式导学开关（右侧栏）：写回 config.json，并对当前对局立即生效
 func _on_joseki_toggled(pressed: bool) -> void:
