@@ -427,6 +427,15 @@ class AzureAgent:
         #    ``reset_game`` 清空（新一局不带旧账）。
         self.event_log = EventLog()
 
+        # —— 时间感知的采集（v3.9.0，设计 §5-H）：**单手用时的采集是纯后端的**（不要求前端配合）——
+        #    ``session_start`` ＝ 本局开始时刻（本局第一手到达时置位）、``move_ts_list`` ＝ 玩家每一手
+        #    的到达时刻；两者都是**局内内存**、``reset_game()`` 清空，**不进 GameState 快照**
+        #    （悔棋不回退——「这一手确实等了这么久」是既成事实）。打点由 ``main.py`` 的 ``/api/move``
+        #    在到达时调 ``mark_move_time()``；结算（间隔 / 均值 / 时长）在 ``time_ctx.facts``（纯函数），
+        #    本类只负责采集——不打点＝零成本，也**不新增任何 LLM / 引擎调用**。
+        self.session_start = None
+        self.move_ts_list = []
+
         # —— 聊天事件（v3.8.0，设计 §6.6）：规则式主题裁切**默认零 LLM** ——
         #    关闭（默认）时 ``chat()`` 之后只走规则式；开启后**只在局末 / 空闲**补一次 LLM 分段总结
         #    （``_digest_chat_llm``），落子回合内一次都不调（性能红线）。
@@ -1382,6 +1391,33 @@ class AzureAgent:
             return
         loop.run_in_executor(None, run)
 
+    # ================= 时间感知（采集，v3.9.0） =================
+
+    def mark_move_time(self, now=None):
+        """记一次「玩家这一手到达」的时刻（时间感知的**唯一采集点**，设计 §5-H）。
+
+        ``main.py`` 的 ``POST /api/move`` 在通过校验、真正驱动 ``player_move`` 之前调用它：
+        本局第一手把它同时记成 ``session_start``（＝本局开始时刻），之后每一手只追加。
+        下一手到达时，``time_ctx.facts`` 用相邻两个时刻之差结算**单手用时**（首手无前一手 ⇒ 不计）。
+
+        ``now`` 留空用系统时钟；脏值（非数值 / 非正）**静默忽略**——采集绝不因为一个坏时间戳抛异常。
+        本方法纯内存、零 IO、零调用；**悔棋不回退**（这一手确实等了这么久），``reset_game()`` 清空。
+        """
+        if now is None:
+            t = time.time()
+        else:
+            if isinstance(now, bool):
+                return
+            try:
+                t = float(now)
+            except (TypeError, ValueError):
+                return
+        if t != t or t <= 0.0:              # NaN / 非正：脏值，不记
+            return
+        if self.session_start is None:
+            self.session_start = t
+        self.move_ts_list.append(t)
+
     # ================= 玩家落子 =================
 
     async def player_move(self, x, y):
@@ -1893,6 +1929,9 @@ class AzureAgent:
         # v3.8.0：事件表是**局内内存**——新一局不带上一局的账（与「不随悔棋回退」是两回事，
         # 设计 §5 E/F：悔棋＝「发生过就是发生过」，重开＝另起一局）
         self.event_log.reset()
+        # v3.9.0：时间感知的采集同样是**局内内存**——新一局从零开始（本局时长 / 单手用时重新计）
+        self.session_start = None
+        self.move_ts_list = []
         self.mood.reset()                        # 新一局：情绪回到基线（平静）
         self.sync_mood(True)
         self._emit(events.state(self.st.payload()))

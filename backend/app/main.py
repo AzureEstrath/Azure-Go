@@ -173,6 +173,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         y = _int(body.get("y"), -1)
         if not (0 <= x < coords.SIZE and 0 <= y < coords.SIZE):
             return {"ok": False, "busy": s.busy, "state": s.st.payload()}
+        s.mark_move_time()                      # 时间感知（v3.9.0）：单手用时的采集点（设计 §5-H）
         await s.player_move(x, y)
         return ok()
 
