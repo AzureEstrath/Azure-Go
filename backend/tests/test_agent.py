@@ -1328,6 +1328,107 @@ class JosekiEventPayloadTest(unittest.TestCase):
         self.assertIsNone(bus.of_type("joseki")[-1]["mistake"])
 
 
+# ================= 聊天事件（v3.8.0）：主题裁切 + 去重，默认零 LLM =================
+
+
+class ChatEventTest(unittest.TestCase):
+    """``chat()`` 之后把聊天按主题写进事件表：默认规则式（零 LLM）、去重、覆盖从开局起。"""
+
+    def test_chat_digest_is_rule_based_and_needs_no_llm(self):
+        """规则式主题裁切**零 LLM**；端到端 chat() 之后事件表里有 ``chat`` 事件。"""
+
+        async def run():
+            agent, _eng, llm, bus = _mk()
+            await agent.chat("这手点三三的定式怎么样")
+            return agent, llm, bus
+
+        agent, llm, bus = asyncio.run(run())
+        evs = [e for e in agent.event_log.all() if e["kind"] == "chat"]
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["detail"]["topic"], "定式")
+        self.assertIn("定式", evs[0]["text"])
+        # 事件原文永不进台词
+        joined = " ".join(str(e.get("text", "")) for e in bus.messages())
+        self.assertNotIn(evs[0]["text"], joined)
+
+        # 直接调裁切步：一次模型调用都不发（假 LLM 计数不变）
+        agent.st.chat_history = [{"role": "user", "content": "这手点三三的定式怎么样"}]
+        before = len(llm.calls)
+        written = agent._record_chat_events()
+        self.assertEqual(len(llm.calls), before, "规则式主题裁切零 LLM 调用")
+        self.assertEqual(written, 0, "同一主题 + 同一摘要 ⇒ 去重不写")
+
+    def test_repeated_topic_not_written_again(self):
+        """重复主题不写：同一轮聊天再来一遍，事件表不增。"""
+
+        async def run():
+            agent, _eng, llm, bus = _mk()
+            await agent.chat("这手点三三的定式怎么样")
+            await agent.chat("这手点三三的定式怎么样")
+            return agent
+
+        agent = asyncio.run(run())
+        evs = [e for e in agent.event_log.all() if e["kind"] == "chat"]
+        self.assertEqual(len(evs), 1, "主题 + 归一化摘要命中已存在 ⇒ 不写第二条")
+
+    def test_chat_events_cover_from_opening(self):
+        """覆盖从开局起：move 0 聊的主题与后来的主题都在表里（只增不减）。"""
+
+        async def run():
+            agent, _eng, llm, bus = _mk()
+            await agent.chat("这手点三三的定式怎么样")     # move 0
+            await agent.player_move(3, 3)                  # 2 手
+            await agent.chat("我今天有点累")               # move 2，换个主题
+            return agent
+
+        agent = asyncio.run(run())
+        evs = [e for e in agent.event_log.all() if e["kind"] == "chat"]
+        self.assertEqual(len(evs), 2)
+        self.assertIn(0, [e["move_no"] for e in evs], "开局那一轮也在表里")
+        self.assertEqual({e["detail"]["topic"] for e in evs}, {"定式", "心情"})
+
+    def test_digest_llm_defaults_off(self):
+        agent, _eng, _llm, _bus = _mk()
+        self.assertFalse(agent.chat_digest_llm, "chat_digest_llm 默认关")
+
+    def test_digest_llm_only_at_summary_and_idle(self):
+        """``chat_digest_llm=true``：落子 / 聊天回合内零额外调用，只在局末 / 空闲补做。"""
+
+        async def run():
+            agent, _eng, llm, bus = _mk()
+            agent.chat_digest_llm = True
+            hits = {"n": 0}
+            orig = agent._digest_chat_llm
+
+            async def spy():
+                hits["n"] += 1
+                return await orig()
+
+            agent._digest_chat_llm = spy
+            await agent.player_move(3, 3)                  # 落子回合：不补做
+            self.assertEqual(hits["n"], 0, "落子回合内不许补做 LLM 摘要")
+            await agent.chat("今天天气不错")               # 聊天回合：不补做
+            self.assertEqual(hits["n"], 0, "聊天回合内不许补做 LLM 摘要")
+            await agent.summarize("")                      # 局末：补做一次
+            self.assertEqual(hits["n"], 1)
+            await agent.idle_remark()                      # 空闲：再补做一次
+            self.assertEqual(hits["n"], 2)
+            return agent
+
+        asyncio.run(run())
+
+    def test_digest_llm_off_makes_no_extra_calls_in_move_turns(self):
+        """开关本身不影响落子回合的引擎 / LLM 调用数（落子回合零额外调用）。"""
+
+        async def run(flag):
+            agent, _eng, llm, _bus = _mk()
+            agent.chat_digest_llm = flag
+            await agent.player_move(3, 3)
+            return len(llm.calls), len(agent.katago.calls)
+
+        self.assertEqual(asyncio.run(run(False)), asyncio.run(run(True)))
+
+
 # ================= 情绪波动：小概率走偏优解（v3.8.0，默认关） =================
 
 

@@ -124,6 +124,75 @@ CHAT_FALLBACK_LINES = [
     "唔…思路断了，等会儿再慢慢跟你说。",
 ]
 
+# —— 聊天事件（v3.8.0，设计 §6.6）：规则式主题裁切，**默认零 LLM** ——
+# 触发点：``chat()`` 里她回复完之后。主题分段＝「时间窗 + 关键词」，摘要是模板句；
+# 只有 ``chat_digest_llm=true`` 才用 LLM，且**只在局末 ``summarize()`` / 空闲 ``idle_remark()`` 补做**
+# （落子回合内一次都不调，守住第四节性能红线）。
+CHAT_TOPIC_WINDOW = 6           # 主题裁切的时间窗：只看最近 6 条玩家发言（与 chat_brief 同量级）
+CHAT_TOPIC_SUMMARY_CHARS = 40   # 单段摘要上限（进事件表前截断）
+CHAT_DIGEST_MAX_MSGS = 12       # LLM 补做时喂进去的聊天条数上限（可选路径，默认不走）
+CHAT_DIGEST_MAX_TOKENS = 200    # LLM 补做的输出上限
+# 主题关键词表（按序优先：一条消息命中多类时取最靠前的那一类）；核不上归「闲聊」。
+# 这里只是**分类用词**，不进提示词，也不放可被模型照抄的示例句。
+CHAT_TOPIC_RULES = (
+    ("定式", ("定式", "点三三", "挂角", "夹击", "靠压", "定形", "小飞")),
+    ("死活", ("死活", "做活", "杀棋", "打劫", "紧气", "两眼")),
+    ("形势", ("形势", "胜率", "领先", "落后", "目差", "厚薄", "大龙")),
+    ("布局", ("布局", "大场", "模样", "拆边", "守角", "占角")),
+    ("复盘", ("复盘", "回看", "悔棋", "重来")),
+    ("心情", ("累", "难过", "开心", "无聊", "喜欢", "心情", "谢谢")),
+    ("棋局", ("下棋", "这一手", "棋力", "棋局", "围棋")),
+)
+CHAT_TOPIC_DEFAULT = "闲聊"
+
+
+def _chat_topic_of(text):
+    """一条玩家发言的主题：命中 ``CHAT_TOPIC_RULES`` 里最靠前的一类，返回 ``(主题, 命中的词)``。"""
+    t = str(text or "")
+    for topic, words in CHAT_TOPIC_RULES:
+        for w in words:
+            if w in t:
+                return topic, w
+    return CHAT_TOPIC_DEFAULT, ""
+
+
+def chat_topics(history, window=CHAT_TOPIC_WINDOW):
+    """规则式主题裁切：把最近聊天按关键词分段，返回 ``[(主题, 摘要)]``（旧 → 新）。
+
+    - **时间窗**：``chat_history`` 里没有墙钟，用「最近 ``window`` 条玩家发言」当窗口
+      （与 ``chat_brief`` 的 6 条同量级）；窗口取的是**从开局起**那段历史的尾部，所以覆盖不止这一轮；
+    - **关键词 / 相似度**：命中 ``CHAT_TOPIC_RULES`` 里最靠前的一类即为该条的主题，核不上归「闲聊」；
+      主题相同的连续玩家发言并成一段（相似度＝同类关键词）；
+    - **摘要**：由该段命中的关键词用模板拼出（非 LLM），同关键词集合 ⇒ 摘要稳定 ⇒ 去重命中；
+    - **纯函数、零 LLM**：不碰 ``self``，可直接在事件写入路径上调用。
+    """
+    msgs = [str(m.get("content", "")) for m in (history or [])
+            if isinstance(m, dict) and str(m.get("role", "")) == "user"]
+    if window and window > 0:
+        msgs = msgs[-int(window):]
+    segs = []                                   # [主题, [命中的关键词]]
+    for t in msgs:
+        topic, kw = _chat_topic_of(t)
+        if segs and segs[-1][0] == topic:
+            if kw and kw not in segs[-1][1]:
+                segs[-1][1].append(kw)
+        else:
+            segs.append([topic, [kw] if kw else []])
+    out = []
+    for topic, kws in segs:
+        summary = ("聊到%s" % "、".join(kws)) if kws else "随便聊了几句"
+        out.append((topic, _one_line_text(summary, CHAT_TOPIC_SUMMARY_CHARS)))
+    return out
+
+
+def _one_line_text(text, limit):
+    """折叠空白 + 截断（与 ``prompts._one_line`` 同口径，事件表侧自带一份，避免跨模块耦合）。"""
+    t = " ".join(str(text if text is not None else "").split())
+    if limit <= 0 or len(t) <= limit:
+        return t
+    return t[:limit] + "…"
+
+
 
 def _discard_task(task):
     """旧一代任务跑完时的收尾：只把异常取走（免得 asyncio 报「exception was never retrieved」）。
@@ -259,7 +328,7 @@ class AzureAgent:
                  tts=None, joseki_progress=None, joseki_rate=JOSEKI_RATE_DEFAULT, joseki_rng=None,
                  pv_max_visits=PV_MAX_VISITS_DEFAULT, emotion_drift=False,
                  drift_base=DRIFT_BASE_DEFAULT, drift_max=DRIFT_MAX_DEFAULT,
-                 pv_max_drop=PV_MAX_DROP_DEFAULT, drift_rng=None):
+                 pv_max_drop=PV_MAX_DROP_DEFAULT, drift_rng=None, chat_digest_llm=False):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -351,8 +420,14 @@ class AzureAgent:
         self._drift_pending = None
 
         # —— 局内事件表（v3.8.0，设计 §6.3）：**局内内存**、不进 GameState 快照、不随悔棋回退 ——
-        #    本批只有「走偏优解」一个写入点（``_record_drift``）；``reset_game`` 清空（新一局不带旧账）。
+        #    写入点两处：「走偏优解」（``_record_drift``）与「聊过天」（``_record_chat_events``）；
+        #    ``reset_game`` 清空（新一局不带旧账）。
         self.event_log = EventLog()
+
+        # —— 聊天事件（v3.8.0，设计 §6.6）：规则式主题裁切**默认零 LLM** ——
+        #    关闭（默认）时 ``chat()`` 之后只走规则式；开启后**只在局末 / 空闲**补一次 LLM 分段总结
+        #    （``_digest_chat_llm``），落子回合内一次都不调（性能红线）。
+        self.chat_digest_llm = bool(chat_digest_llm)
 
         self._mood_region = -1
         self._mood_ms = 0
@@ -1514,6 +1589,83 @@ class AzureAgent:
         })
         return True
 
+    # ================= 聊天事件（v3.8.0，设计 §6.6） =================
+
+    def _record_chat_events(self) -> int:
+        """聊天收尾后：规则式主题裁切 → 逐段写 ``chat`` 事件；返回**新写入**的条数。
+
+        - **默认零 LLM**：分段与摘要都走 ``chat_topics``（纯函数），这里一次模型调用都不发；
+        - **去重**：交给事件表（``kind`` + 归一化 ``text``）——主题 + 摘要命中已存在时 ``add`` 返回
+          ``None``，因此重复主题不会反复写入（设计 §6.6「不要反复写入同一内容」）；
+        - 事件原文是**给模型看的素材**：永不进台词、不产生 ``speech``；
+        - 手数取当前 ``len(st.moves)``；任何异常只打日志，绝不影响对局。
+        """
+        try:
+            segs = chat_topics(self.st.chat_history)
+        except Exception as e:                      # noqa: BLE001 —— 裁切坏了也不能影响对局
+            print("[Agent] 聊天主题裁切异常（已忽略）：%s" % e)
+            return 0
+        move_no = len(self.st.moves)
+        n = 0
+        for topic, summary in segs:
+            ev = self.event_log.add("chat", move_no, "%s：%s" % (topic, summary),
+                                    {"topic": topic, "summary": summary})
+            if ev is not None:
+                n += 1
+        return n
+
+    def _record_digest_lines(self, out) -> int:
+        """把 LLM 补做的「主题：摘要」逐行写进事件表（解析不出的行直接丢，绝不抛）。"""
+        move_no = len(self.st.moves)
+        n = 0
+        for raw in str(out or "").splitlines():
+            line = " ".join(str(raw).split()).strip(" -•\t")
+            if line == "":
+                continue
+            for sep in ("：", ":"):
+                if sep in line:
+                    topic, summary = line.split(sep, 1)
+                    break
+            else:
+                continue
+            topic = " ".join(topic.split())
+            summary = _one_line_text(summary, CHAT_TOPIC_SUMMARY_CHARS)
+            if topic == "" or summary == "":
+                continue
+            ev = self.event_log.add("chat", move_no, "%s：%s" % (topic, summary),
+                                    {"topic": topic, "summary": summary, "source": "llm"})
+            if ev is not None:
+                n += 1
+        return n
+
+    async def _digest_chat_llm(self) -> int:
+        """可选（``chat_digest_llm=true``）：用 LLM 分段总结聊天并写进事件表。
+
+        **只在局末 ``summarize()`` 与空闲 ``idle_remark()`` 补做**——落子 / 聊天回合内一次都不调
+        （性能红线）。未启用 / 没聊过 / LLM 报错 / 解析不出都只打日志并返回 0，绝不影响对局。
+        """
+        if not self.chat_digest_llm or self.llm is None:
+            return 0
+        lines = []
+        for m in list(self.st.chat_history)[-CHAT_DIGEST_MAX_MSGS:]:
+            if not isinstance(m, dict):
+                continue
+            who = "他" if str(m.get("role", "")) == "user" else "我"
+            t = " ".join(str(m.get("content", "")).split())
+            if t != "":
+                lines.append("%s：%s" % (who, t))
+        if not lines:
+            return 0
+        prompt = ("下面是这盘棋里我和 Estarth 的聊天记录。请按主题把它分成若干段，每段一行，"
+                  "格式为「主题：一句话摘要」，主题用两到四个字，摘要不超过二十字；"
+                  "不要复述原话，不要输出别的解释。\n\n" + "\n".join(lines))
+        try:
+            out = await self.llm.chat([{"role": "user", "content": prompt}], CHAT_DIGEST_MAX_TOKENS)
+        except Exception as e:                      # noqa: BLE001
+            print("[Agent] 聊天 LLM 摘要异常（已忽略）：%s" % e)
+            return 0
+        return self._record_digest_lines(out)
+
     def _candidate_from_text(self, text) -> dict | None:
         """从模型原话里认出它自己报出的落点候选（S21）：GTP 坐标或虚着；认不出返回 ``None``。
 
@@ -1596,13 +1748,17 @@ class AzureAgent:
         self._mood_event(self._chat_event(self.chat_emotion(text)), "，他说：「%s」" % text[:40].strip())
         self._set_busy(True)
         self._new_turn()
-        self.begin_epoch()
+        token = self.begin_epoch()
         try:
             await self._turn_guard(self._turn(PHASE_CHAT, {"text": text}))
         except Exception as e:                      # 意外抛出：按失败处理，别让棋盘锁死
             print("[Agent] 聊天异常：%s" % e)
         finally:
             self._set_busy(False)
+        # 她回复完之后：把这轮聊天按主题写进事件表（规则式、零 LLM；事件原文永不进台词）。
+        # 代际守卫：看门狗刚超时 / 本回合被新调用作废时，这一代不再写事件。
+        if self.epoch_ok(token):
+            self._record_chat_events()
 
     async def idle_remark(self):
         """闲置搭话：Estarth 一段时间没动静时，Azure 主动说一句短话。
@@ -1614,8 +1770,11 @@ class AzureAgent:
         if self.busy:
             return
         self._new_turn()
-        self.begin_epoch()
+        token = self.begin_epoch()
         await self._turn_guard(self._turn(PHASE_IDLE))
+        # 空闲：`chat_digest_llm=true` 时在这里补做一次 LLM 分段总结（默认关，零额外调用）
+        if self.epoch_ok(token):
+            await self._digest_chat_llm()
 
     async def summarize(self, note=""):
         """对局总结（顺序见 ``agent_graph.py`` 的 summary 阶段）。"""
@@ -1627,7 +1786,7 @@ class AzureAgent:
             return
         self._set_busy(True)
         self._new_turn()
-        self.begin_epoch()
+        token = self.begin_epoch()
         try:
             await self._turn_guard(self._turn(PHASE_SUMMARY, {"note": note}))
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
@@ -1635,6 +1794,9 @@ class AzureAgent:
             await _emit_line(self, events.AI, "📋 对局总结\n" + self._fallback_line("chat"))
         finally:
             self._set_busy(False)
+        # 局末：`chat_digest_llm=true` 时在这里补做一次 LLM 分段总结（默认关，零额外调用）
+        if self.epoch_ok(token):
+            await self._digest_chat_llm()
 
     # 注意（计划 05 · T20②）：下面四个**同步**方法里的短提示**故意保持纯文字**（不发 `speech`）——
     # 它们是同步方法（S5 不许改成 async），补 `speech` 就得 `await`、还得动端点；Task 5 会在 README 写明。

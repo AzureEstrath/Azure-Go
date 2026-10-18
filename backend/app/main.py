@@ -100,6 +100,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                          emotion_drift=cfg.emotion_drift,
                                          drift_base=cfg.drift_base, drift_max=cfg.drift_max,
                                          pv_max_drop=cfg.pv_max_drop,
+                                         chat_digest_llm=cfg.chat_digest_llm,
                                          memory=mem, tts=tts_client,
                                          joseki_progress=joseki_progress)
             if autostart:
@@ -267,6 +268,10 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                 s.pv_max_drop = max(0.0, min(1.0, float(body["pv_max_drop"])))
             except (TypeError, ValueError):
                 pass
+        if "chat_digest_llm" in body:           # 聊天摘要用 LLM（默认关）：开启后只在局末 / 空闲补做
+            v = body["chat_digest_llm"]         # 只认 JSON 的 true / false；字符串 "false" 是脏值
+            if isinstance(v, bool):
+                s.chat_digest_llm = v
         if "tools_enabled" in body:             # 发言侧工具开关：开启后她才会在提示/落子宣告里查资料
             s.tools_enabled = bool(body["tools_enabled"])
         return ok()

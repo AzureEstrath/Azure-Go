@@ -39,6 +39,8 @@ class AzureConfig:
         self.drift_base = 0.03                      # 基础偏航概率（平静时的 p_drift）
         self.drift_max = 0.08                       # p_drift 上限
         self.pv_max_drop = 0.05                     # 偏航线与最优线的胜率差上限（超了整条不用）
+        # —— 聊天事件摘要（v3.8.0）：默认规则式（零 LLM）；开启后只在局末 / 空闲补做 LLM 分段 ——
+        self.chat_digest_llm = False
         self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
@@ -131,6 +133,10 @@ class AzureConfig:
         self.drift_max = min(_clamp01(d.get("drift_max"), 0.08), DRIFT_MAX_LIMIT)
         self.drift_base = min(_clamp01(d.get("drift_base"), 0.03), self.drift_max)
         self.pv_max_drop = _clamp01(d.get("pv_max_drop"), 0.05)
+        # 聊天事件摘要（v3.8.0）：开关**只认 JSON 的 true / false**（与 `emotion_drift` 同一口径，
+        # 字符串 `"false"` 是脏值 → 保留默认关）。
+        v = d.get("chat_digest_llm")
+        self.chat_digest_llm = v if isinstance(v, bool) else self.chat_digest_llm
         self.llm_base_url = str(d.get("llm_base_url", self.llm_base_url))
         self.llm_model = str(d.get("llm_model", self.llm_model))
         self.llm_api_key = str(d.get("llm_api_key", self.llm_api_key))
