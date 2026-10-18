@@ -701,10 +701,19 @@ async def _decide_own_turn(agent, data):
     修复轮 1 / Important #1：``_drift_pick`` **只定落点、不记账**；待记账的信息经 ``data["drift"]``
     透传到 ``speak``，由 ``_speak_own_turn`` 在**落点定案并提交之后**记账（工具轮重定案 / 回落成 A
     都不留事件）。``_take_drift_pending`` 一次性取走，绝不跨回合残留。
+
+    修复波 / Minor #3：**一轮只掷一次**——条件边 ``tools → decide`` 会让本节点再次进入，重掷一次就把
+    有效偏航概率放大一倍。本阶段第一次装配时已经掷过（``data["drift_picked"]``）⇒ 直接复用上次的落点，
+    绝不重掷；「落点定案后记账」那条口径一个字不动（记账仍在 ``speak`` 里按最终落点判）。
     """
     pick = agent._pick_ai_move(list(data.get("after_infos") or []))
-    pick = agent._drift_pick(list(data.get("after_infos") or []), pick)
-    data["drift"] = agent._take_drift_pending()
+    if data.get("drift_picked"):
+        pick = list(data.get("drift_pick") or pick)
+    else:
+        pick = agent._drift_pick(list(data.get("after_infos") or []), pick)
+        data["drift"] = agent._take_drift_pending()
+        data["drift_pick"] = list(pick)
+        data["drift_picked"] = True
     ai_gtp, ai_x, ai_y = pick[0], pick[1], pick[2]
     data["move"] = {"x": ai_x, "y": ai_y, "gtp": ai_gtp, "pass": ai_gtp == "pass"}
 

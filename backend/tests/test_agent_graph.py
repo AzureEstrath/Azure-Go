@@ -147,6 +147,17 @@ class _ScriptChain:
         return item() if callable(item) else item
 
 
+class _CountingRng:
+    """数「掷了几次」的随机源（v3.8.0 修复波 / Minor #3）：``random()`` 恒 ``0.0``（落在 B 段）并计数。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def random(self):
+        self.calls += 1
+        return 0.0
+
+
 class _DroppingEngine(StubEngine):
     """玩家落子**之后**胜率明显下滑的假引擎（黑方视角 0.5 → 0.2 ⇒ ``drop`` 0.3 > 0.10）。
 
@@ -1394,6 +1405,52 @@ class DriftSettlementTest(unittest.TestCase):
         self.assertFalse(agent.busy, "超时必须归位")
         self.assertEqual(len(agent.st.moves), 1, "她那一手被守卫拦下（棋谱只剩玩家那一手）")
         self.assertEqual(agent.event_log.all(), [], "作废的回合不许留下幽灵偏航事件")
+
+    def test_drift_is_rolled_once_per_turn_across_tool_rounds(self):
+        """修复波 / Minor #3：走**真**工具轮（``decide → tools → decide``）也**只掷一次**。
+
+        重掷会把有效偏航概率放大成「进几次乘几倍」——工具轮每多一轮就多掷一次。这条钉的是**可观测
+        不变量**（一轮一次），不绑具体机制：图路径今天由 ``decide`` 的 ``setup_phase`` 守卫兜着，
+        ``_decide_own_turn`` 里那道 ``data["drift_picked"]`` 复用是同一不变量的第二层保险。
+        """
+        agent, _bus = self._agent_with_drift()
+        rng = _CountingRng()
+        agent.drift_rng = rng
+        agent.tools_enabled = True
+        agent.chain = _ScriptChain([
+            _Ai(tool_calls=[{"name": "board_query", "args": {}, "id": "c1"}]),
+            _Ai(content="我下 Q4。"),                  # 工具轮自报另一个合法点（不是偏航点 D4）
+        ])
+
+        asyncio.run(agent.player_move(3, 3))
+
+        self.assertEqual(rng.calls, 1, "一轮只掷一次（条件边再进入 decide 也不重掷）")
+        self.assertEqual(agent.st.moves[-1][1], "Q4", "落点仍由工具轮定案")
+        self.assertEqual(agent.event_log.all(), [], "最终落点不是偏航点 ⇒ 一条事件都不留")
+
+    def test_same_data_never_rolls_twice(self):
+        """修复波 / Minor #3 的**直接**门卫：同一份 ``data`` 两次进入 ``_decide_own_turn`` 也不重掷。
+
+        生产路径本来就只进一次（``decide`` 的 ``setup_phase`` 守卫），所以这条测的是那一层保险本身
+        ——去掉 ``data["drift_picked"]`` 复用，这里会掷两次（rng.calls == 2）。
+        """
+        from app import agent_graph
+
+        agent, _bus = self._agent_with_drift()
+        rng = _CountingRng()
+        agent.drift_rng = rng
+        data = {"after_infos": PvStubEngine().move_infos(), "epoch": agent._epoch_token}
+        old = agent_graph.THINK_BEAT_SEC
+        agent_graph.THINK_BEAT_SEC = 0                 # 犹豫节拍与本用例无关：压到 0，别真等
+        try:
+            asyncio.run(agent_graph._decide_own_turn(agent, data))
+            asyncio.run(agent_graph._decide_own_turn(agent, data))
+        finally:
+            agent_graph.THINK_BEAT_SEC = old
+
+        self.assertEqual(rng.calls, 1, "同一份 data 再进一次也不重掷")
+        self.assertEqual(data["drift_pick"][0], "D4", "复用第一次掷出的落点")
+        self.assertEqual(data["drift"]["gtp"], "D4", "待记账信息照旧透传给 speak")
 
 
 class PlayerEventWriteTest(unittest.TestCase):

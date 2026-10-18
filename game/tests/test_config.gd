@@ -152,7 +152,10 @@ func _run() -> void:
 	_check("save() 未改动的 joseki_rate 原值不变", is_equal_approx(float(out3.get("joseki_rate", -1.0)), 0.5))
 
 	# —— 5) 情绪波动＝开关 + 基础概率（emotion_drift / drift_base，v3.8.0）——
-	# 口径与 `joseki` 那一格完全一致：键缺失 ⇒ 默认（false / 0.03）；脏值 ⇒ 0.03；越界 ⇒ 夹到 [0,1]。
+	# 口径与 `joseki` 那一格一致：键缺失 ⇒ 默认（false / 0.03）；脏值 ⇒ 0.03；
+	# **越界 ⇒ 夹到 `[0, DRIFT_BASE_LIMIT]`（0.08）而不是 `[0, 1]`**（v3.8.0 修复波 / #4：后端
+	# `config._apply` 把 `drift_base` 夹到 `min(值, drift_max)`、`drift_max` 默认 0.08——两端必须
+	# 读到同一个值，否则前端会把 0.5 推给后端、自己却留着 0.5）。
 	_write_raw({})
 	var c7 := AzureConfig.load_config(TMP)
 	_check("emotion_drift 键缺失 ⇒ 默认 false", not c7.emotion_drift)
@@ -162,20 +165,27 @@ func _run() -> void:
 		_write_raw({"drift_base": bad})
 		var cd2 := AzureConfig.load_config(TMP)
 		_check("drift_base 脏值 %s ⇒ 0.03" % str(bad), is_equal_approx(cd2.drift_base, 0.03))
-	for pair in [[5.0, 1.0], [-1, 0.0]]:
+	for pair in [[5.0, 0.08], [-1, 0.0]]:
 		_write_raw({"drift_base": pair[0]})
 		var cr2 := AzureConfig.load_config(TMP)
 		_check("drift_base 越界 %s ⇒ 夹到 %s" % [str(pair[0]), str(pair[1])],
 			is_equal_approx(cr2.drift_base, pair[1]))
-	for pair in [["0.08", 0.08], ["0.03", 0.03], ["nan", 0.03], ["1e308", 1.0]]:
+	for pair in [["0.08", 0.08], ["0.03", 0.03], ["nan", 0.03], ["1e308", 0.08]]:
 		_write_raw({"drift_base": pair[0]})
 		var cstr2 := AzureConfig.load_config(TMP)
 		_check("drift_base 字符串 \"%s\" ⇒ %s（与 joseki_rate 同一套守卫）" % [str(pair[0]), str(pair[1])],
 			is_equal_approx(cstr2.drift_base, pair[1]))
-	_check("drift_base 的 NaN / INF 口径与 joseki_rate 一致",
+	_check("drift_base 的 NaN / INF 口径：NaN ⇒ 默认 0.03，其余夹到 DRIFT_BASE_LIMIT",
 			is_equal_approx(AzureConfig._normalize_drift_base(NAN), 0.03)
-			and is_equal_approx(AzureConfig._normalize_drift_base(INF), 1.0)
-			and is_equal_approx(AzureConfig._normalize_drift_base(5), 1.0))
+			and is_equal_approx(AzureConfig._normalize_drift_base(INF), AzureConfig.DRIFT_BASE_LIMIT)
+			and is_equal_approx(AzureConfig._normalize_drift_base(5), AzureConfig.DRIFT_BASE_LIMIT))
+	# 修复波 / #4：上限常量就是后端 `drift_max` 的默认（0.08），且「手改 0.5」两端一致
+	_check("DRIFT_BASE_LIMIT 与后端 drift_max 默认一致（0.08）",
+			is_equal_approx(AzureConfig.DRIFT_BASE_LIMIT, 0.08))
+	_write_raw({"drift_base": 0.5})
+	var ccap := AzureConfig.load_config(TMP)
+	_check("手改 drift_base=0.5 ⇒ 前端也夹到 0.08（与后端同一个值，不再留 0.5）",
+			is_equal_approx(ccap.drift_base, 0.08))
 
 	# 往返：读入 → 改动 → save() → 重新解析；开关两个方向都要能回来，未知键照旧原样保留
 	_write_raw({"emotion_drift": true, "drift_base": 0.05, "future_unknown_key": "保留我"})

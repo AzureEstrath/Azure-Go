@@ -1525,6 +1525,9 @@ class AzureAgent:
             return "a"                      # 连 A 都取不到：无从偏航
         drop = _as_float(lines.get("drop"), 0.0)
         if drop > self.pv_max_drop:
+            # **防御性冗余**（不是主判据）：`_drift_pick` 已经用同一个 `max_drop` 过滤过
+            # `pv_lines.extract_lines`，生产上取不到「超限」的线；留着是为了本函数被单独调用
+            # （单测 / 将来别处的调用方）时也守同一条边界——别把它当主闸门改。
             return "a"                      # 偏得太远：这一批线整条不用
         p = self._drift_probability(mood)
         if p <= 0.0:
@@ -1651,13 +1654,18 @@ class AzureAgent:
                 n += 1
         return n
 
-    async def _digest_chat_llm(self) -> int:
+    async def _digest_chat_llm(self, token=None) -> int:
         """可选（``chat_digest_llm=true``）：用 LLM 分段总结聊天并写进事件表。
 
         **只在局末 ``summarize()`` 与空闲 ``idle_remark()`` 补做**——落子 / 聊天回合内一次都不调
         （性能红线）。它跑在 ``_turn_guard`` 之外，所以自带 ``CHAT_DIGEST_TIMEOUT_SEC`` 单次超时
         （Minor #4：不给端点留两分钟的尾巴）；未启用 / 没聊过 / LLM 失败 / 超时 / 解析不出都只打日志
         并返回 0，绝不影响对局，也不动 ``busy`` 的归位位置。
+
+        ``token`` 是调用方那一代的代数（可选）：**写表之前再核一次**（修复波 / Minor #2）——上面那次
+        ``await`` 期间玩家可能已经起了新回合（``begin_epoch``），而摘要里的 ``move_no`` 取的是写表
+        那一刻的 ``len(st.moves)``：不核代际的话，一份描述**旧**聊天的摘要会带上比它描述的那段聊天
+        更新的手数。取不到 ``token``（老调用方 / 单测）时跳过复核，行为与既有逐字一致。
         """
         if not self.chat_digest_llm or self.llm is None:
             return 0
@@ -1686,6 +1694,8 @@ class AzureAgent:
             return 0
         if self._llm_failed(out):                   # 失败文案**不抛异常**，必须在这里挡一次
             print("[Agent] 聊天 LLM 摘要失败（返回错误文案，已忽略）")
+            return 0
+        if token is not None and not self.epoch_ok(token):   # 死代：一条都不写（见 docstring）
             return 0
         return self._record_digest_lines(out)
 
@@ -1795,9 +1805,10 @@ class AzureAgent:
         self._new_turn()
         token = self.begin_epoch()
         await self._turn_guard(self._turn(PHASE_IDLE))
-        # 空闲：`chat_digest_llm=true` 时在这里补做一次 LLM 分段总结（默认关，零额外调用）
+        # 空闲：`chat_digest_llm=true` 时在这里补做一次 LLM 分段总结（默认关，零额外调用）。
+        # 代数一并带进去：那一趟 LLM ``await`` 里若玩家起了新回合，摘要不再写表（修复波 / Minor #2）。
         if self.epoch_ok(token):
-            await self._digest_chat_llm()
+            await self._digest_chat_llm(token)
 
     async def summarize(self, note=""):
         """对局总结（顺序见 ``agent_graph.py`` 的 summary 阶段）。"""
@@ -1817,9 +1828,10 @@ class AzureAgent:
             await _emit_line(self, events.AI, "📋 对局总结\n" + self._fallback_line("chat"))
         finally:
             self._set_busy(False)
-        # 局末：`chat_digest_llm=true` 时在这里补做一次 LLM 分段总结（默认关，零额外调用）
+        # 局末：`chat_digest_llm=true` 时在这里补做一次 LLM 分段总结（默认关，零额外调用）。
+        # 代数一并带进去：那一趟 LLM ``await`` 里若玩家起了新回合，摘要不再写表（修复波 / Minor #2）。
         if self.epoch_ok(token):
-            await self._digest_chat_llm()
+            await self._digest_chat_llm(token)
 
     # 注意（计划 05 · T20②）：下面四个**同步**方法里的短提示**故意保持纯文字**（不发 `speech`）——
     # 它们是同步方法（S5 不许改成 async），补 `speech` 就得 `await`、还得动端点；Task 5 会在 README 写明。

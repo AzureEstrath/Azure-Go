@@ -18,6 +18,11 @@ var joseki_rate := 0.5            # 定式提示频率（0~1，与开关同一�
 var emotion_drift := false
 var drift_base := 0.03            # 偏航的基础概率（0~1，与开关同一格）；关闭档不动它，重新开启时概率能回来
 const DRIFT_BASE_DEFAULT := 0.03  # 与 `AzureConfig.drift_base` 的字段默认 / 后端 `config.drift_base` 一致
+## `drift_base` 的**上限**（v3.8.0 修复波 / #4）：与后端 `config.drift_max` 的默认一致。
+## 后端 `_apply` 把 `drift_base` 夹到 `min(值, drift_max)`（`drift_max` 默认 0.08、另夹到 0.2）；
+## 客户端过去只夹到 `[0, 1]`，于是手改 `config.json` 写 `drift_base: 0.5` 时**前端留 0.5、后端是 0.08**
+## —— 两端读到的不是同一个值（前端还会把它经 `/api/config` 推给后端）。这里对齐到同一个上限。
+const DRIFT_BASE_LIMIT := 0.08
 ## 聊天摘要用 LLM（v3.8.0）：默认关——聊天摘要走**规则式**（纯函数分段 + 模板摘要）、**零额外 LLM 调用**；
 ## 开启后**只在局末 / 空闲**用 LLM 分段总结（落子回合内绝不加调用）。开关在 ⚙ 设置抽屉里。
 var chat_digest_llm := false
@@ -146,8 +151,9 @@ static func _clamp_rate(f: float) -> float:
 static func _normalize_flag(v, fallback: bool) -> bool:
 	return v if typeof(v) == TYPE_BOOL else fallback
 
-## 偏航基础概率归一化：与 `joseki_rate` **同一套守卫与同一条口径**（数值 / 字符串共用判据、
-## NaN ⇒ 默认 0.03、其余夹到 [0,1]、脏值不把启动搞崩）。后端 `config._apply` 也是这么读的。
+## 偏航基础概率归一化：与 `joseki_rate` **同一套守卫**（数值 / 字符串共用判据、NaN ⇒ 默认 0.03、
+## 脏值不把启动搞崩），但**夹取上限不同**：夹到 `[0, DRIFT_BASE_LIMIT]`（＝后端 `drift_max` 默认），
+## 让两端读到同一个值（v3.8.0 修复波 / #4）。
 static func _normalize_drift_base(v) -> float:
 	match typeof(v):
 		TYPE_INT, TYPE_FLOAT:
@@ -160,9 +166,10 @@ static func _normalize_drift_base(v) -> float:
 		_:
 			return DRIFT_BASE_DEFAULT
 
-## 基础概率的唯一守卫：NaN ⇒ 默认 0.03（脏值不当成 0 或 1），其余夹到 [0,1]（与 `_clamp_rate` 同形）。
+## 基础概率的唯一守卫：NaN ⇒ 默认 0.03（脏值不当成 0 或 1），其余夹到 `[0, DRIFT_BASE_LIMIT]`。
+## ⚠ 上限是 `DRIFT_BASE_LIMIT`（0.08，后端 `drift_max` 默认）而**不是 1.0**：见该常量的注释。
 static func _clamp_drift_base(f: float) -> float:
-	return DRIFT_BASE_DEFAULT if is_nan(f) else clampf(f, 0.0, 1.0)
+	return DRIFT_BASE_DEFAULT if is_nan(f) else clampf(f, 0.0, DRIFT_BASE_LIMIT)
 
 ## 写回配置文件（语音设置改动后调用，下次启动仍生效）
 func save() -> bool:

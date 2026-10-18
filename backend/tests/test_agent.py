@@ -1401,9 +1401,9 @@ class ChatEventTest(unittest.TestCase):
             hits = {"n": 0}
             orig = agent._digest_chat_llm
 
-            async def spy():
+            async def spy(*args, **kw):
                 hits["n"] += 1
-                return await orig()
+                return await orig(*args, **kw)
 
             agent._digest_chat_llm = spy
             await agent.player_move(3, 3)                  # 落子回合：不补做
@@ -1428,6 +1428,56 @@ class ChatEventTest(unittest.TestCase):
             return len(llm.calls), len(agent.katago.calls)
 
         self.assertEqual(asyncio.run(run(False)), asyncio.run(run(True)))
+
+
+class ChatDigestEpochTest(unittest.TestCase):
+    """v3.8.0 修复波 / Minor #2：补做摘要的那趟 LLM ``await`` 之后**再核一次代际**。
+
+    摘要里的 ``move_no`` 取**写表那一刻**的 ``len(st.moves)``；不核代际的话，一份描述**旧**聊天的
+    摘要会带上比它描述的那段聊天更新的手数（事件区块里就成了错位的「跨手脉络」素材）。
+    """
+
+    class _DigestLLM:
+        think_mode = 0
+        base_url = "https://api.example.com/v1"
+
+        async def chat(self, messages, max_tokens=300, no_think=False):
+            return "定式：聊了点三三"
+
+    def _seeded(self, llm=None):
+        agent, _eng, _llm, _bus = _mk()
+        agent.chat_digest_llm = True
+        agent.llm = llm if llm is not None else self._DigestLLM()
+        agent.st.chat_history = [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "嗯~ 你好呀"},
+        ]
+        return agent
+
+    def test_dead_epoch_writes_nothing_and_live_epoch_still_writes(self):
+        agent = self._seeded()
+
+        class _BumpingLLM(ChatDigestEpochTest._DigestLLM):
+            async def chat(self, messages, max_tokens=300, no_think=False):
+                agent.begin_epoch()                     # 模拟：这一趟 await 期间玩家起了新回合
+                return "定式：聊了点三三"
+
+        agent.llm = _BumpingLLM()
+        token = agent.begin_epoch()
+        n = asyncio.run(agent._digest_chat_llm(token))
+        self.assertEqual(n, 0, "死代不许写")
+        self.assertEqual(agent.event_log.all(), [], "死代一条都不许落表")
+
+        # 对照：活代照写（证明上一条不是「什么都没发生」换来的）
+        live = self._seeded()
+        live_token = live.begin_epoch()
+        self.assertEqual(asyncio.run(live._digest_chat_llm(live_token)), 1)
+        self.assertEqual(len(live.event_log.all()), 1)
+
+    def test_missing_token_keeps_legacy_behaviour(self):
+        """取不到 token（老调用方 / 单测直接调）⇒ 跳过复核，行为与既有逐字一致。"""
+        agent = self._seeded()
+        self.assertEqual(asyncio.run(agent._digest_chat_llm()), 1)
 
 
 class SlowLLM:

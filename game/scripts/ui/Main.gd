@@ -1602,9 +1602,10 @@ func _build_services() -> void:
 	agent.limit_len = cfg.tts_limit_len           # 转发给后端（连上后自动补发）
 	agent.joseki_teach = cfg.joseki_teach
 	agent.joseki_rate = cfg.joseki_rate         # 定式提示频率（与开关同一格）：同一通道推给后端
-	agent.emotion_drift = cfg.emotion_drift
-	agent.drift_base = cfg.drift_base           # 情绪波动的基础概率（与开关同一格）：同一通道推给后端
-	agent.chat_digest_llm = cfg.chat_digest_llm  # 聊天摘要用 LLM（默认关）：同一通道推给后端（连上后自动补发）
+	# 情绪波动与聊天摘要走**原子入口**（v3.8.0 修复波 / #5）：与 P7 的「不退回两次 setter 各推一次」同一口径
+	# ——「开关 + 基础概率」一次落定、只推一次 `/api/config`（单字段的 `set_digest` 同一形状）。
+	agent.set_drift(cfg.emotion_drift, cfg.drift_base)
+	agent.set_digest(cfg.chat_digest_llm)
 	_wire_agent()
 	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
 
