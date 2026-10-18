@@ -401,7 +401,8 @@ func _build_right_panel(root: Control) -> void:
 	_joseki_opt.item_selected.connect(_on_joseki_level_selected)
 	joseki_row.add_child(_joseki_opt)
 
-	# 语音开关：短回复（对局常用，留外面）；同步说话 / 整段合成 / 长句合并进 ⚙ 设置抽屉（默认收起，均立即生效）
+	# 语音开关：短回复（对局常用，留外面）；同步说话 / 整段合成 / 长句合并进 ⚙ 设置抽屉（默认收起）。
+	# 生效范围**不一样**：前两个立即生效；长句合并只写配置，分块在后端做 ⇒ 重启后端后生效（tooltip 必须说清）。
 	var acc := HBoxContainer.new()
 	acc.add_theme_constant_override("separation", 12)
 	vb.add_child(acc)
@@ -410,7 +411,8 @@ func _build_right_panel(root: Control) -> void:
 	_btn_settings = Button.new()
 	_btn_settings.text = "⚙ 设置 ▸"
 	_btn_settings.toggle_mode = true
-	_btn_settings.tooltip_text = "一次性设置：同步说话 / 整段合成 / 长句合并（都立即生效，改完写回 config.json）"
+	_btn_settings.tooltip_text = "一次性设置：同步说话 / 整段合成（立即生效）、长句合并（重启后端后生效）；" \
+		+ "改动都写回 config.json"
 	_btn_settings.toggled.connect(_on_settings_toggled)
 	acc.add_child(_btn_settings)
 
@@ -426,7 +428,8 @@ func _build_right_panel(root: Control) -> void:
 	_acc_check(drawer, "整段合成", cfg.tts_batch_speak, "batch",
 		"开启：Azure 连发的多条消息合并成一段、连续朗读；关闭：逐句合成，第一句播完等第二句合成（想边听边等选它）")
 	_acc_check(drawer, "长句合并", cfg.tts_long_chunk, "chunk",
-		"单次 TTS 合成字数上限：关=100（更快出第一句，默认）；开=160（长句一次合成、但首句更慢）")
+		"单次 TTS 合成字数上限：关=100（更快出第一句，默认）；开=160（长句一次合成、但首句更慢）。"
+		+ "改完重启后端才生效（分块在后端做）")
 
 	# 聊天区
 	_chat_scroll = ScrollContainer.new()

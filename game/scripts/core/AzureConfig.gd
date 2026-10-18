@@ -110,18 +110,24 @@ static func _normalize_tts_voice(v: String) -> String:
 ## 定式频率归一化：**与后端 `config._apply` 同口径**——数值（含数字字符串）越界夹到 [0,1]；
 ## 脏值（非数字 / null / 数组等）退回默认 0.5，不让一个旋钮把启动搞崩。JSON 的 true/false 按
 ## Python `float(bool)` 的语义折成 1.0/0.0（后端也是这么算的）。
+## 数值与字符串**共用 `_clamp_rate` 这一套守卫**：字符串单独一套判据会出现「同一个值经 JSON
+## 数字 / 字符串两条路读出来不一样」的坑（R-F-2 #5）。字符串认不出数字就退回默认 0.5。
 static func _normalize_joseki_rate(v) -> float:
 	match typeof(v):
 		TYPE_INT, TYPE_FLOAT:
-			var f := float(v)
-			return 0.5 if is_nan(f) else clampf(f, 0.0, 1.0)
+			return _clamp_rate(float(v))
 		TYPE_STRING:
 			var s := (v as String).strip_edges()
-			return clampf(s.to_float(), 0.0, 1.0) if s.is_valid_float() else 0.5
+			return _clamp_rate(s.to_float()) if s.is_valid_float() else 0.5
 		TYPE_BOOL:
 			return 1.0 if v else 0.0
 		_:
 			return 0.5
+
+## 频率的唯一守卫：NaN ⇒ 默认 0.5（脏值不当成 0 或 1），其余夹到 [0,1]。
+## **有意不拦 INF**：`clampf(INF, 0, 1)` = 1.0，与后端 `min(1.0, inf)` 一致（JSON 的 1e999 两端都当 1.0）。
+static func _clamp_rate(f: float) -> float:
+	return 0.5 if is_nan(f) else clampf(f, 0.0, 1.0)
 
 ## 写回配置文件（语音设置改动后调用，下次启动仍生效）
 func save() -> bool:

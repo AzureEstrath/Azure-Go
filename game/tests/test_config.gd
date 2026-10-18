@@ -2,6 +2,7 @@ extends SceneTree
 ## 配置读写自检（headless，无外部依赖）
 ## 覆盖计划 00 的 Review Focus：v2.x 旧配置不崩、废弃键不被写回；
 ## 以及 C1 反向守卫（计划 01）：KataGo 改为独立云服务后，save() 必须清掉已无读取方的 katago_* 旧键。
+## 另：R-F-2 #5 —— `joseki_rate` 的字符串分支与数值分支共用一套守卫（同一个值两条路读出来一致、不产出 NaN）。
 ## 全程只用临时文件，绝不读写仓库里的 game/config.json。
 ## 运行：godot --headless --path game --script res://tests/test_config.gd
 
@@ -100,6 +101,21 @@ func _run() -> void:
 		var cr := AzureConfig.load_config(TMP)
 		_check("joseki_rate 越界 %s ⇒ 夹到 %s" % [str(pair[0]), str(pair[1])],
 			is_equal_approx(cr.joseki_rate, pair[1]))
+
+	# R-F-2 #5：字符串分支与数值分支**共用同一套守卫**（`_clamp_rate`）——同一个值经 JSON 字符串 /
+	# 数字两条路读出来必须一致，尤其不许让字符串路径产出 NaN（那会被 save() 原样写回 config.json）。
+	for pair in [["0.25", 0.25], ["0.5", 0.5], ["0.0", 0.0], ["1.0", 1.0], ["5", 1.0],
+			["nan", 0.5], ["inf", 0.5], ["-inf", 0.5], ["1e999", 1.0]]:
+		_write_raw({"joseki_rate": pair[0]})
+		var cstr := AzureConfig.load_config(TMP)
+		_check("joseki_rate 字符串 \"%s\" ⇒ %s（与数值分支同口径）" % [str(pair[0]), str(pair[1])],
+			is_equal_approx(cstr.joseki_rate, pair[1]))
+	_check("两条路共用一套守卫：NaN ⇒ 0.5、INF ⇒ 1.0（都不越界、都不产出 NaN）",
+			not is_nan(AzureConfig._normalize_joseki_rate("nan"))
+			and is_equal_approx(AzureConfig._normalize_joseki_rate("nan"), 0.5)
+			and is_equal_approx(AzureConfig._normalize_joseki_rate(NAN), 0.5)
+			and is_equal_approx(AzureConfig._normalize_joseki_rate(INF), 1.0)
+			and is_equal_approx(AzureConfig._normalize_joseki_rate(5), 1.0))
 
 	# 往返：读入 → 改动 → save() → 重新解析；开关 true / false 两个方向都要能回来
 	_write_raw({"joseki_rate": 0.25, "joseki_teach": false, "future_unknown_key": "保留我"})
