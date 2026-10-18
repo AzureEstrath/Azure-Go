@@ -7,7 +7,8 @@
 ``level()`` 返回 ``1..4``；``DECAY_DROPPED = 0`` 是**哨兵**：已淡出、不进提示词——超过
 ``DECAY_DROP_AT``、事件时刻比当前手还新（脏值）、或参数根本转不出数字，都返回它（不抛）。
 
-``bad_move_phrase()`` 是给下游（事件区块）用的**文案模板**（设计 §6.4 的四档，信息量递减）：
+``bad_move_phrase()`` 是**「下错了」那句的文案模板**（设计 §6.4 的四档，信息量递减），
+生产调用点在 ``agent_graph._record_player_event``（``subject="他"`` 写 ``player_bad`` 事件）：
 档 1 说「影响 + 后果」、档 2 只说影响、档 3 只说事实（第几手）、档 4 只留方位。缺数据就
 **降级到信息量更少的那一档**，绝不把半句话拼出来；方位词按坐标核对，**核不上就不说方位**
 （项目既有硬要求：方位词要求两轴都能定，正中的行 / 列凑不出方位 ⇒ 不说）。档 4 的方位词用
@@ -69,26 +70,34 @@ def corner_word(x, y):
     return _CORNERS[(sx, sy)]
 
 
-def bad_move_phrase(lv, *, move_no=None, impact="", consequence="", x=None, y=None) -> str:
-    """按档位渲染「我下错了」那句（设计 §6.4 的四档模板）；``DECAY_DROPPED`` ⇒ 空串。"""
+def bad_move_phrase(lv, *, subject="我", move_no=None, impact="", consequence="",
+                    x=None, y=None) -> str:
+    """按档位渲染「下错了」那句（设计 §6.4 的四档模板）；``DECAY_DROPPED`` ⇒ 空串。
+
+    ``subject`` 是**主语**，默认 ``"我"``：Azure 自述口径，输出与既有**逐字符相同**（档 1 的收尾句
+    「我要进行微量的情绪平衡来调整」是 Azure 自己的反应，故只在第一人称下出现）。传第三人称
+    （``"他"``）时给 ``player_bad`` 事件用——**同一套档位与方位词判据**，只换主语、省去那句自述反应；
+    玩家口径不能复用第一人称（否则「他下的坏手」会被写成 Azure 自己下的）。
+    """
     lv = _as_int(lv) or 0
     if lv <= 0:
         return ""
+    s = str(subject if subject is not None else "").strip() or "我"
     n = _as_int(move_no)
     impact = str(impact or "").strip()
     consequence = str(consequence or "").strip()
     if lv == 1 and n is not None and impact and consequence:
-        return "我在 %d 手下错了，影响了 %s 导致 %s，我要进行微量的情绪平衡来调整" % (
-            n, impact, consequence)
+        head = "%s在 %d 手下错了，影响了 %s 导致 %s" % (s, n, impact, consequence)
+        return head + "，我要进行微量的情绪平衡来调整" if s == "我" else head
     if lv <= 2 and n is not None and impact:
-        return "我在 %d 手下错了，目前因为那一步 %s" % (n, impact)
+        return "%s在 %d 手下错了，目前因为那一步 %s" % (s, n, impact)
     if lv <= 3 and n is not None:
-        return "我在 %d 手下错了一手" % n
+        return "%s在 %d 手下错了一手" % (s, n)
     where = corner_word(x, y)
     if lv >= 4 and where:                       # 档 4 的正解：只留方位
-        return "我在%s下错过一手" % where
+        return "%s在%s下错过一手" % (s, where)
     if n is not None:                           # 档 4 但方位核不上 ⇒ 退回「第几手」这句事实
-        return "我在 %d 手下错了一手" % n
+        return "%s在 %d 手下错了一手" % (s, n)
     if where:
-        return "我在%s下错过一手" % where
-    return "我下错过一手"
+        return "%s在%s下错过一手" % (s, where)
+    return "%s下错过一手" % s

@@ -56,7 +56,7 @@ from typing import TypedDict
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from . import coords, events, prompts
+from . import coords, decay, events, prompts
 from .llm_chain import ThinkStream, content_of, content_text_of
 from .tools import TOOLS
 
@@ -132,6 +132,47 @@ def is_joseki_mistake(jk: dict, player_on_line: bool, drop: float, rank_ok: bool
     if str((jk or {}).get("kind", "")) != "deviated":
         return False
     return (not rank_ok) or (drop > 0.10)
+
+
+def _record_player_event(agent, ev, *, move_no, gtp, rank, drop, jk, jk_teach) -> bool:
+    """玩家侧的好手 / 坏手入事件表（P3 的四个写入点之二；返回是否真的写了）。
+
+    - **只有 ``player_good`` / ``player_bad`` 写**：判据与情绪分流（``_prepare_after_player`` 里的
+      ``ev``）**逐字同一档**——``player_good``＝她算的最优手（rank 0）或定式结构点，
+      ``player_bad``＝不在前 5 或胜率掉 > 10%；``player_ok``（前 3 内）与 ``player_off``（rank 3~4）
+      是**常态**，写进去只会把真正的事件淹掉（防噪音），按既有口径不写。
+    - 文本：坏手走 ``decay.bad_move_phrase(..., subject="他")``——与 ``ai_bad`` 同一套档位 / 方位词
+      判据，但主语是玩家（第一人称会把玩家的坏手说成 Azure 自己下的）；好手一句定式模板。
+    - **零额外引擎 / LLM 调用**：只读已经算好的 ``rank`` / ``drop`` / 定式结论。
+    - 事件原文是**给模型看的素材**：永不进台词（这里不产生 ``message`` / ``speech``）；手数取
+      ``move_no``＝``len(st.moves)``（玩家这一手，``add_move`` 之后，与 ``jk_mistake.move_no`` 同口径）。
+    """
+    if ev not in ("player_good", "player_bad"):
+        return False
+    detail = {"rank": int(rank), "gtp": str(gtp or "")}
+    if ev == "player_bad":
+        try:
+            drop_v = float(drop)
+        except (TypeError, ValueError):
+            drop_v = 0.0
+        pct = int(round(drop_v * 100.0))
+        where = decay.corner_word(*coords.gtp_to_xy(str(gtp or "")))
+        impact = ("%s这一片" % where) if where else "全局形势"
+        consequence = ("胜率掉了约%d%%" % pct) if pct > 0 else "局面走了下坡"
+        text = decay.bad_move_phrase(1, subject="他", move_no=move_no,
+                                     impact=impact, consequence=consequence)
+        detail["drop"] = drop_v
+    else:
+        kind = str((jk or {}).get("kind", ""))
+        if jk_teach and kind in ("entered", "branch", "formed"):
+            why = "正合定式"
+            detail["joseki"] = str((jk or {}).get("name") or "")
+        elif int(rank) == 0:
+            why = "正是我算的最优手"
+        else:
+            why = "在我算的前 5 内"
+        text = "他在第%d手走出一手好棋（%s）" % (move_no, why)
+    return agent.event_log.add(ev, move_no, text, detail) is not None
 
 
 def _deep_visits(agent) -> int:
@@ -307,6 +348,14 @@ async def _prepare_after_player(agent, data):
     elif player_rank >= 3:
         ev = "player_off"
     agent._mood_event(ev)
+
+    # ④″″ 玩家侧事件（v3.8.0 / P3 的四个写入点之二）：好手 / 坏手各写一条 —— spec §一 的动机
+    #      「这盘棋我先亏了一手、你后来又送我一块」这种**跨手脉络**正是靠它们才有载体。
+    #      判据与上面那次情绪分流**同一档**（见 ``_record_player_event``）；``player_ok`` /
+    #      ``player_off``（常态）不写。本块**无 ``await``**，且在 ``:298`` 那道 ``_alive`` 守卫之后 ⇒
+    #      死代写不进事件表；只读已算好的 rank / drop，零额外引擎 / LLM 调用；不发 message / speech。
+    _record_player_event(agent, ev, move_no=len(agent.st.moves), gtp=gtp, rank=player_rank,
+                         drop=drop, jk=jk, jk_teach=jk_teach)
 
     # ⑤ Azure 点评这一手（T7：结构点按 `kind` **顶替**这一手的普通点评，不额外增加 LLM 调用）
     #    分流**只看 `kind`**（+ 走错时看 `is_mistake`）：进入 / 分岔 / 收尾必说。T5 起「说」由**门控**

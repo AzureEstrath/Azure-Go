@@ -147,6 +147,20 @@ class _ScriptChain:
         return item() if callable(item) else item
 
 
+class _DroppingEngine(StubEngine):
+    """玩家落子**之后**胜率明显下滑的假引擎（黑方视角 0.5 → 0.2 ⇒ ``drop`` 0.3 > 0.10）。
+
+    只改「玩家落子后局面」那一次（``len(moves) == 1``）的 ``rootInfo``：KataGo 的 ``rootInfo`` 是
+    **行棋方（白）**视角，1 手时 ``to_black_perspective`` 会翻成 ``1 - 0.8 = 0.2``。
+    """
+
+    async def analyze(self, moves, max_visits=None):
+        out = await super().analyze(moves, max_visits)
+        if len(moves) == 1:
+            out["rootInfo"] = {"winrate": 0.8, "scoreLead": 0.0}
+        return out
+
+
 class ToolRouteRealTriggerTest(unittest.TestCase):
     """S6：让工具路由**真的触发**（计划给的 `ToolShapesEventsTest` 在 `StubLLM` 下空转）。
 
@@ -1380,5 +1394,65 @@ class DriftSettlementTest(unittest.TestCase):
         self.assertFalse(agent.busy, "超时必须归位")
         self.assertEqual(len(agent.st.moves), 1, "她那一手被守卫拦下（棋谱只剩玩家那一手）")
         self.assertEqual(agent.event_log.all(), [], "作废的回合不许留下幽灵偏航事件")
+
+
+class PlayerEventWriteTest(unittest.TestCase):
+    """v3.8.0 修复波 / #1：**玩家侧的好手 / 坏手也进事件表**（P3 的四个写入点之二）。
+
+    判据与情绪分流同一档（``_prepare_after_player`` 里的 ``ev``）：
+    ``player_good``＝她算的最优手（rank 0）或定式结构点；``player_bad``＝不在前 5 或胜率掉 > 10%；
+    ``player_ok``（前 3 内）与 ``player_off``（rank 3~4）是**常态**、按既有口径**不写**（防噪音）。
+    ``StubEngine`` 的候选表固定，所以 rank 由落点唯一决定（Q16=0 / D4=1 / D16=3 / 其余 −1）。
+    """
+
+    def test_good_move_writes_a_player_good_event(self):
+        agent, _eng, _llm, _bus = _mk()
+        asyncio.run(agent.player_move(15, 3))           # Q16 ＝ 第一候选 ⇒ rank 0 ⇒ player_good
+        log = [e for e in agent.event_log.all() if e["kind"] == "player_good"]
+        self.assertEqual(len(log), 1)
+        ev = log[0]
+        self.assertEqual(ev["move_no"], 1, "玩家这一手的 1 基序号（add_move 之后）")
+        self.assertEqual(ev["detail"]["rank"], 0)
+        self.assertEqual(ev["detail"]["gtp"], "Q16")
+        self.assertIn("第1手", ev["text"])
+
+    def test_bad_move_writes_a_player_bad_event(self):
+        agent, _eng, _llm, _bus = _mk()
+        asyncio.run(agent.player_move(8, 8))            # J11 不在前 5 ⇒ rank −1 ⇒ player_bad
+        log = [e for e in agent.event_log.all() if e["kind"] == "player_bad"]
+        self.assertEqual(len(log), 1)
+        ev = log[0]
+        self.assertEqual(ev["move_no"], 1)
+        self.assertEqual(ev["detail"]["rank"], -1)
+        self.assertEqual(ev["detail"]["drop"], 0.0)
+        self.assertIn("他", ev["text"], "玩家口径是第三人称（第一人称会把玩家的坏手说成 Azure 自己下的）")
+        self.assertNotIn("我", ev["text"])
+        # 事件原文**永不进台词**：它只进事件表 / 提示词，不产生 message
+        self.assertNotIn(ev["text"], " ".join(m["text"] for m in _bus.messages()))
+
+    def test_normal_moves_write_nothing(self):
+        """防噪音：前 3 内的普通手（player_ok）与 rank 3~4（player_off）都不写。"""
+        a1, _e1, _l1, _b1 = _mk()
+        asyncio.run(a1.player_move(3, 15))              # D4 ＝ 第二候选 ⇒ rank 1 ⇒ player_ok
+        self.assertEqual(a1.event_log.all(), [])
+        a2, _e2, _l2, _b2 = _mk()
+        asyncio.run(a2.player_move(3, 3))               # D16 ＝ 第四候选 ⇒ rank 3 ⇒ player_off
+        self.assertEqual(a2.event_log.all(), [])
+
+    def test_bad_move_by_winrate_drop_records_the_drop(self):
+        """第二条判据：**真亏**（胜率掉 > 10%）也写 ``player_bad``，``detail.drop`` 是实打实的那个数。
+
+        落点取 rank 3 的 D16 ⇒ 「好手」那一支不成立，走的正是 ``drop > 0.10``（黑方视角 0.5 → 0.2）。
+        """
+        agent, _eng, _llm, _bus = _mk()
+        agent.katago = _DroppingEngine()
+        asyncio.run(agent.player_move(3, 3))
+        log = [e for e in agent.event_log.all() if e["kind"] == "player_bad"]
+        self.assertEqual(len(log), 1)
+        ev = log[0]
+        self.assertAlmostEqual(ev["detail"]["drop"], 0.3, places=6)
+        self.assertEqual(ev["detail"]["rank"], 3)
+        self.assertIn("胜率掉了约30%", ev["text"])
+        self.assertIn("左上这一片", ev["text"], "方位词按坐标核对（D16 在左上）")
 
 
