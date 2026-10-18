@@ -25,6 +25,23 @@
 - **超时后必须作废旧代的一切写入（不许只解锁）**：`agent.py` 的 `_turn_guard` 是最外层看门狗（`WATCHDOG_SEC = 1380`，算式写在注释里），超时**只解锁 + 前推一代（`begin_epoch`）+ 一条可读提示**，**不取消**在途任务（取消是协作式的，卡在不可取消等待里的任务照样留半截状态）；`agent_graph` 里**每一个写 `st.*` / 发事件的位置之前**都有一道代数核对 `_alive(agent, data)`（节点入口 + `await` 之后的站点两处），旧那一代的棋谱 / 快照 / 逐手存档 / 事件 / `message`+`speech` / `joseki` 计数全部作废。**不能回退的硬规则**：**既有 `_set_busy(False)` 的位置按阶段编码、一个都不许挪**（挪了会让 `busy_seq` 或「chat 先解锁再发话」回退）；`undo` / `reset_game` 开头各开新一代（玩家新动作把在途旧代一并作废）。门卫：后端 `tests/test_agent_graph.py` 的 `BusyWatchdogTest`。
 - **本局逐手存档的两条写入点（用意 / 感想）都必须是纯追加**：`st.move_notes`（她的**用意** `kind="aim"`、玩家点评与她自己的**感想** `kind="review"`）由 `state.note_move()` 只 `append`——**不滚动、不截断、不发事件、不参与去重**（与旁边那份滚动 18 条 / 截 80 字的 `memory_log` 各写各的、互不影响）。写入点：她的用意在 `_speak_own_turn` 一带（`kind="aim"`），玩家点评与她的感想在 `_finalize_after_player` / `_finalize_just_moved`（`kind="review"`）。**悔棋是唯一的收缩口**（`undo` 按 `move_no <= keep` 裁剪 `move_notes` / `losses`，与快照回滚同义）——**不许**把「滚动 / 截断」塞进写入点。门卫：后端 `tests/test_state.py` / `tests/test_main.py`。
 - **预测线 / 情绪波动 / 事件表（v3.8.0）**：`app/pv_lines.py` 从**既有那一次** `after` 分析的 `moveInfos`（每条候选自带 `pv` / `winrate` / `scoreLead`）里抠出三条五步预测线 A/B/C（A＝最优候选的首手 + `pv` 前 4 手；B/C 在**前 10 个候选**里**依次**取「与**已选各线**不同手数 ≥ `pv_diverge_min`（默认 2）」且「与 A 胜率差 ≤ `pv_max_drop`（默认 5%）」的候选，凑不齐降级，绝不抛）；`app/agent.py` 的 `_maybe_drift` 在 `emotion_drift=true` 时按 **A 常态 → B 小概率 → C 更小概率** 的阶梯选线（`p_drift = clamp(drift_base + emotion_bias, 0, drift_max)`，**B/C 缺失 / 胜率差超限 / 首手非法逐级回落** `c→b→a`，最终必是 A），走 B/C 记一条 `ai_bad` 事件（**落点定案并提交之后**才写，工具轮重定案 / 回落 A / 回合被作废都不留事件）；`app/event_log.py` 是局内事件表（带时刻 `move_no` + 墙钟 `ts`、只增不减、去重、`reset` 清空），`app/decay.py` 把事件按 `DECAY_SPAN=[1,3,6]` 分四档、超 `DECAY_DROP_AT=12` 不进提示词，`app/prompts.py` 的 `event_block()` 渲染成**事件区块**（插长期记忆段之后、铁律段之前）。**三条不能回退的硬规则**：① **线 A/B/C 只吃既有 `moveInfos`（含 `pv`）、不得新增任何引擎分析**——`pv_lines.extract_lines` 是**零 import 的纯函数**；`engine.analyze(moves, max_visits=None)` 的深值**只给「玩家落子后局面」那一次**调用（取 `max(pv_max_visits, max_visits)`，**只增不减**，绝不把这一次砍浅）；② **事件表存储完整、注入有界**——存储层只增不减、去重、**不随悔棋回退**（`undo` 一字不动；悔棋本身**不写事件**，只裁 `move_notes` / `losses`）；注入层受「衰减窗口 + 字符预算 `EVENT_BLOCK_MAX_CHARS`」双重限制，超限丢【最旧 → 最低档】；③ **事件区块为空必须逐字符不变**（`tests/golden/prompts.json` 锁定 `context_block`，新内容只能插在铁律段之前、铁律段本身不许动）、**事件原文永不进台词**（区块是给模型看的素材，**不得产生 `speech`、不得进 `message`**）。聊天摘要默认走**规则式**（纯函数分段 + 模板摘要、**零额外 LLM 调用**），只有 `chat_digest_llm=true` 才在**局末 `summarize()` / 空闲 `idle_remark()`** 用 LLM 补做（落子 / 聊天回合内零额外调用；失败文案整段与单行两道闸门都挡住）。改这一侧要跑的门卫：后端 `tests/test_pv_lines.py` / `tests/test_event_log.py` / `tests/test_decay.py`（编排用例在 `tests/test_agent.py` / `tests/test_agent_graph.py`），前端 `tests/test_config.gd`。
+- **玩家棋风画像 / 时间感知（v3.9.0）**：`app/profile.py`（四维特征 + 指数衰减 EMA 融合，纯函数）+
+  `app/profile_store.py`（独立库 `backend/data/profile.db`，运行产物、已 gitignore）+ `app/time_ctx.py`
+  （时间事实，纯函数、时钟可注入）；提示词侧 `prompts.time_note()` / `profile_note()` 渲染**时间块 + 画像块**，
+  插入顺序 **长期记忆段 → 事件区块 → 时间块 → 画像块 → 铁律段**。**五条不能回退的硬规则**：
+  ① **写入只在 `summarize()` 里**——对局记录 + 画像融合的唯一写点；一律 `await asyncio.to_thread(...)`；
+  **回合内零新增 LLM / 引擎调用**（`MAX_LLM_CALLS_PER_TURN = 4` 不放宽，进步报告**并进现有总结提示词**、
+  不新增调用）；**任何故障只打日志、`busy` 必归位**；② **两块空则 `context_block` 逐字符不变**
+  （`tests/golden/prompts.json` 锁定；铁律段不许动；**两个开关都关 ⇒ 与改动前逐字符一致**），超限丢
+  「最低置信 / 最旧维度」（画像）与「最旧事实优先」（时间），字符预算 `PROFILE_MAX_CHARS` / `TIME_MAX_CHARS` = 240；
+  ③ **时间与画像只在相关时提、禁止把数字当口头禅复述**（「她变话多」反目标，写进块内的说明句）；
+  ④ **`profile.db` 只是运行产物**（`backend/data/` 已 gitignore；不要提交、不要当测试夹具；**与 `memory.db`
+  解耦**——memory 关着画像照常）；⑤ **无信号的画像维不产出**（不把「不知道」写成 0）；`profile_enabled` /
+  `time_aware_enabled` **由客户端在连上时推送**（与既有开关同形）。另：**主动约战提醒**不受
+  `time_aware_enabled` 门控，但与 `profile_enabled` **隐式耦合**（关掉画像 ⇒ 不再写记录 ⇒ 提醒也随之消失）；
+  面板的「来源局」＝**全局最近 N 局记录**、**不是每维各自的来源**（`profile` 表没有局 id 列）。门卫：后端
+  `tests/test_profile_store.py` / `tests/test_profile.py` / `tests/test_time_ctx.py`（编排用例在
+  `tests/test_agent.py` / `tests/test_main.py`），前端 `tests/test_config.gd`。
 - **语音链路（v3.5.0 起）整体在后端**：清洗 / 分句 / 分块 / `[[tone:…]]` 剥离在 `app/speech_text.py`，云端合成 + LRU 缓存（**条数 32 / 8 MiB 双向淘汰**，单条超预算直接不插）+ fail-closed 降级在 `app/tts.py`；后端每发一条要念的台词都**紧接**一条 `speech` 事件（`turn_id` + `seq`，**同回合从 1 递增、跨回合重置**），音频经 `GET /api/tts/audio/{id}` 取回（试听是 `POST /api/tts/speak`）。前端 `TTSClient.gd` 退化为播放器（`play_audio` / `speak_system`），配对与兜底交给 `SpeechPairing.gd`（`Main.gd` 只留胶水）。**四条不能回退的硬规则**：① **清洗规则只在后端一处**——前端 `TTSClient.gd` 不得再出现清洗 / 分句 / 合成；② **`reveal` 时机不许改**——仍在 `ai_move` 那条语音**开始播放**时由前端 `POST /api/reveal`；③ **任何异常都不得让 `busy` 卡死**——合成失败整条降级 `mode:"system"`（文字照常、回合不卡），配对侧不得留下悬空记录（`got && !played` 会恒真 → 棋盘永久锁死）；④ 语音关闭（`tts_enabled=false`）时**零请求、零 `speech` 事件**，文字照常。`SpeechPairing.gd` 的状态机守一条不变量：**任何已登记、且不属于「有意不显示」的两类（`tomb` / `forget_idle`）的台词，最终一定会被显示一次**——无论 `speech` 到没到、配对位是否过 TTL、那一轮是否 `busy`、音频端点回什么。改这两侧时要跑的门卫：后端 `tests/test_tts_backend.py` / `tests/test_speech_text.py` / `tests/test_main.py`，前端 `tests/test_tts.gd` / `tests/test_speech_pairing.gd` / `tests/test_config.gd`。
 - KataGo 是**独立部署的云服务**（`katago_service/`），后端只连 `katago_url` / `katago_token` / `katago_timeout_ms`，**仓库里只有客户端**：`backend/` 里**不得**再引入拉起 `katago` 子进程的代码——`katago.exe` / 权重 / analysis cfg 由服务侧的 `--katago-exe/--model/--config` 或 `KATAGO_EXE/KATAGO_MODEL/KATAGO_CONFIG` 提供，`game/` 连这几个字段都不读。
 - peek（看屏幕搭话）已整体移除（前端 `_peek_*`、`POST /api/peer`、`peer_remark`、VLM 配置都没了）；闲置主动搭话走 `POST /api/idle` + `ai_idle` 事件。
@@ -61,6 +78,7 @@
 - `vrm_path` 建议写**绝对路径**（相对路径要能被 Godot 解析到，否则形象加载失败）。
 - 场景引用带 `uid://`（`Main.tscn` 的 ext_resource），`*.gd.uid` 与 `*.import` 已入库：移动/重命名脚本或资源时同步更新它们，不要手写 uid。
 - **一切外部能力必须优雅降级**（缺后端、缺 KataGo、缺云端 LLM / TTS 都不得崩、不得报错刷屏）：后端返回可读错误且 `busy` 必须归位（不归位＝棋盘永久锁死，本项目最严重的故障形态）；前端连不上后端只在状态栏提示；语音服务不可用时临时降级为系统语音但不改配置。
+- **日志不得把整回合打挂**：`backend/app/main.py` 的启动路径做一次**带守卫**的 `sys.stdout.reconfigure(errors="replace")`（`try/except` + `hasattr`；**只改 `errors`、不改编码**）——中文 Windows 控制台 / 重定向文件是 cp936（strict），而 `llm.py` 打服务商错误体、`profile_store.py` / `joseki_progress.py` / `memory.py` 的 `print("…%s" % e)` 都可能在回合链路上抛 `UnicodeEncodeError`，降级成 `?` 好过打挂回合（也覆盖去重命中时打台词原文那条）。不要去改 `run_server.bat` 的 `PYTHONIOENCODING`。
 - **长期记忆库是运行产物**：默认落在 `backend/data/memory.db`（`backend/data/` 已 gitignore，不要提交、不要拿它当测试夹具），且**只在 `memory_enabled=true` 时**才会被创建。改 `prompts.context_block` 时必须保持「`long_term` 为空串时输出**逐字符不变**」（`tests/golden/prompts.json` 锁定）：新内容只能插在铁律段**之前**，铁律段本身不许动。
 - 坐标语义：内部 `Vector2i(x, y)` 中 x=列、y=行，`Coords.gd` 与 GTP 一致（A..T 跳过 I，行号上大下小）。给玩家写方位词前必须按坐标核对：同列只能说「上下」，同行才能说「左右」，核不上就不说方位（README v1.5.0 的硬性要求）。
 - 发言链路有几条不能回退的硬规则：**音画同步**（`ai_move` 事件带坐标，客户端等「落子宣告」的语音开始播放才揭示棋子，见 `backend/app/agent.py` 文件头与 `POST /api/reveal`）、AI 原话按最近 8 条窗口去重（后端常量 `AI_DEDUP_WINDOW = 8`，见 `backend/app/agent.py`，闸门在 `agent_graph` 的 `finalize`；前端 `Main.gd` 的同名常量只兜 WS 重连乱序）、模型推理段永不显示给玩家、落子宣告不参与复读抑制、走神搭话可整批作废。改 `backend/app/agent.py` / `agent_graph.py` / `prompts.py` 时保留这些前提（台词一律经 `clean_reply()` / `content_of()`），也别在提示词里放可被模型照抄的示例句。
@@ -73,4 +91,4 @@
 fix(chat,ai): 非相邻原样复读窗口去重 + 方位词按坐标核对（v1.5.0）
 ```
 
-版本号同时写进 `README.md` 的「更新」小节（当前 v3.8.0）。
+版本号同时写进 `README.md` 的「更新」小节（当前 v3.9.0）。
