@@ -434,10 +434,12 @@ func _build_right_panel(root: Control) -> void:
 	_drift_opt.add_item("情绪波动：关闭", 0)
 	_drift_opt.add_item("情绪波动：低 3%", 1)
 	_drift_opt.add_item("情绪波动：中 5%", 2)
-	_drift_opt.add_item("情绪波动：高 8%", 3)
+	_drift_opt.add_item("情绪波动：高 6%", 3)
 	_drift_opt.tooltip_text = "开启后她**小概率**不走最优解：在三条预测线里挑一条（越偏越少），偶尔像人一样下偏。\n" \
 		+ "· 关闭 = 行为零变化（恒走最优解、不掷骰）\n" \
-		+ "· 档位 = 基础概率（心情越低落 / 好奇 / 激动，实际概率在基础值与 8% 之间浮动）\n" \
+		+ "· 档位 = 偏航的**基础**概率（这里是本地档位：3% / 5% / 6%）；心情越低落 / 好奇 / 激动，" \
+		+ "实际概率会在此基础上再往上浮动（浮动上限由后端配置 drift_max 决定，默认 8%）——" \
+		+ "所以每一档都留了情绪浮动的余量\n" \
 		+ "· 偏得太远（胜率差超 5%）的线一律不用：宁可走最优解，也不下烂棋"
 	_drift_opt.selected = drift_level_index(cfg.emotion_drift, cfg.drift_base)   # 只显示，不回写 config.json
 	_drift_opt.item_selected.connect(_on_drift_level_selected)
@@ -1885,8 +1887,11 @@ static func joseki_level_index(teach: bool, rate: float) -> int:
 			best = idx
 	return best
 
-## 情绪波动的三档基础概率（与下拉框 index-1 一一对应）：低 3% / 中 5% / 高 8%（上限由后端 `drift_max` 兜底）
-const DRIFT_BASES := [0.03, 0.05, 0.08]
+## 情绪波动的三档基础概率（与下拉框 index-1 一一对应）：低 3% / 中 5% / 高 6%。
+## ⚠ **每一档都必须明显低于后端 `drift_max`（默认 0.08）**：`emotion_bias` 只往上加，档位一旦
+## 顶到上限，该档就被夹平成「固定概率」，情绪再也不参与（修复轮 1 / Important #2）。最高档因此
+## 从 8% 降到 6%（留出 2 个百分点的情绪余量）。
+const DRIFT_BASES := [0.03, 0.05, 0.06]
 
 ## 由 (开关, 基础概率) 反推下拉框档位：关闭 ⇒ 0；否则取最接近 `drift_base` 的一档，
 ## **并列时取更低的那一档**（偏航宁可保守：这是「她可能下偏」的旋钮，不是玩法难度）。
@@ -1943,7 +1948,7 @@ func _on_drift_level_selected(i: int) -> void:
 	if agent != null:
 		# 原子入口（v3.8.0）：开关与基础概率**一次推一次** `/api/config`（与 `set_joseki` 同一个理由）
 		agent.set_drift(on, base)
-	var names := ["关闭", "低 3%", "中 5%", "高 8%"]
+	var names := ["关闭", "低 3%", "中 5%", "高 6%"]
 	_set_status("情绪波动：%s" % names[lvl])
 
 func _send_chat() -> void:

@@ -10,6 +10,20 @@ KataGo 由独立的云服务提供（见 ``katago_service/``）：这里只存�
 import json
 import os
 
+# 情绪波动的「小概率」上限（v3.8.0 / 修复轮 1 / Minor #3）：`drift_max` **不许**开到 1.0——
+# 它是 `p_drift` 的天花板，而阶梯是 `P(A)=1-p`、`P(B)=2p/3`、`P(C)=p/3`：`p ≥ 0.6` 时
+# `P(A) ≤ P(B)`、`p = 1.0` 时她**恒偏航**，正是 spec §5-C 要防的「变成乱下」。
+# 0.2 的余量：`P(A) ≥ 0.8 > P(B) ≤ 0.133`，且比默认 `drift_max=0.08` 宽一倍多，够用不越界。
+DRIFT_MAX_LIMIT = 0.2
+
+
+def _clamp01(v, fallback):
+    """``[0, 1]`` 的安全取值：缺失 / 脏值 → ``fallback``（不抛，不因一个旋钮把启动搞崩）。"""
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return float(fallback)
+
 
 class AzureConfig:
     def __init__(self):
@@ -108,13 +122,15 @@ class AzureConfig:
             self.joseki_rate = max(0.0, min(1.0, float(d.get("joseki_rate", self.joseki_rate))))
         except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把启动搞崩
             self.joseki_rate = 0.5
-        # 情绪波动（v3.8.0）：开关默认关；三个数值夹到 [0,1]，脏值退回默认（同 joseki_rate 的口径）
-        self.emotion_drift = bool(d.get("emotion_drift", self.emotion_drift))
-        for key, fallback in (("drift_base", 0.03), ("drift_max", 0.08), ("pv_max_drop", 0.05)):
-            try:
-                setattr(self, key, max(0.0, min(1.0, float(d.get(key, getattr(self, key))))))
-            except (TypeError, ValueError):
-                setattr(self, key, fallback)
+        # 情绪波动（v3.8.0）：开关**只认 JSON 的 true / false**——字符串 `"false"` / 数字 / null
+        # 一律当脏值 → 默认关（修复轮 1 / Minor #7：`bool("false")` 是 True，会把脏值读成「开」）。
+        v = d.get("emotion_drift")
+        self.emotion_drift = v if isinstance(v, bool) else self.emotion_drift
+        # 三个数值：脏值退回默认；`drift_max` 再夹到「小概率」上限 `DRIFT_MAX_LIMIT`（不是 1.0），
+        # `drift_base` 夹到 `[0, drift_max]`（修复轮 1 / Minor #3）。
+        self.drift_max = min(_clamp01(d.get("drift_max"), 0.08), DRIFT_MAX_LIMIT)
+        self.drift_base = min(_clamp01(d.get("drift_base"), 0.03), self.drift_max)
+        self.pv_max_drop = _clamp01(d.get("pv_max_drop"), 0.05)
         self.llm_base_url = str(d.get("llm_base_url", self.llm_base_url))
         self.llm_model = str(d.get("llm_model", self.llm_model))
         self.llm_api_key = str(d.get("llm_api_key", self.llm_api_key))

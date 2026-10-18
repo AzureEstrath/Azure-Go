@@ -643,9 +643,14 @@ async def _decide_own_turn(agent, data):
     它只吃既有 ``after_infos``（零引擎调用），所以必须在这里、早于「用意」提示词（那条提示词
     里写着「你准备下在 %s」，落点定了才能建）。它**同步**执行且紧跟在 ``_pick_ai_move`` 之后
     （中间没有 ``await``），所以节点入口那道 ``_alive`` 守卫已经把「旧一代不再写事件表」兜住了。
+
+    修复轮 1 / Important #1：``_drift_pick`` **只定落点、不记账**；待记账的信息经 ``data["drift"]``
+    透传到 ``speak``，由 ``_speak_own_turn`` 在**落点定案并提交之后**记账（工具轮重定案 / 回落成 A
+    都不留事件）。``_take_drift_pending`` 一次性取走，绝不跨回合残留。
     """
     pick = agent._pick_ai_move(list(data.get("after_infos") or []))
     pick = agent._drift_pick(list(data.get("after_infos") or []), pick)
+    data["drift"] = agent._take_drift_pending()
     ai_gtp, ai_x, ai_y = pick[0], pick[1], pick[2]
     data["move"] = {"x": ai_x, "y": ai_y, "gtp": ai_gtp, "pass": ai_gtp == "pass"}
 
@@ -877,6 +882,10 @@ async def _speak_own_turn(agent, data, msgs):
     # 逐手存档（v3.7.0）：她这一手的用意（落子宣告原文，未截断），1 基序号＝落子后的手数。
     # **纯追加**：不发事件、不参与去重、不改上面 ai_move 的直发与 speech 配对。
     agent.st.note_move(len(agent.st.moves), "aim", "A", think_msg)
+    # 情绪波动记账（v3.8.0 / 修复轮 1 / Important #1）：**落点已定案并提交**之后才写事件表——
+    # 只有最终落点就是那个偏航点时才写（工具轮重定案 / 回落成 A 都不留事件）；本回合若已被看门狗
+    # 作废，上面那道 ``_alive`` 早退也顺带消掉幽灵事件（Minor #4）。事件永不进台词。
+    agent._record_drift(data.get("drift"), ai_gtp)
     if ai_gtp == "pass":
         await _emit_line(agent, events.AI, "（Azure本手选择了虚着）", epoch=data.get("epoch"))
 

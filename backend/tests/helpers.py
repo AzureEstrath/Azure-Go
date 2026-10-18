@@ -60,15 +60,19 @@ class PvStubEngine(StubEngine):
         "Q4": ["Q4", "R4", "C16", "K10", "O16"],
     }
 
-    async def analyze(self, moves, max_visits=None):
-        out = await super().analyze(moves, max_visits)
+    def move_infos(self):
+        """引擎形状的 ``moveInfos``（前三个候选带 ``pv``）——不经 ``analyze`` 也能测纯函数路径。"""
         infos = []
         for m in self.CAND:
             info = {"move": m, "visits": 1, "winrate": 0.5, "scoreLead": 0.0}
             if m in self.PVS:
                 info["pv"] = list(self.PVS[m])
             infos.append(info)
-        out["moveInfos"] = infos
+        return infos
+
+    async def analyze(self, moves, max_visits=None):
+        out = await super().analyze(moves, max_visits)
+        out["moveInfos"] = self.move_infos()
         return out
 
 

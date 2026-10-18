@@ -182,6 +182,14 @@ func _run() -> void:
 	var c8 := AzureConfig.load_config(TMP)
 	_check("emotion_drift 读入 true", c8.emotion_drift)
 	_check("drift_base 读入 0.05", is_equal_approx(c8.drift_base, 0.05))
+
+	# 修复轮 1 / Minor #7：开关**只认 JSON 的 true / false**。GDScript 的 `bool("false")` 是 true，
+	# 直接用它会把字符串脏值读成「开」；数字 / null 同理当脏值 → 默认 false（后端 `config._apply` 同口径）。
+	for bad in ["false", "true", 1, 0, null]:
+		_write_raw({"emotion_drift": bad})
+		var cf := AzureConfig.load_config(TMP)
+		_check("emotion_drift 脏值 %s ⇒ 默认 false（不把脏值读成「开」）" % str(bad), not cf.emotion_drift)
+
 	c8.emotion_drift = false
 	c8.drift_base = 0.08
 	_check("save() 写回情绪波动改动成功", c8.save())
@@ -251,9 +259,19 @@ func _run() -> void:
 	_check("drift_level_index：关闭档恒 0（基础概率是多少都一样）",
 			m.drift_level_index(false, 0.08) == 0 and m.drift_level_index(false, 0.0) == 0
 			and m.drift_level_index(false, NAN) == 0)
-	_check("drift_level_index：三档精确命中（0.03 ⇒ 1 / 0.05 ⇒ 2 / 0.08 ⇒ 3）",
+	_check("drift_level_index：三档精确命中（0.03 ⇒ 1 / 0.05 ⇒ 2 / 0.06 ⇒ 3）",
 			m.drift_level_index(true, 0.03) == 1 and m.drift_level_index(true, 0.05) == 2
-			and m.drift_level_index(true, 0.08) == 3)
+			and m.drift_level_index(true, 0.06) == 3)
+	_check("drift_level_index：0.08（后端默认上限）只会贴到最高档，不越界",
+			m.drift_level_index(true, 0.08) == 3)
+	# 修复轮 1 / Important #2：**每一档都必须明显低于后端 drift_max（默认 0.08）**——`emotion_bias`
+	# 只往上加，档位一旦顶到上限就被夹平成「固定概率」，情绪再也不参与（老「高 8%」正是如此，
+	# 而 tooltip 却承诺会浮动）。这条与后端 `test_ui_levels_never_flatline_the_mood_bias` 成对。
+	var levels: Array = m.DRIFT_BASES
+	_check("三档基础概率逐档递增，且**每一档都 < 0.08**（留出情绪浮动的余量）",
+			levels.size() == 3 and float(levels[0]) < float(levels[1])
+			and float(levels[1]) < float(levels[2]) and float(levels[2]) < 0.08)
+	_check("最高档是 6%（不是 8%：8% 会被 drift_max 夹平）", is_equal_approx(float(levels[2]), 0.06))
 	_check("drift_level_index：并列取更低的一档（0.04 在 1 与 2 之间 ⇒ 1）",
 			m.drift_level_index(true, 0.04) == 1)
 	_check("drift_level_index：越界 / 脏值不越界（0.0 ⇒ 1、5.0 ⇒ 3、NaN ⇒ 1，恒在 1..3）",

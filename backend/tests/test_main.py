@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi.testclient import TestClient
 
 from app import events
+from app.config import DRIFT_MAX_LIMIT
 from app.llm import LLMClient
 from app.main import create_app
 from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM, mk_agent
@@ -65,7 +66,11 @@ class RestTest(unittest.TestCase):
             self.assertEqual(client.post("/api/peer", json={"fg_title": "x"}).status_code, 404)
 
     def test_config_forwards_emotion_drift(self):
-        """``/api/config`` 透传情绪波动开关与参数（v3.8.0）：脏值不生效、越界夹取、绝不 500。"""
+        """``/api/config`` 透传情绪波动开关与参数（v3.8.0）：脏值不生效、越界按上限夹取、绝不 500。
+
+        修复轮 1：`drift_max` 夹到「小概率」上限 0.2（不是 1.0）、`drift_base` 再夹到 `[0, drift_max]`
+        （Minor #3）；开关只认 JSON 的 true / false（Minor #7）。
+        """
         app = create_app(engine=StubEngine(), llm=StubLLM(), autostart=False)
         with TestClient(app) as client:
             r = client.post("/api/config", json={"emotion_drift": True, "drift_base": 0.05,
@@ -80,9 +85,16 @@ class RestTest(unittest.TestCase):
             r = client.post("/api/config", json={"drift_base": "abc", "drift_max": 5, "pv_max_drop": -1})
             self.assertTrue(r.json()["ok"])
             self.assertAlmostEqual(s.drift_base, 0.05, msg="脏值不生效：保留原值")
-            self.assertAlmostEqual(s.drift_max, 1.0, msg="越界夹到 [0,1]")
+            self.assertAlmostEqual(s.drift_max, DRIFT_MAX_LIMIT, msg="drift_max 夹到 0.2（不是 1.0）")
             self.assertAlmostEqual(s.pv_max_drop, 0.0)
 
+            client.post("/api/config", json={"drift_base": 0.9})
+            self.assertAlmostEqual(s.drift_base, DRIFT_MAX_LIMIT, msg="base 不许超过 max")
+
+            # 开关**只认 JSON 的 true / false**：字符串 "false" 是脏值 → 不生效（保留原值）
+            client.post("/api/config", json={"emotion_drift": True})
+            client.post("/api/config", json={"emotion_drift": "false"})
+            self.assertTrue(s.emotion_drift, "脏值不生效（`bool('false')` 会把脏值读成「关」）")
             client.post("/api/config", json={"emotion_drift": False})
             self.assertFalse(s.emotion_drift, "开关能关回去（关掉＝现状）")
 

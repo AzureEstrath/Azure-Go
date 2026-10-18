@@ -246,14 +246,27 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             except (TypeError, ValueError):     # 脏值不生效：保留原值，不把端点打成 500
                 pass
         if "emotion_drift" in body:             # 「情绪波动」开关：开启后她小概率走偏优解（默认关）
-            s.emotion_drift = bool(body["emotion_drift"])
-        # 情绪波动的三个数值（0~1）：脏值不生效、保留原值（与 joseki_rate 同一口径）
-        for key in ("drift_base", "drift_max", "pv_max_drop"):
-            if key in body:
-                try:
-                    setattr(s, key, max(0.0, min(1.0, float(body[key]))))
-                except (TypeError, ValueError):
-                    pass
+            v = body["emotion_drift"]           # 只认 JSON 的 true / false；字符串 "false" 是脏值（修复轮 1 / Minor #7）
+            if isinstance(v, bool):
+                s.emotion_drift = v
+        # 情绪波动的三个数值：脏值不生效、保留原值（与 joseki_rate 同一口径）。`drift_max` 先夹到
+        # 「小概率」上限 `DRIFT_MAX_LIMIT`（**不是 1.0**），`drift_base` 再夹到 `[0, drift_max]`
+        # （修复轮 1 / Minor #3：p 太大时阶梯不变量会反转、p = 1 时她恒偏航）。顺序固定：先 max 后 base。
+        if "drift_max" in body:
+            try:
+                s.drift_max = min(max(0.0, min(1.0, float(body["drift_max"]))), config_mod.DRIFT_MAX_LIMIT)
+            except (TypeError, ValueError):
+                pass
+        if "drift_base" in body:
+            try:
+                s.drift_base = min(max(0.0, min(1.0, float(body["drift_base"]))), s.drift_max)
+            except (TypeError, ValueError):
+                pass
+        if "pv_max_drop" in body:
+            try:
+                s.pv_max_drop = max(0.0, min(1.0, float(body["pv_max_drop"])))
+            except (TypeError, ValueError):
+                pass
         if "tools_enabled" in body:             # 发言侧工具开关：开启后她才会在提示/落子宣告里查资料
             s.tools_enabled = bool(body["tools_enabled"])
         return ok()

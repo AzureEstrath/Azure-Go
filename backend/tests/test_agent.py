@@ -1398,7 +1398,8 @@ class EmotionDriftTest(unittest.TestCase):
         self.assertEqual(bus_on.messages(events.AI_MOVE)[0]["move"]["gtp"], "D4", "音画同步照旧带坐标")
 
     def test_drift_probability_clamped(self):
-        """``p_drift = clamp(drift_base + emotion_bias(mood), 0, drift_max)``：两头都要夹住。"""
+        """``p_drift = clamp(drift_base + emotion_bias(mood), 0, drift_max)``：两头都要夹住；
+        ``drift_max`` 本身还被「小概率」上限 ``DRIFT_MAX_LIMIT``（0.2）收口（修复轮 1 / Minor #3）。"""
         agent, _eng, _llm, _bus = _mk()
         agent.drift_base, agent.drift_max = 0.5, 0.08
         self.assertAlmostEqual(agent._drift_probability(_AGITATED), 0.08, msg="base 超上限 ⇒ 夹到 drift_max")
@@ -1409,14 +1410,45 @@ class EmotionDriftTest(unittest.TestCase):
         self.assertAlmostEqual(agent._drift_probability(_AGITATED), 0.08, msg="最躁 ⇒ 吃满 drift_max")
         for dirty in (None, "oops", [], {"v": 0.1}, {"v": "x", "c": 0.5, "a": 0.5}):
             self.assertAlmostEqual(agent._drift_probability(dirty), 0.03, msg="缺失 / 脏值 ⇒ 偏移 0")
-        # 构造器同样夹取：越界夹到 [0,1]，脏值退回默认（绝不因一个旋钮把 agent 构造搞崩）
+
+        # 构造器同样夹取（修复轮 1 / Minor #3）：`drift_max` 收口到 DRIFT_MAX_LIMIT（**不是 1.0**），
+        # `drift_base` 再夹到 [0, drift_max]；脏值退回默认（绝不因一个旋钮把 agent 构造搞崩）。
+        from app.config import DRIFT_MAX_LIMIT
+        self.assertAlmostEqual(DRIFT_MAX_LIMIT, 0.2)
         a2 = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus(),
                         drift_base=5, drift_max=-3, pv_max_drop="x")
-        self.assertEqual(a2.drift_base, 1.0)
-        self.assertEqual(a2.drift_max, 0.0)
+        self.assertAlmostEqual(a2.drift_max, 0.0)
+        self.assertAlmostEqual(a2.drift_base, 0.0)
         self.assertAlmostEqual(a2.pv_max_drop, 0.05)
         self.assertEqual(a2._maybe_drift(_drift_lines(), _AGITATED, FixedRng(0.0)), "a",
                          "drift_max=0 ⇒ 概率为 0，恒走 A")
+        a3 = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus(),
+                        drift_base=0.5, drift_max=1.0)
+        self.assertAlmostEqual(a3.drift_max, DRIFT_MAX_LIMIT, "drift_max 不许开到 1.0（否则她恒偏航）")
+        self.assertAlmostEqual(a3.drift_base, DRIFT_MAX_LIMIT, "drift_base 夹到 [0, drift_max]")
+        self.assertLess(a3._drift_probability(_AGITATED), 1.0, "p 恒 < 1：A 永远有机会被选中")
+
+    def test_ui_levels_never_flatline_the_mood_bias(self):
+        """修复轮 1 / Important #2：UI 的**每一档**都必须明显低于 `drift_max`。
+
+        `emotion_bias` 只往上加 ⇒ 档位一旦顶到 `drift_max`，`p = clamp(base + bias, 0, max)` 就被夹平、
+        情绪完全不参与（老「高 8%」那档正是如此，而 tooltip 却承诺会浮动）。这里逐档钉死
+        「平静 ⇒ 就是这一档的基础概率；情绪一上来 p 必须**变大**」。
+        """
+        from app.agent import DRIFT_MAX_DEFAULT
+        levels = [0.03, 0.05, 0.06]          # 与前端 `Main.DRIFT_BASES` 一一对应（前端门卫另有一条 < 0.08）
+        self.assertEqual(levels[-1], 0.06, "最高档是 6%（8% 会被默认上限夹平）")
+        for base in levels:
+            agent, _eng, _llm, _bus = _mk()
+            agent.emotion_drift = True
+            agent.drift_base = base
+            calm = agent._drift_probability(_NEUTRAL)
+            stirred = agent._drift_probability(_AGITATED)
+            self.assertAlmostEqual(calm, base, msg="平静 ⇒ 就是这一档的基础概率")
+            self.assertGreater(stirred, calm, msg="每一档下情绪都必须仍能改变 p")
+            self.assertLessEqual(stirred, DRIFT_MAX_DEFAULT, msg="浮动上限仍是 drift_max")
+            self.assertLess(base, DRIFT_MAX_DEFAULT, msg="档位必须低于 drift_max，留出情绪余量")
+
 
     def test_drift_rng_reproducible(self):
         """注入 rng ⇒ 决策可复现：同种子同串、换种子不同串（说明确实在掷，而不是恒 A）。"""
@@ -1432,7 +1464,7 @@ class EmotionDriftTest(unittest.TestCase):
         self.assertNotEqual(seq(2026), seq(2027), "换种子应当给出不同串（确实在掷骰）")
 
     def test_ladder_prefers_a_then_b_then_c(self):
-        """阶梯：``P(A) > P(B) > P(C)``（越偏越少），三段相加为 1。"""
+        """阶梯：``P(A) > P(B) > P(C)``（越偏越少），三段相加为 1；**天花板档**也成立。"""
         agent, _eng, _llm, _bus = _mk()
         agent.emotion_drift = True
         agent.drift_rng = random.Random(20261017)
@@ -1447,6 +1479,23 @@ class EmotionDriftTest(unittest.TestCase):
         # 与理论值同量级（p = 0.08 ⇒ A ≈ 92%、B ≈ 5.33%、C ≈ 2.67%）
         self.assertAlmostEqual(counts["b"] / 20000.0, 0.08 * 2.0 / 3.0, delta=0.01)
         self.assertAlmostEqual(counts["c"] / 20000.0, 0.08 / 3.0, delta=0.01)
+
+        # 修复轮 1 / Minor #3：把 p 顶到**允许的最大值**（drift_max = DRIFT_MAX_LIMIT = 0.2）也仍是
+        # 「A 常态」——这正是把上限从 1.0 收到 0.2 要守的不变量（p ≥ 0.6 时 P(A) ≤ P(B)、
+        # p = 1.0 时她恒偏航，那是 spec §5-C 明令要防的「变成乱下」）。
+        from app.config import DRIFT_MAX_LIMIT
+        ceil_agent, _e, _l, _b = _mk()
+        ceil_agent.emotion_drift = True
+        ceil_agent.drift_max = DRIFT_MAX_LIMIT
+        ceil_agent.drift_base = DRIFT_MAX_LIMIT
+        ceil_agent.drift_rng = random.Random(20261017)
+        ceil = {"a": 0, "b": 0, "c": 0}
+        for _ in range(20000):
+            ceil[ceil_agent._maybe_drift(lines, mood, ceil_agent.drift_rng)] += 1
+        self.assertGreater(ceil["a"], ceil["b"], "天花板档：P(A) 仍最大")
+        self.assertGreater(ceil["b"], ceil["c"], "天花板档：P(B) 仍大于 P(C)")
+        self.assertGreater(ceil["a"] / 20000.0, 0.75, "P(A) 至少 0.8 量级（1-p = 0.8）")
+
 
     def test_illegal_first_move_falls_back(self):
         """首手不是当前棋盘的合法点 ⇒ ``C → B → A`` 逐级回落，绝不下出非法手。"""
@@ -1524,5 +1573,47 @@ class EmotionDriftTest(unittest.TestCase):
         # 事件原文**永不进台词**：台词里不许出现这句事件文本
         self.assertNotIn(ev["text"], " ".join(m["text"] for m in on.bus.messages()))
         self.assertFalse(hasattr(on.st, "event_log"), "事件表不进 GameState")
+
+    def test_drift_event_only_when_the_move_is_actually_taken(self):
+        """修复轮 1 / Important #1：**先定案、后记账**——偏航点没被真的走成，就不留事件。
+
+        ``_drift_pick`` 只返回落点（把待记账信息放进 ``_drift_pending``）；记账由 ``_record_drift``
+        在落点**定案并提交**之后做，且**只在最终落点就是那个偏航点时**写。工具轮重定案 / 回落成 A
+        两种情形都不留事件（事件是 P5 事件区块喂给模型的素材，与事实不符会被原样注入提示词）。
+        """
+        agent, _eng, _llm, _bus = _mk()
+        agent.emotion_drift = True
+        agent.drift_rng = FixedRng(0.0)                 # 0.0 落在 B 段
+        infos = PvStubEngine().move_infos()
+        pick = agent._pick_ai_move(infos)
+        self.assertEqual(pick[0], "Q16", "A 的首手")
+
+        drifted = agent._drift_pick(infos, pick)
+        self.assertEqual(drifted[0], "D4", "掷中 B ⇒ 落点改成 B 的首手")
+        self.assertEqual(agent.event_log.all(), [], "定案阶段**一条都不许**写事件表")
+        pending = agent._take_drift_pending()
+        self.assertEqual(pending["gtp"], "D4")
+        self.assertEqual(pending["best"], "Q16")
+        self.assertIsNone(agent._take_drift_pending(), "取走即清空（绝不跨回合残留）")
+
+        # ① 落点被重定案（工具轮里模型自报别的点）⇒ 不记账
+        self.assertFalse(agent._record_drift(pending, "Q4"))
+        self.assertEqual(agent.event_log.all(), [], "最终落点不是偏航点 ⇒ 一条都不写")
+        # ② 回落成 A ⇒ 不记账
+        self.assertFalse(agent._record_drift(pending, "Q16"))
+        self.assertEqual(agent.event_log.all(), [])
+        # ③ 取不到待记账信息（没偏航 / 已被取走）⇒ 不记账
+        self.assertFalse(agent._record_drift(None, "D4"))
+        self.assertEqual(agent.event_log.all(), [])
+
+        # ④ 真的走了偏航点 ⇒ 记一条；手数取**提交之后**的 len(st.moves)
+        agent.st.add_move("W", "D4")
+        self.assertTrue(agent._record_drift(pending, "D4"))
+        ev = agent.event_log.all()[0]
+        self.assertEqual(ev["kind"], "ai_bad")
+        self.assertEqual(ev["move_no"], 1)
+        self.assertIn("自主偏航", ev["text"])
+        self.assertEqual(ev["detail"]["line"], "b")
+
 
 

@@ -21,6 +21,7 @@ from .agent_graph import (
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, is_joseki_mistake, _emit_line,
 )
 from .board import GoBoard, SIZE as BOARD_SIZE
+from .config import DRIFT_MAX_LIMIT
 from .emotion import EmotionModel
 from .event_log import EventLog
 from .joseki import JosekiRecognizer
@@ -162,13 +163,17 @@ def _clamp_rate(v):
 DRIFT_BASE_DEFAULT = 0.03        # 基础偏航概率（平静时的 p_drift）
 DRIFT_MAX_DEFAULT = 0.08         # p_drift 上限：再躁也不超过它，免得变成「乱下」
 PV_MAX_DROP_DEFAULT = 0.05       # 偏航线与最优线的胜率差上限（超了这条线整条不用）
-# 阶梯的切分：``p_drift`` 里 2/3 给 B、其余给 C ⇒ P(A) = 1-p > P(B) > P(C)（越偏越少，设计 §6.2）
+# 阶梯的切分：``p_drift`` 里 2/3 给 B、其余给 C ⇒ P(A) = 1-p > P(B) > P(C)（越偏越少，设计 §6.2）。
+# ⚠ 这条不变量只在 ``p < 0.6`` 时成立（``P(A) = 1-p`` 要大于 ``P(B) = 2p/3``）——所以
+# ``drift_max`` 必须被夹在「小概率」范围内（``config.DRIFT_MAX_LIMIT = 0.2``，修复轮 1 / Minor #3）：
+# ``p ≤ 0.2 ⇒ P(A) = 1-p ≥ 0.8 > P(B) = 2p/3 ≤ 0.133 > P(C) = p/3 ≤ 0.067``。
 DRIFT_B_TO_C_SPLIT = 2.0 / 3.0
 # 情绪偏移的映射（设计 §八 把形状留给建造者）：
-#   基线（= ``EmotionModel.baseline``，即「平静」）⇒ 偏移 0；越偏离基线越容易走偏。
+#   基线（= ``EmotionModel.BASELINE``，即「平静」）⇒ 偏移 0；越偏离基线越容易走偏。
 #   三个权重只吃**既有 mood 三维**：愉悦度低（失落 / 难过）/ 好奇度高（好奇 / 兴致）/
 #   唤醒度高（激动 / 烦躁）各占一份；分数到 ``DRIFT_SCORE_FULL`` 就吃满 ``drift_max``。
-DRIFT_MOOD_BASELINE = (0.58, 0.55, 0.30)
+#   **引用 EmotionModel 的类级常量**，不抄字面量副本（修复轮 1 / Minor #2：抄副本会各自漂移）。
+DRIFT_MOOD_BASELINE = EmotionModel.BASELINE
 DRIFT_MOOD_WEIGHTS = (0.45, 0.20, 0.35)
 DRIFT_SCORE_FULL = 0.5
 
@@ -177,6 +182,18 @@ def _clamp_unit(v, default):
     """``[0, 1]`` 的安全取值：键缺失 / 脏值 → ``default``（不抛，不把 agent 构造搞崩）。"""
     try:
         return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _as_float(v, default=0.0) -> float:
+    """取一个 float：缺失 / 脏值 → ``default``（不抛）。
+
+    偏航链路上「胜率差」要在两处读（挑线时判上限、记账时写进事件文本），共用这一处解析
+    （修复轮 1 / Minor #6：原先两处各抄了一份 try/except）。
+    """
+    try:
+        return float(v)
     except (TypeError, ValueError):
         return float(default)
 
@@ -194,12 +211,15 @@ def _mood_dim(mood, key):
         return None
 
 
-def emotion_bias(mood, drift_max=DRIFT_MAX_DEFAULT) -> float:
+def emotion_bias(mood, drift_max=DRIFT_MAX_DEFAULT, baseline=DRIFT_MOOD_BASELINE) -> float:
     """情绪偏移：只吃既有 mood 三维（``v`` / ``c`` / ``a``），返回 ``[0, drift_max]``。
 
     ``score = 0.45*(0.58-v) + 0.20*(c-0.55) + 0.35*(a-0.30)``——基线「平静」恰为 ``0``，
     情绪越低落 / 越好奇 / 越激动，分数越高（三份权重见 ``DRIFT_MOOD_WEIGHTS``）；再按
     ``DRIFT_SCORE_FULL`` 归一、夹到 ``[0, drift_max]``。
+
+    ``baseline`` 默认取 ``EmotionModel.BASELINE``；调用方传 ``self.mood.baseline`` 时，
+    实例自定义过的基线也照用（不抄字面量副本，修复轮 1 / Minor #2）。
 
     非 dict / 任一维缺失或脏值 ⇒ ``0.0``（**不是**负数：波动只往上加，平静时就是 ``drift_base``）。
     """
@@ -208,7 +228,7 @@ def emotion_bias(mood, drift_max=DRIFT_MAX_DEFAULT) -> float:
     a = _mood_dim(mood, "a")
     if v is None or c is None or a is None:
         return 0.0
-    base = DRIFT_MOOD_BASELINE
+    base = baseline if isinstance(baseline, (list, tuple)) and len(baseline) == 3 else DRIFT_MOOD_BASELINE
     score = (DRIFT_MOOD_WEIGHTS[0] * (base[0] - v)
              + DRIFT_MOOD_WEIGHTS[1] * (c - base[1])
              + DRIFT_MOOD_WEIGHTS[2] * (a - base[2]))
@@ -315,14 +335,20 @@ class AzureAgent:
         # —— 情绪波动（v3.8.0）：小概率走偏优解，**默认关**（设计 §6.2）——
         #    关闭时逐项与现状一致：不解析线、不掷骰、不记事件（``_drift_pick`` 第一行就返回）。
         #    ``emotion_drift`` 是开关；``drift_base`` / ``drift_max`` 定 ``p_drift = clamp(base+bias, 0, max)``；
-        #    ``pv_max_drop`` 是偏航线与最优线的胜率差上限（超了整条不用）。三个数值都夹到 ``[0, 1]``，
-        #    脏值退回默认——与 ``config.AzureConfig`` 同口径。
+        #    ``pv_max_drop`` 是偏航线与最优线的胜率差上限（超了整条不用）。
+        #    ``drift_max`` 夹到**小概率上限** ``DRIFT_MAX_LIMIT``（0.2，不是 1.0），``drift_base`` 再夹到
+        #    ``[0, drift_max]``（修复轮 1 / Minor #3：p 太大时阶梯不变量会反转、甚至恒偏航）；
+        #    三个数值的脏值都退回默认——与 ``config.AzureConfig`` 同口径（这里的上限是**最后一道**防线，
+        #    即使有人直接构造 agent 或运行时改属性，``_drift_probability`` 也不会把 p 放到 1.0 以上）。
         #    ``drift_rng`` 是**注入的**随机源（生产用自带 ``random.Random()``，单测注入固定替身）。
         self.emotion_drift = bool(emotion_drift)
-        self.drift_base = _clamp_unit(drift_base, DRIFT_BASE_DEFAULT)
-        self.drift_max = _clamp_unit(drift_max, DRIFT_MAX_DEFAULT)
+        self.drift_max = min(_clamp_unit(drift_max, DRIFT_MAX_DEFAULT), DRIFT_MAX_LIMIT)
+        self.drift_base = min(_clamp_unit(drift_base, DRIFT_BASE_DEFAULT), self.drift_max)
         self.pv_max_drop = _clamp_unit(pv_max_drop, PV_MAX_DROP_DEFAULT)
         self.drift_rng = drift_rng if drift_rng is not None else random.Random()
+        # 本轮偏航的**待记账**信息（修复轮 1 / Important #1）：``_drift_pick`` 只填它、不写表；
+        # 落点定案并提交之后由 ``_record_drift`` 消费（一次性，绝不跨回合残留）。
+        self._drift_pending = None
 
         # —— 局内事件表（v3.8.0，设计 §6.3）：**局内内存**、不进 GameState 快照、不随悔棋回退 ——
         #    本批只有「走偏优解」一个写入点（``_record_drift``）；``reset_game`` 清空（新一局不带旧账）。
@@ -1366,8 +1392,13 @@ class AzureAgent:
 
         只吃**既有那一次**分析的 ``moveInfos``（``pv_lines.extract_lines`` 是纯函数，零引擎调用）；
         **关闭（默认）时原样返回 ``pick``**——不解析线、不掷骰、不记事件，与没有这个功能时逐项一致。
-        走 B / C 时记一条 ``ai_bad`` 事件（设计 §6.3：她走了偏优解）；事件原文**永不进台词**。
+
+        **只返回落点、不写事件表**（修复轮 1 / Important #1）：选中 B/C 时把「待记账」信息放进
+        ``self._drift_pending``（由 ``_take_drift_pending`` 取走交给本轮 ``data``），事件改由
+        ``_record_drift`` 在**落点定案并提交之后**写——工具轮重定案 / 回落到 A / 本回合被作废，
+        三种情形都不会留下与实际落点不符的事件。
         """
+        self._drift_pending = None
         if not self.emotion_drift:
             return pick
         lines = pv_lines.extract_lines(list(move_infos or []), max_drop=self.pv_max_drop)
@@ -1382,13 +1413,27 @@ class AzureAgent:
         # 二次核对（``_maybe_drift`` 已判过一次）：任何意外都回到既有落点，绝不下出非法手
         if xy[0] < 0 or xy[1] < 0 or not self.st.board.is_legal(xy[0], xy[1], "white")["ok"]:
             return pick
-        self._record_drift(letter, gtp, lines, mood)
+        a_moves = list((lines.get("a") or {}).get("moves") or [])
+        self._drift_pending = {
+            "line": letter,
+            "gtp": gtp,
+            "best": str(a_moves[0]) if a_moves else "",
+            "drop": _as_float(lines.get("drop"), 0.0),
+            "mood": str(mood.get("name") or "") if isinstance(mood, dict) else "",
+        }
         return [gtp, xy[0], xy[1]]
+
+    def _take_drift_pending(self):
+        """取走本轮待记账的偏航信息（``None`` ＝ 本轮没偏航）；**一次性**：取走即清空。"""
+        pending = self._drift_pending
+        self._drift_pending = None
+        return pending
 
     def _maybe_drift(self, lines, mood, rng) -> str:
         """按阶梯概率在 A / B / C 里挑一条线，返回线名 ``"a"`` / ``"b"`` / ``"c"``。
 
-        概率：``p = p_drift(mood)`` 里 ``2/3`` 给 B、其余给 C ⇒ ``P(A) > P(B) > P(C)``（越偏越少）。
+        概率：``p = p_drift(mood)`` 里 ``2/3`` 给 B、其余给 C ⇒ ``P(A) > P(B) > P(C)``（越偏越少；
+        ``p`` 被 ``drift_max ≤ DRIFT_MAX_LIMIT`` 兜着，所以 ``P(A) ≥ 0.8``）。
         **安全缺省**（宁可走 A 也不许下出烂棋，设计 §三）：开关关闭 / 线缺失 / 胜率差超
         ``pv_max_drop`` / 首手不是当前棋盘的合法点 —— 一律**逐级回落**（``c → b → a``），
         最终必是 ``"a"``（调用方随即保留既有 ``_pick_ai_move`` 的结果）。
@@ -1400,10 +1445,7 @@ class AzureAgent:
         a = lines.get("a")
         if not self._line_usable(a):
             return "a"                      # 连 A 都取不到：无从偏航
-        try:
-            drop = float(lines.get("drop") or 0.0)
-        except (TypeError, ValueError):
-            drop = 0.0
+        drop = _as_float(lines.get("drop"), 0.0)
         if drop > self.pv_max_drop:
             return "a"                      # 偏得太远：这一批线整条不用
         p = self._drift_probability(mood)
@@ -1422,8 +1464,11 @@ class AzureAgent:
         return "a"
 
     def _drift_probability(self, mood) -> float:
-        """``p_drift = clamp(drift_base + emotion_bias(mood), 0, drift_max)``（设计 §6.2）。"""
-        p = self.drift_base + emotion_bias(mood, self.drift_max)
+        """``p_drift = clamp(drift_base + emotion_bias(mood), 0, drift_max)``（设计 §6.2）。
+
+        基线取**这一局情绪模型的实例基线**（``self.mood.baseline``）——实例自定义过基线也照用。
+        """
+        p = self.drift_base + emotion_bias(mood, self.drift_max, self.mood.baseline)
         if p < 0.0:
             return 0.0
         return self.drift_max if p > self.drift_max else p
@@ -1444,28 +1489,30 @@ class AzureAgent:
             return False
         return bool(self.st.board.is_legal(xy[0], xy[1], "white")["ok"])
 
-    def _record_drift(self, letter, gtp, lines, mood) -> None:
-        """走偏时记一条 ``ai_bad`` 事件（设计 §6.3「我下错了 / 走了偏优解」）。
+    def _record_drift(self, drift, gtp) -> bool:
+        """落点**定案并提交**之后记账（修复轮 1 / Important #1）：只有最终落点就是那个偏航点时才写。
 
-        事件原文是**给模型看的素材**：永不进台词、不产生 ``speech``。手数用她这一手落子后的
-        1 基序号（与 ``note_move`` 同义）；``move_no`` + 文本一起进表，去重键天然按手数区分。
+        事件原文是**给模型看的素材**：永不进台词、不产生 ``speech``。手数取**提交之后**的
+        ``len(st.moves)``——她这一手的 1 基序号（与 ``note_move`` 同义）。
+
+        三种情形都**不留**事件（事件与事实必须一致：它是 P5 事件区块喂给模型的素材）：
+        工具轮把落点重定案 / 回落到 A / 本回合被看门狗作废（调用点在 ``_alive`` 守卫之后）。
+        返回是否真的写了（便于门卫断言）。
         """
-        a_moves = list((lines.get("a") or {}).get("moves") or [])
-        best = str(a_moves[0]) if a_moves else ""
-        try:
-            drop = float(lines.get("drop") or 0.0)
-        except (TypeError, ValueError):
-            drop = 0.0
-        move_no = len(self.st.moves) + 1
+        if not isinstance(drift, dict) or str(drift.get("gtp") or "") != str(gtp or ""):
+            return False
+        move_no = len(self.st.moves)
         text = "我在第%d手自主偏航：没走最优的%s，选了%s（与最优的胜率差约%d%%）" % (
-            move_no, best or "（未知）", gtp, int(round(drop * 100.0)))
+            move_no, drift.get("best") or "（未知）", drift.get("gtp"),
+            int(round(_as_float(drift.get("drop"), 0.0) * 100.0)))
         self.event_log.add("ai_bad", move_no, text, {
-            "line": letter,
-            "gtp": gtp,
-            "best": best,
-            "drop": drop,
-            "mood": str((mood or {}).get("name") or "") if isinstance(mood, dict) else "",
+            "line": str(drift.get("line") or ""),
+            "gtp": str(drift.get("gtp") or ""),
+            "best": str(drift.get("best") or ""),
+            "drop": _as_float(drift.get("drop"), 0.0),
+            "mood": str(drift.get("mood") or ""),
         })
+        return True
 
     def _candidate_from_text(self, text) -> dict | None:
         """从模型原话里认出它自己报出的落点候选（S21）：GTP 坐标或虚着；认不出返回 ``None``。

@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import events
+from helpers import FixedRng, PvStubEngine
 from test_agent import ErrLLM, StubEngine, StubLLM, ZeroRng, _mk
 
 
@@ -1315,4 +1316,69 @@ class PvDepthCallSiteTest(unittest.TestCase):
         self.assertEqual(deep, [150], "150 > 100 ⇒ 三线要的更深搜索在这里生效")
         i = agent.katago.visits.index(150)
         self.assertEqual(agent.katago.calls[i][-1], ["B", "D16"])
+
+
+class DriftSettlementTest(unittest.TestCase):
+    """修复轮 1 / Important #1：偏航**先定案、后记账**——事件必须与最终落点一致。
+
+    事件表是本功能唯一的产出物、也是 P5「事件区块」喂给模型的素材：与事实不符会被原样注入提示词。
+    偏航点可能在 `decide` 之后被工具轮重定案（``_settle_tool_final`` 走 ``_resolve_ai_move``），
+    所以记账必须等落点**定案并提交**之后再做（``_speak_own_turn`` 里），且只在最终落点就是那个
+    偏航点时写。
+    """
+
+    def _agent_with_drift(self):
+        agent, _eng, _llm, bus = _mk()
+        agent.katago = PvStubEngine()            # 三条线凑得出来（StubEngine 没有 pv ⇒ 只有 A）
+        agent.emotion_drift = True
+        agent.drift_rng = FixedRng(0.0)          # 0.0 落在 B 段 ⇒ 偏航点是 D4
+        return agent, bus
+
+    def test_tool_round_resettlement_leaves_no_drift_event(self):
+        """工具轮把落点重定案成别的点 ⇒ 事件表里**不许**留下「我偏航选了 D4」。"""
+        agent, bus = self._agent_with_drift()
+        agent.tools_enabled = True
+        agent.chain = _ScriptChain([_Ai(content="我下 Q4。")])   # 工具轮：模型自报另一个合法点
+
+        asyncio.run(agent.player_move(3, 3))
+
+        self.assertEqual(agent.st.moves[-1][1], "Q4", "落点被工具轮重定案（不是偏航点 D4）")
+        self.assertEqual(bus.messages(events.AI_MOVE)[-1]["move"]["gtp"], "Q4", "音画同步照旧一致")
+        self.assertEqual(agent.event_log.all(), [], "最终落点不是偏航点 ⇒ 一条事件都不许留")
+        self.assertFalse(agent.busy)
+
+    def test_drifted_move_is_recorded_when_no_tool_round_intervenes(self):
+        """反向：没有工具轮插手 ⇒ 真的走了偏航点，事件照写（正反两面都要有）。"""
+        agent, bus = self._agent_with_drift()
+
+        asyncio.run(agent.player_move(3, 3))
+
+        self.assertEqual(agent.st.moves[-1][1], "D4", "走的是 B 的首手")
+        self.assertEqual(bus.messages(events.AI_MOVE)[-1]["move"]["gtp"], "D4")
+        log = agent.event_log.all()
+        self.assertEqual(len(log), 1)
+        self.assertEqual(log[0]["kind"], "ai_bad")
+        self.assertIn("自主偏航", log[0]["text"])
+
+    def test_dead_turn_leaves_no_ghost_drift_event(self):
+        """修复轮 1 / Minor #4：回合被看门狗作废 ⇒ 连**幽灵事件**都不许留（记账点在提交之后）。
+
+        时序与 ``BusyWatchdogTest.test_own_turn_write_is_guarded_after_the_tts_await`` 同款：
+        落子宣告的 TTS 挂住 0.6s、看门狗 0.5s 正好落在合成挂住期间 ⇒ own_turn 越过写入点时
+        本回合已被作废。记在 ``_drift_pick`` 里（定案即记账）的话，这里会留下一条幽灵事件。
+        """
+        agent, bus = self._agent_with_drift()
+        agent.tts = _HangingTTS(hang_at=2, hang=0.6)
+        agent.watchdog_sec = 0.5
+
+        async def run():
+            await agent.player_move(3, 3)
+            await _wait_for(lambda: len(bus.of_type("speech")) >= 2)
+
+        asyncio.run(run())
+
+        self.assertFalse(agent.busy, "超时必须归位")
+        self.assertEqual(len(agent.st.moves), 1, "她那一手被守卫拦下（棋谱只剩玩家那一手）")
+        self.assertEqual(agent.event_log.all(), [], "作废的回合不许留下幽灵偏航事件")
+
 

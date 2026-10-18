@@ -71,7 +71,7 @@ static func load_config(path := "") -> AzureConfig:
 			c.max_visits = int(d.get("max_visits", c.max_visits))
 			c.joseki_teach = bool(d.get("joseki_teach", c.joseki_teach))
 			c.joseki_rate = _normalize_joseki_rate(d.get("joseki_rate", c.joseki_rate))
-			c.emotion_drift = bool(d.get("emotion_drift", c.emotion_drift))
+			c.emotion_drift = _normalize_flag(d.get("emotion_drift"), c.emotion_drift)
 			c.drift_base = _normalize_drift_base(d.get("drift_base", c.drift_base))
 			c.backend_url = str(d.get("backend_url", c.backend_url))
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
@@ -135,6 +135,12 @@ static func _normalize_joseki_rate(v) -> float:
 ## **有意不拦 INF**：`clampf(INF, 0, 1)` = 1.0，与后端 `min(1.0, inf)` 一致（JSON 的 1e999 两端都当 1.0）。
 static func _clamp_rate(f: float) -> float:
 	return 0.5 if is_nan(f) else clampf(f, 0.0, 1.0)
+
+## 布尔开关归一化（v3.8.0 / 修复轮 1 / Minor #7）：**只认 JSON 的 true / false**。
+## GDScript 的 `bool("false")` 是 `true`，直接用它会把字符串脏值读成「开」；数字 / null 同理当脏值，
+## 一律退回默认（`fallback`）。本批新加的开关用它；既有开关的读法一个字不动。
+static func _normalize_flag(v, fallback: bool) -> bool:
+	return v if typeof(v) == TYPE_BOOL else fallback
 
 ## 偏航基础概率归一化：与 `joseki_rate` **同一套守卫与同一条口径**（数值 / 字符串共用判据、
 ## NaN ⇒ 默认 0.03、其余夹到 [0,1]、脏值不把启动搞崩）。后端 `config._apply` 也是这么读的。
