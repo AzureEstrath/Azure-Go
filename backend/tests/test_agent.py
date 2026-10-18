@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app import events
 from app.agent import AzureAgent
 from app.joseki_progress import JosekiProgress
-from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM
+from helpers import BoomLLM, ErrLLM, StubEngine, StubLLM, ZeroRng
 from helpers import mk_agent as _mk
 
 
@@ -1096,8 +1096,10 @@ class JosekiCardGateTest(unittest.TestCase):
         self.dir.cleanup()
 
     def _agent(self):
+        # 必定讲（rate=1.0 + ZeroRng：画像 / 情绪的负浮动也压不过）：本组用例钉的是**资格层**
+        # （族计数 / 走错），不是频率层；频率层的行为由 ``test_joseki_gate`` 显式设 rate + 注入 rng 覆盖。
         return AzureAgent(StubEngine(), StubLLM(), events.RecordingBus(),
-                          joseki_progress=self.progress)
+                          joseki_progress=self.progress, joseki_rate=1.0, joseki_rng=ZeroRng())
 
     def _turn(self, agent, seed, x, y):
         """铺好角内既有手顺，再跑 ``after_player``（玩家那一手由这个阶段落到谱上）。"""

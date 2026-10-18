@@ -240,9 +240,9 @@ class GateWiringTest(unittest.TestCase):
         """未命中（门控不放行）与「识别器没出声」：**事件集合逐项相等**（同一出口）。"""
         def run(gate_miss):
             agent, _eng, llm, bus = mk_agent()
-            # 0.0 ⇒ 必未命中；1.0 ⇒ 必命中。rng 也固定（画像 / 情绪给的正负浮动都压不过确定性）
+            # 0.0 ⇒ 必未命中（`_FixedRng(1.0)` 连 p 到边界也压不过）；1.0 ⇒ 必命中
             agent.joseki_rate = 0.0 if gate_miss else 1.0
-            agent.joseki_rng = _FixedRng(0.999)
+            agent.joseki_rng = _FixedRng(1.0)
             _seed(agent, self.ENTER_SEED)
             if gate_miss:                                     # 门控未命中：识别结果在，只是不讲
                 state = self._after_player(agent)
@@ -269,7 +269,7 @@ class GateWiringTest(unittest.TestCase):
         self.assertEqual(_phase_text(a_llm), _phase_text(b_llm), "提示词也同构")
 
     def test_hit_teaches_emits_and_shows_the_card(self):
-        """命中（未接线 ⇒ 有资格就讲）：讲解模板 + 卡片 + ``joseki`` 事件，一条不多一条不少。"""
+        """命中（测试装配 ``joseki_rate=1.0`` ⇒ p 被夹到 1.0）：讲解模板 + 卡片 + ``joseki`` 事件。"""
         agent, _eng, llm, bus = mk_agent()
         _seed(agent, self.ENTER_SEED)
         state = self._after_player(agent)
@@ -297,7 +297,7 @@ class GateWiringTest(unittest.TestCase):
     def test_gate_records_the_cooldown_after_a_hit(self):
         """命中要记「这一族最近讲过的手数」：窗口内同族不再重复讲，走出窗口恢复。"""
         agent, _eng, _llm, _bus = mk_agent()
-        agent.joseki_rate = 1.0                              # 接上频率层（未接线时没有冷却）
+        agent.joseki_rate = 1.0                              # p 被夹到 1.0 ⇒ 必定讲
         agent.joseki_rng = _FixedRng(0.0)                    # 画像 / 情绪的浮动也压不过确定性
         jk = {"kind": "entered", "family": "star_33", "corner": "左上", "cat": "star"}
         self.assertTrue(asyncio.run(agent.joseki_gate_show(jk, None)))
@@ -308,23 +308,37 @@ class GateWiringTest(unittest.TestCase):
             agent.st.add_move("B", "pass")
         self.assertTrue(asyncio.run(agent.joseki_gate_show(jk, None)), "走出窗口：恢复")
 
-    def test_unwired_rate_keeps_the_old_behaviour(self):
-        """未接线 ``joseki_rate``（直接构造 agent / 单测）⇒ 没有频率层：有资格就讲、也不进冷却。"""
-        agent, _eng, _llm, _bus = mk_agent()
-        self.assertIsNone(agent.joseki_rate, "未接线：保持 None（不是 0.5）")
+    def test_default_rate_is_half_and_still_rolls(self):
+        """默认 ``joseki_rate = 0.5``（与 config 字段一致）：**只有一条路径**——资格层过了就掷 ``p``。
+
+        R-T5-1：不再有「``rate`` 为 ``None`` ⇒ 跳过频率层」的第二种模式（漏接线不该静默退回
+        「每次都教」）。这里直接构造 agent（``mk_agent`` 是测试装配，显式把 rate 拉满到 1.0）。
+        """
+        agent = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus())
+        self.assertEqual(agent.joseki_rate, 0.5, "默认与 config 字段一致（没有 None 哨兵）")
         jk = {"kind": "entered", "family": "star_33", "corner": "左上", "cat": "star"}
-        for _ in range(3):
-            self.assertTrue(asyncio.run(agent.joseki_gate_show(jk, None)), "连着问也照样讲")
-        self.assertEqual(agent._joseki_taught, {}, "未接线不记冷却起点")
+        # 固定 rng：0.4 < 0.5 ⇒ 命中，且命中会记下冷却起点
+        agent.joseki_rng = _FixedRng(0.4)
+        self.assertTrue(asyncio.run(agent.joseki_gate_show(jk, None)))
+        self.assertEqual(agent._joseki_taught, {"star_33": 0}, "命中记下这一族的冷却起点")
+        self.assertFalse(asyncio.run(agent.joseki_gate_show(jk, None)), "冷却窗口内：按未命中处理")
+        # 掷不中（0.6 > 0.5）⇒ 不讲、也不记冷却
+        agent2 = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus())
+        agent2.joseki_rng = _FixedRng(0.6)
+        self.assertFalse(asyncio.run(agent2.joseki_gate_show(jk, None)))
+        self.assertEqual(agent2._joseki_taught, {})
         # 资格层照常把关：这一族已教过 3 次（走错除外）
-        agent.joseki_progress = _FakeProgress({"star_33": 3})
-        self.assertFalse(asyncio.run(agent.joseki_gate_show(jk, None)))
+        agent2.joseki_progress = _FakeProgress({"star_33": 3})
+        self.assertFalse(asyncio.run(agent2.joseki_gate_show(jk, None)))
+        # 脏 rate：退回默认 0.5（不是 0.0「永不讲」，也不是 None）
+        dirty = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus(), joseki_rate="oops")
+        self.assertEqual(dirty.joseki_rate, 0.5)
 
     def test_gate_only_decides_text_and_card(self):
         """门控不改 ``busy``、不改事件配对、不改状态机：未命中时棋子照落、谱照走。"""
         agent, _eng, _llm, bus = mk_agent()
         agent.joseki_rate = 0.0
-        agent.joseki_rng = _FixedRng(0.999)      # 画像给的 +10% 浮动也压不过确定性
+        agent.joseki_rng = _FixedRng(1.0)        # 画像给的 +10% 浮动也压不过「必不命中」
         _seed(agent, self.ENTER_SEED)
         before = len(agent.st.moves)
         state = self._after_player(agent)

@@ -69,9 +69,26 @@ class ErrLLM:
         return "调用出错：HTTP 401（检查模型名是否为 qwen3.5）"
 
 
+class ZeroRng:
+    """固定随机源：``random()`` 恒为 ``0.0`` ⇒ 只要 ``p > 0`` 就一定命中。
+
+    测试装配「必定讲」用它而不是靠 ``joseki_rate=1.0`` 单独兜底：画像 / 情绪的浮动是**负**的时候
+    （熟练 / 见得多 / 低落）``p = clamp(1.0 + adj, 0, 1)`` 会小于 1，仍然会掷一次；把 rng 钉成 0.0
+    才是真正的确定（不依赖真随机，也不受 adj 正负影响）。无状态，可多实例共用。
+    """
+
+    def random(self):
+        return 0.0
+
+
 def mk_agent():
-    """造一套 stub 装配：返回 (agent, engine, llm, bus)。"""
+    """造一套 stub 装配：返回 (agent, engine, llm, bus)。
+
+    ``joseki_rate=1.0`` + ``ZeroRng()`` 是**测试装配的约定**：既有门卫要的是「有资格就必定讲」的
+    确定性场景；定式提示门控本身的频率层行为（0.5 / 冷却 / 画像 / 情绪 / 走错绕过）由
+    ``test_joseki_gate.py`` 显式设 rate 与注入 rng 覆盖。
+    """
     eng = StubEngine()
     llm = StubLLM()
     bus = events.RecordingBus()
-    return AzureAgent(eng, llm, bus), eng, llm, bus
+    return AzureAgent(eng, llm, bus, joseki_rate=1.0, joseki_rng=ZeroRng()), eng, llm, bus

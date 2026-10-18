@@ -128,15 +128,21 @@ def _discard_task(task):
         task.exception()
 
 
-def _clamp_rate(v):
-    """定式提示频率的安全取值：转不出来（脏值）时按 **0.0**（＝不提示）处理，并夹到 ``[0, 1]``。
+# 定式提示频率的默认值（与 ``config.AzureConfig.joseki_rate`` 的字段默认一致）。
+# **只有一个默认值、只有一条路径**：``p = clamp(rate + skill_adj + mood_adj, 0, 1)``——
+# 没有「未接线就跳过频率层」这第二种模式（漏接线不该静默退回「每次都教」）。
+JOSEKI_RATE_DEFAULT = 0.5
 
-    脏值不抛、不把 agent 构造搞崩；``0.0`` 是保守取向（宁可不打扰，也不误开一串讲解）。
+
+def _clamp_rate(v):
+    """定式提示频率的安全取值：夹到 ``[0, 1]``；转不出来（脏值）时退回默认 ``0.5``。
+
+    口径与 ``config.AzureConfig._apply`` 一致（键缺失 / 脏值 → 用默认），脏值不抛、不把 agent 构造搞崩。
     """
     try:
         return max(0.0, min(1.0, float(v)))
     except (TypeError, ValueError):
-        return 0.0
+        return JOSEKI_RATE_DEFAULT
 
 
 class AzureAgent:
@@ -146,7 +152,7 @@ class AzureAgent:
 
     def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False,
                  tools_enabled=False, max_tool_calls=None, memory=None, stream_tokens=False,
-                 tts=None, joseki_progress=None, joseki_rate=None, joseki_rng=None):
+                 tts=None, joseki_progress=None, joseki_rate=JOSEKI_RATE_DEFAULT, joseki_rng=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -201,11 +207,13 @@ class AzureAgent:
         self.joseki_progress = joseki_progress
 
         # —— 定式提示门控（T5 / v3.7.0）：资格层 + 频率层 ——
-        #    ``joseki_rate`` 是**基础频率**（0~1）。**未接线时保持 ``None``＝没有频率层**（有资格就讲，
-        #    与旧版逐字一致）；生产由 main.py 传 ``cfg.joseki_rate``（config.json 默认 0.5，设置面板可调）。
+        #    ``joseki_rate`` 是**基础频率**（0~1，默认 ``JOSEKI_RATE_DEFAULT = 0.5``，与 config 字段一致）；
+        #    永远只有一条路径：``p = clamp(rate + skill_adj + mood_adj, 0, 1)``。生产由 main.py 传
+        #    ``cfg.joseki_rate``；**测试装配要「必定讲」就显式传 ``1.0`` + 注入固定 rng**（画像 / 情绪的
+        #    负浮动会把 ``p`` 压到 1 以下、仍会掷一次；见 ``tests/helpers.ZeroRng``）。
         #    ``joseki_rng`` 是**注入的**随机源：默认自带一个 ``random.Random()``，单测注入固定替身。
         #    冷却表 ``_joseki_taught``（族 → 最近讲过的手数）纯局内，不落盘、随新一局清空。
-        self.joseki_rate = None if joseki_rate is None else _clamp_rate(joseki_rate)
+        self.joseki_rate = _clamp_rate(joseki_rate)
         self.joseki_rng = joseki_rng if joseki_rng is not None else random.Random()
         self._joseki_taught = {}
 
@@ -1045,10 +1053,11 @@ class AzureAgent:
         只决定**文本与卡片**：不改棋子、不改 ``message`` / ``speech`` 配对、不改 ``busy``、不改状态机。
         **未命中 ⇒ 与「没识别到定式」逐字段同构**（不换讲解模板、不上卡片、不发 ``joseki`` 事件）。
 
-        决策顺序（见 ``joseki_gate``）：资格层 → **未接线 ``joseki_rate`` ⇒ 有资格就讲**（没有频率层，
-        与旧版逐字一致）→ 走错必讲（绕过频率层与冷却）→ 同族冷却 → 掷 ``p``。
-        画像只吃**局内信号**（``st.player_ranks`` + 该族计数），情绪吃当前区域；两者取不到 → 0。
-        命中时记下「这一族最近讲过的手数」供冷却用；每次决策留**一行**日志（rate / adj / roll / 命中）。
+        决策顺序（见 ``joseki_gate``）：资格层 → 走错必讲（绕过频率层与冷却）→ 同族冷却 →
+        掷 ``p = clamp(rate + skill_adj + mood_adj, 0, 1)``（**唯一路径**；``p >= 1`` 直接讲、不掷 rng，
+        ``p <= 0`` 直接不讲）。画像只吃**局内信号**（``st.player_ranks`` + 该族计数），情绪吃当前区域；
+        两者取不到 → 0。命中时记下「这一族最近讲过的手数」供冷却用；每次决策留**一行**日志
+        （rate / adj / roll / 命中）。
 
         ``epoch``（v3.7.0）：看门狗守卫——带了它且已经不属于当前这一代时直接不放行（冷却表也不写）。
         """
@@ -1061,12 +1070,6 @@ class AzureAgent:
         if not await self.joseki_show_card(jk, mistake):        # 资格层（旧卡片门禁＝同一件事）
             return False
         move_no = len(self.st.moves)
-        if self.joseki_rate is None:
-            # **未接线**（直接构造 agent / 单测）：没有频率层——有资格就讲，与旧版逐字一致
-            # （冷却也不参与；生产的 main.py 一定会把 cfg.joseki_rate 接上）。
-            print("[Joseki] 定式提示门控：未接线 joseki_rate，有资格就讲（%s / %s / 第%d手）"
-                  % (family or "-", kind or "-", move_no))
-            return True
         # 走错是「必讲」的唯一绕过口；再判一次只为拿这个布尔（``warn=False``：同一回合不重复刷日志）
         is_mistake = self._joseki_mistake_of(jk, mistake, warn=False)
         seen = await self._joseki_seen(family)

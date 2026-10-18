@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import events
-from test_agent import ErrLLM, StubEngine, StubLLM, _mk
+from test_agent import ErrLLM, StubEngine, StubLLM, ZeroRng, _mk
 
 
 class GraphShapeTest(unittest.TestCase):
@@ -583,7 +583,10 @@ class JosekiActiveSpeechTest(unittest.TestCase):
         返回 (agent, llm, calls, own_turn 终态, just_moved 终态)。
         """
         llm = _FreshLLM()
-        agent = AzureAgent(StubEngine(), llm, events.RecordingBus())
+        # 必定讲（rate=1.0 + ZeroRng：画像 / 情绪的负浮动也压不过）：本用例钉的是「她那一步的
+        # 模板与事件」，不是频率层
+        agent = AzureAgent(StubEngine(), llm, events.RecordingBus(),
+                           joseki_rate=1.0, joseki_rng=ZeroRng())
         calls = []
 
         def fake():
@@ -765,7 +768,7 @@ class JosekiActiveSpeechTest(unittest.TestCase):
         用的是真识别结果（角内 4 手走完基本型、最后一手是她下的）——兜底若落在挑模板**之后**，
         这条就会红：她这句会退回普通感想。
         """
-        agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus())
+        agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus(), joseki_rate=1.0, joseki_rng=ZeroRng())
         _seed_moves(agent, [["B", "D16"], ["W", "C17"], ["B", "C16"], ["W", "D17"]])
         agent._new_turn()
         state = asyncio.run(agent._turn(PHASE_JUST_MOVED, {}))
@@ -816,7 +819,7 @@ class JosekiActiveSpeechTest(unittest.TestCase):
     # —— ⑦ 不新增台词 / 不多调一次模型 ——
 
     def test_entered_turn_still_has_exactly_three_lines(self):
-        agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus())
+        agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus(), joseki_rate=1.0, joseki_rng=ZeroRng())
         _seed_moves(agent, self.ENTER_SEED)
         asyncio.run(agent.player_move(5, 2))
 
@@ -827,14 +830,15 @@ class JosekiActiveSpeechTest(unittest.TestCase):
         self.assertEqual(kinds.count(events.AI_MOVE), 1)
 
     def test_llm_calls_stay_within_budget(self):
-        agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus())
+        agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus(), joseki_rate=1.0, joseki_rng=ZeroRng())
         _seed_moves(agent, self.ENTER_SEED)
         asyncio.run(agent.player_move(5, 2))
         self.assertEqual(len(_phase_texts(agent.llm)), 3, "本任务只换提示词：一回合仍恰好三次")
 
         # 开了工具的那条路照旧受硬上限管（本任务不动预算、也不加调用）
         llm2 = _FreshLLM()
-        agent2 = AzureAgent(StubEngine(), llm2, events.RecordingBus(), tools_enabled=True)
+        agent2 = AzureAgent(StubEngine(), llm2, events.RecordingBus(), tools_enabled=True,
+                            joseki_rate=1.0, joseki_rng=ZeroRng())
         chain = _ScriptChain([_Ai(content="嗯~ 这手我想想。")])
         agent2.chain = chain
         _seed_moves(agent2, self.ENTER_SEED)
@@ -917,7 +921,7 @@ class HerOwnJosekiVerdictTest(_HerJosekiFixture):
         for _ in range(3):
             progress.bump("komoku_low_kakari")                   # 玩家那一族：已教 3 次
         agent = AzureAgent(StubEngine(), _FreshLLM(), events.RecordingBus(),
-                           joseki_progress=progress)
+                           joseki_progress=progress, joseki_rate=1.0, joseki_rng=ZeroRng())
         _seed_moves(agent, [["W", "D17"]])                       # 左上小目；玩家落 F17(5,2) ⇒ entered
         her = dict(self.HER_ENTER, family="star_kakari_big")     # 她那一族：第一次见
         calls = self._script_her(agent, her, agent._joseki_check)
@@ -942,7 +946,7 @@ class HerStructureSpeechTest(_HerJosekiFixture):
         for kind, result in cases:
             with self.subTest(kind=kind):
                 llm = _FreshLLM()
-                agent = AzureAgent(StubEngine(), llm, events.RecordingBus())
+                agent = AzureAgent(StubEngine(), llm, events.RecordingBus(), joseki_rate=1.0, joseki_rng=ZeroRng())
                 calls = []
 
                 def fake():
