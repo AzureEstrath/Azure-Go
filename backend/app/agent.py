@@ -15,7 +15,7 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import coords, events, prompt_chains, prompts
+from . import coords, events, joseki_gate, prompt_chains, prompts
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, is_joseki_mistake, _emit_line,
@@ -128,6 +128,17 @@ def _discard_task(task):
         task.exception()
 
 
+def _clamp_rate(v):
+    """定式提示频率的安全取值：转不出来（脏值）时按 **0.0**（＝不提示）处理，并夹到 ``[0, 1]``。
+
+    脏值不抛、不把 agent 构造搞崩；``0.0`` 是保守取向（宁可不打扰，也不误开一串讲解）。
+    """
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class AzureAgent:
     # 回合兜底看门狗（v3.7.0）：算式与取值见模块顶部的 ``WATCHDOG_SEC`` 注释。
     # 实例上另有 ``self.watchdog_sec``（可注入/可覆盖，测试用它把等待压到毫秒级）。
@@ -135,7 +146,7 @@ class AzureAgent:
 
     def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False,
                  tools_enabled=False, max_tool_calls=None, memory=None, stream_tokens=False,
-                 tts=None, joseki_progress=None):
+                 tts=None, joseki_progress=None, joseki_rate=None, joseki_rng=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -188,6 +199,15 @@ class AzureAgent:
         # —— 跨局的定式族计数（T5）：默认不接线（None）⇒ 一律当作「第 1 次」、每次都上卡片；
         #    由 main.py 的 lifespan 无条件注入 JosekiProgress（没有开关，设计 §8.4）——
         self.joseki_progress = joseki_progress
+
+        # —— 定式提示门控（T5 / v3.7.0）：资格层 + 频率层 ——
+        #    ``joseki_rate`` 是**基础频率**（0~1）。**未接线时保持 ``None``＝没有频率层**（有资格就讲，
+        #    与旧版逐字一致）；生产由 main.py 传 ``cfg.joseki_rate``（config.json 默认 0.5，设置面板可调）。
+        #    ``joseki_rng`` 是**注入的**随机源：默认自带一个 ``random.Random()``，单测注入固定替身。
+        #    冷却表 ``_joseki_taught``（族 → 最近讲过的手数）纯局内，不落盘、随新一局清空。
+        self.joseki_rate = None if joseki_rate is None else _clamp_rate(joseki_rate)
+        self.joseki_rng = joseki_rng if joseki_rng is not None else random.Random()
+        self._joseki_taught = {}
 
         self._mood_region = -1
         self._mood_ms = 0
@@ -955,37 +975,30 @@ class AzureAgent:
             "mistake": mistake,
         }))
 
-    # —— 卡片门禁（T5）：前 3 次都上卡片，第 4 次起只在真的走错时才上 ——
+    # —— 定式提示门控（T5 / v3.7.0）：资格层（``joseki_show_card``）+ 频率层（``joseki_gate_show``）——
 
-    async def joseki_show_card(self, jk, mistake=None) -> bool:
-        """这一手该不该上「定式教学卡片」（**只读**：不改 ``st``、不碰计数）。
+    async def _joseki_seen(self, family) -> int:
+        """该族历史出现次数；未接线 / 族 id 缺失 / 读不出来一律 ``0``（＝「第 1 次」，fail-open）。
 
-        自增在 ``joseki_count_entry`` 里，顺序固定「**先问后记**」——若先自增再问，第一次出现时
-        ``seen`` 已是 1，``seen < 3`` 只在第 1、2 次成立，与「前 3 次都上卡片」矛盾。
-
-        判定：同一族历史出现次数（跨局）``seen < 3`` ⇒ 一律 True；第 4 次起只有 ``kind ==
-        "deviated"`` 且 ``is_joseki_mistake(...)``（真亏**且**不在库线上）才 True。
-        ``joseki_progress`` 未接线 / 族 id 缺失（旧库、异常形状）⇒ **保守地 True**（宁可多教一次）；
-        次数读不出来时 ``JosekiProgress.seen`` 自己降到 ``0``（当成第 1 次），所以坏库的表现就是
-        「每次都教」，绝不影响对局。``mistake`` 是 T3 放进 ``data["jk_mistake"]`` 的那个 dict
-        （键 ``is_mistake/on_line/gtp/x/y/drop/rank_ok``）——这里按 ``is_joseki_mistake`` 的口径
-        重算，而不是直接采信 ``is_mistake``。
+        同步磁盘读走 ``asyncio.to_thread``（慢库不得冻住事件循环）；``JosekiProgress.seen`` 自己吞掉
+        异常并降级为 0，这里再兜一层脏值（替身 / 将来实现给了 ``None`` 之类）。
         """
-        if not jk:
-            return False
-        if self.joseki_progress is None:
-            return True
-        family = str(jk.get("family") or "")
-        if family == "":
-            return True
-        seen = await asyncio.to_thread(self.joseki_progress.seen, family)   # 永不抛，故障时 0
+        fam = str(family or "")
+        if self.joseki_progress is None or fam == "":
+            return 0
         try:
-            seen = int(seen)
-        except (TypeError, ValueError):      # 替身 / 将来实现给了脏值：当成第 1 次（fail-open）
-            seen = 0
-        if seen < 3:
-            return True
-        if str(jk.get("kind", "")) != "deviated":
+            return max(0, int(await asyncio.to_thread(self.joseki_progress.seen, fam)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _joseki_mistake_of(self, jk, mistake, warn=True) -> bool:
+        """按 ``is_joseki_mistake`` 的口径重算「走错」（**不**直接采信 ``mistake["is_mistake"]``）。
+
+        与卡片门禁同一口径：``kind != deviated`` 或 ``mistake`` 形状不对 ⇒ ``False``；判定抛异常
+        （脏 ``drop``）⇒ ``False`` + 一行日志，绝不把这一回合打挂。``warn=False`` 供「同一回合里
+        第二次问同一件事」时用（不重复刷日志）。
+        """
+        if str((jk or {}).get("kind", "")) != "deviated":
             return False
         if not isinstance(mistake, dict):
             return False
@@ -994,10 +1007,84 @@ class AzureAgent:
                                      float(mistake.get("drop") or 0.0),
                                      bool(mistake.get("rank_ok")))
         except Exception as e:                  # noqa: BLE001 —— 脏 mistake 绝不许把这一回合打挂
-            # 保守取向（与整条链一致）：判不出来就**当没走错**——第 4 次起默认不上卡片，
-            # 既不误判「走错」、也不额外打扰玩家；只留一行日志，对局照常。
-            print("[Joseki] 走错判定失败（按「不算走错」保守处理，不影响对局）：%s" % e)
+            # 保守取向（与整条链一致）：判不出来就**当没走错**——既不误判「走错」、也不额外打扰玩家；
+            # 只留一行日志，对局照常。
+            if warn:
+                print("[Joseki] 走错判定失败（按「不算走错」保守处理，不影响对局）：%s" % e)
             return False
+
+    async def joseki_show_card(self, jk, mistake=None) -> bool:
+        """**资格层**（T5 / v3.7.0）：这条定式**该不该教**（只读：不改 ``st``、不碰计数）。
+
+        判定并入 ``joseki_gate.eligible``：同一族历史出现次数（跨局）``seen < 3`` ⇒ 有资格；
+        第 4 次起只有「走错」（``kind == "deviated"`` 且 ``is_joseki_mistake(...)``：真亏**且**不在
+        库线上）才有资格；``joseki_teach=false`` ⇒ 一律无资格。``joseki_progress`` 未接线 / 族 id 缺失
+        （旧库、异常形状）⇒ **保守地有资格**（宁可多教一次）；次数读不出来时 ``JosekiProgress.seen``
+        自己降到 ``0``（当成第 1 次），所以坏库的表现就是「每次都教」，绝不影响对局。
+
+        顺序固定「**先问后记**」——自增在 ``joseki_count_entry`` 里；若先自增再问，第一次出现时
+        ``seen`` 已是 1，``seen < 3`` 只在第 1、2 次成立，与「前 3 次都有资格」矛盾。
+
+        ``mistake`` 是 ``data["jk_mistake"]`` 那个 dict（键 ``is_mistake/on_line/gtp/x/y/drop/rank_ok``）
+        ——这里按 ``is_joseki_mistake`` 的口径重算，而不是直接采信 ``is_mistake``。
+
+        注：本方法自 T5 起只回答**资格层**（频率层在 ``joseki_gate_show``）；返回值同时用作卡片字段
+        ``data["jk_show_card"]`` 的前半段（命中频率层才真的上卡片）。
+        """
+        if not jk:
+            return False
+        return joseki_gate.eligible(
+            await self._joseki_seen(jk.get("family")),
+            str(jk.get("kind", "")),
+            self._joseki_mistake_of(jk, mistake),
+            bool(self.joseki_teach))
+
+    async def joseki_gate_show(self, jk, mistake=None, epoch=None) -> bool:
+        """**门控总出口**（T5 / v3.7.0）：这一手该不该讲（资格层 + 频率层；只读，不改任何状态）。
+
+        只决定**文本与卡片**：不改棋子、不改 ``message`` / ``speech`` 配对、不改 ``busy``、不改状态机。
+        **未命中 ⇒ 与「没识别到定式」逐字段同构**（不换讲解模板、不上卡片、不发 ``joseki`` 事件）。
+
+        决策顺序（见 ``joseki_gate``）：资格层 → **未接线 ``joseki_rate`` ⇒ 有资格就讲**（没有频率层，
+        与旧版逐字一致）→ 走错必讲（绕过频率层与冷却）→ 同族冷却 → 掷 ``p``。
+        画像只吃**局内信号**（``st.player_ranks`` + 该族计数），情绪吃当前区域；两者取不到 → 0。
+        命中时记下「这一族最近讲过的手数」供冷却用；每次决策留**一行**日志（rate / adj / roll / 命中）。
+
+        ``epoch``（v3.7.0）：看门狗守卫——带了它且已经不属于当前这一代时直接不放行（冷却表也不写）。
+        """
+        if not jk or not self.joseki_teach:
+            return False
+        if epoch is not None and not self.epoch_ok(epoch):
+            return False
+        kind = str(jk.get("kind", ""))
+        family = str(jk.get("family") or "")
+        if not await self.joseki_show_card(jk, mistake):        # 资格层（旧卡片门禁＝同一件事）
+            return False
+        move_no = len(self.st.moves)
+        if self.joseki_rate is None:
+            # **未接线**（直接构造 agent / 单测）：没有频率层——有资格就讲，与旧版逐字一致
+            # （冷却也不参与；生产的 main.py 一定会把 cfg.joseki_rate 接上）。
+            print("[Joseki] 定式提示门控：未接线 joseki_rate，有资格就讲（%s / %s / 第%d手）"
+                  % (family or "-", kind or "-", move_no))
+            return True
+        # 走错是「必讲」的唯一绕过口；再判一次只为拿这个布尔（``warn=False``：同一回合不重复刷日志）
+        is_mistake = self._joseki_mistake_of(jk, mistake, warn=False)
+        seen = await self._joseki_seen(family)
+        sk = joseki_gate.skill_adj(list(self.st.player_ranks), seen)
+        md = joseki_gate.mood_adj(self.mood_payload())
+        d = joseki_gate.decision(
+            rng=self.joseki_rng, rate=self.joseki_rate, skill_adj=sk, mood_adj=md,
+            seen=seen, kind=kind, mistake=is_mistake, teach_on=True,
+            last_taught_move=self._joseki_taught.get(family), move_no=move_no)
+        print("[Joseki] 定式提示门控：rate=%.2f skill=%+.2f mood=%+.2f p=%.2f roll=%s 冷却=%s 命中=%s"
+              "（%s / %s / 第%d手）"
+              % (self.joseki_rate, sk, md, d["p"],
+                 "-" if d["roll"] is None else "%.3f" % d["roll"],
+                 "是" if d["cooldown"] else "否", "是" if d["show"] else "否",
+                 family or "-", kind or "-", move_no))
+        if d["show"] and family != "":
+            self._joseki_taught[family] = move_no        # 冷却起点：这一族最近讲过的手数
+        return bool(d["show"])
 
     async def joseki_count_entry(self, jk, epoch=None) -> None:
         """记一次「这一族被走到了」（**同族同局最多计 1 次**；只写计数，不发事件、不决定卡片）。
@@ -1285,6 +1372,7 @@ class AzureAgent:
         self.st.joseki_log = s["joseki_log"]      # 定式去重记录随快照回滚：悔棋重走那手可以重新讲解
         self.st.joseki_counted = s["joseki_counted"]    # 族计数随快照回滚（快照＝这一手之前，故这一手计的那次退回）
         self.st.joseki_dropped = s["joseki_dropped"]    # 已被退回计数的族也随快照回到当时的样子
+        self.st.player_ranks = s["player_ranks"]        # 棋力画像（v3.7.0）：悔掉的几手不再计入
         self.st.snapshots = self.st.snapshots[:turn_index]
         self.st.bad_moves = [b for b in self.st.bad_moves if int(b["turn_index"]) < turn_index]
         self.st.pre_analysis = None
@@ -1315,6 +1403,7 @@ class AzureAgent:
         keep_pass = self.st.allow_pass
         self.st.reset()
         self.st.allow_pass = keep_pass
+        self._joseki_taught = {}                 # 新一局：门控的冷却表清空（手数从头数）
         self.mood.reset()                        # 新一局：情绪回到基线（平静）
         self.sync_mood(True)
         self._emit(events.state(self.st.payload()))

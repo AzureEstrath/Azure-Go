@@ -717,13 +717,13 @@ class JosekiActiveSpeechTest(unittest.TestCase):
             self.assertNotIn(str(e["name"]), text)
         self.assertNotIn("不要提胜率数值", text)                    # 三条模板的文案也不出现
 
-    # —— ⑤ `show_card` 只管卡片：台词分流**只看 kind**（U34 修订版）——
+    # —— ⑤ T5（v3.7.0）口径修订：**资格层 + 频率层**决定讲不讲，卡片与讲解同一件事 ——
 
-    def test_speech_dispatch_does_not_depend_on_the_card_gate(self):
-        """这一族已经教过 3 次（卡片不上），但 `entered` 是结构点 ⇒ 讲的仍是进入那一课的讲解。
+    def test_fourth_entry_is_not_taught_after_the_family_is_learned(self):
+        """这一族已经教过 3 次 ⇒ 资格层不再放行（既没走错、也过了「前 3 次」）。
 
-        U34 修订版：`show_card` 是**卡片**的次数规则（T5/T6/T8），管的是卡片字段，不管说不说；
-        台词只按 `kind`（+ 走错时按 `is_mistake`）分流，而且讲不讲都只有本来那一条气泡。
+        v3.7.0 口径修订（T5）：`data["jk_show_card"]` 不再是「只管卡片」的次数规则，而是**门控**
+        的结论——未命中与「没识别到定式」逐字段同构：普通点评、不上卡片、不发 `joseki` 事件。
         """
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
@@ -736,12 +736,13 @@ class JosekiActiveSpeechTest(unittest.TestCase):
         state = self._after_player(agent, 5, 2)
 
         jk = state["data"]["jk"]
-        self.assertEqual(str(jk["kind"]), "entered")
-        self.assertIs(state["data"]["jk_show_card"], False, "第 4 次进入：卡片照旧不上")
+        self.assertEqual(str(jk["kind"]), "entered", "识别结果仍在，只是不讲")
+        self.assertIs(state["data"]["jk_show_card"], False, "第 4 次进入：门控不放行")
+        self.assertEqual(agent.bus.of_type("joseki"), [], "未命中：不发 joseki 事件")
         text = _phase_texts(llm)[0]
-        self.assertIn(prompts.joseki_enter_prompt(
+        self.assertIn("用你自己的口吻评", text)                     # 未命中＝普通点评
+        self.assertNotIn(prompts.joseki_enter_prompt(
             str(jk["name"]), str(jk["key"]), str(jk["corner"])), text)
-        self.assertNotIn("用你自己的口吻评", text)                # 顶替：普通点评一个字都不在
 
     # —— ⑥ 她那一步：`jk2` 被算出来、卡片结论被补齐，事件照发 ——
 
@@ -776,11 +777,11 @@ class JosekiActiveSpeechTest(unittest.TestCase):
             _phase_texts(agent.llm)[-1])
         self.assertIs(agent.bus.of_type("joseki")[-1]["show_card"], True)
 
-    def test_her_close_also_ignores_the_card_gate(self):
-        """她那一步同理（U34 修订版）：`formed` ⇒ 收尾讲解（azure 版），卡片不上也照讲。
+    def test_her_close_is_not_taught_after_the_family_is_learned(self):
+        """她那一步同理（v3.7.0 口径修订 T5）：这一族已教过 3 次 ⇒ 门控不放行，退回普通感想。
 
-        玩家那手没出定式结果、这一族又已经教过 3 次 ⇒ `show_card` 在她那一格才定下来、且为假；
-        她那句仍是 `joseki_close_prompt(..., "azure")`，**不**退回 `joseki_short_prompt`。
+        玩家那手没出定式结果、这一族又已经教过 3 次 ⇒ `jk_show_card` 在她那一格才定下来、且为假；
+        她那句是**普通感想**，既不是 `joseki_close_prompt(..., "azure")`、也不发 `joseki` 事件。
         """
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
@@ -799,13 +800,17 @@ class JosekiActiveSpeechTest(unittest.TestCase):
         state = self._after_player(agent, 3, 3)
         self.assertNotIn("jk_show_card", state["data"], "玩家那手没出定式结果")
         state = asyncio.run(agent._turn(PHASE_OWN_TURN, state["data"], state["turn_id"]))
-        self.assertIs(state["data"]["jk_show_card"], False, "这一族已教过 3 次：卡片不上")
+        self.assertIs(state["data"]["jk_show_card"], False, "这一族已教过 3 次：门控不放行")
         ai_gtp = str(state["data"]["move"]["gtp"])
         state = asyncio.run(agent._turn(PHASE_JUST_MOVED, state["data"], state["turn_id"]))
 
         text = _phase_texts(llm)[-1]
-        self.assertIn(prompts.joseki_close_prompt("点三三·基本型", "（要点）", "左上", "azure"), text)
+        self.assertNotIn(prompts.joseki_close_prompt("点三三·基本型", "（要点）", "左上", "azure"), text)
         self.assertNotIn(prompts.joseki_short_prompt("点三三·基本型", "（要点）", ai_gtp), text)
+        self.assertIn("换一句新话", text, "退回普通感想")
+        self.assertEqual(
+            [e for e in agent.bus.of_type("joseki") if str(e.get("kind", "")) == "formed"], [],
+            "未命中：她那一步也不发 joseki 事件")
 
     # —— ⑦ 不新增台词 / 不多调一次模型 ——
 

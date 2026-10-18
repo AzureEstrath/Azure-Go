@@ -8,7 +8,7 @@
     POST /api/summarize   {note}            对局总结
     POST /api/undo        {turn}            俗手回档
     POST /api/reset                         重开一局
-    POST /api/config      {allow_pass}      允许虚着开关（另见 limit_len / joseki_teach / tools_enabled）
+    POST /api/config      {allow_pass}      允许虚着开关（另见 limit_len / joseki_teach / joseki_rate / tools_enabled）
     POST /api/reveal                        落子宣告语音开始（需要 round-trip 的客户端）
     POST /api/interaction {what}            玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话
@@ -92,6 +92,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                                          think_mode=cfg.llm_think_mode,
                                                          extra_body=merge_extra_body(cfg))
             app.state.agent = AzureAgent(eng, cli, events.EventBus(), joseki_teach=cfg.joseki_teach,
+                                         joseki_rate=cfg.joseki_rate,
                                          tools_enabled=cfg.tools_enabled, max_tool_calls=cfg.max_tool_calls,
                                          stream_tokens=cfg.stream_tokens,
                                          memory=mem, tts=tts_client,
@@ -234,6 +235,11 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             s.limit_len = bool(body["limit_len"])
         if "joseki_teach" in body:              # 客户端「定式导学」开关：转发到后端编排
             s.joseki_teach = bool(body["joseki_teach"])
+        if "joseki_rate" in body:               # 「定式导学」的频率（0~1，与开关同一格）：门控的基础概率
+            try:
+                s.joseki_rate = max(0.0, min(1.0, float(body["joseki_rate"])))
+            except (TypeError, ValueError):     # 脏值不生效：保留原值，不把端点打成 500
+                pass
         if "tools_enabled" in body:             # 发言侧工具开关：开启后她才会在提示/落子宣告里查资料
             s.tools_enabled = bool(body["tools_enabled"])
         return ok()

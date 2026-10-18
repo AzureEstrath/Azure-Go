@@ -189,6 +189,10 @@ async def _prepare_after_player(agent, data):
     agent.st.board.play(x, y, "black")
     agent.st.add_move("B", gtp)
     turn_index = len(agent.st.snapshots) - 1
+    # ③′ 棋力画像（v3.7.0 门控）：本局玩家这一手的 rank。**纯追加**——不发事件、不参与去重、
+    #     不进 payload；快照取在它之前，所以悔棋回档时这一手不再计入（门控的 skill_adj 只吃这份
+    #     局内信号，不新建任何数据库 / 文件 / 长期存储）。
+    agent.st.player_ranks.append(player_rank)
 
     # ④ 俗手判定：不在我算的前5，或胜率明显下滑
     drop = winrate_before - after_black_wr
@@ -244,21 +248,27 @@ async def _prepare_after_player(agent, data):
         "move_no": len(agent.st.moves),
     }
 
-    # ④‴′ 卡片门禁（T5）：前 3 次都上卡片，第 4 次起只在真的走错时才上。**先问后记**：
-    #      ``seen < 3`` 必须在自增之前读（否则第一次出现时 seen 已是 1，前 3 次就只成立 2 次）。
-    #      结论只落进本轮 data 交给 T6/T7 消费：本任务不新增/不删除任何事件，_joseki_emit 照旧。
+    # ④‴′ 定式提示门控（T5 / v3.7.0）：**资格层**（族计数 / 走错 / 总开关）+ **频率层**
+    #      （rate + 画像 / 情绪 ±10% + 冷却）。**先问后记**：``seen < 3`` 必须在自增之前读
+    #      （否则第一次出现时 seen 已是 1，前 3 次就只成立 2 次）。
+    #      命中 ⇒ 讲解 + 卡片 + ``joseki`` 事件；未命中 ⇒ 与「没识别到定式」逐字段同构（只点评这一手）。
+    #      结论只落进本轮 data 交给下游消费：门控不新增 / 不删除任何事件，也不碰 ``busy``。
     if jk:
-        data["jk_show_card"] = await agent.joseki_show_card(jk, data.get("jk_mistake"))
-        if _alive(agent, data):                     # 看门狗守卫：入围查询 ``await`` 过
+        data["jk_show_card"] = await agent.joseki_gate_show(jk, data.get("jk_mistake"),
+                                                            epoch=data.get("epoch"))
+        if _alive(agent, data):                     # 看门狗守卫：门控查询 ``await`` 过
             await agent.joseki_count_entry(jk, epoch=data.get("epoch"))
-            agent._joseki_emit(jk, data.get("jk_show_card", False), data.get("jk_mistake"),
-                               epoch=data.get("epoch"))
+            if data.get("jk_show_card"):
+                agent._joseki_emit(jk, True, data.get("jk_mistake"), epoch=data.get("epoch"))
+    # 门控命中才换讲解模板 / 上卡片；未命中与「没识别到定式」同一条出口（T5）
+    jk_teach = bool(data.get("jk_show_card"))
+    jk_kind = str(jk.get("kind", ""))
 
     # ④′ 情绪反应：按这一手的好坏结算三维情绪（即时反馈不等 LLM）
     if not _alive(agent, data):                     # 看门狗守卫：旧一代不再动情绪、不发 mood 事件
         return
     ev = "player_ok"
-    if str(jk.get("kind", "")) == "formed" or player_rank == 0:
+    if (jk_teach and jk_kind == "formed") or player_rank == 0:
         ev = "player_good"
     elif player_rank < 0 or drop > 0.10:
         ev = "player_bad"
@@ -267,20 +277,21 @@ async def _prepare_after_player(agent, data):
     agent._mood_event(ev)
 
     # ⑤ Azure 点评这一手（T7：结构点按 `kind` **顶替**这一手的普通点评，不额外增加 LLM 调用）
-    #    分流**只看 `kind`**（+ 走错时看 `is_mistake`）：进入 / 分岔 / 收尾必说。`show_card` 是**卡片**
-    #    的次数规则（T5/T6/T8），管的是卡片字段、不管说不说——讲解顶替的是本来那条点评，不多气泡。
+    #    分流**只看 `kind`**（+ 走错时看 `is_mistake`）：进入 / 分岔 / 收尾必说。T5 起「说」由**门控**
+    #    决定（`data["jk_show_card"]`＝资格层 + 频率层的结论）：命中 ⇒ 换讲解模板；未命中 ⇒ 与
+    #    「没识别到定式」逐字段同构（普通点评，不上卡片、不发 `joseki` 事件）。
     eval_prompt = ""
-    kind = str(jk.get("kind", ""))
+    kind = jk_kind
     mistake = data.get("jk_mistake") or {}
-    if kind == "entered":
+    if jk_teach and kind == "entered":
         eval_prompt = prompts.joseki_enter_prompt(
             str(jk.get("name") or ""), str(jk.get("key") or ""), str(jk.get("corner") or ""))
-    elif kind == "branch" or (kind == "deviated" and mistake.get("is_mistake") is True):
+    elif jk_teach and (kind == "branch" or (kind == "deviated" and mistake.get("is_mistake") is True)):
         # 「走错」＝真亏又出线：这里正是「有别的走法」的场合，与分岔同一套
         eval_prompt = prompts.joseki_branch_prompt(
             str(jk.get("name") or ""), str(jk.get("key") or ""),
             list(jk.get("candidates") or []))
-    elif kind == "formed":
+    elif jk_teach and kind == "formed":
         eval_prompt = prompts.joseki_close_prompt(
             str(jk.get("name") or ""), str(jk.get("key") or ""), str(jk.get("corner") or ""),
             "player")
@@ -303,8 +314,8 @@ async def _prepare_after_player(agent, data):
         if prev_eval != "":
             angles = ["这手的方向/意图", "厚薄与轻重", "形状好不好", "和附近棋子的呼应", "对以后势力的影响", "和刚才几手的联系"]
             eval_prompt += " 你上一手点评的原话是「%s」：这次不要复用里面出现过的形容词和句式，也别用同样的夸奖方式；从%s这个角度换个说法，还是一句话。" % (prev_eval, angles[random.randrange(len(angles))])
-        # 定式偏离：在常规点评后轻轻提一句常规形状
-        if str(jk.get("kind", "")) == "deviated":
+        # 定式偏离：在常规点评后轻轻提一句常规形状（门控命中才提——未命中＝没识别到定式）
+        if jk_teach and str(jk.get("kind", "")) == "deviated":
             want = jk.get("expect", (-1, -1))
             if want[0] >= 0:
                 eval_prompt += " " + prompts.joseki_hint_clause(str(jk["name"]), coords.xy_to_gtp(want[0], want[1]))
@@ -316,7 +327,7 @@ async def _prepare_after_player(agent, data):
         "after_player",
         prompts.with_context(agent.st.moves, agent.st.memory_log, agent.st.chat_history,
                              eval_prompt, "after_player", False, agent.st.last_katago, agent.st.board),
-        len_note=agent._len_note(teach=str(jk.get("kind", "")) == "formed"),
+        len_note=agent._len_note(teach=(jk_teach and jk_kind == "formed")),
     )
 
 
@@ -353,8 +364,9 @@ async def _joseki_own_move(agent, data):
     jk2 = agent._joseki_check()
     data["jk2"] = jk2
     if jk2:
-        data["jk_show_card"] = await agent.joseki_show_card(jk2, None)
-        if not _alive(agent, data):                 # 看门狗守卫：入围查询 ``await`` 过
+        # 门控（T5）：资格层 + 频率层；命中才讲解 / 上卡片 / 发 joseki 事件，未命中＝没识别到定式。
+        data["jk_show_card"] = await agent.joseki_gate_show(jk2, None, epoch=data.get("epoch"))
+        if not _alive(agent, data):                 # 看门狗守卫：门控查询 ``await`` 过
             return
     elif "jk_show_card" not in data:
         data["jk_show_card"] = False
@@ -386,17 +398,17 @@ async def _prepare_just_moved(agent, data):
     if _alive(agent, data):                         # 看门狗守卫：旧一代不再推信息栏
         agent._emit(events.info(wr, sc))
 
-    if str(jk2.get("kind", "")) == "entered":
+    if str(jk2.get("kind", "")) == "entered" and data.get("jk_show_card"):
         # T7（U36）+ F2：她走出的**结构点**并进**她的**发言位（这条落子后的感想），与玩家那一侧
-        #   同一套分流——进入 / 分岔 / 收尾必说，只按 `kind`（`show_card` 只管卡片，不管说不说，
-        #   U34 修订版）；讲解**顶替**本来那句普通感想，不新增气泡、不多调一次模型。
+        #   同一套分流——进入 / 分岔 / 收尾必说，只按 `kind`；**门控命中才讲**（T5：未命中＝没识别到定式，
+        #   走普通感想）。讲解**顶替**本来那句普通感想，不新增气泡、不多调一次模型。
         ai_eval_prompt = prompts.joseki_enter_prompt(
             str(jk2.get("name") or ""), str(jk2.get("key") or ""), str(jk2.get("corner") or ""))
-    elif str(jk2.get("kind", "")) == "branch":
+    elif str(jk2.get("kind", "")) == "branch" and data.get("jk_show_card"):
         ai_eval_prompt = prompts.joseki_branch_prompt(
             str(jk2.get("name") or ""), str(jk2.get("key") or ""),
             list(jk2.get("candidates") or []))
-    elif str(jk2.get("kind", "")) == "formed":
+    elif str(jk2.get("kind", "")) == "formed" and data.get("jk_show_card"):
         # T7（U36）：她走完定式时，「收尾」并进**她的**发言位（这条落子后的感想）。
         ai_eval_prompt = prompts.joseki_close_prompt(
             str(jk2.get("name") or ""), str(jk2.get("key") or ""),
@@ -766,7 +778,8 @@ async def _speak_after_player(agent, data, msgs):
     """玩家那手的点评（定式成型时换成讲解，不额外增加 LLM 调用）。"""
     jk = data.get("jk") or {}
     player_eval = await _say(agent, msgs, 300)
-    if str(jk.get("kind", "")) == "formed" and agent._llm_failed(player_eval):
+    if (data.get("jk_show_card") and str(jk.get("kind", "")) == "formed"
+            and agent._llm_failed(player_eval)):
         player_eval = prompts.joseki_fallback(str(jk["name"]), str(jk["key"]))
     elif agent._llm_failed(player_eval):        # 云端失败：点评退化为兜底台词
         player_eval = agent._fallback_line("game")
@@ -825,7 +838,9 @@ async def _speak_just_moved(agent, data, msgs):
     ai_eval = await _say(agent, msgs, 120)
     # F2：她这一手的**结构点**（进入 / 分岔 / 收尾）在云端失败时也要退化成定式兜底台词，
     #   不能只认 `formed`——台词分流只看 `kind`（U34 修订版），与 `_prepare_just_moved` 的模板一致。
-    if str(jk2.get("kind", "")) in ("entered", "branch", "formed") and agent._llm_failed(ai_eval):
+    #   T5：门控命中才算结构点（未命中＝没识别到定式，退化为普通兜底台词）。
+    if (data.get("jk_show_card") and str(jk2.get("kind", "")) in ("entered", "branch", "formed")
+            and agent._llm_failed(ai_eval)):
         ai_eval = prompts.joseki_fallback(str(jk2["name"]), str(jk2["key"]))
     elif agent._llm_failed(ai_eval):            # 云端失败：落子后那句退化为兜底台词
         ai_eval = agent._fallback_line("game")
@@ -1069,8 +1084,9 @@ async def _finalize_just_moved(agent, data):
     # F1）；`mistake` **恒为 None**——走错是玩家那一手的事，她这一手没有 mistake（F1：不再照搬
     # 玩家那手的 `jk_mistake`，否则红标会画在玩家的偏离点上）。
     # `_set_busy(False)` 的位置**不动**（T7 只换了 `jk2` 的算法在哪一步，事件顺序与解锁点一字未变）。
-    agent._joseki_emit(data.get("jk2") or {},
-                       data.get("jk_show_card", False), None, epoch=data.get("epoch"))
+    # T5：门控命中才发这条棋盘注记——未命中与「没识别到定式」同一条出口（`jk2` 为空时本来也不发）。
+    if data.get("jk_show_card"):
+        agent._joseki_emit(data.get("jk2") or {}, True, None, epoch=data.get("epoch"))
     agent._set_busy(False)
     await agent._mood_llm_refine()
     # 不在这里 emit state：落子的可见更新由 reveal_move() 在她这段语音开始时触发

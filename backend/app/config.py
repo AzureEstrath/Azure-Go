@@ -18,6 +18,7 @@ class AzureConfig:
         self.katago_timeout_ms = 30000              # 单次 /analyze 超时
         self.max_visits = 500
         self.joseki_teach = True
+        self.joseki_rate = 0.5                      # 定式提示频率（0~1）：与开关同一格；门控未接线时按「每次都讲」
         self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
@@ -89,6 +90,10 @@ class AzureConfig:
         self.katago_timeout_ms = int(d.get("katago_timeout_ms", self.katago_timeout_ms))
         self.max_visits = int(d.get("max_visits", self.max_visits))
         self.joseki_teach = bool(d.get("joseki_teach", self.joseki_teach))
+        try:
+            self.joseki_rate = max(0.0, min(1.0, float(d.get("joseki_rate", self.joseki_rate))))
+        except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把启动搞崩
+            self.joseki_rate = 0.5
         self.llm_base_url = str(d.get("llm_base_url", self.llm_base_url))
         self.llm_model = str(d.get("llm_model", self.llm_model))
         self.llm_api_key = str(d.get("llm_api_key", self.llm_api_key))

@@ -31,6 +31,9 @@ class GameState:
         # 两者都随快照回滚（悔棋重走那一族时，退回的那一次可以重新计入）
         self.joseki_counted = []
         self.joseki_dropped = []
+        # 本局玩家每手的 rank（v3.7.0 定式提示门控的棋力画像）：-1 = 不在她算的前 5。
+        # **纯局内信号**——不落盘、不发事件、不进 payload；随快照回滚（悔棋后那一手不再计入画像）。
+        self.player_ranks = []
         self.chat_history = []
         self.allow_pass = False    # 是否允许 Azure 虚着
         self.pre_analysis = None   # {n, a} 落子前局面分析缓存
@@ -50,6 +53,7 @@ class GameState:
             "joseki_log": copy.deepcopy(self.joseki_log),
             "joseki_counted": copy.deepcopy(self.joseki_counted),
             "joseki_dropped": copy.deepcopy(self.joseki_dropped),
+            "player_ranks": copy.deepcopy(self.player_ranks),
         }
 
     def last_played_xy(self):
@@ -128,6 +132,7 @@ class GameState:
         self.joseki_log = []
         self.joseki_counted = []
         self.joseki_dropped = []
+        self.player_ranks = []
         self.chat_history = []
         self.pre_analysis = None
         self.last_katago = ""
