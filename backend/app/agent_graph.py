@@ -106,6 +106,19 @@ class TurnState(TypedDict):
 
 # ================= 走错判定（纯函数，供 after_player 用） =================
 
+def _alive(agent, data) -> bool:
+    """本回合是否仍属于**当前那一代**（v3.7.0 看门狗守卫）。
+
+    看门狗一触发就把代数前推一代（``AzureAgent._watchdog_fire``），在途那一代随即失效：它之后
+    的一切 ``st.*`` 写入与事件发射都要先过这里。取不到 ``epoch`` 时按「仍然有效」处理（直接驱动
+    ``_turn`` 的老调用方、单测），行为与没有看门狗时逐字一致。
+    """
+    token = (data or {}).get("epoch")
+    if token is None:
+        return True
+    return agent.epoch_ok(token)
+
+
 def is_joseki_mistake(jk: dict, player_on_line: bool, drop: float, rank_ok: bool) -> bool:
     """「走错」＝**真亏**且**不在库线上**（纯函数，无副作用、不调引擎）。
 
@@ -139,7 +152,7 @@ async def _prepare_after_player(agent, data):
         if "error" in analysis:
             print("[KataGo] " + str(analysis["error"]))
             analysis = {}
-        else:
+        elif _alive(agent, data):                   # 看门狗守卫：超时后旧一代不再写局面缓存
             agent.st.pre_analysis = {"n": n, "a": analysis}
     winrate_before = 0.5
     move_infos = []
@@ -164,9 +177,14 @@ async def _prepare_after_player(agent, data):
         conv = prompts.to_black_perspective(after, n + 1)
         after_black_wr = float(conv[0])
         after_black_score = float(conv[1])
-        agent._update_katago_brief(after, n + 1)       # 当前棋面的引擎形势，供 Azure 上下文
+        if _alive(agent, data):                     # 看门狗守卫：超时后旧一代不再写形势摘要
+            agent._update_katago_brief(after, n + 1)       # 当前棋面的引擎形势，供 Azure 上下文
 
     # ③ 提交玩家落子（先存快照，供俗手回档）
+    # —— 看门狗守卫（v3.7.0）：上面两次引擎分析都 ``await`` 过，超时后旧一代的一切写入作废
+    #    （快照 / 棋盘 / 棋谱 / 俗手账 / 亏损手账 / 权威快照事件），也不许再往下走 ——
+    if not _alive(agent, data):
+        return
     agent.st.snapshots.append(agent.st.make_snapshot())
     agent.st.board.play(x, y, "black")
     agent.st.add_move("B", gtp)
@@ -231,10 +249,14 @@ async def _prepare_after_player(agent, data):
     #      结论只落进本轮 data 交给 T6/T7 消费：本任务不新增/不删除任何事件，_joseki_emit 照旧。
     if jk:
         data["jk_show_card"] = await agent.joseki_show_card(jk, data.get("jk_mistake"))
-        await agent.joseki_count_entry(jk)
-        agent._joseki_emit(jk, data.get("jk_show_card", False), data.get("jk_mistake"))
+        if _alive(agent, data):                     # 看门狗守卫：入围查询 ``await`` 过
+            await agent.joseki_count_entry(jk, epoch=data.get("epoch"))
+            agent._joseki_emit(jk, data.get("jk_show_card", False), data.get("jk_mistake"),
+                               epoch=data.get("epoch"))
 
     # ④′ 情绪反应：按这一手的好坏结算三维情绪（即时反馈不等 LLM）
+    if not _alive(agent, data):                     # 看门狗守卫：旧一代不再动情绪、不发 mood 事件
+        return
     ev = "player_ok"
     if str(jk.get("kind", "")) == "formed" or player_rank == 0:
         ev = "player_good"
@@ -325,13 +347,18 @@ async def _joseki_own_move(agent, data):
     """
     if "jk2" in data:
         return
+    if not _alive(agent, data):                     # 看门狗守卫：旧一代不再识别、不再记族计数
+        data["jk2"] = {}
+        return
     jk2 = agent._joseki_check()
     data["jk2"] = jk2
     if jk2:
         data["jk_show_card"] = await agent.joseki_show_card(jk2, None)
+        if not _alive(agent, data):                 # 看门狗守卫：入围查询 ``await`` 过
+            return
     elif "jk_show_card" not in data:
         data["jk_show_card"] = False
-    await agent.joseki_count_entry(jk2)
+    await agent.joseki_count_entry(jk2, epoch=data.get("epoch"))
 
 
 async def _prepare_just_moved(agent, data):
@@ -352,10 +379,12 @@ async def _prepare_just_moved(agent, data):
         ri = post.get("rootInfo") or {}
         wr = float(ri.get("winrate", 0.5))
         sc = float(ri.get("scoreLead", 0.0))
-        agent._update_katago_brief(post, len(agent.st.moves))
-        # 这份「她落子后」的分析即下一手玩家落子前的局面：缓存复用
-        agent.st.pre_analysis = {"n": len(agent.st.moves), "a": post}
-    agent._emit(events.info(wr, sc))
+        if _alive(agent, data):                     # 看门狗守卫：超时后旧一代不再写形势与缓存
+            agent._update_katago_brief(post, len(agent.st.moves))
+            # 这份「她落子后」的分析即下一手玩家落子前的局面：缓存复用
+            agent.st.pre_analysis = {"n": len(agent.st.moves), "a": post}
+    if _alive(agent, data):                         # 看门狗守卫：旧一代不再推信息栏
+        agent._emit(events.info(wr, sc))
 
     if str(jk2.get("kind", "")) == "entered":
         # T7（U36）+ F2：她走出的**结构点**并进**她的**发言位（这条落子后的感想），与玩家那一侧
@@ -394,8 +423,11 @@ async def _prepare_observe(agent, data):
     analysis = await agent.katago.analyze(agent.st.moves)
     if "error" in analysis:
         print("[KataGo] " + str(analysis["error"]))
-        await _emit_line(agent, events.AI, "嗯...我这边一时算不清，稍等再试吧~")
+        await _emit_line(agent, events.AI, "嗯...我这边一时算不清，稍等再试吧~",
+                         epoch=data.get("epoch"))
         data["short"] = True
+        return
+    if not _alive(agent, data):                     # 看门狗守卫：超时后旧一代不再写缓存 / 出话
         return
     agent.st.pre_analysis = {"n": n, "a": analysis}
     tops = [str(m.get("move", "")) for m in (analysis.get("moveInfos", []) or [])[:3]]
@@ -415,8 +447,11 @@ async def _prepare_analyze(agent, data):
     analysis = await agent.katago.analyze(agent.st.moves)
     if "error" in analysis:
         print("[KataGo] " + str(analysis["error"]))
-        await _emit_line(agent, events.AI, "唔…我这边一时算不清，稍后再让我看看吧。")
+        await _emit_line(agent, events.AI, "唔…我这边一时算不清，稍后再让我看看吧。",
+                         epoch=data.get("epoch"))
         data["short"] = True
+        return
+    if not _alive(agent, data):                     # 看门狗守卫：超时后旧一代不再写缓存 / 出话
         return
     conv = prompts.to_black_perspective(analysis, n)
     black_wr = float(conv[0])
@@ -513,14 +548,19 @@ _PREPARE = {
 
 
 def _prepare_node(agent):
-    """① prepare：建上下文与提示词（含阶段所需的引擎调用）。"""
+    """① prepare：建上下文与提示词（含阶段所需的引擎调用）。
+
+    看门狗守卫（v3.7.0）：本回合已经被作废时（看门狗刚超时）整个 prepare 都不跑——不再调引擎、
+    不再写任何 ``st.*``。本节点没有 ``_set_busy(False)``，提前跳过不会让棋盘卡住（``busy`` 由
+    看门狗与公开方法的 ``finally`` 归位）。
+    """
 
     async def prepare(state: TurnState) -> TurnState:
         phase = str(state.get("phase") or "")
         data = dict(state.get("data") or {})
         msgs = []
         fn = _PREPARE.get(phase)
-        if fn is not None:
+        if fn is not None and _alive(agent, data):
             msgs = list(await fn(agent, data) or [])
         return {
             "phase": phase,
@@ -638,13 +678,15 @@ def _decide_node(agent):
         # 工具轮会带着同一份 data 再次进入本节点，那时 messages 已带上 AI/Tool 消息，装配不能再跑
         # 一遍；而 data 是三个阶段的跨阶段载体，所以标记必须带上 phase（否则 after_player 的标记
         # 会让 own_turn 整个跳过装配）。
+        # 看门狗守卫（v3.7.0）：本回合已作废时不再装配（不再召回记忆、不再发 ``tool`` 事件）。
         if data.get("setup_phase") != phase:
-            if phase == PHASE_OWN_TURN and not data.get("short"):
+            if phase == PHASE_OWN_TURN and not data.get("short") and _alive(agent, data):
                 messages = list(await _decide_own_turn(agent, data) or [])
             data["setup_phase"] = phase
 
         wants = False
         if (agent.tools_enabled and phase in TOOL_PHASES and not data.get("short")
+                and _alive(agent, data)              # 看门狗守卫：旧一代不再跑工具轮
                 and _tool_round_ready(agent)
                 and int(data.get("llm_rounds", 0)) < MAX_LLM_CALLS_PER_TURN):
             data["llm_rounds"] = int(data.get("llm_rounds", 0)) + 1
@@ -686,6 +728,8 @@ def _tools_node(agent):
         tool_calls = int(state.get("tool_calls") or 0)
         by_name = {t.name: t for t in TOOLS}
         for tc in list(data.get("pending_tool_calls") or []):
+            if not _alive(agent, data):                 # 看门狗守卫：旧一代不再执行工具（不再发 tool 事件）
+                break
             name = str(tc.get("name", ""))
             args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
             if tool_calls >= agent.max_tool_calls:      # 预算用尽：不执行，但补预算提示（不得留未应答的 id）
@@ -740,6 +784,10 @@ async def _speak_own_turn(agent, data, msgs):
         think_msg = agent._fallback_line("game")
     data["think_msg"] = think_msg
 
+    # —— 看门狗守卫（v3.7.0）：上面那次出话 ``await`` 过；本回合若已作废，落子宣告、棋谱、
+    #    揭示标记、逐手存档一个都不许写（旧一代不许在玩家已经重新落子之后改棋盘） ——
+    if not _alive(agent, data):
+        return
     mv = dict(data.get("move") or {})
     ai_gtp = str(mv.get("gtp") or "")
     ai_x = int(mv.get("x", -1))
@@ -748,7 +796,7 @@ async def _speak_own_turn(agent, data, msgs):
     # speech 紧跟在它后面发（T3/T2b：语音与气泡一一配对，前端仍在语音开始时 reveal）
     await _emit_line(agent, events.AI_MOVE, think_msg, move={
         "x": ai_x, "y": ai_y, "gtp": ai_gtp, "pass": ai_gtp == "pass",
-    })
+    }, epoch=data.get("epoch"))
 
     # 真正落子：先落到内部棋谱；棋盘可见的更新延后到语音开始时（reveal_move）
     if ai_gtp == "pass":
@@ -762,7 +810,7 @@ async def _speak_own_turn(agent, data, msgs):
     # **纯追加**：不发事件、不参与去重、不改上面 ai_move 的直发与 speech 配对。
     agent.st.note_move(len(agent.st.moves), "aim", "A", think_msg)
     if ai_gtp == "pass":
-        await _emit_line(agent, events.AI, "（Azure本手选择了虚着）")
+        await _emit_line(agent, events.AI, "（Azure本手选择了虚着）", epoch=data.get("epoch"))
 
 
 async def _speak_just_moved(agent, data, msgs):
@@ -839,14 +887,18 @@ _SPEAK = {
 
 
 def _speak_node(agent):
-    """③ speak：出话（点评 / 落子宣告 / 聊天回复都走这里）。"""
+    """③ speak：出话（点评 / 落子宣告 / 聊天回复都走这里）。
+
+    看门狗守卫（v3.7.0）：本回合已作废时不再出话（不再调模型、不发任何台词）。本节点没有
+    ``_set_busy(False)``，提前跳过不会让棋盘卡住。
+    """
 
     async def speak(state: TurnState) -> TurnState:
         phase = str(state.get("phase") or "")
         data = dict(state.get("data") or {})
         msgs = list(state.get("messages") or [])
         fn = _SPEAK.get(phase)
-        if fn is not None:
+        if fn is not None and _alive(agent, data):
             await fn(agent, data, msgs)
         return {"reply": str(data.get("reply") or ""), "data": data}
 
@@ -896,6 +948,8 @@ async def _streamed_text(agent, msgs, max_tokens):
             if held and not agent._is_repeat_prefix(agent.clean_reply(acc)):
                 held = False                    # 分叉了：确认是新话，积压的增量按序补发
             if not held:
+                if not agent.turn_alive():          # 看门狗守卫：旧一代的增量不再外发
+                    break
                 for d in deltas[sent:]:
                     agent._emit(events.token(agent.turn_id, d))
                 sent = len(deltas)
@@ -943,35 +997,48 @@ async def _emit_speech(agent, text):
     ))
 
 
-async def _emit_line(agent, kind, text, move=None):
-    """发一条对外台词：先 ``message``，**紧随其后**补 ``speech``（音画同步：前端按 turn_id+seq 配对）。"""
+async def _emit_line(agent, kind, text, move=None, epoch=None):
+    """发一条对外台词：先 ``message``，**紧随其后**补 ``speech``（音画同步：前端按 turn_id+seq 配对）。
+
+    ``epoch``（v3.7.0）：看门狗守卫——带了它且已经不属于当前这一代时，这条台词（连同它的
+    ``speech``）一条都不发。调用点从本轮 ``data`` 里传；不传（公开方法的非法手提示、空盘提示，
+    以及既有单测的直接调用）时行为与以前逐字一致——那些是**新的用户动作**，不是被作废的旧一代。
+    """
+    if epoch is not None and not agent.epoch_ok(epoch):
+        return
     agent._emit(events.message(kind, text, move))
     await _emit_speech(agent, text)
 
 
-async def _emit_deduped(agent, kind, text):
+async def _emit_deduped(agent, kind, text, epoch=None):
     """发一条**非落子宣告**的 ``message`` 事件：窗口内一字不差的原话不再推给前端。
 
     只做「发事件」这一道闸门（S25/S26）：调用方的 ``memory_log`` / ``chat_history`` 写入**照常**发生；
     被抑制时**不发任何替代事件**（**连同它的 ``speech`` 一起不发**，T3——否则玩家会听到一句屏幕上没有的话）；
     被抑制的那句照常入窗（S27，与前端 ``_recent_ai_texts`` 一致）。
     ``ai_move`` 落子宣告不走这里（在 ``_speak_own_turn`` 里直发），永不受判重。
+
+    ``epoch``（v3.7.0）：看门狗守卫——带了它且已经不属于当前这一代时，整条（含 ``speech``）
+    一条都不发，也**不入去重窗口**（旧一代的话不该影响新一代的判重）。
     """
     from .agent import AI_DEDUP_WINDOW        # 延迟导入：agent ↔ agent_graph 是模块级循环依赖
+    if epoch is not None and not agent.epoch_ok(epoch):
+        return
     if agent._is_repeat(text):
         print("[Agent] 原话去重（最近 %d 条内一字不差）已抑制：%s" % (AI_DEDUP_WINDOW, text))
     else:
-        await _emit_line(agent, kind, text)
+        await _emit_line(agent, kind, text, epoch=epoch)
     agent._note_line(text)
 
 
 async def _finalize_after_player(agent, data):
     """点评入档并发给玩家（tag ``E``）。**不归位 busy**：本回合还有她自己的落子。"""
     text = str(data.get("reply") or "")
-    agent.st.log_memory("E", text, len(agent.st.moves))
-    # 逐手存档（v3.7.0）：玩家那手的点评，存**未截断的原文**（log_memory 那条仍是滚动 18 条 / 截 80 字）
-    agent.st.note_move(len(agent.st.moves), "review", "E", text)
-    await _emit_deduped(agent, events.AI_COMMENT, text)
+    if _alive(agent, data):                     # 看门狗守卫：旧一代不写账（发话由 ``_emit_deduped`` 自己拦）
+        agent.st.log_memory("E", text, len(agent.st.moves))
+        # 逐手存档（v3.7.0）：玩家那手的点评，存**未截断的原文**（log_memory 那条仍是滚动 18 条 / 截 80 字）
+        agent.st.note_move(len(agent.st.moves), "review", "E", text)
+    await _emit_deduped(agent, events.AI_COMMENT, text, epoch=data.get("epoch"))
 
 
 async def _finalize_own_turn(agent, data):
@@ -987,16 +1054,17 @@ async def _finalize_own_turn(agent, data):
 async def _finalize_just_moved(agent, data):
     """落子后感想入档（tag ``A``）、发事件、定式轨迹，然后归位 busy 与情绪小调用。"""
     text = str(data.get("reply") or "")
-    agent.st.log_memory("A", text, len(agent.st.moves))
-    # 逐手存档（v3.7.0）：她这一手的落子后感想，存**未截断的原文**
-    agent.st.note_move(len(agent.st.moves), "review", "A", text)
-    await _emit_deduped(agent, events.AI_COMMENT, text)
+    if _alive(agent, data):                     # 看门狗守卫：旧一代不写账、不画棋盘注记
+        agent.st.log_memory("A", text, len(agent.st.moves))
+        # 逐手存档（v3.7.0）：她这一手的落子后感想，存**未截断的原文**
+        agent.st.note_move(len(agent.st.moves), "review", "A", text)
+    await _emit_deduped(agent, events.AI_COMMENT, text, epoch=data.get("epoch"))
     # 卡片载荷（T6）：`jk_show_card` 是**她那一步**的入围结论（`_joseki_own_move` 按她的族重算，
     # F1）；`mistake` **恒为 None**——走错是玩家那一手的事，她这一手没有 mistake（F1：不再照搬
     # 玩家那手的 `jk_mistake`，否则红标会画在玩家的偏离点上）。
     # `_set_busy(False)` 的位置**不动**（T7 只换了 `jk2` 的算法在哪一步，事件顺序与解锁点一字未变）。
     agent._joseki_emit(data.get("jk2") or {},
-                       data.get("jk_show_card", False), None)
+                       data.get("jk_show_card", False), None, epoch=data.get("epoch"))
     agent._set_busy(False)
     await agent._mood_llm_refine()
     # 不在这里 emit state：落子的可见更新由 reveal_move() 在她这段语音开始时触发
@@ -1005,16 +1073,19 @@ async def _finalize_just_moved(agent, data):
 async def _finalize_observe(agent, data):
     """提示发事件（短路时只归位 busy），然后解锁。"""
     if not data.get("short"):
-        await _emit_deduped(agent, events.AI_COMMENT, str(data.get("reply") or ""))
+        await _emit_deduped(agent, events.AI_COMMENT, str(data.get("reply") or ""),
+                            epoch=data.get("epoch"))
     agent._set_busy(False)
 
 
 async def _finalize_analyze(agent, data):
     """分析发事件 + 形势栏（短路时只归位 busy），然后解锁。"""
     if not data.get("short"):
-        await _emit_deduped(agent, events.AI, "📊 " + str(data.get("reply") or ""))
-        info = data.get("info") or {}
-        agent._emit(events.info(float(info.get("wr", 0.5)), float(info.get("score", 0.0))))
+        await _emit_deduped(agent, events.AI, "📊 " + str(data.get("reply") or ""),
+                            epoch=data.get("epoch"))
+        if _alive(agent, data):                 # 看门狗守卫：旧一代不再推形势栏
+            info = data.get("info") or {}
+            agent._emit(events.info(float(info.get("wr", 0.5)), float(info.get("score", 0.0))))
     agent._set_busy(False)
 
 
@@ -1024,24 +1095,28 @@ async def _finalize_chat(agent, data):
     reply = str(data.get("reply") or "")
     if agent._llm_failed(reply):                # 云端失败：聊天退化为兜底台词
         reply = agent._fallback_line("chat")
-    agent.st.chat_history.append({"role": "assistant", "content": reply})
-    await _emit_deduped(agent, events.AI, reply)
+    if _alive(agent, data):                     # 看门狗守卫：旧一代不再写聊天历史
+        agent.st.chat_history.append({"role": "assistant", "content": reply})
+    await _emit_deduped(agent, events.AI, reply, epoch=data.get("epoch"))
     await agent._mood_llm_refine()
 
 
 async def _finalize_idle(agent, data):
     """闲置搭话收尾（不进 busy，与今天一致）。"""
     reply = str(data.get("reply") or "")
-    agent.st.chat_history.append({"role": "assistant", "content": reply})
-    await _emit_deduped(agent, events.AI_IDLE, reply)
+    if _alive(agent, data):                     # 看门狗守卫：旧一代不再写聊天历史
+        agent.st.chat_history.append({"role": "assistant", "content": reply})
+    await _emit_deduped(agent, events.AI_IDLE, reply, epoch=data.get("epoch"))
 
 
 async def _finalize_summary(agent, data):
     """总结收尾：置终局标记 → 发话 → 真总结才写长期记忆 → 解锁。"""
     text = str(data.get("reply") or "")
-    agent.st.finished = True
-    await _emit_deduped(agent, events.AI, "📋 对局总结\n" + text)
-    if not data.get("failed"):                  # 只写真总结：兜底台词不是总结，写进去会污染记忆
+    if _alive(agent, data):                     # 看门狗守卫：旧一代不再置终局标记 / 写长期记忆
+        agent.st.finished = True
+    await _emit_deduped(agent, events.AI, "📋 对局总结\n" + text, epoch=data.get("epoch"))
+    if not data.get("failed") and _alive(agent, data):
+        # 只写真总结：兜底台词不是总结，写进去会污染记忆
         await asyncio.to_thread(agent._remember_game, text,
                                 float(data.get("wr", 0.5)), float(data.get("score", 0.0)))
     agent._set_busy(False)

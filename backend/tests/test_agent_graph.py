@@ -960,3 +960,144 @@ class HerStructureSpeechTest(_HerJosekiFixture):
                                  "结构点顶替本来那条：气泡数仍是 3，不新增")
                 self.assertEqual(len(calls), 2, "她那一步只许识别一次")
 
+
+# —— 以下为「体验与可靠性批 v3.7.0」· Task E 追加（既有断言一个字符都没改；追加在文件末尾，
+#    理由同上：本仓的唯一跑法 `python -m unittest discover -s tests` 不会执行上面的 `unittest.main()`）——
+#
+# `busy` 兜底看门狗 + 代际守卫：一回合卡死时 `busy` 必须归位（不归位＝棋盘永久锁死，本项目最严重的
+# 故障形态）；而且**超时不是只解锁**——旧那一代的后续写入（棋谱 / 快照 / 俗手账 / 逐手存档 / 揭示
+# 标记 / 台词与 speech / 定式计数）一律作废，否则解锁后新回合会与旧回合抢写同一份 `st`。
+
+
+class _SlowEngine(StubEngine):
+    """固定延迟的假引擎：模拟「正常偏慢」的一回合（总耗时仍在看门狗预算内）。"""
+
+    def __init__(self, delay=0.01):
+        super().__init__()
+        self.delay = float(delay)
+
+    async def analyze(self, moves):
+        await asyncio.sleep(self.delay)
+        return await super().analyze(moves)
+
+
+class _SlowLLM(StubLLM):
+    """固定延迟的假 LLM：同上。"""
+
+    def __init__(self, delay=0.01, text="嗯~ 这一步我看着挺顺。"):
+        super().__init__(text)
+        self.delay = float(delay)
+
+    async def chat(self, messages, max_tokens=300, no_think=False):
+        await asyncio.sleep(self.delay)
+        return await super().chat(messages, max_tokens, no_think)
+
+
+class _HangingEngine(StubEngine):
+    """卡死的假引擎：先挂满 ``hang`` 秒再返回（比看门狗长 ⇒ 超时先到）。
+
+    有意**不**抛异常也不理取消：它模拟的是「等一个永远等不到的响应」，超时后它照样会恢复并把
+    剩下的编排跑完——这正是要看代际守卫拦下来的那一批迟到写入。
+    """
+
+    def __init__(self, hang=0.3):
+        super().__init__()
+        self.hang = float(hang)
+
+    async def analyze(self, moves):
+        await asyncio.sleep(self.hang)
+        return await super().analyze(moves)
+
+
+class BusyWatchdogTest(unittest.TestCase):
+    """看门狗（超时解锁 + 前推代数）与代际守卫（旧一代的写入全部作废）。"""
+
+    HINT = "算得太久"                       # 超时那条可读提示的辨识片段
+
+    def _hints(self, bus):
+        return [e for e in bus.messages() if self.HINT in str(e.get("text", ""))]
+
+    def test_normal_slow_turn_is_not_interrupted(self):
+        # 三次 ainvoke + 重试的引擎调用 + 工具轮，全在 WATCHDOG_SEC 内 → 不触发
+        agent, _eng, _llm, bus = _mk()
+        agent.katago = _SlowEngine(0.02)          # 每次引擎分析 20ms
+        agent.llm = _SlowLLM(0.02)                # 每次出话 20ms
+        agent.tools_enabled = True                # 她那一步走工具轮（多一次模型往返）
+        agent.chain = _ScriptChain([_Ai(content="嗯~ 这手我想想。")])
+        agent.watchdog_sec = 1.0                  # 远大于本回合总耗时（含 0.35s 的犹豫节拍）
+
+        asyncio.run(agent.player_move(3, 3))
+
+        self.assertFalse(agent.busy)
+        self.assertEqual(self._hints(bus), [], "正常偏慢的一回合不该触发看门狗")
+        self.assertEqual([e["busy"] for e in bus.of_type("busy")], [True, False])
+        self.assertEqual(len(bus.messages(events.AI_MOVE)), 1, "落子宣告照发")
+        self.assertEqual(len(agent.st.moves), 2, "玩家那一手与她那一手都落进棋谱")
+
+    def test_watchdog_releases_busy_on_a_hung_turn(self):
+        # 卡死 → busy 归位、只发一条可读提示
+        agent, _eng, _llm, bus = _mk()
+        agent.katago = _HangingEngine(0.3)        # 第一次引擎分析就挂 0.3s
+        agent.watchdog_sec = 0.05
+
+        async def run():
+            await agent.player_move(3, 3)
+            await asyncio.sleep(0.4)              # 让卡死那一代自己跑完
+
+        asyncio.run(run())
+
+        self.assertFalse(agent.busy, "超时必须归位，否则棋盘永久锁死")
+        self.assertEqual([e["busy"] for e in bus.of_type("busy")], [True, False])
+        hints = self._hints(bus)
+        self.assertEqual(len(hints), 1, "超时只发一条可读提示（走既有 message 通道）")
+        self.assertEqual(str(hints[0].get("type")), "message")
+        self.assertEqual(str(hints[0].get("kind")), events.AI)
+        # 旧一代恢复后什么都没发出来：整回合只有那一条提示
+        self.assertEqual(len(bus.messages()), 1)
+
+    def test_late_writes_after_timeout_are_discarded(self):
+        # 超时后旧那一代的所有写入全部作废（st.moves / bad_moves / move_notes 不变）
+        agent, _eng, _llm, bus = _mk()
+        agent.katago = _HangingEngine(0.3)
+        agent.watchdog_sec = 0.05
+        before = (len(agent.st.moves), len(agent.st.bad_moves), len(agent.st.move_notes),
+                  len(agent.st.snapshots), len(agent.st.losses), len(agent.st.memory_log))
+
+        async def run():
+            await agent.player_move(3, 3)
+            await asyncio.sleep(0.4)              # 卡死那一代恢复后继续跑完
+
+        asyncio.run(run())
+
+        after = (len(agent.st.moves), len(agent.st.bad_moves), len(agent.st.move_notes),
+                 len(agent.st.snapshots), len(agent.st.losses), len(agent.st.memory_log))
+        self.assertEqual(after, before, "超时后旧那一代的写入必须全部作废")
+        self.assertEqual(agent.st.board.at(3, 3), "", "玩家那一手也不许落进内部棋盘")
+        self.assertEqual(agent.st.move_seq, [])
+        self.assertFalse(agent._reveal_pending)
+        self.assertEqual(len(self._hints(bus)), 1, "提示照发（归上一条用例细看），但写入一律作废")
+
+    def test_no_double_busy_event(self):
+        # 看门狗归位 + 公开方法 finally 再归位：busy 事件一条不多（`_set_busy` 自带去重）
+        agent, _eng, _llm, bus = _mk()
+        agent.katago = _HangingEngine(0.3)
+        agent.watchdog_sec = 0.05
+
+        async def run():
+            await agent.player_move(3, 3)
+            await asyncio.sleep(0.4)
+
+        asyncio.run(run())
+        seq = [e["busy"] for e in bus.of_type("busy")]
+        self.assertEqual(seq, [True, False])
+        self.assertEqual(seq.count(False), 1, "解锁只许有一条 busy 事件")
+
+        # 棋盘不再锁死：紧接着的一次公开调用照常受理（新回合 = 新一代）
+        agent.katago = StubEngine()
+        agent.watchdog_sec = 1.0
+        asyncio.run(agent.player_move(15, 15))
+        self.assertFalse(agent.busy)
+        self.assertEqual([e["busy"] for e in bus.of_type("busy")], [True, False, True, False])
+        self.assertEqual(len(bus.messages(events.AI_MOVE)), 1)
+        self.assertEqual(len(agent.st.moves), 2)
+

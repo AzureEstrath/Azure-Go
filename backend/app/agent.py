@@ -59,6 +59,19 @@ MOVE_TOOLS = ("katago_analyze", "board_query")
 TOOL_BUDGET_TEXT = "工具调用次数已达上限（%d 次），这次不再执行；请不要再调用任何工具，直接用自然语言回答。"
 TOOL_TIMEOUT_TEXT = "工具执行超时（%d 秒），这次没取到结果；别再重试同一个工具，直接回答。"
 
+# —— 回合兜底看门狗（v3.7.0）：`busy` 不归位＝棋盘永久锁死，这是本项目最严重的故障形态 ——
+# 值按**最坏一回合预算 × 2**算，再向上取整到 60 的倍数。最坏预算按代码里的真实上限推：
+#   ① LLM：MAX_LLM_CALLS_PER_TURN(4) × 单次超时 120s
+#      （llm_chain.DEFAULT_TIMEOUT_SEC，且 ChatOpenAI 固定 max_retries=0）＝ 480s
+#   ② 引擎：一回合 3 次 analyze（after_player 的「落子前 / 落子后」＋ just_moved 的复算）
+#      × 单次 katago_timeout_ms（默认 30000ms） × 引擎内部重试 2 次（engine.analyze 的 for _ in range(2)）
+#      ＝ 3 × 30 × 2 ＝ 180s
+#   ③ 工具轮：max_tool_calls(2) × 单工具超时 TOOL_TIMEOUT_SEC(10s) ＝ 20s
+#   预算 ≈ 680s（≈11.3 分钟）；680 × 2 ＝ 1360s → 取整到 60 的倍数 ＝ 1380s（23 分钟）
+# 说明：这是**真卡死**的兜底，不是延迟上限——正常偏慢的一回合（几十秒级）离它很远，不会被误伤；
+# 而云端 LLM 自己有 120s 超时、引擎自己有 30s×2，所以只有在「等一个永远不来的响应」时才会走到这里。
+WATCHDOG_SEC = 1380
+
 # 括号里带「着棋点位」的舞台提示不需要显示，例如（白棋落在 C4）/（第7手 Q16）/（C4）
 _PAREN_GROUP_PATTERN = "[（(][^（()）\\n]{0,40}[）)]"
 _MOVE_HINT_PATTERN = "[A-HJ-Ta-hj-t]\\s?\\d{1,2}|落子|落在|虚着|pass|着子|第\\s?\\d+\\s?手"
@@ -98,7 +111,21 @@ CHAT_FALLBACK_LINES = [
 ]
 
 
+def _discard_task(task):
+    """旧一代任务跑完时的收尾：只把异常取走（免得 asyncio 报「exception was never retrieved」）。
+
+    看门狗**有意不取消**旧任务（见 ``AzureAgent._turn_guard``），所以它迟早会自己跑完；这里只是
+    把它挂在 ``add_done_callback`` 上做一次收尾，不改变任何结果。
+    """
+    if not task.cancelled():
+        task.exception()
+
+
 class AzureAgent:
+    # 回合兜底看门狗（v3.7.0）：算式与取值见模块顶部的 ``WATCHDOG_SEC`` 注释。
+    # 实例上另有 ``self.watchdog_sec``（可注入/可覆盖，测试用它把等待压到毫秒级）。
+    WATCHDOG_SEC = WATCHDOG_SEC
+
     def __init__(self, engine, llm, bus=None, joseki_teach=True, limit_len=False,
                  tools_enabled=False, max_tool_calls=None, memory=None, stream_tokens=False,
                  tts=None, joseki_progress=None):
@@ -111,6 +138,14 @@ class AzureAgent:
         self.joseki_teach = joseki_teach
         self.limit_len = limit_len
         self.busy = False
+
+        # —— 回合代数（v3.7.0）：每一次公开编排调用开启新一代，本回合的所有写入都带这一代的 token ——
+        #    看门狗超时 / 新的公开调用都会把它前推，旧一代的 ``epoch_ok`` 随即全部为假 ⇒
+        #    它之后的一切 ``st.*`` 写入与事件发射一律作废（见 ``agent_graph`` 的守卫）。
+        self.epoch = 0
+        self._epoch_token = 0       # 当前在途那一代的 token（``begin_epoch()`` 刷新）
+        # 看门狗秒数：取模块常量，实例上可覆盖（测试用极小值，绝不真的等 23 分钟）
+        self.watchdog_sec = float(self.WATCHDOG_SEC)
 
         # —— 复盘模式（v3.7.0）：后端的**独立模式**（可进可出、不碰 `st`、不碰 `busy`）——
         #    `review` 期间她不能开口：落子/聊天/闲置/提示/分析在 main.py 侧一律可读拒绝，
@@ -172,13 +207,84 @@ class AzureAgent:
             self._graph = build_graph(self)
         return self._graph
 
+    # ================= 回合代数与兜底看门狗（v3.7.0） =================
+
+    def begin_epoch(self) -> int:
+        """开启新一代（一次公开编排调用＝一代）：自增并返回新代数，同时记住它是在途那一代。
+
+        ``player_move`` 的三个阶段共用一个 token；「新的公开调用」与「看门狗超时」都会前推代数，
+        让上一代的 ``epoch_ok`` 变成假。
+        """
+        self.epoch += 1
+        self._epoch_token = self.epoch
+        return self.epoch
+
+    def epoch_ok(self, token) -> bool:
+        """``token`` 是否仍属于**当前**这一代（超时 / 新回合都会让旧一代作废）。
+
+        取不到 token（``None`` / 脏值）按「不属于」处理——宁可不写，也不让一个来路不明的写入
+        落到盘面上。
+        """
+        try:
+            return int(token) == self.epoch
+        except (TypeError, ValueError):
+            return False
+
+    def turn_alive(self) -> bool:
+        """**在途那一代**是否仍然有效（看门狗超时后为假）。
+
+        给拿不到本轮 ``data`` 的少数调用点用（流式 ``token`` 事件、情绪小调用、悔棋的退回计数）：
+        它们只该在「本回合还没被作废」时动手。新的公开调用会 ``begin_epoch()`` 刷新它，所以
+        ``undo`` / ``reset_game`` 这类**新的用户动作**不受上一轮超时的影响（见那两处的注释）。
+        """
+        return self.epoch_ok(self._epoch_token)
+
+    def _watchdog_fire(self):
+        """看门狗触发：解锁 + **前推一代** + 一行日志 + 一条可读提示（走既有 ``message`` 通道）。
+
+        「前推一代」是这里的关键，也是「超时不再放开并发」的全部含义：解锁会让玩家立刻可以开始
+        新的一手，而在途那一代（可能还卡在某个等待里、也可能刚恢复）的 ``epoch_ok`` 已经全部为假，
+        它之后的一切写入与发话都会被守卫拦掉——解锁因此不会让两代抢写同一份 ``st``。
+
+        解锁走 ``_set_busy``（自带去重）：随后公开方法的 ``finally`` 再调一次不会多发 ``busy`` 事件。
+        """
+        self.epoch += 1
+        self._set_busy(False)
+        print("[Agent] 回合兜底超时（%g 秒）：已解锁棋盘，这一回合的后续写入一律作废。" % float(self.watchdog_sec))
+        self._emit(events.message(events.AI, "唔…这一手我算得太久了，先接着下吧。"))
+
+    async def _turn_guard(self, coro):
+        """最外层看门狗：跑完一次公开编排；超时则解锁 + 前推一代，本回合余下的写入全部作废。
+
+        返回编排结果；**超时返回 ``None``**（调用方据此放弃本回合的后续阶段，但**不抛异常**——
+        真正的编排异常照旧由调用方的 ``except`` 兜住，行为与没有看门狗时一致）。
+
+        **有意不取消**旧任务：它可能卡在不可取消的等待里（引擎 / 云端 / 工具），``wait_for`` 式的
+        取消只会把半截状态留在半路、还会把 CancelledError 抛进本来就在降级的外部调用；让它自己跑完、
+        用代际守卫把它的写入全部拦掉，既简单又不会留下更坏的状态。旧任务跑完即自行结束
+        （异常由 ``_discard_task`` 收走，不会变成「never retrieved」告警）。
+        """
+        task = asyncio.ensure_future(coro)
+        done, _pending = await asyncio.wait({task}, timeout=float(self.watchdog_sec))
+        if not done:
+            self._watchdog_fire()
+            task.add_done_callback(_discard_task)
+            return None
+        return task.result()
+
     async def _turn(self, phase, data=None, turn_id=None):
         """跑一次回合状态图（一个阶段），返回终态。
 
         编排顺序（引擎调用 / 提示词 / 台词 / 事件 / 记忆标签）全在 ``agent_graph`` 的四个节点里；
         这里只把「阶段 + 棋谱快照 + 中间数据」交出去。多阶段回合（``player_move``）由调用方依次
         跑，``turn_id`` 一路沿用（流式 token 与重复发话的判据靠它）。
+
+        本回合的**代数**（v3.7.0）随 ``data`` 一路带下去：节点里每一个写 ``st.*`` / 发事件之前都要
+        拿它核对一次（见 ``agent_graph._alive``）。跨阶段的 ``data`` 沿用第一阶段的那个 token，
+        所以 ``player_move`` 的三次 ``ainvoke`` 属于同一代。
         """
+        d = dict(data or {})
+        d.setdefault("epoch", self._epoch_token)
         state = {
             "phase": str(phase),
             "moves": list(self.st.moves),
@@ -188,7 +294,7 @@ class AzureAgent:
             "wants_tools": False,
             "move": None,
             "turn_id": str(turn_id or self.turn_id or ""),
-            "data": dict(data or {}),
+            "data": d,
         }
         return await self.graph.ainvoke(state)
 
@@ -711,8 +817,13 @@ class AzureAgent:
 
         优先结构化输出（模型直接给三维增量），拿不到才回落到正则解析（v2 行为不变）；两条路都
         拿不到就静默收场，情绪只保留本地事件结算的结果。
+
+        v3.7.0 看门狗守卫：在途那一代已被作废（看门狗刚超时）时直接返回——它的心情结算与 ``mood``
+        事件都属于那一代，跟着作废（``busy`` 那时已是 False，光靠上面那条判据拦不住）。
         """
         if self.llm is None or self._mood_desc == "" or self.busy:
+            return
+        if not self.turn_alive():
             return
         now = int(time.monotonic() * 1000)
         if now - self._mood_ms < MOOD_LLM_GAP_MS:
@@ -787,7 +898,7 @@ class AzureAgent:
     def _joseki_logged(self, key) -> bool:
         return any(str(e.get("key", "")) == key for e in self.st.joseki_log)
 
-    def _joseki_emit(self, r, show_card=False, mistake=None):
+    def _joseki_emit(self, r, show_card=False, mistake=None, epoch=None):
         """棋盘高亮轨迹：成型=按手顺点亮；偏离=只点「常规一手」那个位置。
 
         卡片载荷（计划 07 T6）：``show_card`` / ``mistake`` 由调用方（``agent_graph`` 的两个
@@ -800,7 +911,12 @@ class AzureAgent:
         旧行为一字不动（U32）：``deviated`` 仍把 ``points`` 换成 ``[expect]``、``expect`` 缺失
         时提前 return，``points`` 为空时也提前 return（不发事件）——新字段只是**追加**在发出去的
         那个 payload 上。
+
+        ``epoch``（v3.7.0）：看门狗守卫——带了它且已经不属于当前这一代时，这条棋盘注记不发。
+        调用点都从本轮 ``data`` 里传 ``epoch``；不传（既有单测的直接调用）时行为与以前逐字一致。
         """
+        if epoch is not None and not self.epoch_ok(epoch):
+            return
         if not r:
             return
         pts = list(r.get("points", []))
@@ -876,14 +992,19 @@ class AzureAgent:
             print("[Joseki] 走错判定失败（按「不算走错」保守处理，不影响对局）：%s" % e)
             return False
 
-    async def joseki_count_entry(self, jk) -> None:
+    async def joseki_count_entry(self, jk, epoch=None) -> None:
         """记一次「这一族被走到了」（**同族同局最多计 1 次**；只写计数，不发事件、不决定卡片）。
 
         先把族落进 ``st.joseki_counted``（并把它从 ``st.joseki_dropped`` 里摘掉——新的一集开始），
         再 ``bump``。磁盘 IO 走 ``to_thread``（慢库不得冻住事件循环）；失败也只是丢这一次记忆——
         ``JosekiProgress`` 内部已吞掉异常并降级返回旧值，这里绝不抛、绝不影响对局。
+
+        ``epoch``（v3.7.0）：看门狗守卫——带了它且已经不属于当前这一代时，这一族的计数（内存与
+        磁盘）都不再写。调用点都从本轮 ``data`` 里传；不传时行为与以前逐字一致。
         """
         if not jk or self.joseki_progress is None:
+            return
+        if epoch is not None and not self.epoch_ok(epoch):
             return
         family = str(jk.get("family") or "")
         if family == "":
@@ -903,8 +1024,14 @@ class AzureAgent:
         不 await）；**没有 loop**（纯同步单测 / 被同步代码直接调用）时就地同步做完——两者都
         **不阻塞**调用方。绝不能把整个 ``undo`` 丢线程：``_emit`` / ``bus.publish`` 从工作线程唤醒
         ``asyncio.Queue`` 不是线程安全的，所以这一层只碰 ``JosekiProgress``。
+
+        v3.7.0 看门狗守卫：在途那一代已经被作废时（看门狗刚超时、玩家随即悔棋）这一笔退回计数
+        一并作废——这一局的族计数与盘面同属一代，不该由一代已死的动作去改。``undo`` 自己会先
+        ``begin_epoch()``，所以正常的悔棋永远走得到下面（守卫只在「旧一代还在收尾」时拦下）。
         """
         if self.joseki_progress is None:
+            return
+        if not self.turn_alive():
             return
         fams = [f for f in dict.fromkeys(families or []) if f]      # 去重 + 丢掉空族
         if not fams:
@@ -947,14 +1074,27 @@ class AzureAgent:
             return
         self._set_busy(True)
         self._new_turn()                            # 三阶段共用同一轮标识（S33）
+        token = self.begin_epoch()                  # 三阶段共用同一代（看门狗超时后整代作废）
         try:
-            state = await self._turn(PHASE_AFTER_PLAYER, {"x": x, "y": y})
-            state = await self._turn(PHASE_OWN_TURN, state.get("data"), state.get("turn_id"))
-            await self._turn(PHASE_JUST_MOVED, state.get("data"), state.get("turn_id"))
+            await self._turn_guard(self._player_move_turns(x, y, token))
         except Exception as e:                      # 编排意外抛出（LLM/引擎）：不得让 busy 永久为真
             print("[Agent] 落子编排异常：%s" % e)
         finally:
             self._set_busy(False)
+
+    async def _player_move_turns(self, x, y, token):
+        """``player_move`` 的三个阶段（同一个 epoch，交给 ``_turn_guard`` 整体兜底）。
+
+        阶段之间核对一次代数：看门狗一触发，这一代就作废了，剩下的阶段一个都不许再跑
+        （否则她会在玩家已经重新落子之后，拿旧局面继续下她那一手）。
+        """
+        state = await self._turn(PHASE_AFTER_PLAYER, {"x": x, "y": y})
+        if not self.epoch_ok(token):
+            return
+        state = await self._turn(PHASE_OWN_TURN, state.get("data"), state.get("turn_id"))
+        if not self.epoch_ok(token):
+            return
+        await self._turn(PHASE_JUST_MOVED, state.get("data"), state.get("turn_id"))
 
     def _pick_ai_move(self, move_infos) -> list:
         """按引擎候选顺序取第一个在当前棋盘合法的点；不允许虚着时绝不虚着。"""
@@ -1034,8 +1174,9 @@ class AzureAgent:
             return
         self._set_busy(True)
         self._new_turn()
+        self.begin_epoch()
         try:
-            await self._turn(PHASE_OBSERVE)
+            await self._turn_guard(self._turn(PHASE_OBSERVE))
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
             print("[Agent] 提示异常：%s" % e)
             await _emit_line(self, events.AI_COMMENT, self._fallback_line("game"))
@@ -1052,8 +1193,9 @@ class AzureAgent:
             return
         self._set_busy(True)
         self._new_turn()
+        self.begin_epoch()
         try:
-            await self._turn(PHASE_ANALYZE)
+            await self._turn_guard(self._turn(PHASE_ANALYZE))
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
             print("[Agent] 分析异常：%s" % e)
             await _emit_line(self, events.AI, "📊 " + self._fallback_line("game"))
@@ -1071,19 +1213,26 @@ class AzureAgent:
         self._mood_event(self._chat_event(self.chat_emotion(text)), "，他说：「%s」" % text[:40].strip())
         self._set_busy(True)
         self._new_turn()
+        self.begin_epoch()
         try:
-            await self._turn(PHASE_CHAT, {"text": text})
+            await self._turn_guard(self._turn(PHASE_CHAT, {"text": text}))
         except Exception as e:                      # 意外抛出：按失败处理，别让棋盘锁死
             print("[Agent] 聊天异常：%s" % e)
         finally:
             self._set_busy(False)
 
     async def idle_remark(self):
-        """闲置搭话：Estarth 一段时间没动静时，Azure 主动说一句短话。"""
+        """闲置搭话：Estarth 一段时间没动静时，Azure 主动说一句短话。
+
+        同样走看门狗（超时也解锁 + 前推一代），只是它**不进 busy**：与今天一致（空闲搭话不锁棋盘）。
+        注意「新的公开调用会 ``begin_epoch()``」顺带带来了一个既有语义的加强：玩家一回来就落子时，
+        还在途的走神搭话那一代随即作废，它那句就不再冒出来——与前端「走神搭话可整批作废」一致。
+        """
         if self.busy:
             return
         self._new_turn()
-        await self._turn(PHASE_IDLE)                 # 不进 busy：与今天一致（空闲搭话不锁棋盘）
+        self.begin_epoch()
+        await self._turn_guard(self._turn(PHASE_IDLE))
 
     async def summarize(self, note=""):
         """对局总结（顺序见 ``agent_graph.py`` 的 summary 阶段）。"""
@@ -1095,8 +1244,9 @@ class AzureAgent:
             return
         self._set_busy(True)
         self._new_turn()
+        self.begin_epoch()
         try:
-            await self._turn(PHASE_SUMMARY, {"note": note})
+            await self._turn_guard(self._turn(PHASE_SUMMARY, {"note": note}))
         except Exception as e:                      # 意外抛出：给一句兜底台词，别让棋盘锁死
             print("[Agent] 总结异常：%s" % e)
             await _emit_line(self, events.AI, "📋 对局总结\n" + self._fallback_line("chat"))
@@ -1106,9 +1256,14 @@ class AzureAgent:
     # 注意（计划 05 · T20②）：下面四个**同步**方法里的短提示**故意保持纯文字**（不发 `speech`）——
     # 它们是同步方法（S5 不许改成 async），补 `speech` 就得 `await`、还得动端点；Task 5 会在 README 写明。
     def undo(self, turn_index):
-        """俗手回档：撤销该手及其后的 Azure 应手，回到该手之前。"""
+        """俗手回档：撤销该手及其后的 Azure 应手，回到该手之前。
+
+        v3.7.0：开头 ``begin_epoch()`` 开新一代——玩家这一手动作会把**还在途的上一代**（例如
+        刚被看门狗解锁、却仍在后台收尾的那一回合）一并作废，免得它的迟到写入盖回这次回档。
+        """
         if self.busy:
             return
+        self.begin_epoch()
         if turn_index < 0 or turn_index >= len(self.st.snapshots):
             self._emit(events.message(events.AI, "这个回档点已经不存在了哦"))
             return
@@ -1148,6 +1303,8 @@ class AzureAgent:
         self._emit(events.message(events.AI, "嗯~ 那我们退回第%d手，重新想想…" % len(self.st.moves)))
 
     def reset_game(self):
+        # v3.7.0：开新一代——新一局开始，上一代（可能还在后台收尾）的迟到写入一律作废
+        self.begin_epoch()
         keep_pass = self.st.allow_pass
         self.st.reset()
         self.st.allow_pass = keep_pass
