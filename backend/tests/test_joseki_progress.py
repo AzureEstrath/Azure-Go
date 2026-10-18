@@ -21,6 +21,7 @@ from app import coords, events
 from app.agent import AzureAgent
 from app.joseki import JosekiRecognizer
 from app.joseki_progress import DEFAULT_DB_PATH, JosekiProgress
+from app.profile import KAKARI_AXIS, extract_axes
 from helpers import StubEngine, StubLLM, mk_agent
 
 
@@ -424,6 +425,58 @@ class DedupKeySplitTest(unittest.TestCase):
         self.assertEqual(str(first.get("kind")), "formed")
         self.assertEqual([e["key"] for e in agent.st.joseki_log], ["F:左上:star"])
         self.assertEqual(agent._joseki_check(), {})
+
+
+class PlayerSubjectFamiliesTest(unittest.TestCase):
+    """修复波 #1：``joseki_families``（``open.favorite_kakari`` 的唯一信号源）只算**玩家**的族。
+
+    ``_joseki_check()`` 在玩家落子后与她落子后**两处**都会调用、都往 ``joseki_log`` 追加；旧实现
+    只按去重键前缀 ``E:`` / ``B:`` 取族、不看这一手是谁下的 ⇒ v3.9.0 画像里唯一一条「开局偏好」
+    的断言（「他挂角比守角更主动 / 他更爱先守角」）由两个人的落子算出来，与已经收口到玩家口径的
+    ``blunder.*`` / ``weak.corner_*`` 自相矛盾。回归拦截：去掉 ``_joseki_families_played`` 里的
+    色过滤（改回只看前缀）时本类的四条用例必红。
+    """
+
+    # 手数（``move_no`` 是**落子后**的手数）：1=玩家(B) 2=她(W) 3=玩家(B)
+    MOVES = [["B", "D16"], ["W", "C17"], ["B", "Q16"]]
+
+    def _agent_with_log(self, entries):
+        agent = _agent(None)
+        _seed(agent, self.MOVES)
+        agent.st.joseki_log = [dict(e) for e in entries]
+        return agent
+
+    def test_her_side_family_is_excluded(self):
+        agent = self._agent_with_log([
+            {"key": "E:左上:star_kakari_small", "move_no": 1},   # 玩家那一手走出的族
+            {"key": "E:右下:komoku_shimari", "move_no": 2},      # 她那一手走出的族
+        ])
+        self.assertEqual(agent._joseki_families_played(), ["star_kakari_small"])
+
+    def test_only_her_families_produce_no_kakari_axis(self):
+        agent = self._agent_with_log([{"key": "B:右下:komoku_shimari", "move_no": 2}])
+        fams = agent._joseki_families_played()
+        self.assertEqual(fams, [], "她那一侧走出的族一个都不进玩家画像")
+        self.assertNotIn(KAKARI_AXIS, extract_axes({"joseki_families": fams}),
+                         "没有玩家侧的族 ⇒ 不产 open.favorite_kakari")
+
+    def test_her_shimari_does_not_drag_the_kakari_ratio(self):
+        """分子分母同源：只有玩家那一手的挂角算数（旧实现会掺进她的守角 ⇒ 0.5）。"""
+        agent = self._agent_with_log([
+            {"key": "E:左上:star_kakari_small", "move_no": 1},   # 玩家：挂角
+            {"key": "E:右下:komoku_shimari", "move_no": 2},      # 她：守角
+        ])
+        axes = extract_axes({"joseki_families": agent._joseki_families_played()})
+        self.assertEqual(axes[KAKARI_AXIS], 1.0, "只算玩家：挂角 1 / （挂角 + 守角）1")
+
+    def test_dirty_move_no_is_not_claimed_for_the_player(self):
+        """取不到手数（脏值 / 缺键 / 越界）时保守跳过——宁可少算偏好，也不误算成玩家的。"""
+        agent = self._agent_with_log([
+            {"key": "E:左上:star_kakari_small"},                     # 缺 move_no
+            {"key": "B:右上:star_shimari", "move_no": "oops"},        # 脏值
+            {"key": "E:左下:komoku_shimari", "move_no": 9},           # 越界（本局只有 3 手）
+        ])
+        self.assertEqual(agent._joseki_families_played(), [])
 
 
 class AssemblyTest(unittest.TestCase):

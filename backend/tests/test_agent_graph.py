@@ -1046,6 +1046,24 @@ class _HangingEngine(StubEngine):
         return await super().analyze(moves)
 
 
+class _HangingLLM(StubLLM):
+    """卡死的假 LLM：**先把调用记账**（``started`` 是「它真的挂在那里」的确定性信号）再挂满 ``hang`` 秒。
+
+    与 ``_HangingEngine`` 同一用意：模拟「等一个永远等不到的响应」，超时后它照样会恢复并把剩下的
+    编排跑完——正是要看代际守卫 / 看门狗那一代核对拦下来的那一批。
+    """
+
+    def __init__(self, hang=0.5):
+        super().__init__()
+        self.hang = float(hang)
+        self.started = 0
+
+    async def chat(self, messages, max_tokens=300, no_think=False):
+        self.started += 1
+        await asyncio.sleep(self.hang)
+        return await super().chat(messages, max_tokens, no_think)
+
+
 class _HangingTTS:
     """卡死的假 TTS：第 ``hang_at`` 次 ``speak`` 先挂满 ``hang`` 秒再返回（其余立刻返回）。
 
@@ -1172,24 +1190,68 @@ class BusyWatchdogTest(unittest.TestCase):
     def test_late_writes_after_timeout_are_discarded(self):
         # 超时后旧那一代的所有写入全部作废（st.moves / bad_moves / move_notes 不变）
         agent, _eng, _llm, bus = _mk()
-        agent.katago = _HangingEngine(0.3)
+        hang = _HangingEngine(0.3)
+        agent.katago = hang
         agent.watchdog_sec = 0.05
         before = (len(agent.st.moves), len(agent.st.bad_moves), len(agent.st.move_notes),
                   len(agent.st.snapshots), len(agent.st.losses), len(agent.st.memory_log))
 
         async def run():
             await agent.player_move(3, 3)
-            await asyncio.sleep(0.4)              # 卡死那一代恢复后继续跑完
+            # 轮询等「僵尸那一代真的跑完它的两次引擎分析」（0.3s × 2）——固定 sleep 的判别力来自
+            # 「等够了」，这里改成等一个**事件**：只有僵尸跑到第一个写入点（`_prepare_after_player`
+            # 的 `add_move` 在第一次分析之后、第二次分析之前），「旧一代什么都没写」才不是
+            # 「它还没来得及写」换来的（原来的 0.4s 其实还在第一次分析的等待里 ⇒ 把守卫全删掉
+            # 也照样绿，判别力为零）。
+            await _wait_for(lambda: len(hang.calls) >= 2)
 
         asyncio.run(run())
 
         after = (len(agent.st.moves), len(agent.st.bad_moves), len(agent.st.move_notes),
                  len(agent.st.snapshots), len(agent.st.losses), len(agent.st.memory_log))
+        self.assertEqual(len(hang.calls), 2, "僵尸那一代的两次引擎分析都已跑完（不是「还没轮到」）")
         self.assertEqual(after, before, "超时后旧那一代的写入必须全部作废")
         self.assertEqual(agent.st.board.at(3, 3), "", "玩家那一手也不许落进内部棋盘")
         self.assertEqual(agent.st.move_seq, [])
         self.assertFalse(agent._reveal_pending)
         self.assertEqual(len(self._hints(bus)), 1, "提示照发（归上一条用例细看），但写入一律作废")
+
+    def test_idle_watchdog_does_not_touch_a_newer_in_flight_turn(self):
+        """修复波 #3：看门狗只在**自己那一代**还活着时才触发（``_turn_guard`` 传 token）。
+
+        ``idle_remark`` 是唯一不进 ``busy`` 的入口：它自己的看门狗若在玩家新回合在途时迟到触发，
+        旧实现会**解锁并前推代数**，把玩家那个正在跑的回合整个作废（``_ctx_extras`` 的
+        ``to_thread(profile_facts)`` 在文件系统卡住时没有超时，所以「idle 自身 await 有界」不足以
+        排除这个形态）。这里把 idle 那一代的看门狗时限钉成 0.3s、玩家那一代钉成 5s，并**等 idle 的
+        speak 真的挂上**（``llm.started``）之后才开玩家回合，让「idle 超时」必然落在玩家回合在途期间
+        （判别力来自这两个信号，不是「睡够某个秒数」）。
+        """
+        agent, _eng, _llm, bus = _mk()
+        agent.katago = _HangingEngine(0.15)        # 玩家回合被引擎拖住在途（5s 预算内跑得完）
+        agent.llm = _HangingLLM(0.5)               # idle 的 speak 挂住 ⇒ idle 的看门狗先到期
+        agent.watchdog_sec = 0.3                   # idle 这一代的时限（`_turn_guard` 调用时读走）
+
+        async def run():
+            idle = asyncio.ensure_future(agent.idle_remark())
+            self.assertTrue(await _wait_for(lambda: agent.llm.started >= 1),
+                            "idle 的 speak 已经挂在那里（这一代还活着，不是「已经过期」）")
+            agent.watchdog_sec = 5.0               # 玩家这一代：时限远大于本回合总耗时
+            pm = asyncio.ensure_future(agent.player_move(3, 3))
+            await asyncio.sleep(0)                 # 玩家开更新的一代（idle 那一代就此过期）
+            self.assertTrue(agent.busy, "玩家回合已经开始（在途）")
+            self.assertTrue(await _wait_for(lambda: idle.done()), "idle 的看门狗应已到期")
+            # —— 断言点：过期那一代的看门狗什么都没做 ——
+            self.assertTrue(agent.busy, "过期的 idle 看门狗不得解锁玩家的在途回合")
+            self.assertEqual(self._hints(bus), [], "也不得发那条「算得太久」提示")
+            await pm
+            await idle
+
+        asyncio.run(run())
+
+        self.assertFalse(agent.busy)
+        self.assertEqual(self._hints(bus), [], "整场只有过期那一次超时，不该有任何提示")
+        self.assertEqual(len(agent.st.moves), 2, "玩家那一手与她那一手都照常落进棋谱")
+        self.assertEqual(len(bus.messages(events.AI_MOVE)), 1, "落子宣告照发")
 
     def test_no_double_busy_event(self):
         # 看门狗归位 + 公开方法 finally 再归位：busy 事件一条不多（`_set_busy` 自带去重）

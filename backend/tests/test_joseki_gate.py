@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))                  
 
 from app import coords, events, joseki_gate, prompts
 from app.agent import AzureAgent
-from app.agent_graph import PHASE_AFTER_PLAYER
+from app.agent_graph import PHASE_AFTER_PLAYER, PHASE_OWN_TURN
 from app.joseki import JosekiRecognizer
 from app.joseki_progress import JosekiProgress
 from helpers import StubEngine, StubLLM, mk_agent
@@ -471,6 +471,45 @@ class CountOnlyWhenTaughtTest(unittest.TestCase):
         self.assertEqual(sum(taught), 3, "六次遭遇里真的讲了 3 次（固定 rng 交替）")
         # 固定 rng 的契约：命中 / 未命中交替；第 6 次 ``seen`` 已到 3 ⇒ 资格层拦下（连掷都不掷）。
         self.assertEqual(taught, [True, False, True, False, True, False])
+
+
+class HerSideCountOnlyWhenTaughtTest(unittest.TestCase):
+    """修复波（账本挂着的「她那一侧计数收窄缺对称门卫」）：她那一侧也只在**真的讲了**时计数。
+
+    ``CountOnlyWhenTaughtTest`` 的对称版——那一条走 ``after_player``（玩家侧），这一条走
+    ``own_turn``（她那一侧）：``agent_graph._joseki_own_move`` 里 ``if jk2 and data["jk_show_card"]``
+    是**唯一**的计数入口，未命中一次都不许 ``bump``。回归拦截：把它改回「门控未命中也计数」时，
+    ``progress.bumps`` 会等于遭遇次数（6）而不是讲解次数（3），本用例必红。
+    """
+
+    HER_JK = {"kind": "entered", "family": "komoku_low_kakari", "corner": "右下", "cat": "komoku"}
+
+    def _her_encounter(self, progress, roll):
+        """一局里她那一步遭遇这一族一次（她那一侧的识别用合成的结果驱动，只钉计数口径）。"""
+        agent = _agent(progress, joseki_rate=0.5, joseki_rng=_FixedRng(roll))
+        _seed(agent, [["B", "D16"]])             # 盘上有一手，她那一步才有地方落
+        agent._joseki_check = lambda: dict(self.HER_JK)
+        agent._new_turn()
+        state = asyncio.run(agent._turn(PHASE_OWN_TURN))
+        return state["data"]
+
+    def test_her_family_counts_only_when_it_was_actually_taught(self):
+        progress = _FakeProgress()
+        taught = []
+        for i, roll in enumerate((0.0, 0.99, 0.0, 0.99, 0.0, 0.99)):
+            data = self._her_encounter(progress, roll)
+            with self.subTest(round=i + 1):
+                self.assertEqual(str((data.get("jk2") or {}).get("family") or ""),
+                                 self.HER_JK["family"], "每一轮都真的识别到了定式")
+                taught.append(bool(data.get("jk_show_card")))
+
+        self.assertEqual(taught, [True, False, True, False, True, False],
+                         "固定 rng 交替命中；第 6 次 seen 已到 3 ⇒ 资格层拦下（连掷都不掷）")
+        self.assertEqual(len(progress.bumps), sum(taught),
+                         "她那一侧的计数次数必须等于讲解次数（回归版会等于遭遇次数）")
+        self.assertEqual(progress.bumps, [self.HER_JK["family"]] * sum(taught),
+                         "未命中的那几次一次都没记")
+        self.assertEqual(progress.seen(self.HER_JK["family"]), sum(taught))
 
 
 # ================= ③ 真库端到端 + 配置透传 =================
