@@ -827,6 +827,12 @@ async def _speak_own_turn(agent, data, msgs):
         "x": ai_x, "y": ai_y, "gtp": ai_gtp, "pass": ai_gtp == "pass",
     }, epoch=data.get("epoch"))
 
+    # —— 看门狗守卫（v3.7.0 修复波 / R-I-3）：上面那次 ``_emit_line`` 内含 TTS 合成的网络
+    #    ``await``（最坏 tts_timeout_sec），看门狗可能正好在这一段触发——旧一代**不许**把
+    #    自己那一手落进棋谱、也不许写逐手存档（玩家可能已经重新落子）。与上面 :818 的守卫
+    #    同一写法；``_set_busy`` 的位置一概不动。 ——
+    if not _alive(agent, data):
+        return
     # 真正落子：先落到内部棋谱；棋盘可见的更新延后到语音开始时（reveal_move）
     if ai_gtp == "pass":
         agent.st.board.pass_move()

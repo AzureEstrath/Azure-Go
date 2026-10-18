@@ -1019,6 +1019,45 @@ class _HangingEngine(StubEngine):
         return await super().analyze(moves)
 
 
+class _HangingTTS:
+    """卡死的假 TTS：第 ``hang_at`` 次 ``speak`` 先挂满 ``hang`` 秒再返回（其余立刻返回）。
+
+    ``_emit_line`` 是「先发 ``message``、再 ``await`` 合成」——挂在这里正是那次 ``await`` 的窗口；
+    合成返回后 ``_emit_speech`` 还会补一条 ``speech`` 事件，所以「第 N 条 ``speech`` 到了」是
+    「这一段 ``await`` 已经过去」的**确定性**信号（同一协程步内紧接着就是落子写入，见下）。
+    """
+
+    def __init__(self, hang_at=2, hang=0.6):
+        self.hang_at = int(hang_at)
+        self.hang = float(hang)
+        self.calls = 0
+
+    @property
+    def enabled(self):
+        return True
+
+    async def speak(self, text):
+        self.calls += 1
+        if self.calls == self.hang_at:
+            await asyncio.sleep(self.hang)
+        return {"id": "t%d" % self.calls, "mode": "openai", "text": "",
+                "tone": "", "pitch": 0.0}
+
+
+async def _wait_for(pred, timeout=5.0, step=0.01):
+    """轮询等待（替代「睡够某个秒数」）：判别力来自**僵尸那一代真的跑到了某处**，不是等够时间。
+
+    到 ``timeout`` 仍未满足就返回 ``False``（由调用方的断言暴露问题），绝不真等 ``WATCHDOG_SEC``。
+    """
+    loop = asyncio.get_running_loop()
+    end = loop.time() + float(timeout)
+    while not pred():
+        if loop.time() > end:
+            return False
+        await asyncio.sleep(step)
+    return True
+
+
 class BusyWatchdogTest(unittest.TestCase):
     """看门狗（超时解锁 + 前推代数）与代际守卫（旧一代的写入全部作废）。"""
 
@@ -1047,12 +1086,16 @@ class BusyWatchdogTest(unittest.TestCase):
     def test_watchdog_releases_busy_on_a_hung_turn(self):
         # 卡死 → busy 归位、只发一条可读提示
         agent, _eng, _llm, bus = _mk()
-        agent.katago = _HangingEngine(0.3)        # 第一次引擎分析就挂 0.3s
+        hang = _HangingEngine(0.3)                # 第一次引擎分析就挂 0.3s
+        agent.katago = hang
         agent.watchdog_sec = 0.05
 
         async def run():
             await agent.player_move(3, 3)
-            await asyncio.sleep(0.4)              # 让卡死那一代自己跑完
+            # 轮询等「僵尸那一代真的跑完它的两次引擎分析」（0.3s × 2）——固定 sleep 的判别力来自
+            # 「等够了」，这里改成等一个**事件**：只有僵尸跑完，「旧一代什么都没发」才不是
+            # 「它还没来得及发」换来的（原来的 0.4s 其实还在第二次分析的等待里）。
+            await _wait_for(lambda: len(hang.calls) >= 2)
 
         asyncio.run(run())
 
@@ -1062,8 +1105,40 @@ class BusyWatchdogTest(unittest.TestCase):
         self.assertEqual(len(hints), 1, "超时只发一条可读提示（走既有 message 通道）")
         self.assertEqual(str(hints[0].get("type")), "message")
         self.assertEqual(str(hints[0].get("kind")), events.AI)
+        self.assertEqual(len(hang.calls), 2, "僵尸那一代的两次引擎分析都已跑完（不是「还没轮到」）")
         # 旧一代恢复后什么都没发出来：整回合只有那一条提示
         self.assertEqual(len(bus.messages()), 1)
+
+    def test_own_turn_write_is_guarded_after_the_tts_await(self):
+        """修复波 #1 / R-I-3：``_speak_own_turn`` 在 ``_emit_line``（内含 TTS 合成 ``await``）**之后**
+        也要核对代数——超时后的旧一代不许落子进棋谱、不许写逐手存档（玩家可能已经重新落子）。
+
+        时序：after_player 的点评（TTS 第 1 次，立刻返回）→ own_turn 的犹豫节拍 0.35s →
+        落子宣告的 TTS（第 2 次，挂 0.6s）；看门狗 0.5s **正好落在合成挂住期间**。
+        断言前等到第 2 条 ``speech``（合成返回后才会补发）——它与落子写入在**同一协程步**内，
+        所以「等到它」等价于「僵尸已经走到并越过那个写入点」，断言不会因为「还没跑到」而假绿。
+        """
+        agent, _eng, _llm, bus = _mk()
+        agent.tts = _HangingTTS(hang_at=2, hang=0.6)
+        agent.watchdog_sec = 0.5                  # > 犹豫节拍(0.35)；< 节拍 + 合成挂住(0.35+0.6)
+
+        async def run():
+            await agent.player_move(3, 3)
+            await _wait_for(lambda: len(bus.of_type("speech")) >= 2)
+
+        asyncio.run(run())
+
+        self.assertFalse(agent.busy, "超时必须归位")
+        self.assertEqual(len(self._hints(bus)), 1, "看门狗照发一条可读提示")
+        self.assertEqual(len(bus.of_type("speech")), 2, "第二条 speech（落子宣告）已到 ⇒ 僵尸越过了合成 await")
+        # —— 三条写入全都不许发生 ——
+        self.assertEqual(len(agent.st.moves), 1, "棋谱里只剩玩家那一手；她那一手必须被守卫拦下")
+        self.assertEqual(agent.st.moves[0][0], "B")
+        stones = [(x, y) for x in range(19) for y in range(19) if agent.st.board.at(x, y) != ""]
+        self.assertEqual(stones, [(3, 3)], "内部棋盘上只该有玩家那一颗子")
+        self.assertEqual([n["kind"] for n in agent.st.move_notes], ["review"],
+                         "逐手存档只该有玩家点评那一条；她的「用意」（kind=aim）不许写")
+        self.assertFalse(agent._reveal_pending, "旧一代不许置揭示标记")
 
     def test_late_writes_after_timeout_are_discarded(self):
         # 超时后旧那一代的所有写入全部作废（st.moves / bad_moves / move_notes 不变）

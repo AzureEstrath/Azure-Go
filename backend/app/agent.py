@@ -77,6 +77,10 @@ TOOL_TIMEOUT_TEXT = "工具执行超时（%d 秒），这次没取到结果；�
 # 说明：这是**真卡死**的兜底，不是延迟上限——正常偏慢的一回合（几十秒级）离它很远，不会被误伤；
 # 而云端 LLM 自己有 120s 超时、引擎自己有 30s×2、工具 10s，所以只有在「等一个永远不来的响应」
 # 时才会走到这里。
+# ⚠ **1040s 不是严格上界**：它只算「正常编排」那条路。**降级路径**（工具开但链不可用时的
+#   ``agent._tool_loop``，模型往返上限 ``MAX_TOOL_ROUNDS = 12``，见 agent.py 常量区）按 12 次
+#   LLM × 120s 算可达 ≈1440s，**不计入**上面这个 1040s 的上界（该路径按 AGENTS.md 是「工具开但链
+#   不可用」的兜底，本注释只描述主链路的预算）。
 WATCHDOG_SEC = 1380
 
 # 括号里带「着棋点位」的舞台提示不需要显示，例如（白棋落在 C4）/（第7手 Q16）/（C4）
@@ -1067,6 +1071,8 @@ class AzureAgent:
         （rate / adj / roll / 命中）。
 
         ``epoch``（v3.7.0）：看门狗守卫——带了它且已经不属于当前这一代时直接不放行（冷却表也不写）。
+        **两处**核对：入口一次（省掉无谓的资格层查询），资格层的 ``to_thread`` 之后、写冷却表之前
+        再一次（v3.7.0 修复波）——冷却表绝不能由「会被调用方丢弃的那一代」写入。
         """
         if not jk or not self.joseki_teach:
             return False
@@ -1092,6 +1098,13 @@ class AzureAgent:
                  "是" if d["cooldown"] else "否", "是" if d["show"] else "否",
                  family or "-", kind or "-", move_no))
         if d["show"] and family != "":
+            # 看门狗守卫（v3.7.0 修复波）：上面的资格层会 ``to_thread`` 读族计数（慢库 / 慢磁盘），
+            # 这一段 ``await`` 之后代数可能已经失效——**冷却表不许由会被丢弃的那一代写入**：调用方
+            # （``agent_graph`` 的 ``_alive``）会把计数与事件一起丢掉，但 ``_joseki_taught`` 一旦记下，
+            # 这一族在冷却窗口（8 手）内就会被静默压掉一次讲解。「命中才记」的语义不变，只是把
+            # 「记」推到代数复核之后。
+            if epoch is not None and not self.epoch_ok(epoch):
+                return False
             self._joseki_taught[family] = move_no        # 冷却起点：这一族最近讲过的手数
         return bool(d["show"])
 

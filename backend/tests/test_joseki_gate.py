@@ -308,6 +308,37 @@ class GateWiringTest(unittest.TestCase):
             agent.st.add_move("B", "pass")
         self.assertTrue(asyncio.run(agent.joseki_gate_show(jk, None)), "走出窗口：恢复")
 
+    def test_cooldown_is_not_written_by_a_dead_generation(self):
+        """修复波 #3：冷却表只许由**活代**写入。
+
+        门控在资格层（``_joseki_eligibility`` 会 ``to_thread`` 读族计数，慢库下可能卡住）之后、写冷却表
+        之前可能跨过看门狗：调用方（``agent_graph`` 的 ``_alive``）会把计数与事件一起丢掉，但
+        ``_joseki_taught`` 一旦记下，这一族在冷却窗口（8 手）内就会被静默压掉一次讲解。这里让资格层
+        在返回前把代数前推一代（模拟看门狗），断言冷却表没被写、结论也不放行。
+        """
+        agent, _eng, _llm, _bus = mk_agent()
+        agent.joseki_rate = 1.0                              # p 被夹到 1.0 ⇒ 本来必定讲
+        agent.joseki_rng = _FixedRng(0.0)
+        tok = agent.begin_epoch()
+        jk = {"kind": "entered", "family": "star_33", "corner": "左上", "cat": "star"}
+        real = agent._joseki_eligibility
+
+        async def eligibility(jk_, mistake_):
+            res = await real(jk_, mistake_)
+            agent.begin_epoch()                              # 看门狗在「资格层 await」之后触发
+            return res
+
+        with mock.patch.object(agent, "_joseki_eligibility", eligibility):
+            shown = asyncio.run(agent.joseki_gate_show(jk, None, epoch=tok))
+
+        self.assertFalse(shown, "死代：门控结论不放行")
+        self.assertEqual(agent._joseki_taught, {}, "冷却表不许由会被丢弃的那一代写入")
+
+        # 对照：活代照旧记（证明上面那条不是「什么都没发生」换来的）
+        tok2 = agent.begin_epoch()
+        self.assertTrue(asyncio.run(agent.joseki_gate_show(jk, None, epoch=tok2)))
+        self.assertEqual(agent._joseki_taught, {"star_33": 0})
+
     def test_default_rate_is_half_and_still_rolls(self):
         """默认 ``joseki_rate = 0.5``（与 config 字段一致）：**只有一条路径**——资格层过了就掷 ``p``。
 
