@@ -179,7 +179,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         y = _int(body.get("y"), -1)
         if not (0 <= x < coords.SIZE and 0 <= y < coords.SIZE):
             return {"ok": False, "busy": s.busy, "state": s.st.payload()}
-        s.mark_move_time()                      # 时间感知（v3.9.0）：单手用时的采集点（设计 §5-H）
+        # 时间感知的打点**不在这里**（v3.9.0 修复轮 1 / I-1）：坐标在盘内但 ``is_legal`` 不成立的
+        # 落子（自杀手 / 打劫回提 / 占用点）同样是「被拒的一手」，打点会污染 ``move_ts_list`` 与
+        # ``avg_move_sec`` ⇒ 采集点已移进 ``agent.player_move`` 的合法性判定之后。
         await s.player_move(x, y)
         return ok()
 

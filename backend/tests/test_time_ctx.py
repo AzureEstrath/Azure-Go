@@ -4,10 +4,12 @@
 
 - **时钟可注入**：``now`` 必给，跨日 / 跨时区边界按**本地时区**的日历日切；
 - **首手无前一手 ⇒ 单手用时不计**（有效落子时刻少于 2 个就不产出该字段）；
-- **缺什么就不产出什么**、脏值（``now=None`` / 非数值 / 未来时间戳）**不抛**；
-- 采集点＝``POST /api/move`` 到达时打点（``agent.mark_move_time``），``reset_game`` 清空。
+- **缺什么就不产出什么**、脏值（``now=None`` / 非数值 / ``inf`` / 未来时间戳）**不抛**；
+- 采集点＝``POST /api/move`` 到达**且这一手真的成立**（``is_legal`` 通过）时打点
+  （``agent.mark_move_time``，修复轮 1 / I-1），``reset_game`` 清空。
 """
 
+import asyncio
 import os
 import sys
 import time
@@ -39,6 +41,21 @@ class FactsShapeTest(unittest.TestCase):
         """``now`` 脏 ⇒ 整个 dict 为空（当前时间是一切的锚点）。"""
         for bad in (None, "abc", 0, -1, float("nan"), True):
             self.assertEqual(time_ctx.facts(now=bad), {}, "now=%r" % (bad,))
+
+    def test_infinite_and_huge_values_do_not_raise(self):
+        """修复轮 1 / Minor #5：``inf`` 与超大墙钟不许抛（``json`` 默认能造出 ``Infinity``）。"""
+        inf = float("inf")
+        self.assertEqual(time_ctx.facts(now=inf), {})
+        self.assertEqual(time_ctx.facts(now=1e18), {}, "超出 datetime / localtime 的能力 ⇒ 当脏值")
+        self.assertEqual(time_ctx.facts(now=time_ctx.MAX_TS + 1.0), {})
+        got = time_ctx.facts(now=NOW, session_start=inf, last_game_ts=inf,
+                             move_ts_list=[NOW - 10.0, inf], game_ts_list=[inf, NOW])
+        self.assertNotIn("session_sec", got)
+        self.assertNotIn("last_gap_days", got)
+        self.assertNotIn("avg_move_sec", got, "inf 忽略后只剩 1 个有效时刻 ⇒ 不计")
+        self.assertEqual(got["streak_days"], 1, "inf 那一天忽略、今天有 ⇒ 1")
+        # 字符串形式的 "inf" 也一样（脏值）
+        self.assertEqual(time_ctx.facts(now="inf"), {})
 
     def test_basic_fields_are_local(self):
         got = time_ctx.facts(now=NOW)
@@ -109,9 +126,46 @@ class StreakTest(unittest.TestCase):
         self.assertEqual(time_ctx.facts(now=NOW, game_ts_list=again)["streak_days"], 3)
 
     def test_today_not_finished_does_not_break_the_streak(self):
-        """今天还没下完（还没有已结束的对局）不算断：锚点退到昨天。"""
+        """今天还没下完（还没有已结束的对局）不算断：锚点退到昨天（没有 session 信息时的旧口径）。"""
         games = [_local(2026, 10, 18, 22, 0), _local(2026, 10, 17, 9, 0)]
         self.assertEqual(time_ctx.facts(now=NOW, game_ts_list=games)["streak_days"], 2)
+
+    def test_today_session_counts_today(self):
+        """裁决（修复轮 1）：**session 是今天 ⇒ 今天也算连续的一天**（口语口径），四条门卫。"""
+        session_today = _local(2026, 10, 19, 12, 0)
+        yesterday = _local(2026, 10, 18, 22, 0)
+        day_before = _local(2026, 10, 17, 9, 0)
+
+        # ① 今天已有完成的对局 + 昨天有 ⇒ 2（既有口径：含今天）
+        got = time_ctx.facts(now=NOW, session_start=session_today,
+                             game_ts_list=[_local(2026, 10, 19, 10, 0), yesterday])
+        self.assertEqual(got["streak_days"], 2)
+
+        # ② 今天没有完成的对局、session 是今天、昨天有 ⇒ 2（不是 1、也不是 0）
+        got = time_ctx.facts(now=NOW, session_start=session_today, game_ts_list=[yesterday])
+        self.assertEqual(got["streak_days"], 2)
+
+        # ③ 昨天没有对局 ⇒ 1（今天）
+        got = time_ctx.facts(now=NOW, session_start=session_today, game_ts_list=[day_before])
+        self.assertEqual(got["streak_days"], 1)
+        got = time_ctx.facts(now=NOW, session_start=session_today, game_ts_list=[])
+        self.assertEqual(got["streak_days"], 1, "一局都还没结束，但今天正在下 ⇒ 第 1 天")
+
+        # ④ 今天、昨天都没有对局、session 也不在今天 ⇒ 0（渲染侧不开口）
+        got = time_ctx.facts(now=NOW, game_ts_list=[day_before])
+        self.assertEqual(got["streak_days"], 0)
+
+    def test_session_that_crossed_midnight_counts_as_today(self):
+        """跨午夜续下的一局：开始时刻在昨天、**最后一手在今天** ⇒ 这个 session 算「今天」。"""
+        start = _local(2026, 10, 18, 23, 50)
+        last = _local(2026, 10, 19, 0, 5)
+        got = time_ctx.facts(now=NOW, session_start=start, move_ts_list=[start, last],
+                             game_ts_list=[_local(2026, 10, 18, 22, 0)])
+        self.assertEqual(got["streak_days"], 2)
+        # 反过来：session 完全在昨天、今天没有完成对局 ⇒ 回到旧口径（锚点＝昨天）
+        got2 = time_ctx.facts(now=NOW, session_start=_local(2026, 10, 18, 20, 0),
+                              game_ts_list=[_local(2026, 10, 18, 22, 0)])
+        self.assertEqual(got2["streak_days"], 1)
 
     def test_broken_when_the_last_game_is_older_than_yesterday(self):
         games = [_local(2026, 10, 17, 9, 0)]
@@ -195,7 +249,11 @@ class MoveEndpointPunctuationTest(unittest.TestCase):
             self.assertEqual(s.move_ts_list, [])
 
     def test_rejected_moves_are_not_recorded(self):
-        """畸形坐标 / 复盘拒绝：**不打点**（不是一次真实落子到达）。"""
+        """畸形坐标 / 复盘拒绝 / **盘内但 ``is_legal`` 不成立**：都不打点（不是一次真实落子到达）。
+
+        修复轮 1 / I-1：打点已移进 ``agent.player_move`` 的合法性判定之后——占用点 / 自杀手 /
+        打劫回提这类「坐标合法但这一手不成立」的落子，既不打点也不置位 ``session_start``。
+        """
         app = self._app()
         with TestClient(app) as client:
             s = app.state.agent
@@ -203,6 +261,24 @@ class MoveEndpointPunctuationTest(unittest.TestCase):
                 self.assertFalse(client.post("/api/move", json=body).json()["ok"])
             self.assertEqual(s.move_ts_list, [])
             self.assertIsNone(s.session_start)
+
+            # 盘内但被 ``is_legal`` 拒（已占用的点）：同样不打点
+            self.assertTrue(client.post("/api/move", json={"x": 3, "y": 3}).json()["ok"])
+            self.assertEqual(len(s.move_ts_list), 1)
+            client.post("/api/move", json={"x": 3, "y": 3})          # 同一手再落一次 ⇒ 占用点
+            self.assertEqual(len(s.move_ts_list), 1, "被 is_legal 拒的落子不算一次到达")
+            self.assertEqual(s.st.board.at(3, 3), "black")
+
+    def test_suicide_move_is_not_recorded(self):
+        """盘内、空点，但**自杀手**（``is_legal`` 不成立）⇒ 不打点、不置位 ``session_start``。"""
+        agent, _eng, _llm, _bus = mk_agent()
+        agent.st.board.play(1, 0, "white")          # 黑 (0,0) 的两口气被白填满
+        agent.st.board.play(0, 1, "white")
+        self.assertEqual(agent.st.board.at(0, 0), "")
+        self.assertFalse(agent.st.board.is_legal(0, 0, "black")["ok"], "这一手是自杀")
+        asyncio.run(agent.player_move(0, 0))
+        self.assertEqual(agent.move_ts_list, [], "自杀手不算一次到达")
+        self.assertIsNone(agent.session_start)
 
 
 class TimeFactsAccessorTest(unittest.TestCase):

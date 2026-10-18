@@ -22,9 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))                  
 
 from app import coords
 from app.profile import (ADDRESS_AXIS, ALWAYS_AXES, ALPHA_CAP, BLUNDER_AXIS, BLUNDER_TYPES,
-                         CORE_AXES, DROP_AXES, HALF_LIFE, NON_NUMERIC_AXES, TOP_TYPE_AXIS,
-                         TOPIC_PREFIX, WEAK_AXES, alpha_of, confidence_of, extract_axes, merge,
-                         steady_alpha)
+                         CORE_AXES, DROP_AXES, HALF_LIFE, KAKARI_AXIS, NON_NUMERIC_AXES,
+                         TOP_TYPE_AXIS, TOPIC_PREFIX, WEAK_AXES, alpha_of, confidence_of,
+                         extract_axes, merge, steady_alpha)
 from app.profile_store import ProfileStore
 
 STABLE_KEYS = set(ALWAYS_AXES)
@@ -46,18 +46,31 @@ def _mv(color, gtp, drop=None):
 class ExtractShapeTest(unittest.TestCase):
     """形状稳定 + 缺维 / 脏值当 0、绝不抛。"""
 
-    def test_empty_rec_produces_only_always_axes(self):
-        """空 rec：只有 ``ALWAYS_AXES``（全 0）——失误 / 称呼 / 主题一组键**都不产出**。"""
+    def test_empty_rec_produces_no_axes_at_all(self):
+        """空 rec：**一个键都不产出**（修复轮 1 / I-2）——没有信号就没有维，不是「全 0」。
+
+        结构性 0.0 会被渲染侧（Q3 的画像块）念成观测到的特征（「他爱先守角」「很少脱先」），
+        所以「不知道」一律**不发这个键**（与 ``blunder.*`` / ``weak.*`` 的 ``_has_drop_data`` 同一做法）。
+        """
         for rec in ({}, None, "不是字典", 42, []):
             with self.subTest(rec=rec):
                 got = extract_axes(rec)
-                self.assertEqual(set(got), STABLE_KEYS, "一定产出的维只有 ALWAYS_AXES")
+                self.assertEqual(got, {}, "空 rec 没有任何信号 ⇒ 不产出任何维")
                 for axis in ALWAYS_AXES:
-                    self.assertEqual(got[axis], 0.0, axis)
+                    self.assertNotIn(axis, got, "没有信号 ⇒ 不产出 %s" % axis)
                 for axis in DROP_AXES:
                     self.assertNotIn(axis, got, "没有 drop 信号 ⇒ 不产出 %s" % axis)
                 self.assertNotIn(ADDRESS_AXIS, got, "没有信号源 ⇒ 不产出 address_pref")
                 self.assertEqual([k for k in got if k.startswith(TOPIC_PREFIX)], [])
+
+    def test_axes_that_do_have_signal_stay_in_range(self):
+        """有信号时该出的维都要出、且都在 ``[0,1]``（防 I-2 的「不产出」改过头）。"""
+        got = extract_axes({"moves": _seq(("B", "Q16"), ("W", "Q15"), ("B", "D4")),
+                            "joseki_families": {"star_kakari_small": 1}})
+        for axis in ALWAYS_AXES:
+            self.assertIn(axis, got, "%s 有信号（角 + 两手棋 + 挂角族）⇒ 必须产出" % axis)
+            self.assertTrue(0.0 <= got[axis] <= 1.0, "%s=%r" % (axis, got[axis]))
+        self.assertTrue(STABLE_KEYS <= set(got), "ALWAYS 组全在：缺 %r" % (STABLE_KEYS - set(got)))
 
     def test_dirty_rec_never_raises_and_stays_in_range(self):
         dirty = {"ts": object(), "move_count": "x", "final_black_wr": None, "final_score": [1],
@@ -65,8 +78,10 @@ class ExtractShapeTest(unittest.TestCase):
                  "per_move_ms": "x", "joseki_families": object(),
                  "chat_topics": [None, {}, 7, ["", ""]], "summary": None}
         got = extract_axes(dirty)
+        # 全是脏值 ⇒ 没有信号、也不产出任何**结构性**维（`chat_topics` 里的脏条目会成主题，
+        # 那是既有的 `persona.topic.*` 口径，Minor #8 已裁决不改）
         for axis in ALWAYS_AXES:
-            self.assertTrue(0.0 <= got[axis] <= 1.0, "%s=%r" % (axis, got[axis]))
+            self.assertNotIn(axis, got, "脏 moves ⇒ %s 没有信号、不产出" % axis)
         # 条目级脏值：坏条目跳过、好条目照算；脏 drop 当「没亏」但**信号仍在**
         got2 = extract_axes({"moves": [None, 42, {"gtp": 5}, {"color": "B", "gtp": "Q16"},
                                        {"color": "B", "gtp": "D16", "drop": "abc"}]})
@@ -105,19 +120,22 @@ class ExtractFeatureTest(unittest.TestCase):
         self.assertAlmostEqual(got["open.star"], 0.0)
 
     def test_opening_window_ignores_late_corner_stones(self):
-        """开局窗口＝玩家自己的前 12 手：第 13 手才去角上不算开局偏好。"""
+        """开局窗口＝玩家自己的前 12 手：第 13 手才去角上 ⇒ 角上**没有信号**（不是 star=1.0）。"""
         moves = [["B", coords.xy_to_gtp(10, 4 + i)] for i in range(12)]   # 前 12 手都在中腹一带
         moves.append(["B", coords.xy_to_gtp(3, 3)])                       # 第 13 手才去星位
         got = extract_axes({"moves": moves})
-        self.assertEqual([got[a] for a in
-                          ("open.star", "open.komoku", "open.sansan", "open.mokuhazushi")],
-                         [0.0, 0.0, 0.0, 0.0])
+        # 窗口内没占到角 ⇒ 四类都没有信号（修复轮 1 / I-2：不产出，而不是「全 0」）
+        for axis in ("open.star", "open.komoku", "open.sansan", "open.mokuhazushi"):
+            self.assertNotIn(axis, got, "窗口外的角不算开局偏好 ⇒ %s 无信号、不产出" % axis)
 
     def test_favorite_kakari_from_joseki_families(self):
         rec = {"joseki_families": {"star_kakari_small": 3, "komoku_shimari": 1, "star_33": 5}}
         self.assertAlmostEqual(extract_axes(rec)["open.favorite_kakari"], 0.75)
-        self.assertEqual(extract_axes({"joseki_families": {}})["open.favorite_kakari"], 0.0)
-        self.assertEqual(extract_axes({})["open.favorite_kakari"], 0.0)
+        # 修复轮 1 / I-2：没识别出挂角 / 守角族 ⇒ **不产出**（0.0 会被念成「他爱先守角」）
+        self.assertNotIn(KAKARI_AXIS, extract_axes({"joseki_families": {}}))
+        self.assertNotIn(KAKARI_AXIS, extract_axes({}))
+        # 只有挂角、没有守角：0.0 是**真的量到 0**（有信号）⇒ 照样产出
+        self.assertEqual(extract_axes({"joseki_families": {"star_kakari_small": 2}})[KAKARI_AXIS], 1.0)
         # 列表形状也认
         self.assertAlmostEqual(
             extract_axes({"joseki_families": ["star_kakari_small", ["komoku_shimari", 3]]}
@@ -133,9 +151,9 @@ class ExtractFeatureTest(unittest.TestCase):
         # 脱先：第二手跑到远处
         got2 = extract_axes({"moves": _seq(("B", "Q16"), ("W", "Q15"), ("B", "D4"))})
         self.assertAlmostEqual(got2["style.tenuki"], 1.0)
-        # 首手没有上一手 ⇒ 不进分母
+        # 首手没有上一手 ⇒ 脱先**没有信号**（不产出；修复轮 1 / I-2），不是「很少脱先」
         got3 = extract_axes({"moves": _seq(("B", "Q16"))})
-        self.assertAlmostEqual(got3["style.tenuki"], 0.0)
+        self.assertNotIn("style.tenuki", got3, "只落 1 手 ⇒ 脱先无信号、不产出")
         self.assertAlmostEqual(got3["style.aggression"], 0.0)
 
     def test_territory_vs_influence_is_mean_line_height(self):
@@ -143,7 +161,7 @@ class ExtractFeatureTest(unittest.TestCase):
         rec = {"moves": _seq(("B", "Q16"), ("W", "Q15"), ("B", "Q14"), ("W", "D4"),
                              ("B", "C3"))}
         got = extract_axes(rec)
-        # Q16/Q14 都靠右边（线数 3）、C3 靠左下（线数 2）⇒ (3+3+2)/3 再除以 8
+        # Q16/Q14 都靠右边（线数 3）、C3 靠左下（线数 2）⇒ (3+3+2)/3 再除以 18
         self.assertAlmostEqual(got["style.territory_vs_influence"], (3 + 3 + 2) / (3 * 18))
         low = extract_axes({"moves": _seq(("B", coords.xy_to_gtp(0, 9)), ("W", "K10"),
                                           ("B", coords.xy_to_gtp(1, 9)))})

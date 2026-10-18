@@ -196,7 +196,11 @@ def extract_axes(game_rec) -> dict:
     返回 ``{axis: 值}``：数值维是 ``[0,1]`` 的 ``float``，``blunder.top_type`` /
     ``persona.address_pref`` 是**字符串**。产出形状分三类：
 
-    - ``ALWAYS_AXES``（开局四类 + 挂角 + 行棋风格三项）**一定都在**（算不出来就是 0.0）；
+    - ``ALWAYS_AXES``（开局四类 + 挂角 + 行棋风格三项）**只在有信号时**产出（修复轮 1 / I-2）：
+      「没占到任何角」⇒ 开局四类不产出、「没识别出挂角 / 守角族」⇒ ``open.favorite_kakari``
+      不产出、「玩家不足 2 手」⇒ ``style.tenuki`` 不产出、「一手都没有」⇒ 三项风格与
+      ``blunder.rate`` 都不产出——**缺键 ≠ 值为 0**（结构性 0.0 会被渲染侧念成「他爱先守角」
+      「很少脱先」这种凭印象编的话）；
     - ``DROP_AXES``（``blunder.rate`` / ``weak.corner_*`` / ``blunder.top_type``）
       **只在 ``moves`` 带逐手 ``drop`` 信号时**才产出——缺信号＝**不发这些键**
       （不把「不知道」写成 0；Q7 负责写记录时把 ``st.losses`` 填进 ``moves``）；
@@ -319,13 +323,33 @@ def extract_axes(game_rec) -> dict:
     # 落子会把玩家的失误率系统性压低（这个值会经 Q6 进提示词给模型看）。
     if _has_drop_data(rec):
         blunders = _drops_of(rec)
-        out[BLUNDER_AXIS] = _clamp01(len(blunders) / float(n_player)) if n_player else 0.0
+        if n_player:
+            out[BLUNDER_AXIS] = _clamp01(len(blunders) / float(n_player))
         if blunders:
             out[TOP_TYPE_AXIS] = _blunder_type(occ, blunders)
         for i, axis in enumerate(_CORNER_KEYS):               # 该象限真亏数 / **玩家**在该象限落子数
             placed = sum(1 for x, y in player if _corner_index(x, y) == i)
             hit = sum(1 for x, y, _d in blunders if _corner_index(x, y) == i)
             out[axis] = _clamp01(hit / float(placed)) if placed else 0.0
+
+    # —— 结构性 0.0 的维**不产出**（修复轮 1 / I-2）——
+    # `ALWAYS_AXES` 上面被无条件初始化成 0.0，但「**没有信号**」与「真的量到 0」在存储里长成同一个
+    # 0.0，渲染侧（Q3 的画像块）就会把前者念成后者：绝大多数对局识别不出任何挂角 / 守角族 ⇒ 从第二局
+    # 起每条提示词都断言「他爱先守角」；只落 1 手就被总结的玩家 ⇒ 被断言「很少脱先」。**缺键 ≠ 值为 0**
+    # ——与 `blunder.*` / `weak.*` 的 `_has_drop_data` 同一做法（`merge` 对 `ALWAYS_AXES` 的缺键仍按 0
+    # 参与融合，只是不再凭空涨样本数；`tests/golden/prompts.json` 与既有输出不受影响）。
+    if not known:                                   # 玩家前 12 手没占到任何角：开局四类都没有信号
+        for axis in OPEN_AXES:
+            out.pop(axis, None)
+    if kakari + shimari <= 0:                       # 没识别出任何挂角 / 守角族
+        out.pop(KAKARI_AXIS, None)
+    if not n_player:                                # 一手都没有：三项风格都没有信号
+        for axis in STYLE_AXES:
+            out.pop(axis, None)
+    elif not tenuki_flags:                          # 玩家不足 2 手：脱先没有信号（首手无前一手）
+        out.pop("style.tenuki", None)
+    if not n_player:                                # 有 drop 信号但没有玩家手：失误率没有信号
+        out.pop(BLUNDER_AXIS, None)
 
     # —— 性格与话题（``address_pref`` 现在没有信号源：推导不出来就**不产出该键**） ——
     out.update(_topic_axes(rec))

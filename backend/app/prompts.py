@@ -7,6 +7,8 @@
 是后端长期记忆新增的，Godot 版没有；``long_term`` 为空串时输出仍与 Godot 版逐字符一致。
 """
 
+import math
+
 from . import coords, decay
 from .board import GoBoard, SIZE as BOARD_SIZE
 
@@ -511,20 +513,21 @@ PROFILE_BLUNDER_MIN_MOVE = 10
 
 
 def _num(v, default=0.0) -> float:
-    """画像里的数值维容错：``bool`` / 非数值 → ``default``（不抛）。"""
+    """画像 / 时间里的数值容错：``bool`` / 非数值 / ``inf`` / ``NaN`` → ``default``（不抛）。"""
     if isinstance(v, bool) or v is None:
         return float(default)
     try:
-        return float(v)
-    except (TypeError, ValueError):
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
         return float(default)
+    return f if math.isfinite(f) else float(default)
 
 
 def _dur_cn(sec) -> str:
     """秒 → 人话时长：不到 1 分说秒、不到 1 小时说「x 分 y 秒」、否则「x 小时 y 分」；脏值返回 ``''``。"""
     try:
         s = int(round(float(sec)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):     # inf / NaN / 超大值（Minor #5）
         return ""
     if s < 0:
         return ""
@@ -540,15 +543,18 @@ def _gap_cn(days) -> str:
     """距上次对局的天数 → 人话（不到 1 小时 / x 小时 / x 天）；脏值返回 ``''``。"""
     try:
         d = float(days)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return ""
-    if d < 0:
+    if not math.isfinite(d) or d < 0:
         return ""
     if d < 1.0 / 24.0:
         return "不到 1 小时"
     if d < 1.0:
         return "%d 小时" % max(1, int(round(d * 24.0)))
-    return "%d 天" % int(round(d))
+    try:
+        return "%d 天" % int(round(d))
+    except (OverflowError, ValueError):                # 理论上到不了（上面已挡 inf），兜一道
+        return ""
 
 
 def _time_lines(t) -> list:
@@ -569,9 +575,10 @@ def _time_lines(t) -> list:
                          else "本局已下 %s" % dur)
     if "avg_move_sec" in t:
         avg = _num(t.get("avg_move_sec"), -1.0)
-        if avg >= 0.0:
+        dur = _dur_cn(avg) if avg >= 0.0 else ""
+        if dur != "":                    # 脏值（inf / NaN）⇒ 整句不说，绝不拼出「平均每手 」
             lines.append("他平均每手不到 1 秒" if avg < 1.0
-                         else "他平均每手 %s" % _dur_cn(avg))
+                         else "他平均每手 %s" % dur)
     if "last_gap_days" in t:
         gap = _gap_cn(t.get("last_gap_days"))
         if gap != "":
@@ -580,7 +587,7 @@ def _time_lines(t) -> list:
     if streak is not None:
         try:
             n = int(streak)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):     # inf / NaN / 超大值（Minor #5）
             n = 0
         if n >= 1:
             lines.append("连续第 %d 天在陪 Estarth" % n)
@@ -718,12 +725,12 @@ def _profile_items(profile, now_move_no) -> list:
 
 
 def _move_no(v) -> int:
-    """手数容错：``bool`` / 非数值 → 0（不抛）。"""
+    """手数容错：``bool`` / 非数值 / ``inf`` → 0（不抛）。"""
     if isinstance(v, bool):
         return 0
     try:
         return int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 

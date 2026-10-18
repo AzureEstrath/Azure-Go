@@ -1469,6 +1469,7 @@ class AzureAgent:
 
         多阶段回合：依次跑 ``after_player → own_turn → just_moved`` 三个阶段的图（顺序见
         ``agent_graph.py``）。前置判定（已忙 / 非法手）留在公开契约里：非法手**不置 busy、不调引擎**，
+        **也不打时间戳**（时间感知的采集点在合法性判定之后，修复轮 1 / I-1），
         只发一条可读提示 + 权威快照让界面撤销乐观落子。提示**也是台词**：走 ``_emit_line``（T20①），
         开局一次 ``_new_turn()`` 给配对的 ``speech`` 一个干净的 ``turn_id`` / ``seq``。
 
@@ -1484,6 +1485,10 @@ class AzureAgent:
             self._emit(events.state(self.st.payload()))   # 先让界面撤销乐观落子（不等合成）
             await _emit_line(self, events.AI, "这手不成立：%s" % legal["err"])
             return
+        # 时间感知的采集点（v3.9.0，设计 §5-H；修复轮 1 / I-1 起**放在合法性判定之后**）：
+        # 只有真的一手（``is_legal`` 通过）才算「到达」，被拒的落子不打点——否则 ``session_start``
+        # 会被一次失败尝试置位、``move_ts_list`` 多一个幽灵时刻、``avg_move_sec`` 的间隔被算歪。
+        self.mark_move_time()
         self._set_busy(True)
         self._new_turn()                            # 三阶段共用同一轮标识（S33）
         token = self.begin_epoch()                  # 三阶段共用同一代（看门狗超时后整代作废）

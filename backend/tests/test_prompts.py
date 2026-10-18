@@ -678,6 +678,36 @@ class TestProfileTimeBlocks(_Base):
         self.assertIn("距上次对局 3 天", out)
         self.assertIn("连续第 1 天在陪 Estarth", out)
 
+    def test_missing_axes_are_not_read_as_the_opposite(self):
+        """修复轮 1 / I-2：**缺键 ⇒ 该句不出现**（不是被念成 0 那一侧）。"""
+        out = prompts.profile_note({"style.aggression": 0.6, "blunder.rate": 0.3}, 40)
+        self.assertIn("敢接触", out)
+        for gone in ("很少脱先", "更爱先守角", "更偏实地", "很少下出明显亏损"):
+            self.assertNotIn(gone, out, "缺键不许被念成 0 那一侧：%s" % gone)
+        # 真·0.0（有信号）仍要念出来——「缺键」与「量到 0」必须分得开
+        self.assertIn("更爱先守角", prompts.profile_note({"open.favorite_kakari": 0.0}, 40))
+        self.assertIn("很少脱先", prompts.profile_note({"style.tenuki": 0.0}, 40))
+        # 端到端：真实 `extract_axes` 对「没识别出挂角 / 守角族」的对局不产出该键 ⇒ 不出现那句话
+        from app.profile import extract_axes
+        axes = extract_axes({"moves": [["B", "Q16"], ["W", "D4"]]})
+        self.assertNotIn("open.favorite_kakari", axes)
+        self.assertNotIn("更爱先守角", prompts.profile_note(axes, 40))
+        self.assertNotIn("很少脱先", prompts.profile_note(axes, 40), "只落 1 手 ⇒ 脱先无信号")
+
+    def test_infinite_values_do_not_produce_broken_lines(self):
+        """修复轮 1 / Minor #5：``inf`` 不许抛、也不许拼出「他平均每手 」这种半句话。"""
+        inf = float("inf")
+        t = {"date": "2026-10-19", "weekday": "周一", "clock": "21:03",
+             "session_sec": inf, "avg_move_sec": inf, "last_gap_days": inf, "streak_days": inf}
+        out = prompts.time_note(t)
+        self.assertIn("现在是 2026-10-19 周一 21:03", out)
+        for gone in ("本局", "平均每手", "距上次对局", "连续第"):
+            self.assertNotIn(gone, out)
+        self.assertNotIn("  \n", out)                # 不留下半句话 / 尾随空格
+        self.assertEqual(prompts.profile_note({"style.aggression": inf, "blunder.rate": inf}, 40), "")
+        # 超大（但有限）的时长也一样安全
+        self.assertEqual(prompts.time_note({"session_sec": 1e300}), "")
+
     def test_blocks_carry_the_instruction_and_no_copyable_example(self):
         """两块都必须带说明句（只在相关时提 / 别把数字当口头禅），且不放可照抄的示例句。"""
         t = prompts.time_note(_facts())
