@@ -459,14 +459,14 @@ import asyncio
 class ErrEngine(StubEngine):
     """引擎失败（云服务不可用）：``analyze`` 回 ``{"error": …}`` ⇒ prepare 的短路提示路径。"""
 
-    async def analyze(self, moves):
+    async def analyze(self, moves, max_visits=None):
         return {"error": "云服务不可用"}
 
 
 class BoomEngine(StubEngine):
     """引擎直接抛（比「回 error」更凶的失败形态）⇒ 公开方法的 ``except`` 兜底路径。"""
 
-    async def analyze(self, moves):
+    async def analyze(self, moves, max_visits=None):
         raise RuntimeError("云服务断连")
 
 

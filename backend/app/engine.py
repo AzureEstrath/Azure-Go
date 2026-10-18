@@ -138,7 +138,7 @@ class KataGoEngine:
 
     # ================= 分析 =================
 
-    async def analyze(self, moves) -> dict:
+    async def analyze(self, moves, max_visits=None) -> dict:
         """请求一次分析；失败一律返回 ``{"error": <可读中文>}``（``agent.py`` 靠 ``"error" in analysis`` 判定）。
 
         连接类错误与超时重试 **1 次**：重试在本次调用内部完成、只返回一个结果，
@@ -147,6 +147,12 @@ class KataGoEngine:
         传输层失败（连接被拒 / 连接或读取错误）对应子进程时代的「管道断了」——那时进程确实已死，
         故这里也置 ``_dead``；超时与 HTTP 状态响应（503 预热 / 401 / 500）都**不**置死
         （旧实现里超时不杀进程），成功分析会把它清掉（见 ``_parse_reply``）。
+
+        ``max_visits``（v3.8.0）：**按调用**覆盖本次搜索深度，``None`` / 0 ＝ 用实例默认
+        （``self.max_visits``），默认语义与旧版逐字一致。预测线 A/B/C 只吃既有 ``moveInfos``
+        （零额外调用），但要求更深的搜索才拿得到足够长的 ``pv``——深度**只给「玩家落子后局面」
+        那一次**（调用点见 ``agent_graph._prepare_after_player``）：全局提高会让同一回合的
+        ``post`` 复算也变慢，逼近 ``katago_timeout_ms``。
         """
         self._seq += 1
         req = {
@@ -156,7 +162,7 @@ class KataGoEngine:
             "komi": 7.5,
             "boardXSize": 19,
             "boardYSize": 19,
-            "maxVisits": self.max_visits,
+            "maxVisits": int(max_visits or self.max_visits),
             "includeOwnership": True,       # 逐点归属（+ = 黑）：用于「双方实地估算」
         }
         err = ""

@@ -166,7 +166,11 @@ async def _prepare_after_player(agent, data):
             break
 
     # ② 玩家落子后局面（轮到白方）：用于选择 Azure 的应手
-    after = await agent.katago.analyze(agent._moves_with("B", gtp))
+    #    v3.8.0：**只有这一次**分析加深度（``pv_max_visits``）——预测线 A/B/C 只吃这一次返回的
+    #    ``moveInfos``（零额外调用），但需要更深的搜索才拿得到足够长的 ``pv``；``post`` 复算与
+    #    提示 / 分析 / 总结一律用默认深度（全局加深会让每回合都变慢）。
+    after = await agent.katago.analyze(agent._moves_with("B", gtp),
+                                       max_visits=agent.pv_max_visits)
     after_infos = []
     after_black_wr = 0.5
     after_black_score = 0.0

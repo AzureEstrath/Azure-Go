@@ -95,6 +95,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                          joseki_rate=cfg.joseki_rate,
                                          tools_enabled=cfg.tools_enabled, max_tool_calls=cfg.max_tool_calls,
                                          stream_tokens=cfg.stream_tokens,
+                                         pv_max_visits=cfg.pv_max_visits,
                                          memory=mem, tts=tts_client,
                                          joseki_progress=joseki_progress)
             if autostart:

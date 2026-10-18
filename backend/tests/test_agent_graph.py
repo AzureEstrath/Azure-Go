@@ -363,7 +363,7 @@ class _LosingEngine(StubEngine):
         super().__init__()
         self.winrates = dict(winrates or {4: 0.50, 5: 0.70})   # 落子前 50%；落子后白方视角 70% ⇒ 黑方掉 20%
 
-    async def analyze(self, moves):
+    async def analyze(self, moves, max_visits=None):
         self.calls.append([list(m) for m in moves])
         wr = float(self.winrates.get(len(moves), 0.5))
         return {
@@ -986,7 +986,7 @@ class _SlowEngine(StubEngine):
         super().__init__()
         self.delay = float(delay)
 
-    async def analyze(self, moves):
+    async def analyze(self, moves, max_visits=None):
         await asyncio.sleep(self.delay)
         return await super().analyze(moves)
 
@@ -1014,7 +1014,7 @@ class _HangingEngine(StubEngine):
         super().__init__()
         self.hang = float(hang)
 
-    async def analyze(self, moves):
+    async def analyze(self, moves, max_visits=None):
         await asyncio.sleep(self.hang)
         return await super().analyze(moves)
 
@@ -1273,4 +1273,31 @@ class TwoMoveFamilyStructureCouplingTest(unittest.TestCase):
         self.assertIn(prompts.joseki_fallback(str(jk2["name"]), str(jk2["key"])),
                       str(state2["data"]["reply"]), "结构点的失败兜底＝定式兜底台词")
         self.assertNotIn(agent2._fallback_line("game"), str(state2["data"]["reply"]))
+
+
+# —— 以下为阶段三（v3.8.0）追加：深搜**只给**「玩家落子后局面」那一次（既有断言一字未改）——
+
+
+class PvDepthCallSiteTest(unittest.TestCase):
+    """``max_visits`` 的调用点：整局里**只有** after_player 的那一次分析带深值。
+
+    其余调用点（``just_moved`` 的复算、提示 / 分析 / 总结、工具）一律**不传**——全局提深度会让
+    每回合都变慢（``post`` 也变慢，≈10s→≈20s，逼近超时），所以深度只给三线要用的那一次。
+    """
+
+    def test_only_the_after_player_analysis_is_deepened(self):
+        agent, eng, _llm, _bus = _mk()
+        self.assertEqual(agent.pv_max_visits, 150)
+
+        async def run():
+            await agent.player_move(3, 3)
+            await agent.hint()
+            await agent.analyze_position()
+            await agent.summarize("辛苦啦")
+
+        asyncio.run(run())
+        deep = [v for v in eng.visits if v is not None]
+        self.assertEqual(deep, [150], "深搜必须恰好一次，其余调用点一个都不许带")
+        i = eng.visits.index(150)
+        self.assertEqual(eng.calls[i][-1], ["B", "D16"], "深搜那一次＝玩家刚落下那一手之后的局面")
 

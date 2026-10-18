@@ -19,7 +19,7 @@ class StubEngine:
         self.error = error
         self.calls = []
 
-    async def analyze(self, moves):
+    async def analyze(self, moves, max_visits=None):
         self.calls.append([list(m) for m in moves])
         if self.error:
             return {"error": self.error}

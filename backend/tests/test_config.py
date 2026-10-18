@@ -94,5 +94,27 @@ class MemoryConfigTest(unittest.TestCase):
             self.assertEqual(AzureConfig.load(p).embed_timeout, 10.0)
 
 
+class PvDepthConfigTest(unittest.TestCase):
+    """阶段三（v3.8.0）：``pv_max_visits`` 字段面 + ``katago_timeout_ms`` 的新代码默认。"""
+
+    def test_defaults(self):
+        c = AzureConfig()
+        self.assertEqual(c.pv_max_visits, 150)
+        self.assertEqual(c.katago_timeout_ms, 45000)
+
+    def test_pv_max_visits_round_trip_and_dirty_fallback(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"pv_max_visits": 220}, f)
+            self.assertEqual(AzureConfig.load(p).pv_max_visits, 220)
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"pv_max_visits": "abc"}, f)
+            self.assertEqual(AzureConfig.load(p).pv_max_visits, 150, "脏值退回默认")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,16 +14,22 @@ from app.agent import AzureAgent
 
 
 class StubEngine:
-    """固定返回的假引擎：候选点覆盖常见位置，便于断言确定性的应手。"""
+    """固定返回的假引擎：候选点覆盖常见位置，便于断言确定性的应手。
+
+    ``analyze`` 收 ``max_visits``（v3.8.0 的按调用深度）：既有的 ``calls`` 语义一字不变，
+    另外把每次的 ``max_visits`` 记进 ``visits``（与 ``calls`` 同序），供「深搜只给哪一次」的门卫用。
+    """
 
     CAND = ["Q16", "D4", "Q4", "D16", "K10", "C3", "R14", "F16", "J3", "O16", "C16", "R4"]
 
     def __init__(self):
         self.calls = []
+        self.visits = []
         self.dead = False
 
-    async def analyze(self, moves):
+    async def analyze(self, moves, max_visits=None):
         self.calls.append([list(m) for m in moves])
+        self.visits.append(max_visits)
         return {
             "rootInfo": {"winrate": 0.5, "scoreLead": 0.0},
             "moveInfos": [{"move": m, "visits": 1} for m in self.CAND],
