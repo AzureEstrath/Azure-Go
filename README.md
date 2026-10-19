@@ -729,6 +729,12 @@ curl -o line.wav http://127.0.0.1:8000/api/tts/audio/音频id
 云服务**（`katago_service\`）提供，后端只连它（见下方「KataGo 服务部署」）。游戏客户端只做渲染、输入与语音播放，
 **不启动任何模型服务**（没有 local 模式）。后端连不上时只在状态栏提示，不影响界面操作。
 
+- **一键启动 / 自检**：双击仓库根目录的 `run_test_env.bat` —— 默认启动全套（KataGo 云服务 → 等它就绪 → 后端 →
+  等它就绪 → 游戏）；`run_test_env.bat backend` 只起两个服务、`run_test_env.bat tests` 跑全部门卫（后端全量 +
+  KataGo 服务全量 + `game\tests\` 下全部 headless 脚本 + `--headless --quit` 自检，**跑完自动还原**
+  `game\project.godot`）、`run_test_env.bat stop` 停掉它们、`run_test_env.bat restore` 单独还原 `game\project.godot`。
+  引擎 / 权重 / analysis 配置与 Godot 可执行文件都可经 `KATAGO_EXE` / `KATAGO_MODEL` / `KATAGO_CONFIG` / `GODOT_EXE` 覆盖。
+  **启动模式别把它的输出接到管道或重定向里**（服务窗口会一直持有那个句柄，看起来像卡住）。
 - **启动后端**：双击 `backend\run_server.bat`（等价的手动启动：`cd backend` 后 `python -m app.main`），
   监听 `http://127.0.0.1:8000`。依赖 `fastapi` / `uvicorn` / `websockets` / `httpx` /
   `langchain-core` / `langchain-openai`（见 `backend\requirements.txt`；LLM 调用走 LangChain）。
