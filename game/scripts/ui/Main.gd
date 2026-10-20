@@ -6,6 +6,7 @@ const PANEL_W := 380
 const BOARD_CELLS := 4                      # 棋盘切成 4×4 个格子矩形判重叠：菱形棋盘的外接矩形太"虚胖"
 const BOARD_LAST := 18                      # 19 路棋盘的最大下标
 const CARD_FOLLOW_SEC := 0.25                # 「卡片跟随取景」的节流间隔（秒）
+const MOVE_PENDING_SEC := 12.0               # 「点下就锁」的兜底解锁：回包/事件全丢也不许把棋盘锁死
 const TEAL := Color(0.306, 0.804, 0.769)
 const TEAL_DARK := Color(0.173, 0.620, 0.620)
 ## 白底面板上的深色文字（手数 / 勾选项等）：与 TEAL_DARK 同一深色系。
@@ -30,6 +31,8 @@ var _right_panel: PanelContainer           # 右侧：对局 / 聊天
 var _joseki_card: JosekiCard = null        # 定式浮层参考图卡片（浮在棋盘上方，不进任何侧栏）
 var _joseki_card_home := Vector2.ZERO      # 我们最后一次给卡片摆的位置（用户拖走后不再接管）
 var _card_check := 0.0                     # 「跟随取景」的节流计时（见 _follow_joseki_card）
+var _move_pending := false                 # 「点下就锁」的本地闩：busy 事件回来前挡住第二手（v3.9.5）
+var _move_seq := 0                         # 本地闩的代数：作废还在跑的兜底计时器
 var _left_open := false                    # 左侧默认收起，保持棋盘视野
 var _right_open := true
 var _left_toggle: Button
@@ -1405,7 +1408,7 @@ func _clear_thinking_if_idle() -> void:
 ## 或**正在只读复盘**。冻结范围（棋盘只读 / 四个按钮 / 聊天）在静态 `review_lock_state` 里一处定死，
 ## 这里只把它**逐项应用**到控件上——退出复盘时同样走这里，所以「逐项恢复」不需要另一套逻辑（V20/V21）。
 func _refresh_lock() -> void:
-	var s := review_lock_state(_reviewing, agent != null and agent.busy, _speech_hold)
+	var s := review_lock_state(_reviewing, agent != null and agent.busy, _speech_hold, _move_pending)
 	if board != null:
 		board.locked = bool(s["locked"])
 		board.set_readonly(bool(s["readonly"]))   # 复盘只读（落子与摸头同源）
@@ -1431,8 +1434,9 @@ func _refresh_lock() -> void:
 
 ## 界面的「冻结状态」：进复盘 / 她思考中 / 她还有话没播完，各自的冻结范围。
 ## 纯函数、不碰场景树 ⇒ 门卫可直接断言「进入复盘 ⇒ 冻结；退出 ⇒ 逐项回到进入前」（V11/V21）。
-static func review_lock_state(reviewing: bool, busy: bool, speech_hold: bool) -> Dictionary:
-	var locked := busy or speech_hold
+static func review_lock_state(reviewing: bool, busy: bool, speech_hold: bool,
+		move_pending := false) -> Dictionary:
+	var locked := busy or speech_hold or move_pending
 	return {
 		"readonly": reviewing,                  # 棋盘只读：**只在复盘**（不接受落子与摸头）
 		"locked": locked,                       # 她思考中 / 她的语音还没播完
@@ -1742,6 +1746,7 @@ func _wire_agent() -> void:
 	agent.state_changed.connect(_on_state_changed)
 	agent.info_changed.connect(_on_info_changed)
 	agent.busy_changed.connect(_on_busy_changed)
+	agent.move_rejected.connect(_on_move_rejected)   # 这一手被后端拒绝：撤掉乐观子（v3.9.5）
 	agent.mood_changed.connect(_on_mood_changed)
 	agent.joseki_event.connect(_on_joseki_event)
 	agent.tool_event.connect(_on_tool_event)
@@ -1887,9 +1892,42 @@ func _greet() -> void:
 
 func _on_intersection_clicked(x: int, y: int) -> void:
 	_allow_tts_fillers()
+	# 点下就锁（本地闩）：`busy` 事件回来之前还有一瞬，期间再点会发出第二手——后端会挡下，
+	# 但棋盘上已经乐观画上了那颗子，回包又被忽略 ⇒ 撤不掉的幽灵子（v3.9.5）。闩由
+	# busy / state / 拒绝回包解开，另有 MOVE_PENDING_SEC 兜底，绝不把棋盘锁死。
+	_move_pending = true
+	_move_seq += 1
+	var seq := _move_seq
+	_refresh_lock()
+	get_tree().create_timer(MOVE_PENDING_SEC).timeout.connect(func():
+		if seq == _move_seq and _move_pending:
+			_move_pending = false
+			_refresh_lock())
 	agent.player_move(x, y)
 
+## 解开「点下就锁」的本地闩（并作废还在跑的兜底计时器）；解锁当场刷新一次，别等下一个事件
+func _release_move_pending() -> void:
+	if not _move_pending:
+		return
+	_move_pending = false
+	_move_seq += 1
+	_refresh_lock()
+
+## 后端明确拒绝了这一手（她还在应手 / 非法）：按权威快照撤掉乐观落下的那颗子。
+func _on_move_rejected(st: Dictionary) -> void:
+	_release_move_pending()
+	if board != null:
+		var stones = st.get("stones", [])
+		if typeof(stones) == TYPE_ARRAY:
+			board.set_stones(stones)
+		var seq = st.get("move_seq", [])
+		if typeof(seq) == TYPE_ARRAY:
+			board.set_move_seq(seq)
+	_set_status("这一手没走成：她还在应手，等她落子后再下。")
+	_refresh_lock()
+
 func _on_state_changed(p: Dictionary) -> void:
+	_release_move_pending()                # 权威快照到了：乐观落子已经被它取代
 	board.set_stones(p["stones"])
 	board.set_move_seq(p.get("move_seq", []))       # 悬停已有棋子时推手数用（后端 state 自带 GTP 手顺）
 	var mc := int(p["move_count"])
@@ -1978,6 +2016,7 @@ static func score_hint(score, winrate) -> String:
 	return "" if p == "--" else p
 
 func _on_busy_changed(busy: bool) -> void:
+	_release_move_pending()                # 后端已接手（或回合已结束）：本地闩让位给真实状态
 	if not busy:
 		_tool_active = false               # 回合结束：某个 start 的 end 万一没到，别让它卡住下一次 start
 	if avatar != null:

@@ -468,6 +468,8 @@ class AzureAgent:
         self._mood_region = -1
         self._mood_ms = 0
         self._mood_desc = ""
+        self._busy_seq = 0            # busy 的所有者编号（每次置真 +1）：见 `_clear_busy`
+        self._busy_owner = 0
         self._reveal_pending = False
         self._recent_lines = []       # AI 原话去重窗口（最近 AI_DEDUP_WINDOW 条，跨回合存活，见 Main.gd 原判据）
         self._graph = None            # 回合状态图：首次用到时装配（build_graph 用闭包捕获 self）
@@ -791,11 +793,33 @@ class AzureAgent:
         return out
 
     def _set_busy(self, v):
-        """设置忙碌状态；值没变就不推事件（嵌套的编排外壳会各自兜一次归位）。"""
+        """设置忙碌状态；值没变就不推事件（嵌套的编排外壳会各自兜一次归位）。
+
+        **置真时发放一个「所有者编号」并返回**（清位时把它交给 `_clear_busy`）。`busy` 是单例布尔，
+        旧回合的 ``finally`` 若不核对所有权，会把**新回合**的锁提前解开——见 `_clear_busy`。
+        """
+        if v:
+            self._busy_seq += 1
+            self._busy_owner = self._busy_seq
+        else:
+            self._busy_owner = 0
         if self.busy == v:
-            return
+            return self._busy_owner
         self.busy = v
         self._emit(events.busy(v))
+        return self._busy_owner
+
+    def _clear_busy(self, owner=0):
+        """清 busy，但**只允许拥有者清**：旧回合的 ``finally`` 不许解开新回合的锁。
+
+        复现路径（v3.9.5）：`_finalize_just_moved` 在她这一手讲完就 `_set_busy(False)`（设计如此：
+        不让玩家等后台的情绪小调用），紧接着 `_mood_llm_refine()` 还要跑 1~20 秒（它有 15 秒限频，
+        所以每两三手才出现一次）。玩家在这段窗口里落子 ⇒ 新回合把 busy 置真；旧回合的 ``finally``
+        回来若无条件清位，就把**新回合**的锁解了 ⇒ 她还没应手，玩家又能再下一手。
+        """
+        if owner and owner != self._busy_owner:
+            return
+        self._set_busy(False)
 
     def clean_reply(self, text) -> str:
         """去掉带点位的舞台提示；清洗后为空则退回原文。"""
@@ -1739,7 +1763,7 @@ class AzureAgent:
         # 只有真的一手（``is_legal`` 通过）才算「到达」，被拒的落子不打点——否则 ``session_start``
         # 会被一次失败尝试置位、``move_ts_list`` 多一个幽灵时刻、``avg_move_sec`` 的间隔被算歪。
         self.mark_move_time()
-        self._set_busy(True)
+        owner = self._set_busy(True)
         self._new_turn()                            # 三阶段共用同一轮标识（S33）
         token = self.begin_epoch()                  # 三阶段共用同一代（看门狗超时后整代作废）
         try:
@@ -1747,7 +1771,7 @@ class AzureAgent:
         except Exception as e:                      # 编排意外抛出（LLM/引擎）：不得让 busy 永久为真
             print("[Agent] 落子编排异常：%s" % e)
         finally:
-            self._set_busy(False)
+            self._clear_busy(owner)                 # 只清自己那份：别解开后来新回合的锁
 
     async def _player_move_turns(self, x, y, token):
         """``player_move`` 的三个阶段（同一个 epoch，交给 ``_turn_guard`` 整体兜底）。
@@ -2075,7 +2099,7 @@ class AzureAgent:
         """💡 提示：给方向性提示，不直接说坐标（顺序见 ``agent_graph.py`` 的 observe 阶段）。"""
         if self.busy:
             return
-        self._set_busy(True)
+        owner = self._set_busy(True)
         self._new_turn()
         token = self.begin_epoch()
         try:
@@ -2084,7 +2108,7 @@ class AzureAgent:
             print("[Agent] 提示异常：%s" % e)
             await _emit_line(self, events.AI_COMMENT, self._fallback_line("game"))
         finally:
-            self._set_busy(False)
+            self._clear_busy(owner)
 
     async def analyze_position(self):
         """局面分析：以 Azure（执白）的视角解读局势（顺序见 ``agent_graph.py`` 的 analyze 阶段）。"""
@@ -2094,7 +2118,7 @@ class AzureAgent:
             self._new_turn()                        # 空盘提示也是对外台词（T20①）
             await _emit_line(self, events.AI, "棋盘还空着呢~ 先落几手，我再帮你看看形势。")
             return
-        self._set_busy(True)
+        owner = self._set_busy(True)
         self._new_turn()
         token = self.begin_epoch()
         try:
@@ -2103,7 +2127,7 @@ class AzureAgent:
             print("[Agent] 分析异常：%s" % e)
             await _emit_line(self, events.AI, "📊 " + self._fallback_line("game"))
         finally:
-            self._set_busy(False)
+            self._clear_busy(owner)
 
     async def chat(self, text):
         """自由聊天（顺序见 ``agent_graph.py`` 的 chat 阶段）。"""
@@ -2114,7 +2138,7 @@ class AzureAgent:
         self.st.chat_history.append({"role": "user", "content": text})
         # 按聊天内容即时结算情绪（本地关键词分类）
         self._mood_event(self._chat_event(self.chat_emotion(text)), "，他说：「%s」" % text[:40].strip())
-        self._set_busy(True)
+        owner = self._set_busy(True)
         self._new_turn()
         token = self.begin_epoch()
         try:
@@ -2122,7 +2146,7 @@ class AzureAgent:
         except Exception as e:                      # 意外抛出：按失败处理，别让棋盘锁死
             print("[Agent] 聊天异常：%s" % e)
         finally:
-            self._set_busy(False)
+            self._clear_busy(owner)
         # 她回复完之后：把这轮聊天按主题写进事件表（规则式、零 LLM；事件原文永不进台词）。
         # 代际守卫：看门狗刚超时 / 本回合被新调用作废时，这一代不再写事件。
         if self.epoch_ok(token):
@@ -2158,7 +2182,7 @@ class AzureAgent:
             self._new_turn()                        # 空盘提示也是对外台词（T20①）
             await _emit_line(self, events.AI, "还没下过棋呢~")
             return
-        self._set_busy(True)
+        owner = self._set_busy(True)
         self._new_turn()
         token = self.begin_epoch()
         state = None
@@ -2168,7 +2192,7 @@ class AzureAgent:
             print("[Agent] 总结异常：%s" % e)
             await _emit_line(self, events.AI, "📋 对局总结\n" + self._fallback_line("chat"))
         finally:
-            self._set_busy(False)
+            self._clear_busy(owner)
         # 局末（Q7）：**写入点只有这里**——本局记录 + 融合后的画像（开关关着 / 无素材 ⇒ 不写）
         if self.epoch_ok(token):
             await self._persist_game(state)

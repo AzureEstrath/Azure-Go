@@ -2364,3 +2364,39 @@ class DedupLogEncodingTest(unittest.TestCase):
                              "两局都照常落盘——去重命中只是不打这句台词，不许打挂回合（丢记录）")
             self.assertTrue(all(g["summary"] == self.EMOJI for g in store.games()),
                             "记录里的总结仍是**原文**（只降级日志副本，不动台词）")
+
+class BusyOwnershipTest(unittest.TestCase):
+    """busy 的「所有者」闸门（v3.9.5）：旧回合的 finally 不许解开新回合的锁。
+
+    复现路径：`_finalize_just_moved` 讲完就 `_set_busy(False)`（设计如此），随后
+    `_mood_llm_refine()` 还要跑 1~20 秒（15 秒限频 ⇒ 每两三手出现一次）；玩家在这段窗口里落子
+    ⇒ 新回合把 busy 置真，旧回合 finally 回来若无条件清位，就把新回合的锁解了 ⇒ 她还没应手，
+    玩家又能再下一手。
+    """
+
+    def _agent(self):
+        return AzureAgent(StubEngine(), StubLLM(), events.RecordingBus())
+
+    def test_stale_turn_cannot_unlock_a_newer_turn(self):
+        a = self._agent()
+        old = a._set_busy(True)
+        self.assertTrue(a.busy)
+        a._set_busy(False)                 # 旧回合讲完就解锁（节点的既有行为）
+        a._set_busy(True)                  # 玩家在窗口里落子：新回合置真
+        a._clear_busy(old)                 # 旧回合的 finally 回来
+        self.assertTrue(a.busy, "旧回合不许把新回合的锁提前解开")
+        a._set_busy(False)
+        self.assertFalse(a.busy)
+
+    def test_owner_clear_still_unlocks_when_nothing_new_started(self):
+        a = self._agent()
+        owner = a._set_busy(True)
+        a._clear_busy(owner)
+        self.assertFalse(a.busy, "没有新回合时，拥有者自己清位照常生效")
+
+    def test_clear_without_owner_is_unconditional(self):
+        """不传 owner（旧调用点 / 看门狗）保持旧语义：无条件清位。"""
+        a = self._agent()
+        a._set_busy(True)
+        a._clear_busy()
+        self.assertFalse(a.busy)

@@ -89,6 +89,15 @@ func _run() -> void:
 			not bool(main_script.review_lock_state(false, true, false)["readonly"])
 			and bool(main_script.review_lock_state(false, true, false)["buttons_disabled"])
 			and bool(main_script.review_lock_state(false, true, false)["chat_editable"]))
+	# v3.9.5：点下就锁——`busy` 事件回来之前的那一瞬也在锁内（否则能连发两手，
+	# 后端挡下后棋盘上留下一颗撤不掉的幽灵子）。
+	_check("⑤ 点下就锁：move_pending 也算锁住、且不设只读",
+			bool(main_script.review_lock_state(false, false, false, true)["locked"])
+			and not bool(main_script.review_lock_state(false, false, false, true)["readonly"]))
+	_check("⑤ 闩释放后回到不锁（默认参数与三参调用逐项一致）",
+			not bool(main_script.review_lock_state(false, false, false, false)["locked"])
+			and main_script.review_lock_state(false, false, false) ==
+					main_script.review_lock_state(false, false, false, false))
 	var b3 := Board3D.new()
 	b3.set_readonly(true)
 	b3.set_readonly(false)

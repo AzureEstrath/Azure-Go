@@ -35,6 +35,9 @@ signal speech_event(payload: Dictionary)
 signal net_status(text: String, bad: bool)
 ## 聊天排队内容变了（入队 / 出队 / 退回 / 清空）：Main 据此刷新右下角那行提示（计划 06）
 signal chat_queue_changed()
+## 后端明确拒绝了这一手（多半是「她还在应手」——`busy` 事件还没到客户端的竞态）：
+## 载荷是**权威快照**，前端拿它撤掉乐观落下的那颗子，而不是让幽灵子留在盘上。
+signal move_rejected(state: Dictionary)
 
 const RECONNECT_MIN := 1.0
 const RECONNECT_MAX := 8.0
@@ -220,7 +223,22 @@ static func _without_type(d: Dictionary) -> Dictionary:
 # ================= 命令（REST，与 Main 的调用点一一对应） =================
 
 func player_move(x: int, y: int) -> void:
-	_post("/api/move", {"x": x, "y": y})
+	# 这一手必须**看回包**：后端忙时会回 `{"ok": false, "busy": true, "state": …}`（HTTP 仍是 200），
+	# 而棋盘在她应手之前已经乐观画上了这颗子——不看回包那它就变成永远撤不掉的幽灵子
+	# （v3.9.5：玩家会以为「她还没下，我又下了一手」）。拒绝时把权威快照交回 Main。
+	fetch_bytes("/api/move", HTTPClient.METHOD_POST, {"x": x, "y": y},
+			func(ok: bool, _code: int, body: PackedByteArray) -> void:
+				if not ok:
+					return                       # 连不上：棋盘锁的超时兜底会放行，别在这里解锁
+				var d = JSON.parse_string(body.get_string_from_utf8())
+				if typeof(d) != TYPE_DICTIONARY:
+					return
+				if bool(d.get("ok", true)):
+					return                       # 正常受理：等 busy / state 事件
+				_apply_busy(bool(d.get("busy", false)))
+				var st = d.get("state", null)
+				if typeof(st) == TYPE_DICTIONARY:
+					move_rejected.emit(st))
 
 func hint() -> void:
 	_post("/api/hint")
