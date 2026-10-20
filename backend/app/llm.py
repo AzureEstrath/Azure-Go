@@ -184,6 +184,15 @@ class LLMClient:
         print("[LLM] 服务端拒绝参数（HTTP %d），去掉扩展字段与输出上限重试" % e.status_code)
         return True
 
+    @staticmethod
+    def _finish_reason(ai) -> str:
+        """``AIMessage.response_metadata["finish_reason"]`` 的安全读取（取不到返空串）。"""
+        md = getattr(ai, "response_metadata", None) or {}
+        try:
+            return str(md.get("finish_reason") or "")
+        except Exception:                           # noqa: BLE001 —— 脏替身也不许把回合打挂
+            return ""
+
     def _reason_of(self, e) -> str:
         """把链抛出的异常映射成可读中文（不含任何凭据）。"""
         if isinstance(e, openai.APIStatusError):
@@ -221,7 +230,21 @@ class LLMClient:
             return "调用出错：" + self._reason_of(e)
 
         text = content_of(ai)
-        return text if text != "" else FAIL_TEXT
+        if text == "" and self._finish_reason(ai) == "length":
+            # 推理型模型把推理 token 也计入 max_tokens：上限被推理段吃光时 content 恒为空。
+            # 去掉**所有**扩展字段（含用户写死的上限）重试一次——这是恢复，不是重试风暴
+            # （max_retries 仍是 0）；代价是这一次请求丢掉用户的额外参数（top_k 等）。
+            print("[LLM] 输出上限被推理段吃光（finish_reason=length），去掉上限重试一次")
+            try:
+                ai = await self._sync_chain().bind(extra_body={}).ainvoke(messages)
+            except Exception as e:                  # noqa: BLE001
+                print("[LLM] 重试失败：%s" % e)
+                return "调用出错：" + self._reason_of(e)
+            text = content_of(ai)
+        if text == "":
+            print("[LLM] 空回复（finish_reason=%s），返回兜底台词" % (self._finish_reason(ai) or "?"))
+            return FAIL_TEXT
+        return text
 
     # ================= 情绪增量（结构化输出） =================
 

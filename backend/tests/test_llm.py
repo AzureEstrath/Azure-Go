@@ -90,6 +90,57 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}])),
                          "唔...我脑子有点转不过来了")
 
+    def test_length_finish_with_empty_content_retries_without_budget(self):
+        """推理段烧光预算（finish_reason=length + 空 content）⇒ 去掉输出上限重试一次，台词照常。"""
+        seen = []
+
+        def handler(req):
+            seen.append(json.loads(req.content.decode("utf-8")))
+            if len(seen) == 1:
+                return httpx.Response(200, json={
+                    "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                    "choices": [{"index": 0, "finish_reason": "length",
+                                 "message": {"role": "assistant", "content": ""}}]})
+            return httpx.Response(200, json=_reply("重试后的台词"))
+
+        c = _client(handler)
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80)),
+                         "重试后的台词")
+        self.assertEqual(len(seen), 2)
+        self.assertIn("max_tokens", seen[0])
+        self.assertNotIn("max_tokens", seen[1])        # 重试这一次不许再带上限
+
+    def test_length_finish_retry_also_empty_falls_back(self):
+        """重试仍空 ⇒ 落兜底台词（只重试一次，不许循环）。"""
+        calls = []
+
+        def handler(req):
+            calls.append(1)
+            return httpx.Response(200, json={
+                "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "length",
+                             "message": {"role": "assistant", "content": ""}}]})
+
+        c = _client(handler)
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80)),
+                         "唔...我脑子有点转不过来了")
+        self.assertEqual(len(calls), 2)
+
+    def test_truncated_but_nonempty_reply_is_used_as_is(self):
+        """现状契约（防回归）：有内容就算被截断也照用，不许重试——重试只针对「空 content」。"""
+        calls = []
+
+        def handler(req):
+            calls.append(1)
+            return httpx.Response(200, json={
+                "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "length",
+                             "message": {"role": "assistant", "content": "这手很实"}}]})
+
+        c = _client(handler)
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80)), "这手很实")
+        self.assertEqual(len(calls), 1)
+
     def test_http_401_is_readable(self):
         c = _client(lambda req: httpx.Response(401, json={"error": {"message": "bad key"}}))
         out = asyncio.run(c.chat([{"role": "user", "content": "hi"}]))
