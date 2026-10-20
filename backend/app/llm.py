@@ -28,6 +28,11 @@ from .llm_chain import FAIL_TEXT, build_chat_model, content_of
 
 REASON_BUDGET_MED = 160         # 思考档位 1（中等）：推理段的追加预算
 REASON_BUDGET_STRONG = 800      # 思考档位 2（强思考）：推理段的追加预算
+# 推理型模型（推理 token 也计入 max_tokens）的**常态余量**：实测 deepseek-v4.1-flash 一次回答的推理量
+# 在 500~4000 token 之间，远大于台词预算本身。预算里没有这块余量时，服务端在推理段就把上限烧光，
+# 直接返回 finish_reason=length + 空 content（台词退化成兜底句，v3.9.1 修复）。长尾由 chat() 的
+# 「去掉上限重试一次」兜底。
+REASON_HEADROOM_DEFAULT = 4096
 
 
 class MoodDelta(BaseModel):
@@ -129,14 +134,19 @@ class LLMClient:
         return u.startswith("http://") or u.startswith("https://")
 
     def _budget(self, max_tokens, no_think) -> int:
-        """思考档位的输出上限：推理段与正文共用，按档位追加一段预算。"""
+        """思考档位的输出上限：推理段与正文共用，按档位追加一段预算。
+
+        ``no_think`` 是调用方明确的「这次不要推理」⇒ 一个 token 都不多给；其余情况**永远**带上
+        ``REASON_HEADROOM_DEFAULT``（推理型模型不看档位也会推理，档位只是「再多想一点」）。档位
+        1/2 的追加量**叠在余量之上**——否则提高档位反而会把上限压到比档位 0 更低。
+        """
         if no_think:
             return max_tokens
         if self.think_mode == 2:
-            return max_tokens + REASON_BUDGET_STRONG
+            return max_tokens + REASON_HEADROOM_DEFAULT + REASON_BUDGET_STRONG
         if self.think_mode == 1:
-            return max_tokens + REASON_BUDGET_MED
-        return max_tokens
+            return max_tokens + REASON_HEADROOM_DEFAULT + REASON_BUDGET_MED
+        return max_tokens + REASON_HEADROOM_DEFAULT
 
     @staticmethod
     def _pins_budget(body) -> bool:

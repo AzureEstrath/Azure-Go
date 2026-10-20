@@ -17,7 +17,7 @@ import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.llm import LLMClient
+from app.llm import LLMClient, REASON_HEADROOM_DEFAULT
 
 
 def _reply(content):
@@ -70,7 +70,7 @@ class ChatTest(unittest.TestCase):
         out = asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100))
         self.assertEqual(out, "好")
         # 输出上限的线上键就是 max_tokens（不是 langchain-openai 默认改的 max_completion_tokens）
-        self.assertEqual(seen[0]["max_tokens"], 100)
+        self.assertEqual(seen[0]["max_tokens"], 100 + REASON_HEADROOM_DEFAULT)
         self.assertNotIn("max_completion_tokens", seen[0])
 
     def test_reasoning_content_not_shown(self):
@@ -187,7 +187,7 @@ class ChatTest(unittest.TestCase):
         c = _client(handler, extra_body={"top_k": 40})
         self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100)), "好")
         self.assertEqual(seen[0]["top_k"], 40)
-        self.assertEqual(seen[0]["max_tokens"], 100)
+        self.assertEqual(seen[0]["max_tokens"], 100 + REASON_HEADROOM_DEFAULT)
 
     def test_explicit_max_tokens_wins(self):
         """配置里写死了 max_tokens：注入的预算必须让位（尊重显式配置）。"""
@@ -228,7 +228,7 @@ class ChatTest(unittest.TestCase):
         c = _client(handler)          # 用户没配扩展字段：注入的 max_tokens 就是唯一的「加料」
         out = asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100))
         self.assertEqual(out, "好")
-        self.assertEqual(seen[0]["max_tokens"], 100)
+        self.assertEqual(seen[0]["max_tokens"], 100 + REASON_HEADROOM_DEFAULT)
         self.assertNotIn("max_tokens", seen[1])
         self.assertTrue(c._extra_body_unsupported)
 
@@ -259,15 +259,15 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(seen[0]["max_tokens"], 32)   # no_think：不加推理预算
 
     def test_reason_budget_ladder(self):
-        """思考档位 1/2 各追加一段推理预算（+160 / +800）；档位 0 与 no_think 都不追加。"""
+        """推理余量是**底**，思考档位 1/2 再各叠加 +160 / +800；no_think 一个都不加（阶梯必须单调）。"""
         from app.llm import REASON_BUDGET_MED, REASON_BUDGET_STRONG
         self.assertEqual((REASON_BUDGET_MED, REASON_BUDGET_STRONG), (160, 800))
         c = _client(lambda req: httpx.Response(200, json=_reply("好")))
-        self.assertEqual(c._budget(100, False), 100)
+        self.assertEqual(c._budget(100, False), 100 + REASON_HEADROOM_DEFAULT)
         c.think_mode = 1
-        self.assertEqual(c._budget(100, False), 260)
+        self.assertEqual(c._budget(100, False), 100 + REASON_HEADROOM_DEFAULT + 160)
         c.think_mode = 2
-        self.assertEqual(c._budget(100, False), 900)
+        self.assertEqual(c._budget(100, False), 100 + REASON_HEADROOM_DEFAULT + 800)
         self.assertEqual(c._budget(100, True), 100)   # no_think 优先：强思考也不追加
 
 
