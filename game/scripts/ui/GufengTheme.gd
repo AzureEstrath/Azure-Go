@@ -7,22 +7,30 @@ extends RefCounted
 ##   · **不引入字体文件**——优先系统楷体（`KaiTi` / 华文楷体），没有就退回宋体 / 雅黑；
 ##   · **不改任何几何**——侧栏宽、卡片尺寸、避让落位全部沿用原值，门卫不受影响。
 ##
-## 材质是两张程序化生成的贴图（`tools/` 里的脚本可复现）：
-##   `paper.png`      256×256 可平铺宣纸（低频云斑 + 细颗粒 + 纤维）
-##   `frame_ink.png`  128×128 九宫格墨框（手绘抖动的双线框 + 四角积墨）
+## 材质是程序化生成的贴图（`tools/` 里的脚本可复现）：
+##   `paper.png`       256×256 可平铺宣纸（低频云斑 + 细颗粒 + 纤维）
+##   `frame_line.png`  128×128 **纸页边**九宫格（1px 发丝线 + 内侧极淡压暗，**没有黑框**）
+##   `frame_ink.png`   128×128 手绘墨框——只给**定式卡片**这张"纸片"用，侧栏不用
+##
+## 两条配色铁律（v3.10.1，来自实机反馈）：
+##   · **不用近黑做背景**：标题条用黛青 `DEEP`，不用 `INK`；
+##   · **不用高饱和荧光色**：朱砂 / 赭石 / 黛 全部压过明度，文字一律 ≥ 4.5:1。
 
 ## —— 色 ——
 const PAPER := Color(0.961, 0.937, 0.878)        # #F5EFE0 宣纸
 const PAPER_WARM := Color(0.984, 0.965, 0.918)   # #FBF6EA 纸白
 const PAPER_TONE := Color(0.937, 0.894, 0.796)   # #EFE4CB 淡宣
-const INK := Color(0.173, 0.165, 0.149)          # #2C2A26 墨
-const INK_SOFT := Color(0.420, 0.384, 0.341)     # #6B6257 淡墨
+const INK := Color(0.173, 0.165, 0.149)          # #2C2A26 墨（**只做文字与线**，不做大块底色）
+const INK_SOFT := Color(0.353, 0.322, 0.286)     # #5A5249 淡墨（次级文字；纸上 ≥ 5:1）
 const CINNABAR := Color(0.651, 0.231, 0.180)     # #A63B2E 朱砂
 const DAI := Color(0.243, 0.361, 0.345)          # #3E5C58 黛
+const DEEP := Color(0.169, 0.259, 0.239)         # #2B423D 黛青（标题条底色：深而不黑）
+const OCHRE := Color(0.557, 0.400, 0.169)        # #8E662B 贝石（分岔印；对纸白 4.75:1）
 
 ## —— 材质 ——
 const PAPER_TEX := preload("res://assets/ui/paper.png")
-const FRAME_TEX := preload("res://assets/ui/frame_ink.png")
+const FRAME_TEX := preload("res://assets/ui/frame_ink.png")     # 只给定式卡片
+const LINE_TEX := preload("res://assets/ui/frame_line.png")     # 侧栏 / 弹窗：纸页边
 const GRABBER_TEX := preload("res://assets/ui/grabber.png")
 const CHECK_OFF_TEX := preload("res://assets/ui/check_off.png")
 const CHECK_ON_TEX := preload("res://assets/ui/check_on.png")
@@ -46,10 +54,10 @@ static func font() -> Font:
 
 # ================= 面 =================
 
-## 大面板：宣纸底 + 墨框（九宫格，墨框不随拉伸变粗）
+## 大面板：宣纸底 + **发丝纸边**（没有黑框：实机反馈"工具栏黑边"就是原墨框）
 static func panel(pad := 12) -> StyleBoxTexture:
 	var sb := StyleBoxTexture.new()
-	sb.texture = FRAME_TEX
+	sb.texture = LINE_TEX
 	sb.set_texture_margin_all(FRAME_MARGIN)
 	sb.content_margin_left = pad + 4
 	sb.content_margin_right = pad + 4
@@ -57,16 +65,16 @@ static func panel(pad := 12) -> StyleBoxTexture:
 	sb.content_margin_bottom = pad
 	return sb
 
-## 标题条：**墨底**。右侧压一条朱砂横线——这是整块面板上最重的一笔。
+## 标题条：**黛青底**（深色但不是黑）+ 朱砂横线。右侧压一枚单字印。
 static func header() -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = INK
+	sb.bg_color = DEEP
 	sb.border_color = CINNABAR
 	sb.border_width_bottom = 2
 	sb.content_margin_left = 12
 	sb.content_margin_right = 12
-	sb.content_margin_top = 8
-	sb.content_margin_bottom = 8
+	sb.content_margin_top = 9
+	sb.content_margin_bottom = 9
 	return sb
 
 ## 纸签：拉起式对话、设置抽屉、确认框都用它（无圆角、1px 淡墨线）
@@ -132,13 +140,13 @@ static func apply_button(b: Button, big := false) -> void:
 	b.add_theme_font_size_override("font_size", fs)
 	b.add_theme_stylebox_override("normal", _btn_box(PAPER_WARM, 0.45, false))
 	b.add_theme_stylebox_override("hover", _btn_box(PAPER_TONE, 0.85, false))
-	b.add_theme_stylebox_override("pressed", _btn_box(INK, 0.9, true))
+	b.add_theme_stylebox_override("pressed", _btn_box(DEEP, 0.9, true))
 	b.add_theme_stylebox_override("focus", _btn_box(Color(0, 0, 0, 0), 0.0, false))
 	b.add_theme_stylebox_override("disabled", _btn_box(PAPER, 0.12, false))
 	b.add_theme_color_override("font_color", INK)
 	b.add_theme_color_override("font_hover_color", CINNABAR)
 	b.add_theme_color_override("font_pressed_color", PAPER_WARM)
-	b.add_theme_color_override("font_disabled_color", Color(INK, 0.32))
+	b.add_theme_color_override("font_disabled_color", Color(INK, 0.45))
 
 static func _btn_box(bg: Color, border_a: float, inverted: bool) -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
@@ -153,8 +161,9 @@ static func _btn_box(bg: Color, border_a: float, inverted: bool) -> StyleBoxFlat
 	sb.set_corner_radius_all(0)
 	sb.content_margin_left = 10
 	sb.content_margin_right = 10
-	sb.content_margin_top = 5
-	sb.content_margin_bottom = 5
+	# 最小点按高度 ≈ 32px（原来 24px 在 4K/缩放屏上太难点）
+	sb.content_margin_top = 7
+	sb.content_margin_bottom = 7
 	return sb
 
 ## 朱砂主按钮（结束 / 确认）：整块红印，反白字
@@ -214,12 +223,12 @@ static func apply_line_edit(e: LineEdit) -> void:
 	sb.border_width_bottom = 1
 	sb.content_margin_left = 8
 	sb.content_margin_right = 8
-	sb.content_margin_top = 4
-	sb.content_margin_bottom = 4
+	sb.content_margin_top = 7
+	sb.content_margin_bottom = 7
 	e.add_theme_stylebox_override("normal", sb)
 	e.add_theme_stylebox_override("focus", sb)
 	e.add_theme_color_override("font_color", INK)
-	e.add_theme_color_override("font_placeholder_color", Color(INK_SOFT, 0.7))
+	e.add_theme_color_override("font_placeholder_color", Color(INK_SOFT, 0.85))
 	e.add_theme_color_override("caret_color", CINNABAR)
 
 ## 下拉框：纸签 + 墨线（与按钮同一套语言）
@@ -247,16 +256,19 @@ static func build_theme(f: Font) -> Theme:
 	th.set_stylebox("panel", "PanelContainer", panel(10))
 	th.set_stylebox("normal", "Button", _btn_box(PAPER_WARM, 0.45, false))
 	th.set_stylebox("hover", "Button", _btn_box(PAPER_TONE, 0.85, false))
-	th.set_stylebox("pressed", "Button", _btn_box(INK, 0.9, true))
+	th.set_stylebox("pressed", "Button", _btn_box(DEEP, 0.9, true))
 	th.set_stylebox("normal", "OptionButton", _btn_box(PAPER_WARM, 0.45, false))
 	th.set_stylebox("hover", "OptionButton", _btn_box(PAPER_TONE, 0.85, false))
+	th.set_stylebox("pressed", "OptionButton", _btn_box(PAPER_TONE, 0.85, false))
+	th.set_stylebox("focus", "OptionButton", _btn_box(Color(0, 0, 0, 0), 0.0, false))
+	th.set_color("font_pressed_color", "OptionButton", CINNABAR)
 	th.set_stylebox("normal", "LineEdit", _input_box())
 	th.set_stylebox("focus", "LineEdit", _input_box())
-	th.set_color("font_placeholder_color", "LineEdit", Color(INK_SOFT, 0.65))
+	th.set_color("font_placeholder_color", "LineEdit", Color(INK_SOFT, 0.85))
 	th.set_color("caret_color", "LineEdit", CINNABAR)
 	# 滑杆：墨色细线 + 朱砂已选段 + 纸面圆点（默认的灰蓝滑块与宣纸不搭）
 	var track := StyleBoxFlat.new()
-	track.bg_color = Color(INK, 0.18)
+	track.bg_color = Color(INK, 0.28)
 	track.content_margin_top = 1
 	track.content_margin_bottom = 1
 	th.set_stylebox("slider", "HSlider", track)
@@ -267,7 +279,31 @@ static func build_theme(f: Font) -> Theme:
 	# 复选框：墨线方框 / 朱砂勾
 	th.set_icon("unchecked", "CheckBox", CHECK_OFF_TEX)
 	th.set_icon("checked", "CheckBox", CHECK_ON_TEX)
+	# 勾选态在 Godot 里走 Button 的 "pressed" 样式 ⇒ 会继承成深色块把字吞掉：显式清空
+	for st in ["normal", "pressed", "hover", "disabled", "focus"]:
+		th.set_stylebox(st, "CheckBox", _empty_box())
+	for st in ["font_color", "font_pressed_color", "font_hover_color", "font_focus_color", "font_disabled_color"]:
+		th.set_color(st, "CheckBox", INK)
+	# 滚动条：极细墨线（默认那根灰条在纸上太抢眼）
+	th.set_stylebox("scroll", "VScrollBar", _scroll_grabber(Color(0, 0, 0, 0), 3))
+	th.set_stylebox("scroll_focus", "VScrollBar", _scroll_grabber(Color(0, 0, 0, 0), 3))
+	th.set_stylebox("grabber", "VScrollBar", _scroll_grabber(Color(INK, 0.28), 3))
+	th.set_stylebox("grabber_highlight", "VScrollBar", _scroll_grabber(Color(CINNABAR, 0.50), 3))
+	th.set_stylebox("grabber_pressed", "VScrollBar", _scroll_grabber(Color(CINNABAR, 0.70), 3))
 	return th
+
+## 空样式（复选框 / 只留图标的地方用）
+static func _empty_box() -> StyleBoxEmpty:
+	return StyleBoxEmpty.new()
+
+## 滚动条：一条 6px 宽的细条（内容边距决定宽度）
+static func _scroll_grabber(col: Color, half := 3) -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = col
+	sb.set_corner_radius_all(half)
+	sb.content_margin_left = half
+	sb.content_margin_right = half
+	return sb
 
 ## 滑杆「已选」那一段：一条朱砂细条
 static func _bar(col: Color) -> StyleBoxFlat:
@@ -285,6 +321,6 @@ static func _input_box() -> StyleBoxFlat:
 	sb.border_width_bottom = 1
 	sb.content_margin_left = 8
 	sb.content_margin_right = 8
-	sb.content_margin_top = 5
-	sb.content_margin_bottom = 5
+	sb.content_margin_top = 7
+	sb.content_margin_bottom = 7
 	return sb

@@ -49,7 +49,7 @@ const INVALID := Vector2i(-1, -1)                  # 非法坐标哨兵（棋盘
 ## 结构点徽标：**印章**（实心方块 + 纸白字），靠印色分四类
 const BADGE_SEAL := {
 	"entered": Color(0.243, 0.361, 0.345),   # 黛印
-	"branch": Color(0.690, 0.478, 0.165),    # 赭石印
+	"branch": Color(0.557, 0.400, 0.169),    # 贝石印
 	"deviated": Color(0.651, 0.231, 0.180),  # 朱砂印
 	"formed": Color(0.420, 0.384, 0.341),    # 淡墨印
 }

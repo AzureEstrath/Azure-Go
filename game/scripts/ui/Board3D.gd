@@ -200,7 +200,7 @@ func _build_board() -> void:
 	bmi.mesh = box
 	bmi.position = Vector3(0, -0.3, 0)
 	var bmat := StandardMaterial3D.new()
-	bmat.albedo_color = Color(0.804, 0.722, 0.541)
+	bmat.albedo_color = Color(0.722, 0.635, 0.463)
 	bmat.roughness = 0.85
 	bmi.material_override = bmat
 	add_child(bmi)
@@ -264,7 +264,7 @@ func _label(text: String, pos: Vector3) -> void:
 	l.text = text
 	l.font_size = 64
 	l.pixel_size = 0.008
-	l.modulate = Color(0.24, 0.29, 0.24)
+	l.modulate = Color(0.20, 0.18, 0.15)
 	l.rotation_degrees = Vector3(-90, 0, 0)
 	l.position = pos
 	add_child(l)
@@ -283,7 +283,7 @@ func _build_ghost() -> void:
 	_tip.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	_tip.font_size = 48
 	_tip.pixel_size = 0.006
-	_tip.modulate = Color(0.09, 0.42, 0.42)
+	_tip.modulate = Color(0.20, 0.28, 0.26)
 	_tip.outline_size = 12
 	_tip.no_depth_test = true
 	_tip.visible = false
@@ -327,7 +327,7 @@ func _make_stone(x: int, y: int, color: String, last: bool) -> void:
 		dot.texture = _dot_tex
 		dot.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 		dot.pixel_size = 0.004
-		dot.modulate = Color(0.306, 0.804, 0.769) if color == "black" else Color(0.906, 0.298, 0.235)
+		dot.modulate = Color(0.984, 0.965, 0.918) if color == "black" else Color(0.651, 0.231, 0.180)
 		dot.position = _world(x, y, STONE_H + 0.05)
 		_stones_root.add_child(dot)
 
@@ -405,7 +405,7 @@ func highlight_points(points: Array, kind := "formed") -> void:
 		dot.texture = _dot_tex
 		dot.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 		dot.pixel_size = 0.0064
-		dot.modulate = Color(0.32, 0.94, 0.92, 0.0) if kind == "formed" else Color(0.95, 0.78, 0.32, 0.0)
+		dot.modulate = Color(0.243, 0.361, 0.345, 0.0) if kind == "formed" else Color(0.557, 0.400, 0.169, 0.0)
 		dot.position = _world(px.x, px.y, STONE_H + 0.42)
 		_joseki_root.add_child(dot)
 		_joseki_marks.append(dot)
@@ -419,8 +419,8 @@ func highlight_points(points: Array, kind := "formed") -> void:
 			lb.pixel_size = 0.0026
 			lb.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 			lb.no_depth_test = true
-			lb.modulate = Color(0.88, 1.0, 1.0, 0.0)
-			lb.outline_modulate = Color(0.03, 0.22, 0.26, 0.9)
+			lb.modulate = Color(0.984, 0.965, 0.918, 0.0)
+			lb.outline_modulate = Color(0.173, 0.165, 0.149, 0.92)
 			lb.position = _world(px.x, px.y, STONE_H + 1.25)
 			_joseki_root.add_child(lb)
 			_joseki_marks.append(lb)

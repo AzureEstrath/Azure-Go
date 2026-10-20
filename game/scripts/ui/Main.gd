@@ -7,13 +7,6 @@ const BOARD_CELLS := 4                      # 棋盘切成 4×4 个格子矩形�
 const BOARD_LAST := 18                      # 19 路棋盘的最大下标
 const CARD_FOLLOW_SEC := 0.25                # 「卡片跟随取景」的节流间隔（秒）
 const MOVE_PENDING_SEC := 12.0               # 「点下就锁」的兜底解锁：回包/事件全丢也不许把棋盘锁死
-const TEAL := Color(0.306, 0.804, 0.769)
-const TEAL_DARK := Color(0.173, 0.620, 0.620)
-## 白底面板上的深色文字（手数 / 勾选项等）：与 TEAL_DARK 同一深色系。
-## 两处曾各写一遍同一个字面量（v3.7.0 修复波收口），行为不变。
-const PANEL_TEXT_DARK := Color(0.13, 0.30, 0.30)
-const BUBBLE_AI := Color(0.878, 0.957, 0.957)
-const BUBBLE_SYS := Color(1.0, 0.953, 0.804)
 
 ## 启动设置面板确认（_ready 里 await 它，之后才按新配置起各服务）
 signal setup_confirmed
@@ -192,16 +185,16 @@ func _build_world() -> void:
 	var we := WorldEnvironment.new()
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
-	env.background_color = Color(0.945, 0.918, 0.855)   # 暖宣纸（古风主题的一部分）
+	env.background_color = Color(0.878, 0.843, 0.769)   # 与 Ambience 桌面同色：远处不出现色阶
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	env.ambient_light_color = Color(0.95, 0.91, 0.84)
-	env.ambient_light_energy = 0.95
+	env.ambient_light_energy = 0.80
 	we.environment = env
 	add_child(we)
 
 	var light := DirectionalLight3D.new()
 	light.rotation_degrees = Vector3(-55, -38, 0)
-	light.light_energy = 1.2
+	light.light_energy = 0.95
 	light.shadow_enabled = true
 	add_child(light)
 
@@ -396,7 +389,7 @@ func _build_right_panel(root: Control) -> void:
 	var t2 := Label.new()
 	t2.text = "青蓝色 · 永恒17岁 · 天才少女 · 右键拖拽旋转视角 · 滚轮缩放"
 	t2.add_theme_font_size_override("font_size", 11)
-	t2.add_theme_color_override("font_color", Color(GufengTheme.PAPER_WARM, 0.72))
+	t2.add_theme_color_override("font_color", Color(GufengTheme.PAPER_WARM, 0.88))
 	t2.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hv.add_child(t2)
 	hrow.add_child(GufengTheme.seal_char("弈"))      # 朱砂单字印：整块面板最重的一笔
@@ -408,7 +401,7 @@ func _build_right_panel(root: Control) -> void:
 	vb.add_child(info)
 	_lbl_moves = Label.new()
 	_lbl_moves.text = "手数: 0"
-	_lbl_moves.add_theme_color_override("font_color", PANEL_TEXT_DARK)  # 面板是白底：默认主题白字看不见（R-GH-1）
+	_lbl_moves.add_theme_color_override("font_color", GufengTheme.INK)  # 面板是白底：默认主题白字看不见（R-GH-1）
 	info.add_child(_lbl_moves)
 	_lbl_wr = Label.new()
 	_lbl_wr.text = "黑胜率: --"
@@ -420,14 +413,14 @@ func _build_right_panel(root: Control) -> void:
 	score_col.add_theme_constant_override("separation", 0)
 	_lbl_score = Label.new()
 	_lbl_score.text = score_line(null)
-	_lbl_score.add_theme_color_override("font_color", Color(0.153, 0.682, 0.376))
+	_lbl_score.add_theme_color_override("font_color", GufengTheme.DAI)
 	_lbl_score.tooltip_text = "目差 = 黑棋实地估算 − 白棋实地估算（正数＝黑好，负数＝白好）。\n" \
 		+ "它和胜率偶尔会不同调（胜率 51% + 目差 -2.5 是正常的），两个一起看；下面那行是量级人话。"
 	score_col.add_child(_lbl_score)
 	_lbl_score_hint = Label.new()
 	_lbl_score_hint.text = ""                      # 量级人话：空串＝还没有形势信息（占位不显示，行高不跳）
 	_lbl_score_hint.add_theme_font_size_override("font_size", 11)
-	_lbl_score_hint.add_theme_color_override("font_color", Color(0.45, 0.45, 0.45))
+	_lbl_score_hint.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	score_col.add_child(_lbl_score_hint)
 	info.add_child(score_col)
 	_chk_pass = CheckBox.new()
@@ -520,7 +513,7 @@ func _build_right_panel(root: Control) -> void:
 	_button(prof_row, "她眼中的你", _on_profile_panel)
 	_lbl_profile = Label.new()
 	_lbl_profile.add_theme_font_size_override("font_size", 11)
-	_lbl_profile.add_theme_color_override("font_color", PANEL_TEXT_DARK)
+	_lbl_profile.add_theme_color_override("font_color", GufengTheme.INK)
 	_lbl_profile.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_lbl_profile.visible = false
 	drawer.add_child(_lbl_profile)
@@ -552,8 +545,8 @@ func _build_right_panel(root: Control) -> void:
 
 	# 排队提示（她忙时发的聊天先排着；右下角显示「排队中 N 条 · 队头前几个字」，队列空则隐藏）
 	_lbl_queue = Label.new()
-	_lbl_queue.add_theme_font_size_override("font_size", 11)
-	_lbl_queue.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
+	_lbl_queue.add_theme_font_size_override("font_size", 12)
+	_lbl_queue.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	_lbl_queue.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_lbl_queue.visible = false
 	vb.add_child(_lbl_queue)
@@ -591,7 +584,7 @@ func _build_right_panel(root: Control) -> void:
 	var bad_title := Label.new()
 	bad_title.text = "俗手回档（点一下回到那手之前）"
 	bad_title.add_theme_font_size_override("font_size", 12)
-	bad_title.add_theme_color_override("font_color", Color(0.627, 0.416, 0.173))
+	bad_title.add_theme_color_override("font_color", GufengTheme.CINNABAR)
 	vb.add_child(bad_title)
 	_bad_box = HBoxContainer.new()
 	_bad_box.add_theme_constant_override("separation", 6)
@@ -599,7 +592,7 @@ func _build_right_panel(root: Control) -> void:
 	_render_bad_moves([])
 
 	_lbl_status = Label.new()
-	_lbl_status.add_theme_font_size_override("font_size", 11)
+	_lbl_status.add_theme_font_size_override("font_size", 12)
 	_lbl_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(_lbl_status)
 
@@ -616,9 +609,16 @@ func _build_left_panel(root: Control) -> void:
 	panel.add_theme_stylebox_override("panel", GufengTheme.panel(12))
 	root.add_child(panel)
 
+	# 这一栏控件多，窗口一矮就被裁掉下半截：整栏可滚（右栏有聊天区自己会缩，不需要）
+	var scroll := ScrollContainer.new()
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	panel.add_child(scroll)
+
 	var vb := VBoxContainer.new()
+	vb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	vb.add_theme_constant_override("separation", 8)
-	panel.add_child(vb)
+	scroll.add_child(vb)
 
 	var head := PanelContainer.new()
 	head.add_theme_stylebox_override("panel", GufengTheme.header())
@@ -637,7 +637,7 @@ func _build_left_panel(root: Control) -> void:
 	var t2 := Label.new()
 	t2.text = "云端 OpenAI 兼容语音服务 / Windows 系统语音 · 侧栏收起后依然朗读"
 	t2.add_theme_font_size_override("font_size", 11)
-	t2.add_theme_color_override("font_color", Color(GufengTheme.PAPER_WARM, 0.72))
+	t2.add_theme_color_override("font_color", Color(GufengTheme.PAPER_WARM, 0.88))
 	t2.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hv.add_child(t2)
 	hrow.add_child(GufengTheme.seal_char("音"))
@@ -753,7 +753,7 @@ func _build_left_panel(root: Control) -> void:
 	_tts_status = Label.new()
 	_tts_status.text = "未开启朗读"
 	_tts_status.add_theme_font_size_override("font_size", 11)
-	_tts_status.add_theme_color_override("font_color", Color(0.45, 0.45, 0.45))
+	_tts_status.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	_tts_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(_tts_status)
 
@@ -761,16 +761,16 @@ func _build_left_panel(root: Control) -> void:
 	tip.text = "语音由后端合成（云端 OpenAI 兼容服务），本端只负责播放；\n" \
 		+ "· 零配置兜底：上面第 1 项「Windows 系统语音」直接用本机 SAPI，不联网\n" \
 		+ "· 云端合成不可用时，后端会直接改用系统语音念（配置里仍是你的选择）"
-	tip.add_theme_font_size_override("font_size", 10)
-	tip.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
+	tip.add_theme_font_size_override("font_size", 11)
+	tip.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	tip.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(tip)
 
 func _field_label(text: String) -> Label:
 	var l := Label.new()
 	l.text = text
-	l.add_theme_font_size_override("font_size", 11)
-	l.add_theme_color_override("font_color", Color(0.35, 0.45, 0.45))
+	l.add_theme_font_size_override("font_size", 12)
+	l.add_theme_color_override("font_color", GufengTheme.INK)
 	return l
 
 ## 统一勾选项样式：面板是白底，默认主题的浅色字/浅色勾选框几乎看不见 → 全部改成深色
@@ -1098,14 +1098,14 @@ func _add_stream_bubble() -> void:
 	bubble.add_child(inner)
 	var who := Label.new()
 	who.text = "Azure"
-	who.add_theme_font_size_override("font_size", 10)
-	who.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
+	who.add_theme_font_size_override("font_size", 11)
+	who.add_theme_color_override("font_color", GufengTheme.CINNABAR)
 	inner.add_child(who)
 	var lbl := Label.new()
 	lbl.text = ""
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	lbl.custom_minimum_size = Vector2(292, 0)
-	lbl.add_theme_color_override("font_color", Color(0.106, 0.337, 0.337))
+	lbl.add_theme_color_override("font_color", GufengTheme.INK)
 	inner.add_child(lbl)
 	_chat_box.add_child(row)
 	_stream_label = lbl
@@ -1271,15 +1271,14 @@ func _add_msg_now(kind: String, text: String) -> void:
 	if kind == "ai":
 		var who := Label.new()
 		who.text = "Azure"
-		who.add_theme_font_size_override("font_size", 10)
-		who.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
+		who.add_theme_font_size_override("font_size", 11)
+		who.add_theme_color_override("font_color", GufengTheme.CINNABAR)
 		inner.add_child(who)
 	var lbl := Label.new()
 	lbl.text = text if kind != "ai" else ""      # AI 消息先空着：交给 _start_typing 按节奏逐字显示
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	lbl.custom_minimum_size = Vector2(292, 0)
-	lbl.add_theme_color_override("font_color",
-		Color.WHITE if kind == "user" else Color(0.106, 0.337, 0.337))
+	lbl.add_theme_color_override("font_color", GufengTheme.INK)   # 三种气泡都是纸底：一律墨字
 	inner.add_child(lbl)
 
 	_chat_box.add_child(row)
@@ -1370,14 +1369,14 @@ func _show_thinking() -> void:
 	bubble.add_child(inner)
 	var who := Label.new()
 	who.text = "Azure"
-	who.add_theme_font_size_override("font_size", 10)
-	who.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
+	who.add_theme_font_size_override("font_size", 11)
+	who.add_theme_color_override("font_color", GufengTheme.CINNABAR)
 	inner.add_child(who)
 	var lbl := Label.new()
 	lbl.text = "Azure 思考中……"
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	lbl.custom_minimum_size = Vector2(292, 0)
-	lbl.add_theme_color_override("font_color", Color(0.106, 0.337, 0.337))
+	lbl.add_theme_color_override("font_color", GufengTheme.INK)
 	inner.add_child(lbl)
 	_chat_box.add_child(row)
 	_thinking_row = row
@@ -1485,7 +1484,7 @@ func _render_bad_moves(list: Array) -> void:
 		var l := Label.new()
 		l.text = "暂无俗手记录"
 		l.add_theme_font_size_override("font_size", 12)
-		l.add_theme_color_override("font_color", Color(0.7, 0.7, 0.7))
+		l.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 		_bad_box.add_child(l)
 		return
 	for b in list:
@@ -1508,12 +1507,12 @@ func _set_status(text: String, bad := false) -> void:
 	_status_bad = bad
 	_lbl_status.text = text
 	_lbl_status.add_theme_color_override("font_color",
-		Color(0.8, 0.2, 0.2) if bad else Color(0.45, 0.45, 0.45))
+		GufengTheme.CINNABAR if bad else GufengTheme.INK_SOFT)
 
 ## 简易模态输入框（用于「重来」确认与总结备注）
 func _ask_note(title_text: String, on_ok: Callable) -> void:
 	var back := ColorRect.new()
-	back.color = Color(0, 0, 0, 0.35)
+	back.color = Color(0.09, 0.08, 0.06, 0.45)
 	back.set_anchors_preset(Control.PRESET_FULL_RECT)
 	back.mouse_filter = Control.MOUSE_FILTER_STOP
 	_ui_root.add_child(back)
@@ -1581,7 +1580,7 @@ func _maybe_show_setup() -> void:
 
 func _build_setup_panel() -> void:
 	var back := ColorRect.new()
-	back.color = Color(0, 0, 0, 0.45)
+	back.color = Color(0.09, 0.08, 0.06, 0.55)
 	back.set_anchors_preset(Control.PRESET_FULL_RECT)
 	back.mouse_filter = Control.MOUSE_FILTER_STOP
 	_ui_root.add_child(back)
@@ -1600,7 +1599,12 @@ func _build_setup_panel() -> void:
 
 	var scroll := ScrollContainer.new()
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	box.add_child(scroll)
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	# 对话框拆成「滚动内容 + 固定动作区」：内容再长，「开始对局」也不会被滚出可视区
+	var outer := VBoxContainer.new()
+	outer.add_theme_constant_override("separation", 10)
+	box.add_child(outer)
+	outer.add_child(scroll)
 	var vb := VBoxContainer.new()
 	vb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	vb.add_theme_constant_override("separation", 8)
@@ -1609,12 +1613,12 @@ func _build_setup_panel() -> void:
 	var title := Label.new()
 	title.text = "出发前的准备"
 	title.add_theme_font_size_override("font_size", 20)
-	title.add_theme_color_override("font_color", TEAL_DARK)
+	title.add_theme_color_override("font_color", GufengTheme.INK)
 	vb.add_child(title)
 	var sub := Label.new()
 	sub.text = "以下默认就是上次的配置，直接点「开始对局」即可；改过的值会写回 config.json。"
 	sub.add_theme_font_size_override("font_size", 11)
-	sub.add_theme_color_override("font_color", Color(0.45, 0.45, 0.45))
+	sub.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(sub)
 
@@ -1642,21 +1646,27 @@ func _build_setup_panel() -> void:
 	var le_tts_voice := _setup_field(tts_body, "音色", cfg.tts_voice,
 		"云端服务的音色 id（各服务商不同，如 alloy / 中文女）；进游戏后左侧栏也可下拉改")
 
+	var sep := ColorRect.new()
+	sep.color = Color(GufengTheme.INK, 0.22)
+	sep.custom_minimum_size = Vector2(0, 1)
+	sep.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	outer.add_child(sep)
 	var hb := HBoxContainer.new()
 	hb.alignment = BoxContainer.ALIGNMENT_END
-	vb.add_child(hb)
+	outer.add_child(hb)
 	var start := Button.new()
-	start.text = "▶ 开始对局"
+	start.text = "开始对局"
 	start.add_theme_font_size_override("font_size", 16)
+	GufengTheme.apply_seal_button(start)
 	hb.add_child(start)
 	start.pressed.connect(func():
 		_apply_setup(think_opt, le_llm_url, le_llm_model, le_llm_key, le_tts_url, le_tts_voice)
 		back.queue_free()
 		setup_confirmed.emit())
 	start.grab_focus()
-	# 高度随内容自适应（折叠时紧凑，展开分节后变高），并保持垂直居中
+	# 高度随内容自适应（折叠时紧凑，展开分节后变高），并保持垂直居中；+64 是底部固定的动作区
 	await get_tree().process_frame
-	var h := clampf(vb.get_combined_minimum_size().y + 24.0, 240.0, 640.0)
+	var h := clampf(vb.get_combined_minimum_size().y + 24.0 + 64.0, 240.0, 640.0)
 	box.offset_top = -h * 0.5
 	box.offset_bottom = h * 0.5
 
