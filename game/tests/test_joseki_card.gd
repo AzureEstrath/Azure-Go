@@ -286,6 +286,62 @@ func _run() -> void:
 			main_script.joseki_anchor(vp, blocked, [], Vector2.ZERO, card, false, false)
 			== Vector2(24.0, vp.y - card.y - 24.0))
 
+	# —— ⑮ 关闭入口（v3.9.3）：卡片原先没有任何关闭控件，只能等 120s TTL 或 formed ——
+	var cx := JosekiCard.new()
+	cx.apply_event({"kind": "branch", "name": "乙", "corner": "左上", "k": 1,
+			"line": [{"x": 3, "y": 3, "c": "B"}, {"x": 3, "y": 2, "c": "B"}],
+			"candidates": [{"name": "一间跳", "next": [5, 2]}]})
+	_check("⑮ 关闭热区在卡片右上角",
+			cx.close_rect().position.x > JosekiCard.CARD_W * 0.6
+			and cx.close_rect().position.y < 40.0)
+	_check("⑮ 热区中心算命中、棋盘区域不算",
+			cx.hit_close(cx.close_rect().get_center()) and not cx.hit_close(Vector2(40, 200)))
+	cx.dismiss()
+	_check("⑮ dismiss 收起卡片", cx.state() == "hidden")
+	cx.apply_event({"kind": "branch", "name": "乙", "corner": "左上", "k": 1,
+			"line": [{"x": 3, "y": 3, "c": "B"}], "candidates": []})
+	_check("⑮ 手关过的同一结构点不再自动弹", cx.state() == "hidden")
+	cx.apply_event({"kind": "deviated", "name": "乙", "corner": "左上", "k": 1,
+			"line": [{"x": 3, "y": 3, "c": "B"}], "candidates": []})
+	_check("⑮ 换了结构点照常弹", cx.state() == "shown")
+	cx.free()
+
+	# —— ⑯ 角内取景窗口：13 路局部放大，有子越界就退回 19 路（绝不裁子）——
+	var cy := JosekiCard.new()
+	cy.apply_event({"kind": "entered", "name": "丙", "corner": "左上", "k": 1,
+			"line": [{"x": 3, "y": 3, "c": "B"}, {"x": 3, "y": 2, "c": "B"}]})
+	var win1 := cy.view_window()
+	_check("⑯ 左上角内两手 ⇒ 13 路取景、原点 (0,0)",
+			int(win1["size"]) == 13 and win1["origin"] == Vector2i(0, 0))
+	cy.apply_event({"kind": "entered", "name": "丁", "corner": "右下", "k": 1,
+			"line": [{"x": 15, "y": 15, "c": "B"}, {"x": 16, "y": 14, "c": "W"}]})
+	var win2 := cy.view_window()
+	_check("⑯ 右下角 ⇒ 窗口原点 (6,6)",
+			int(win2["size"]) == 13 and win2["origin"] == Vector2i(6, 6))
+	cy.apply_event({"kind": "entered", "name": "戊", "corner": "左上", "k": 1,
+			"line": [{"x": 3, "y": 3, "c": "B"}, {"x": 15, "y": 15, "c": "W"}]})
+	_check("⑯ 有子跑出角内 ⇒ 退回 19 路（不裁子）", int(cy.view_window()["size"]) == 19)
+	cy.apply_event({"kind": "entered", "name": "己", "corner": "?", "k": 1,
+			"line": [{"x": 3, "y": 3, "c": "B"}]})
+	_check("⑯ 角名不认识 ⇒ 19 路全盘", int(cy.view_window()["size"]) == 19)
+
+	# —— ⑰ 头部徽标 / 候选图例 / TTL ——
+	cy.apply_event({"kind": "branch", "name": "庚", "corner": "左上", "k": 0,
+			"line": [{"x": 3, "y": 3, "c": "B"}],
+			"candidates": [{"name": "一间跳", "next": [5, 2]}, {}, {"name": ""}, 3,
+					{"name": "贴住", "next": [4, 2]}]})
+	_check("⑰ 徽标：分岔", cy.badge_text() == "分岔")
+	_check("⑰ 候选图例只收有名字的，脏值跳过",
+			cy.legend_items() == ["一间跳", "贴住"])
+	cy.apply_event({"kind": "deviated", "name": "庚", "corner": "左上", "k": 0,
+			"line": [{"x": 3, "y": 3, "c": "B"}]})
+	_check("⑰ 徽标：走错", cy.badge_text() == "走错")
+	cy._tick(59.0)
+	_check("⑰ TTL 60s：59 秒还在", cy.state() == "shown")
+	cy._tick(2.0)
+	_check("⑰ TTL 60s：61 秒收起", cy.state() == "hidden")
+	cy.free()
+
 	if _fail == 0:
 		print("[josekicard] PASS：", _total, " 项断言全部通过")
 	else:

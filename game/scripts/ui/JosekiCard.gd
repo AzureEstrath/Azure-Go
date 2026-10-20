@@ -13,13 +13,20 @@ extends Control
 ##   · TTL 兜底走**可注入**的 `_tick(delta)`：后端不识别「脱先」（不发收尾事件），久无新事件就自己收起；
 ##     而收尾**只有** `formed`（库线走完）一种，`deviated` 是「走错」→ 照常上卡片并把那一手标红（U45）。
 
-const CARD_TTL_SEC := 120.0   # 兜底 TTL：距最后一次 apply_event 超过这么久仍没新事件 → 自动收起（U38）
-const CARD_W := 240.0         # 卡片宽（含内边距），Main 的默认落位与避让几何都用它
-const CARD_H := 260.0         # 卡片高：上边距 + 标题 + 小棋盘 + 下边距
-const PAD := 16.0             # 卡片内边距
-const HEAD_H := 26.0          # 标题占高
-const TITLE_SIZE := 14        # 标题字号（12px 在 1280×800 下读不清）
+const CARD_TTL_SEC := 60.0    # 兜底 TTL：距最后一次 apply_event 超过这么久仍没新事件 → 自动收起（U38）
+# 尺寸按「默认布局下能完整落在棋盘上方」定：1280×800、侧栏展开时棋盘顶在 y≈323，
+# 卡片高必须 ≤ 299 才不会一出生就压棋盘（320 高时上沿会跑到 -9，只能退回兜底位）。
+const CARD_W := 236.0         # 卡片宽（含内边距），Main 的默认落位与避让几何都用它
+const CARD_H := 288.0         # 卡片高：头部 + 小棋盘 + 候选图例 + 内边距
+const PAD := 14.0             # 卡片内边距
+const HEAD_H := 34.0          # 头部占高（课名 / 结构点徽标 / 关闭）
+const GRID_GAP := 6.0         # 头部与棋盘之间的留白
+const TITLE_SIZE := 15        # 标题字号（12px 在 1280×800 下读不清）
+const CLOSE_SIZE := 22.0      # 关闭热区边长（自绘 ×，不建子节点：五条不变量都靠 `_draw`）
 const GRID := 19              # 小棋盘路数：后端坐标就是 19 路
+# 角内取景窗口：定式只看一个角，19 路全盘会把 3~8 颗子摊成一片；按角截 13 路放大。
+# **任何一颗子落在窗口外就退回 19 路全盘**——参考图绝不裁子。
+const WINDOW := 13
 # 避让时**只把外壳**（底色 / 网格 / 边框）压到这个系数：整卡一起压透明会把文字连同棋子糊成一片
 # 灰影（v3.9.2 修复的正是这个——参考图是要读的，不是要藏的）。
 const FADED_SHELL := 0.40
@@ -27,6 +34,17 @@ const FADED_SHELL := 0.40
 const BG := Color(0.07, 0.16, 0.18, 0.82)          # 半透明深色底（不切断棋盘视线）
 const BORDER := Color(0.306, 0.804, 0.769, 0.85)   # 与主界面同一套青蓝
 const GRID_LINE := Color(0.83, 0.91, 0.90, 0.70)
+# 结构点徽标：颜色 + 文案（`kind` 是后端给的四个值之一）
+const BADGE_COLORS := {
+	"entered": Color(0.31, 0.96, 0.90),
+	"branch": Color(1.0, 0.72, 0.20),
+	"deviated": Color(0.95, 0.30, 0.24),
+	"formed": Color(0.75, 0.82, 0.82),
+}
+const BADGE_TEXT := {"entered": "进入", "branch": "分岔", "deviated": "走错", "formed": "收尾"}
+const BADGE_W := 46.0         # 徽标胶囊宽（两个汉字 + 内边距）
+const HOSHI := [Vector2i(3, 3), Vector2i(3, 9), Vector2i(3, 15), Vector2i(9, 3),
+		Vector2i(9, 9), Vector2i(9, 15), Vector2i(15, 3), Vector2i(15, 9), Vector2i(15, 15)]
 const STONE_B := Color(0.10, 0.11, 0.12)
 const STONE_W := Color(0.97, 0.97, 0.95)
 const RING := Color(0.31, 0.96, 0.90)              # 第 k 手的高亮环
@@ -44,12 +62,19 @@ var _since_event := 0.0        # 距上次 apply_event 的秒数，只由 _tick 
 
 ## —— 要画的字段（全部原样来自后端事件，卡片不加工）——
 var _title := ""               # 课程名（事件的 name）
+var _kind := ""                # 结构点（entered / branch / deviated / formed）：只用于头部徽标
+var _corner := ""              # 角名（左上 / 右上 / 左下 / 右下）：决定 13 路取景窗口
 var _line: Array = []          # 手顺：[{x, y, c}]，c = "B" / "W"
 var _k := -1                   # 第 k 手（0 基）高亮；缺键/脏值/越界 = -1（不高亮）
 var _candidates: Array = []    # 分岔候选：[{name, next: [x, y]}]
 var _mistake = null            # 走错那一手 {move_no, x, y, drop}，否则 null
 
+## 玩家手关过的「同一张」：同 (name, kind) 再来事件时不再自动弹（换结构点/换族照常弹）
+var _dismissed_name := ""
+var _dismissed_kind := ""
+
 var _dragging := false         # 左键按住拖动中
+var _hover_close := false      # 鼠标悬在关闭热区上（只影响画法，不动逻辑）
 
 func _init() -> void:
 	# 树外也成立的属性：门卫不看场景树（U13）。鼠标只在自己矩形内被吃掉（U40）
@@ -83,8 +108,16 @@ func apply_event(e: Dictionary) -> void:
 	if not _truthy(e.get("show_card", true)):
 		clear()
 		return
+	# 玩家手关过这一张（同 name + kind）：不再自动弹回来；换结构点 / 换族才清掉这份记忆
+	var nm := str(e.get("name", ""))
+	if _dismissed_kind != "" and kind == _dismissed_kind and nm == _dismissed_name:
+		return
+	_dismissed_kind = ""
+	_dismissed_name = ""
 	# 换族 / 换角：直接替换成新的一张，不做叠卡（U38）
-	_title = str(e.get("name", ""))
+	_title = nm
+	_kind = kind
+	_corner = str(e.get("corner", ""))
 	_line = e["line"] if typeof(e.get("line", null)) == TYPE_ARRAY else []
 	_candidates = e["candidates"] if typeof(e.get("candidates", null)) == TYPE_ARRAY else []
 	_k = int(e["k"]) if _is_int_ish(e.get("k", null)) else -1
@@ -115,8 +148,11 @@ func set_panel_overlap(rects: Array) -> void:
 func clear() -> void:
 	_active = false
 	_faded = false
+	_dim = 1.0
 	_since_event = 0.0
 	_title = ""
+	_kind = ""
+	_corner = ""
 	_line = []
 	_k = -1
 	_candidates = []
@@ -133,6 +169,55 @@ func state() -> String:
 ## 只作用于底色 / 网格 / 边框；标题与棋子**恒为不透明**（淡出不许把参考图变成灰影）。
 func dim() -> float:
 	return _dim
+
+## 关闭热区（卡片右上角，自绘 ×）：纯几何，树外可断言。
+func close_rect() -> Rect2:
+	return Rect2(CARD_W - PAD - CLOSE_SIZE, (HEAD_H - CLOSE_SIZE) * 0.5, CLOSE_SIZE, CLOSE_SIZE)
+
+## 坐标是否落在关闭热区里（`_gui_input` 与门卫共用同一判据）
+func hit_close(p: Vector2) -> bool:
+	return close_rect().has_point(p)
+
+## 关掉这张卡，并记住「同一张别再自动弹」：同 (name, kind) 再来事件时直接忽略。
+## 换了结构点 / 换了定式（name 不同）⇒ 照常弹，不用玩家再点一次关闭。
+func dismiss() -> void:
+	_dismissed_name = _title
+	_dismissed_kind = _kind
+	clear()
+
+## 头部徽标文案（纯逻辑）：进入 / 分岔 / 走错 / 收尾；不认识的 kind → 空串（不画徽标）
+func badge_text() -> String:
+	return str(BADGE_TEXT.get(_kind, ""))
+
+## 候选图例（纯逻辑）：只收有名字的候选，非字典 / 空名一律跳过（脏值不抛）
+func legend_items() -> Array:
+	var out: Array = []
+	for cand in _candidates:
+		if typeof(cand) != TYPE_DICTIONARY:
+			continue
+		var nm := str((cand as Dictionary).get("name", "")).strip_edges()
+		if nm != "":
+			out.append(nm)
+	return out
+
+## 角内取景窗口：`{origin: Vector2i, size: int}`。按 `_corner` 取 13 路局部放大；
+## **任何一颗子落在窗口外就退回 19 路全盘**（参考图绝不裁子）；角名不认识也退回全盘。
+func view_window() -> Dictionary:
+	var size := WINDOW
+	var origin := Vector2i.ZERO
+	match _corner:
+		"右上": origin = Vector2i(GRID - size, 0)
+		"左下": origin = Vector2i(0, GRID - size)
+		"右下": origin = Vector2i(GRID - size, GRID - size)
+		"左上": origin = Vector2i.ZERO
+		_: return {"origin": Vector2i.ZERO, "size": GRID}
+	for it in _line:
+		var p := _pos_of(it)
+		if p == INVALID:
+			continue
+		if p.x < origin.x or p.y < origin.y or p.x >= origin.x + size or p.y >= origin.y + size:
+			return {"origin": Vector2i.ZERO, "size": GRID}
+	return {"origin": origin, "size": size}
 
 ## 当前画得出来的合法棋子数（非法坐标不计；供门卫断言）
 func stone_count() -> int:
@@ -241,33 +326,94 @@ func _mistake_cell() -> Vector2i:
 func _draw() -> void:
 	var whole := Rect2(Vector2.ZERO, Vector2(CARD_W, CARD_H))
 	# 只有「壳」吃 dim：底色 / 边框 / 网格。文字与棋子一律原色（见 `dim()` 的注释）。
-	draw_rect(whole, Color(BG, BG.a * _dim), true)
-	draw_rect(whole, Color(BORDER, BORDER.a * _dim), false, 1.0)
-	var grid_fg := Color(GRID_LINE, GRID_LINE.a * _dim)
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(BG, BG.a * _dim)
+	sb.border_color = Color(BORDER, BORDER.a * _dim)
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(10)
+	sb.shadow_color = Color(0.0, 0.0, 0.0, 0.22 * _dim)
+	sb.shadow_size = 8
+	sb.shadow_offset = Vector2(0, 3)
+	draw_style_box(sb, whole)
 
 	var f := get_theme_default_font()
-	var step := _grid_step()
-	var x0 := PAD
-	var y0 := PAD + HEAD_H
+	_draw_header(f)
+	_draw_grid(f)
+	_draw_legend(f)
+
+## 头部：课名 + 结构点徽标 + 关闭 ×（自绘，不建子节点：五条不变量都靠 `_draw` 与纯函数）
+func _draw_header(f: Font) -> void:
+	var cr := close_rect()
 	if f != null:
+		var badge := badge_text()
+		var badge_x := cr.position.x - 10.0 - BADGE_W
+		var title_w := maxf(40.0, badge_x - 8.0 - PAD)
 		# 标题用后端给的课名；没有就给个中性占位（卡片不自己编台词）
-		draw_string(f, Vector2(x0, PAD + 14.0), _title if _title != "" else "定式参考",
-				HORIZONTAL_ALIGNMENT_LEFT, CARD_W - PAD * 2.0, TITLE_SIZE, TITLE_FG)
+		draw_string(f, Vector2(PAD, HEAD_H * 0.5 + 5.0), _title if _title != "" else "定式参考",
+				HORIZONTAL_ALIGNMENT_LEFT, title_w, TITLE_SIZE, TITLE_FG)
+		if badge != "":
+			var col: Color = BADGE_COLORS.get(_kind, Color(0.75, 0.82, 0.82))
+			var pill := StyleBoxFlat.new()
+			pill.bg_color = Color(col, 0.16)
+			pill.border_color = Color(col, 0.70)
+			pill.set_border_width_all(1)
+			pill.set_corner_radius_all(10)
+			var br := Rect2(badge_x, (HEAD_H - 20.0) * 0.5, BADGE_W, 20.0)
+			draw_style_box(pill, br)
+			draw_string(f, Vector2(br.position.x, br.position.y + 15.0), badge,
+					HORIZONTAL_ALIGNMENT_CENTER, br.size.x, 12, col)
+	# 关闭 ×：悬停时给一层浅底（光标形状在 `_gui_input` 里切）
+	if _hover_close:
+		var hsb := StyleBoxFlat.new()
+		hsb.bg_color = Color(1.0, 1.0, 1.0, 0.16)
+		hsb.set_corner_radius_all(6)
+		draw_style_box(hsb, cr.grow(2.0))
+	var c := cr.position + cr.size * 0.5
+	var q := cr.size.x * 0.26
+	var xc := Color(TITLE_FG, 0.95 if _hover_close else 0.70)
+	draw_line(c + Vector2(-q, -q), c + Vector2(q, q), xc, 1.6)
+	draw_line(c + Vector2(-q, q), c + Vector2(q, -q), xc, 1.6)
+	draw_line(Vector2(PAD, HEAD_H), Vector2(CARD_W - PAD, HEAD_H), Color(BORDER, 0.35 * _dim), 1.0)
 
-	# 小棋盘网格（19 路）
-	var side := step * float(GRID - 1)
-	for i in GRID:
+## 小棋盘：窗口由 `view_window()` 决定（角内 13 路 / 越界退回 19 路）
+func _draw_grid(f: Font) -> void:
+	var win := view_window()
+	var n := int(win["size"])
+	var o: Vector2i = win["origin"]
+	var origin := _grid_origin()
+	var side := CARD_W - PAD * 2.0
+	var step := side / float(n - 1)
+	var grid_fg := Color(GRID_LINE, GRID_LINE.a * _dim)
+	for i in n:
 		var t := float(i) * step
-		draw_line(Vector2(x0 + t, y0), Vector2(x0 + t, y0 + side), grid_fg, 1.0)
-		draw_line(Vector2(x0, y0 + t), Vector2(x0 + side, y0 + t), grid_fg, 1.0)
+		draw_line(origin + Vector2(t, 0.0), origin + Vector2(t, side), grid_fg, 1.0)
+		draw_line(origin + Vector2(0.0, t), origin + Vector2(side, t), grid_fg, 1.0)
+	# 星位：只画落在窗口里的（13 路时通常剩 2~3 个，用来定方向）
+	for h in HOSHI:
+		var hp: Vector2i = h
+		if hp.x < o.x or hp.y < o.y or hp.x >= o.x + n or hp.y >= o.y + n:
+			continue
+		draw_circle(_cell_pos(hp), maxf(1.6, step * 0.085),
+				Color(GRID_LINE, GRID_LINE.a * 0.85 * _dim))
 
-	# 手顺着子：黑 B / 白 W（c 不认识按黑画，不抛）
-	var r := step * 0.42
+	# 手顺着子：黑 B / 白 W（c 不认识按黑画，不抛）；石子够大时叠手顺数字
+	var r := step * 0.44
 	for i in _line.size():
 		var p := _pos_of(_line[i])
 		if p == INVALID:
 			continue
-		draw_circle(_cell_pos(p), r, _stone_color(_line[i]))
+		var col := _stone_color(_line[i])
+		var ctr := _cell_pos(p)
+		draw_circle(ctr, r, col)
+		draw_arc(ctr, r, 0.0, TAU, 20,
+				Color(0.0, 0.0, 0.0, 0.30) if col == STONE_W else Color(1.0, 1.0, 1.0, 0.18), 1.0)
+		# 19 路回退时 r≈5.6，写数字只会变成噪点：低于 7 就不写
+		if f != null and r >= 7.0:
+			var num := str(i + 1)
+			var fs := clampi(int(round(step * 0.60)), 9, 12)
+			var fg := Color(0.08, 0.10, 0.10) if col == STONE_W else Color(0.95, 0.98, 0.97)
+			draw_string(f, ctr + Vector2(-float(fs) * 0.5 * float(num.length()), float(fs) * 0.36),
+					num, HORIZONTAL_ALIGNMENT_LEFT, 0.0, fs, fg)
 
 	# 第 k 手高亮环（判据在 `_k_cell()`：越界 / 脏值 / 坐标非法一律不高亮也不抛）
 	var pk := _k_cell()
@@ -293,12 +439,43 @@ func _draw() -> void:
 		draw_line(qm - Vector2(r, r), qm + Vector2(r, r), BAD, 2.0)
 		draw_line(qm - Vector2(r, -r), qm + Vector2(r, -r), BAD, 2.0)
 
+## 底部候选图例：`① 一间跳  ② 贴住`（候选名后端一直在发，以前白扔了）
+func _draw_legend(f: Font) -> void:
+	if f == null:
+		return
+	var items := legend_items()
+	if items.is_empty():
+		return
+	var fs := 12
+	var y := CARD_H - 12.0
+	var x := PAD
+	var shown := 0
+	for i in items.size():
+		if shown >= 3:                              # 最多三条，多了用省略号收尾
+			draw_string(f, Vector2(x, y), "…", HORIZONTAL_ALIGNMENT_LEFT, 0.0, fs,
+					Color(TITLE_FG, 0.70))
+			break
+		var txt := "%d %s" % [i + 1, items[i]]
+		var w := f.get_string_size(txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x
+		if x + w > CARD_W - PAD:
+			break
+		draw_string(f, Vector2(x, y), txt, HORIZONTAL_ALIGNMENT_LEFT, 0.0, fs,
+				Color(TITLE_FG, 0.88))
+		x += w + 14.0
+		shown += 1
+
+func _grid_origin() -> Vector2:
+	return Vector2(PAD, HEAD_H + GRID_GAP)
+
 func _grid_step() -> float:
-	return (CARD_W - PAD * 2.0) / float(GRID - 1)
+	var win := view_window()
+	return (CARD_W - PAD * 2.0) / float(int(win["size"]) - 1)
 
 func _cell_pos(p: Vector2i) -> Vector2:
+	var win := view_window()
+	var o: Vector2i = win["origin"]
 	var s := _grid_step()
-	return Vector2(PAD + float(p.x) * s, PAD + HEAD_H + float(p.y) * s)
+	return _grid_origin() + Vector2(float(p.x - o.x) * s, float(p.y - o.y) * s)
 
 func _stone_color(it) -> Color:
 	if typeof(it) == TYPE_DICTIONARY and str((it as Dictionary).get("c", "")).to_upper().begins_with("W"):
@@ -329,9 +506,19 @@ func _gui_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
 		var mb := event as InputEventMouseButton
 		if mb.button_index == MOUSE_BUTTON_LEFT:
+			if mb.pressed and hit_close(mb.position):   # 关闭优先于拖动：别让 × 变成「拖一下」
+				_dragging = false
+				dismiss()
+				accept_event()
+				return
 			_dragging = mb.pressed
 			accept_event()
 	elif event is InputEventMouseMotion:
+		var over := hit_close((event as InputEventMouseMotion).position)
+		if over != _hover_close:
+			_hover_close = over
+			mouse_default_cursor_shape =	Control.CURSOR_POINTING_HAND if over else Control.CURSOR_DRAG
+			queue_redraw()
 		if not _dragging:
 			return
 		_drag_step((event as InputEventMouseMotion).relative,
