@@ -1,0 +1,6 @@
+# 引擎本体 / 运行库 / 权重 / analysis 配置 / OpenCL 调优缓存：归部署侧持有，不入库
+# （server.py 的 BUNDLED_ENGINE_DIR 会从这里兜底找引擎，约 93 MB）
+engine/
+
+# 运行产物：引擎自己的日志（proc.py 用 -override-config logDir= 指到这）
+logs/

@@ -5,9 +5,15 @@
 定式识别器：纯本地计算、零引擎调用（每手几十次比较，不在热路径上）
 做法：取「最新一手所在角」的全部着子序列做角部归一化，
      再对定式库做 4 组变换（2 朝向 × 2 换色）下的最长前缀游走。
-识别结果：
-  formed   —— 序列恰好走完某条定式（刚成型）：points = 该定式实际棋盘点（供棋盘高亮轨迹）
+识别结果（统一结构，命中时一律含 kind/family/name/cat/corner/k/key/line/points/candidates/side）：
+  entered  —— 角内**恰好 2 手**吻合库中某条起手：line = 这一课的核心手顺（刚进入这一课；2 手条目
+               同样算进入）。优先级高于 formed 与 branch（U52），候选照旧带在 candidates 里
+  branch   —— 角内全部手都吻合、但第 k+1 手存在分歧：candidates = 其余线条的落点与整条线
+               （角内恰好 2 手的那一次由 entered 接手；现实库的分岔落在 index ≥ 3）
+  formed   —— 序列恰好走完某条定式（len(条目) ≥ 3；刚成型）：points = 该定式实际棋盘点（供棋盘高亮轨迹）
   deviated —— 玩家在角内落子偏离了已吻合 ≥MIN_PREFIX 手的定式：expect = 库中下一手的棋盘点
+其余情况一律不出结果：角内最后一手没吻合共享前缀（含不足 2 手）、以及 k == len(seq) > 2 且无
+分歧的「中段推进」——后者按设计保持沉默，由编排走普通点评。
 """
 
 from . import board
@@ -20,7 +26,10 @@ class JosekiData:
     编码：每条 seq 为 [[col, nx, ny], ...]
       - col：0 = 该角先落子的一方，1 = 另一方（识别时两种换色都会尝试）
       - nx/ny：角部归一化坐标（0 基，距角越近越小；星位=(3,3) 小目=(2,3) 三三=(2,2)）
-      - 只写一种朝向；对角镜像由识别器自动覆盖；pass 与角外的着手在识别时自动跳过
+      - 只写一种朝向；对角镜像由识别器自动覆盖。**例外**是 `star_33`（挡另一边）与
+        `sansan_kakari`（顶这边 / 顶那边）这两族：它们把**两个朝向都显式写成两条线**，目的就是让
+        识别器在「同一手有两个对称走法」时判出**分岔**（`branch`）——不要当成重复条目清理掉；
+        pass 与角外的着手在识别时自动跳过
     数据来源：本地 KataGo（b18c384nbt，400 visits）自对弈实测提取（2026-10）
     条目分工：核心（约 4 手）负责「成型讲解」；延伸条目用于继续跟线、避免把正常次序误判为偏离
     """
@@ -28,41 +37,141 @@ class JosekiData:
     LIST = [
         # —— 星位（4-4）· 点三三 ——
         {
-            "name": "点三三·基本型", "cat": "star",
+            "name": "点三三·基本型", "cat": "star", "family": "star_33",
             "seq": [[0, 3, 3], [1, 2, 2], [0, 2, 3], [1, 3, 2]],
             "key": "对方点三三就还他角地：挡在这边守住外侧，之后可以先手转向别处——现在最常见的开局就是它。",
         },
         {
-            "name": "点三三·定形", "cat": "star",
+            "name": "点三三·定形", "cat": "star", "family": "star_33",
             "seq": [[0, 3, 3], [1, 2, 2], [0, 2, 3], [1, 3, 2], [0, 5, 2], [1, 4, 2], [0, 4, 3], [1, 5, 1]],
             "key": "点三三之后的定形：先小飞取外势，再顺势压过来，对方爬边做活。走完角上告一段落。",
         },
         {
-            "name": "点三三·定形", "cat": "star",
+            "name": "点三三·定形", "cat": "star", "family": "star_33",
             "seq": [[0, 3, 3], [1, 2, 2], [0, 2, 3], [1, 3, 2], [0, 4, 3], [1, 5, 2]],
             "key": "点三三之后的另一个次序：先压再飞，效果一样——外势取到、角地给对方，之后转大场。",
         },
         # —— 星位 · 小飞挂 ——
         {
-            "name": "小飞挂·靠压定式", "cat": "star",
+            "name": "小飞挂·靠压定式", "cat": "star", "family": "star_kakari_small",
             "seq": [[0, 3, 3], [1, 5, 2], [0, 4, 2], [1, 5, 3]],
             "key": "对方小飞挂角时靠上去再长：把他压低、自己走厚，是很稳的应对。",
         },
         {
-            "name": "小飞挂·靠压定形", "cat": "star",
+            "name": "小飞挂·靠压定形", "cat": "star", "family": "star_kakari_small",
             "seq": [[0, 3, 3], [1, 5, 2], [0, 4, 2], [1, 5, 3], [0, 3, 5]],
             "key": "靠压之后拆二安定：这块棋已经站稳，可以放心脱先去下别处。",
         },
         # —— 星位 · 双飞燕 ——
         {
-            "name": "双飞燕·靠压一边", "cat": "star",
+            "name": "双飞燕·靠压一边", "cat": "star", "family": "star_double_kakari",
             "seq": [[0, 3, 3], [1, 2, 5], [1, 5, 2], [0, 3, 5]],
             "key": "对方两边小飞挂（双飞燕）时先靠住一边：别两边都想要，处理完一边再回头。",
         },
         {
-            "name": "双飞燕·靠压一边", "cat": "star",
+            "name": "双飞燕·靠压一边", "cat": "star", "family": "star_double_kakari",
             "seq": [[0, 3, 3], [1, 2, 5], [1, 5, 2], [0, 3, 5], [1, 3, 6], [0, 4, 5], [1, 2, 3]],
             "key": "双飞燕继续：靠完之后顺势连长，把外势往中央走，将来再经营另一边。",
+        },
+        # —— 星位（4-4）· 小飞挂 · 小飞应 ——
+        {
+            "name": "小飞挂·小飞应", "cat": "star", "family": "star_kakari_small",
+            "seq": [[0, 3, 3], [1, 5, 2], [0, 2, 5]],
+            "key": "对方小飞挂进来不必贴上去：自己在另一边小飞一手，角地守住了，外边也顺手张开，是很稳的应法。",
+        },
+        {
+            "name": "小飞挂·小飞应定形", "cat": "star", "family": "star_kakari_small",
+            "seq": [[0, 3, 3], [1, 5, 2], [0, 2, 5], [1, 5, 4]],
+            "key": "小飞应之后对方在外面拆二安定下来：角上已经结实，可以放手去下别处，外势留给他慢慢经营。",
+        },
+        # —— 星位（4-4）· 守角 ——
+        {
+            "name": "星位·小飞守角", "cat": "star", "family": "star_shimari",
+            "seq": [[0, 3, 3], [0, 5, 2]],
+            "key": "星位不用急着挂别人，先小飞守角把角地做实：这两手一落角就是你的，之后放心去抢大场。",
+        },
+        {
+            "name": "星位·守角后被挂角", "cat": "star", "family": "star_shimari",
+            "seq": [[0, 3, 3], [0, 5, 2], [1, 2, 5], [0, 2, 7]],
+            "key": "守角之后对方来挂角：角地已经归你，顺手占住另一条三路上的大场，他外边那手还得自己补。",
+        },
+        # —— 星位（4-4）· 大飞挂（隔两路的低挂） ——
+        {
+            "name": "星位·大飞挂", "cat": "star", "family": "star_kakari_big",
+            "seq": [[0, 3, 3], [1, 6, 2]],
+            "key": "对方大飞挂隔得远，一时杀不进来：先占大场，回头再补角也来得及。",
+        },
+        {
+            "name": "星位·大飞挂定形", "cat": "star", "family": "star_kakari_big",
+            "seq": [[0, 3, 3], [1, 6, 2], [1, 2, 5], [0, 5, 3]],
+            "key": "大飞挂之后你若脱先，他会从另一边再小飞挂过来，这时一间跳补住角最省事——角还是你的，他只能走在外边。",
+        },
+        # —— 星位（4-4）· 一间挂（隔一路的高挂） ——
+        {
+            "name": "星位·一间挂", "cat": "star", "family": "star_kakari_one",
+            "seq": [[0, 3, 3], [1, 3, 5]],
+            "key": "对方一间挂隔着一路、角上并不吃紧：先看他想走哪边，别急着贴上去。",
+        },
+        {
+            "name": "星位·一间挂定形", "cat": "star", "family": "star_kakari_one",
+            "seq": [[0, 3, 3], [1, 3, 5], [1, 5, 3], [0, 2, 5]],
+            "key": "一间挂之后你脱先，他会再走一手往外张开；等他形状走出来，你再小飞护角，外边自然就厚了。",
+        },
+        # —— 小目（3-4）· 小飞挂 ——
+        {
+            "name": "小目·小飞挂（尖应）", "cat": "komoku", "family": "komoku_small_kakari",
+            "seq": [[0, 3, 2], [1, 2, 4], [0, 4, 3]],
+            "key": "小目被小飞挂时贴着角尖一手：把他挡在外面，角地稳稳归你，外边的模样也顺手张开。",
+        },
+        {
+            "name": "小目·小飞挂（飞应）", "cat": "komoku", "family": "komoku_small_kakari",
+            "seq": [[0, 3, 2], [1, 2, 4], [0, 5, 3]],
+            "key": "小目被小飞挂也可以飞应：不跟他接触、先把角围起来，让他自己在外面走。",
+        },
+        # —— 小目（3-4）· 守角 ——
+        {
+            "name": "小目·一间跳守角", "cat": "komoku", "family": "komoku_shimari",
+            "seq": [[0, 3, 2], [0, 3, 4]],
+            "key": "小目不必等对方来挂也能先守：自己一间跳就是守角，角地立刻实在，两边都好下。",
+        },
+        # —— 小目（3-4）· 一间低挂 ——
+        {
+            "name": "小目·一间低挂", "cat": "komoku", "family": "komoku_low_kakari",
+            "seq": [[0, 3, 2], [1, 5, 2], [0, 3, 4]],
+            "key": "对方一间低挂时，直接一间跳守角最简单：角归你，他在外边那手还得自己补。",
+        },
+        # —— 三三（3-3）· 被挂角 ——
+        {
+            "name": "三三·被挂角（顶这边）", "cat": "san", "family": "sansan_kakari",
+            "seq": [[0, 2, 2], [1, 3, 3], [0, 3, 2], [1, 4, 3]],
+            "key": "三三被对方从星位方向挂进来时，挨着他顶一手最实在：角地还留在你手里，外围顺着长出去。",
+        },
+        {
+            "name": "三三·被挂角（顶那边）", "cat": "san", "family": "sansan_kakari",
+            "seq": [[0, 2, 2], [1, 3, 3], [0, 2, 3], [1, 3, 4]],
+            "key": "从另一边顶也一样：你贴住他、角地留在自己手里，让他顺着外面长出去。",
+        },
+        # —— 星位（4-4）· 点三三 · 挡另一边（T11 修复轮 U49 补：与上面「点三三」同形，另一条挡法） ——
+        {
+            "name": "点三三·挡另一边", "cat": "star", "family": "star_33",
+            "seq": [[0, 3, 3], [1, 2, 2], [0, 3, 2], [1, 2, 3]],
+            "key": "点三三也能从另一边挡：角地让给他、自己贴住外边取势，这条边走厚之后就能先手去下别处。",
+        },
+        {
+            "name": "点三三·挡另一边定形", "cat": "star", "family": "star_33",
+            "seq": [[0, 3, 3], [1, 2, 2], [0, 3, 2], [1, 2, 3], [0, 2, 5], [1, 2, 4], [0, 3, 4], [1, 1, 5]],
+            "key": "从另一边挡下去的定形：再小飞一手把外边走厚，对方爬边做活，角上就此告一段落。",
+        },
+        # —— 小目（3-4）· 小飞挂 · 尖顶（T11 修复轮 U51 补：引擎自己的候选 C16 及其 PV） ——
+        {
+            "name": "小目·小飞挂（尖顶）", "cat": "komoku", "family": "komoku_tsuke",
+            "seq": [[0, 3, 2], [1, 2, 4], [0, 2, 3]],
+            "key": "小目被小飞挂时贴着他尖顶一手：角地立刻守住，他只能顺着外面长出去，你顺势小飞起来。",
+        },
+        {
+            "name": "小目·小飞挂（尖顶定形）", "cat": "komoku", "family": "komoku_tsuke",
+            "seq": [[0, 3, 2], [1, 2, 4], [0, 2, 3], [1, 3, 4], [0, 5, 3]],
+            "key": "尖顶之后他往外长、你顺势小飞：角上是你的，外边这一块也站住了，可以放心脱先。",
         },
     ]
 
@@ -128,6 +237,62 @@ def _better(a, b):
     return a[2] > b[2]
 
 
+def _entry_best(seq, pat, first_col):
+    """某一条库条目在 4 组变换（2 朝向 × 2 换色）下的最长吻合；一手都不吻合返回 None。"""
+    b = None
+    for tr in (False, True):
+        for same in (True, False):
+            k = _match_prefix(seq, pat, first_col, tr, same)
+            if k <= 0:
+                continue
+            score = [1 if (k == len(pat) and k == len(seq)) else 0, k, len(pat)]
+            if b is None or _better(score, b["score"]):
+                b = {"k": k, "tr": tr, "same": same, "score": score}
+    return b
+
+
+def _pat_line(c, pat, first_col, tr, same):
+    """库里一条定式的全部着子落到真实棋盘坐标：元素 {"x","y","c"}，长度＝len(pat)。"""
+    out = []
+    for item in pat:
+        want = first_col if (item[0] == 0) == same else _opp(first_col)
+        px = item[2] if tr else item[1]
+        py = item[1] if tr else item[2]
+        xy = _denorm(c, px, py)
+        out.append({"x": int(xy[0]), "y": int(xy[1]), "c": want})
+    return out
+
+
+def _prefix_ok(seq, line, k):
+    """映射回真实棋盘的前 k 手与既有角内序列逐手一致（颜色 + 坐标）。"""
+    for i in range(k):
+        if line[i]["c"] != str(seq[i]["col"]):
+            return False
+        if line[i]["x"] != int(seq[i]["gx"]) or line[i]["y"] != int(seq[i]["gy"]):
+            return False
+    return True
+
+
+def _hit(kind, ref, c, side, k, points, candidates, expect=None):
+    """命中结果的基础结构：保证键集一致；name/cat/key/family 与 line 一律取自显示线 ref。"""
+    out = {
+        "kind": kind,
+        "family": str(ref["e"]["family"]),
+        "name": str(ref["e"]["name"]),
+        "cat": str(ref["e"]["cat"]),
+        "corner": CORNERS[c],
+        "side": side,
+        "k": k,
+        "key": str(ref["e"]["key"]),
+        "line": ref["line"],
+        "points": points,
+        "candidates": candidates,
+    }
+    if expect is not None:
+        out["expect"] = expect
+    return out
+
+
 class JosekiRecognizer:
     @staticmethod
     def scan(moves):
@@ -173,15 +338,12 @@ class JosekiRecognizer:
             pat = e["seq"]
             if len(pat) < 2:
                 continue
-            for tr in (False, True):
-                for same in (True, False):
-                    k = _match_prefix(seq, pat, first_col, tr, same)
-                    if k <= 0:
-                        continue
-                    complete = k == len(pat) and k == len(seq)
-                    score = [1 if complete else 0, k, len(pat)]
-                    if not best or _better(score, best["score"]):
-                        best = {"e": e, "k": k, "tr": tr, "same": same, "score": score, "complete": complete}
+            b = _entry_best(seq, pat, first_col)
+            if b is None:
+                continue
+            if not best or _better(b["score"], best["score"]):
+                best = {"e": e, "k": b["k"], "tr": b["tr"], "same": b["same"],
+                        "score": b["score"], "complete": b["score"][0] == 1}
         if not best:
             return {}
         k = best["k"]
@@ -189,27 +351,92 @@ class JosekiRecognizer:
         pat = e["seq"]
         # side：以「角内最后一手」是谁下的为准（成型时即 k-1，偏离时即刚落的第 k+1 手）
         side = "player" if str(seq[-1]["col"]) == "B" else "azure"
-        base = {
-            "name": str(e["name"]), "cat": str(e["cat"]),
-            "corner": CORNERS[c], "side": side, "k": k,
-        }
-        if best["complete"]:
-            pts = []
-            for i in range(k):
-                pts.append((int(seq[i]["gx"]), int(seq[i]["gy"])))
-            base["kind"] = "formed"
-            base["key"] = str(e["key"])
-            base["points"] = pts
-            return base
-        # 4) 偏离：玩家刚在角内落子、且与某个已吻合 4+ 手的定式不同（只对玩家开口，避免打扰）
+        # 4) 共享前缀集合：每条库条目各自取最长吻合，吻合 ≥k 手、且前 k 手映射回真实棋盘与既有
+        #    角内序列逐手一致者入选（因此至少含 legacy 选中的那一条）——用于挑显示线与候选。
+        shared = []
+        for e2 in JosekiData.LIST:
+            pat2 = e2["seq"]
+            if len(pat2) < 2:
+                continue
+            b2 = _entry_best(seq, pat2, first_col)
+            if b2 is None or b2["k"] < k:
+                continue
+            line2 = _pat_line(c, pat2, first_col, b2["tr"], b2["same"])
+            if not _prefix_ok(seq, line2, k):
+                continue
+            shared.append({"e": e2, "line": line2})
+        # 5) 偏离：玩家刚在角内落子、且与某个已吻合 MIN_PREFIX+ 手的定式不同（只对玩家开口，避免打扰）
+        #    判定与 expect 取值沿用现状。
+        expect = None
         if k >= MIN_PREFIX and len(pat) > k and len(seq) == k + 1 and side == "player":
             item = pat[k]
             want_col = first_col if (item[0] == 0) == best["same"] else _opp(first_col)
             if str(seq[k]["col"]) == want_col:
                 ex = int(item[2]) if best["tr"] else int(item[1])
                 ey = int(item[1]) if best["tr"] else int(item[2])
-                base["kind"] = "deviated"
-                base["key"] = str(e["key"])
-                base["expect"] = _denorm(c, ex, ey)
-                return base
-        return {}
+                expect = _denorm(c, ex, ey)
+        # 6) 显示线 ref：偏离时取 legacy 选中条目（它正是含「正解」expect 的那条，让 name/key 与 line
+        #    自洽）；其余情况取 shared 中最短的一条＝这一课的核心手顺。取不到就不出结果。
+        if expect is not None:
+            ref = {"e": e, "line": _pat_line(c, pat, first_col, best["tr"], best["same"])}
+        else:
+            ref = None
+            for s in shared:
+                if ref is None or len(s["e"]["seq"]) < len(ref["e"]["seq"]):
+                    ref = s
+        if ref is None:
+            return {}
+        # 7) 候选：与显示线共享前 k 手、第 k+1 手（0 基 index=k）落在不同点的其余线条；
+        #    显示线没有第 k+1 手时全收，按落点去重。分岔的两个候选必须是**同一方**的两种走法：
+        #    不同朝向会把两条不同课的线凑到同一前缀，出现「参考线的下一步是黑、候选却是白」的
+        #    自相矛盾画法，故锚定显示线第 k 手的颜色，只留同色的候选线。
+        ref_next = None
+        ref_col = None
+        if len(ref["line"]) > k:
+            ref_next = (int(ref["line"][k]["x"]), int(ref["line"][k]["y"]))
+            ref_col = str(ref["line"][k]["c"])
+        candidates = []
+        seen = []
+        for s in shared:
+            if s["e"] is ref["e"]:
+                continue
+            if len(s["e"]["seq"]) <= k:
+                continue
+            item = s["line"][k]
+            if ref_col is not None and str(item["c"]) != ref_col:
+                continue
+            nxt = (int(item["x"]), int(item["y"]))
+            if ref_next is not None and nxt == ref_next:
+                continue
+            if nxt in seen:
+                continue
+            seen.append(nxt)
+            candidates.append({
+                "name": str(s["e"]["name"]), "family": str(s["e"]["family"]),
+                "next": nxt, "line": s["line"],
+            })
+        # 8) 分类（U52/U53）：**进入优先**——角内恰好 2 手、吻合库中某条起手时一律判「进入」，
+        #    优先级高于「收尾」（2 手条目在第 2 手不判 formed：那只是认出了这个字形，角并没走完，
+        #    判 formed 会让卡片当场 `clear()`，11 族里有 4 族的参考图永远打不出来）与「分岔」
+        #    （候选**照旧**填进结果，两种走法交给卡片——这一刻还没轮到谁选点，第一句该说的是
+        #    「这一角开始走 X」）。
+        #    其余情况：分岔只在「轮到你在这一角选点」时才成立——角内最后一手必须正好吻合那条共享
+        #    前缀（k == len(seq)）；最后一手已出线时既不是分岔也不是进入（k ≥ MIN_PREFIX 的真偏离由
+        #    上面 deviated 处理，k < MIN_PREFIX 不打扰）。k == len(seq) > 2 且无候选是「正跟着书
+        #    走的中段」，按设计必须沉默：识别器不出结果，编排自然走普通点评（T7 的前提）。
+        if k == 2 and len(seq) == 2:
+            kind = "entered"
+        elif best["complete"]:
+            kind = "formed"
+        elif expect is not None:
+            kind = "deviated"
+        elif k != len(seq):
+            return {}
+        elif candidates:
+            kind = "branch"
+        else:
+            return {}
+        pts = []
+        for i in range(k):
+            pts.append((int(seq[i]["gx"]), int(seq[i]["gy"])))
+        return _hit(kind, ref, c, side, k, pts, candidates, expect)

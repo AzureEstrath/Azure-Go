@@ -12,6 +12,35 @@ const TTS_VOICE_DEFAULT := "中文女"
 
 var max_visits := 500
 var joseki_teach := true          # 定式导学：识别对局中走出的定式并讲解（右侧栏可关；关掉=行为零变化）
+var joseki_rate := 0.5            # 定式提示频率（0~1，与开关同一格）：门控的基础概率；关闭档不动它，重新开启时频率能回来
+## 情绪波动（v3.8.0）：小概率不走最优解、在 A/B/C 三条预测线里挑（越偏越少）。
+## 默认关；关掉=行为零变化（恒走最优解、不掷骰、不记事件）。开关与参数同在 ⚙ 设置抽屉的一格里。
+var emotion_drift := false
+var drift_base := 0.03            # 偏航的基础概率（0~1，与开关同一格）；关闭档不动它，重新开启时概率能回来
+## `drift_max` 的**只读镜像**（v3.9.0 / R-P3-4 彻底收口）：从 `config.json` 读、默认 `0.08`、脏值 → 默认。
+## 前端**不写它、不推它**（`save()` 不落这个键、`/api/config` 也不发），只拿它当 `drift_base` 的
+## 夹取上限；手改过的值随 `_raw` 原样保留。这样手改 `drift_max` 时两端读到的上限始终一致。
+var drift_max := 0.08
+const DRIFT_BASE_DEFAULT := 0.03  # 与 `AzureConfig.drift_base` 的字段默认 / 后端 `config.drift_base` 一致
+## `drift_base` 的**缺省上限**（v3.8.0 修复波 / #4）：＝后端 `config.drift_max` 的默认（0.08）。
+## 后端 `_apply` 把 `drift_base` 夹到 `min(值, drift_max)`、`drift_max` 另夹到 0.2；客户端过去
+## 只夹到 `[0, 1]`，于是手改 `config.json` 写 `drift_base: 0.5` 时**前端留 0.5、后端是 0.08**。
+## v3.9.0 起上限改读只读镜像 `drift_max`（见上），这个常量降级为「`drift_max` 缺省时的默认值」。
+const DRIFT_BASE_LIMIT := 0.08
+## `drift_max` 的默认（与后端 `config.drift_max` 一致）：镜像缺键 / 脏值时用它。
+const DRIFT_MAX_DEFAULT := 0.08
+## 后端配置层给 `drift_max` 的另一道上限（`config.DRIFT_MAX_LIMIT = 0.2`）：镜像也照此夹，
+## 免得手改一个 `5.0` 时前端留 `5.0`、后端却只认 `0.2`。
+const DRIFT_MAX_LIMIT := 0.2
+## 聊天摘要用 LLM（v3.8.0）：默认关——聊天摘要走**规则式**（纯函数分段 + 模板摘要）、**零额外 LLM 调用**；
+## 开启后**只在局末 / 空闲**用 LLM 分段总结（落子回合内绝不加调用）。开关在 ⚙ 设置抽屉里。
+var chat_digest_llm := false
+## 玩家棋风画像（v3.9.0）：跨局攒「她眼中的你」，手动结束对局时写进后端的 profile.db。
+## 默认关；关掉=行为零变化（不注入画像块、不写记录、不攒画像）。开关与只读面板同在 ⚙ 设置抽屉的一格里。
+var profile_enabled := false
+## 时间感知（v3.9.0）：让她知道现在几点、这一局下了多久、你多久没来、连续第几天。
+## 默认关；关掉=行为零变化（不注入时间块）。与画像开关同一格、**一次推一次** `/api/config`。
+var time_aware_enabled := false
 # —— 前后端架构 ——
 # 编排（KataGo / LLM / 定式 / 情绪）全部在后端服务进程，游戏只做渲染与语音，经 REST + WebSocket 通信
 var backend_url := "http://127.0.0.1:8000"   # 后端服务地址（WS 地址由其推导）
@@ -64,6 +93,13 @@ static func load_config(path := "") -> AzureConfig:
 			c._raw = (d as Dictionary).duplicate()
 			c.max_visits = int(d.get("max_visits", c.max_visits))
 			c.joseki_teach = bool(d.get("joseki_teach", c.joseki_teach))
+			c.joseki_rate = _normalize_joseki_rate(d.get("joseki_rate", c.joseki_rate))
+			c.emotion_drift = _normalize_flag(d.get("emotion_drift"), c.emotion_drift)
+			c.drift_max = _normalize_drift_max(d.get("drift_max", c.drift_max))
+			c.drift_base = _normalize_drift_base(d.get("drift_base", c.drift_base), c.drift_max)
+			c.chat_digest_llm = _normalize_flag(d.get("chat_digest_llm"), c.chat_digest_llm)
+			c.profile_enabled = _normalize_flag(d.get("profile_enabled"), c.profile_enabled)
+			c.time_aware_enabled = _normalize_flag(d.get("time_aware_enabled"), c.time_aware_enabled)
 			c.backend_url = str(d.get("backend_url", c.backend_url))
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
@@ -105,6 +141,72 @@ static func _normalize_tts_voice(v: String) -> String:
 	var s := v.strip_edges()
 	return TTS_VOICE_DEFAULT if s.to_lower() in LEGACY_TTS_VOICES else s
 
+## 定式频率归一化：**与后端 `config._apply` 同口径**——数值（含数字字符串）越界夹到 [0,1]；
+## 脏值（非数字 / null / 数组等）退回默认 0.5，不让一个旋钮把启动搞崩。JSON 的 true/false 按
+## Python `float(bool)` 的语义折成 1.0/0.0（后端也是这么算的）。
+## 数值与字符串**共用 `_clamp_rate` 这一套守卫**：字符串单独一套判据会出现「同一个值经 JSON
+## 数字 / 字符串两条路读出来不一样」的坑（R-F-2 #5）。字符串认不出数字就退回默认 0.5。
+static func _normalize_joseki_rate(v) -> float:
+	match typeof(v):
+		TYPE_INT, TYPE_FLOAT:
+			return _clamp_rate(float(v))
+		TYPE_STRING:
+			var s := (v as String).strip_edges()
+			return _clamp_rate(s.to_float()) if s.is_valid_float() else 0.5
+		TYPE_BOOL:
+			return 1.0 if v else 0.0
+		_:
+			return 0.5
+
+## 频率的唯一守卫：NaN ⇒ 默认 0.5（脏值不当成 0 或 1），其余夹到 [0,1]。
+## **有意不拦 INF**：`clampf(INF, 0, 1)` = 1.0，与后端 `min(1.0, inf)` 一致（JSON 的 1e999 两端都当 1.0）。
+static func _clamp_rate(f: float) -> float:
+	return 0.5 if is_nan(f) else clampf(f, 0.0, 1.0)
+
+## 布尔开关归一化（v3.8.0 / 修复轮 1 / Minor #7）：**只认 JSON 的 true / false**。
+## GDScript 的 `bool("false")` 是 `true`，直接用它会把字符串脏值读成「开」；数字 / null 同理当脏值，
+## 一律退回默认（`fallback`）。本批新加的开关用它；既有开关的读法一个字不动。
+static func _normalize_flag(v, fallback: bool) -> bool:
+	return v if typeof(v) == TYPE_BOOL else fallback
+
+## 偏航基础概率归一化：与 `joseki_rate` **同一套守卫**（数值 / 字符串共用判据、NaN ⇒ 默认 0.03、
+## 脏值不把启动搞崩），但**夹取上限不同**：夹到 `[0, limit]`（`limit` 缺省＝`DRIFT_MAX_DEFAULT`，
+## 生产路径传只读镜像 `drift_max`），让两端读到同一个值（v3.8.0 修复波 / #4 → v3.9.0 镜像化）。
+static func _normalize_drift_base(v, limit := DRIFT_MAX_DEFAULT) -> float:
+	match typeof(v):
+		TYPE_INT, TYPE_FLOAT:
+			return _clamp_drift_base(float(v), limit)
+		TYPE_STRING:
+			var s := (v as String).strip_edges()
+			return _clamp_drift_base(s.to_float(), limit) if s.is_valid_float() else DRIFT_BASE_DEFAULT
+		TYPE_BOOL:
+			return 1.0 if v else 0.0
+		_:
+			return DRIFT_BASE_DEFAULT
+
+## 基础概率的唯一守卫：NaN ⇒ 默认 0.03（脏值不当成 0 或 1），其余夹到 `[0, limit]`。
+## ⚠ 上限是 `limit`（只读镜像 `drift_max`，缺省 0.08）而**不是 1.0**：见 `DRIFT_BASE_LIMIT` 的注释。
+static func _clamp_drift_base(f: float, limit := DRIFT_MAX_DEFAULT) -> float:
+	return DRIFT_BASE_DEFAULT if is_nan(f) else clampf(f, 0.0, limit)
+
+## `drift_max` 只读镜像归一化（v3.9.0）：与 `drift_base` **同一套守卫**（数值 / 字符串共用判据、
+## NaN ⇒ 默认 0.08、脏值不把启动搞崩），上限是后端配置层的 `DRIFT_MAX_LIMIT`（0.2）。
+static func _normalize_drift_max(v) -> float:
+	match typeof(v):
+		TYPE_INT, TYPE_FLOAT:
+			return _clamp_drift_max(float(v))
+		TYPE_STRING:
+			var s := (v as String).strip_edges()
+			return _clamp_drift_max(s.to_float()) if s.is_valid_float() else DRIFT_MAX_DEFAULT
+		TYPE_BOOL:
+			return 1.0 if v else 0.0
+		_:
+			return DRIFT_MAX_DEFAULT
+
+## 镜像的唯一守卫：NaN ⇒ 默认 0.08，其余夹到 `[0, DRIFT_MAX_LIMIT]`（与后端 `_apply` 同形）。
+static func _clamp_drift_max(f: float) -> float:
+	return DRIFT_MAX_DEFAULT if is_nan(f) else clampf(f, 0.0, DRIFT_MAX_LIMIT)
+
 ## 写回配置文件（语音设置改动后调用，下次启动仍生效）
 func save() -> bool:
 	if _path == "":
@@ -123,6 +225,13 @@ func save() -> bool:
 	d.erase("katago_config")
 	d["max_visits"] = max_visits
 	d["joseki_teach"] = joseki_teach
+	d["joseki_rate"] = joseki_rate                 # 与开关同一格：关闭档也写回（重新开启时频率能回来）
+	d["emotion_drift"] = emotion_drift
+	d["drift_base"] = drift_base                   # 与开关同一格：关闭档也写回（重新开启时概率能回来）
+	# `drift_max` 是**只读镜像**（v3.9.0）：前端不写它、也不推它——手改过的值随 `_raw` 原样保留。
+	d["chat_digest_llm"] = chat_digest_llm        # 聊天摘要用 LLM（默认关）：单字段开关，写回即生效
+	d["profile_enabled"] = profile_enabled        # 玩家棋风画像（默认关）：与下面的时间感知同一格
+	d["time_aware_enabled"] = time_aware_enabled  # 时间感知（默认关）：两个字段一起原子推一次 `/api/config`
 	d.erase("backend_mode")                       # 只剩「连后端」一条路径：旧配置里的 backend_mode 不再写回
 	d["backend_url"] = backend_url
 	d["llm_base_url"] = llm_base_url

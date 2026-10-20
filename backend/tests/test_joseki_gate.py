@@ -1,0 +1,566 @@
+"""定式提示门控（计划 07 · Task 5 / v3.7.0）：**资格层 + 频率层**。
+
+11 个用例名逐字来自任务书 Step 1（``test_rate_zero_never_shows`` … ``test_undo_returns_the_count``）；
+其余是接线用例（``player_ranks`` 局内信号、冷却经 agent 生效、``/api/config`` 透传）。
+
+口径（全篇最重要的简化）：
+- 资格层：族计数 ``< 3`` 有资格；``>= 3`` 只在「走错」（真亏且偏离库线）时有资格；``joseki_teach=false``
+  一律无资格；
+- 频率层：有资格时掷一次 ``p = clamp(rate + skill_adj + mood_adj, 0, 1)``；**未命中与「没识别到定式」
+  逐字段同构**（只点评这一手）；
+- 走错 → 必讲（绕过频率层与冷却）；结构点（进入 / 分岔 / 收尾）→ 走频率层；中间推进识别器自己沉默。
+
+随机数一律**注入**（``joseki_gate`` 的纯函数拿 ``rng``；agent 侧持默认 rng，可注入替身），
+所以本文件一条断言都不依赖真随机。
+"""
+
+import asyncio
+import os
+import random
+import sys
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # backend/（app.*）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))                     # tests/（helpers）
+
+from app import coords, events, joseki_gate, prompts
+from app.agent import AzureAgent
+from app.agent_graph import PHASE_AFTER_PLAYER, PHASE_OWN_TURN
+from app.joseki import JosekiRecognizer
+from app.joseki_progress import JosekiProgress
+from helpers import StubEngine, StubLLM, mk_agent
+
+
+# ================= 替身 =================
+
+class _FixedRng:
+    """固定随机数的 rng 替身：注入它就等于「这一次掷出多少」完全可控。"""
+
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def random(self):
+        self.calls += 1
+        return self.value
+
+
+class _FakeProgress:
+    """族计数替身：只记账、不碰磁盘（契约与 ``JosekiProgress`` 的四个方法一致）。"""
+
+    def __init__(self, seen_counts=None):
+        self.seen_counts = dict(seen_counts or {})
+        self.bumps = []
+        self.unbumps = []
+
+    def seen(self, family):
+        return int(self.seen_counts.get(family, 0))
+
+    def bump(self, family):
+        self.seen_counts[family] = self.seen(family) + 1
+        self.bumps.append(family)
+        return self.seen_counts[family]
+
+    def unbump(self, family):
+        self.seen_counts[family] = max(0, self.seen(family) - 1)
+        self.unbumps.append(family)
+        return self.seen_counts[family]
+
+    def forget_all(self):
+        n = len(self.seen_counts)
+        self.seen_counts.clear()
+        return n
+
+
+def _seed(agent, seq):
+    """把一串 ``[color, gtp]`` 直接铺进棋盘与棋谱（绕过编排，好造出确定的角部手顺）。"""
+    for color, gtp in seq:
+        x, y = coords.gtp_to_xy(gtp)
+        agent.st.board.play(x, y, "black" if color == "B" else "white")
+        agent.st.add_move(color, gtp)
+
+
+def _agent(progress=None, **kw):
+    return AzureAgent(StubEngine(), StubLLM(), events.RecordingBus(),
+                      joseki_progress=progress, **kw)
+
+
+# ================= ① 纯函数层（注入 rng） =================
+
+class GatePureTest(unittest.TestCase):
+    """``joseki_gate`` 的纯函数：资格层 / 频率层 / 冷却 / 画像 / 情绪。"""
+
+    def test_rate_zero_never_shows(self):
+        """p=0 → 必不说（走错除外）。"""
+        rng = _FixedRng(0.0)                     # 就算掷出 0.0，p=0 也不该讲
+        for _ in range(10):
+            self.assertFalse(joseki_gate.should_show(
+                rng=rng, rate=0.0, skill_adj=0.0, mood_adj=0.0, seen=0, kind="entered",
+                mistake=False, teach_on=True, last_taught_move=None, move_no=3))
+        self.assertEqual(rng.calls, 0, "p=0 连掷都不该掷（确定性）")
+        # 走错例外：p=0 也必讲
+        self.assertTrue(joseki_gate.should_show(
+            rng=rng, rate=0.0, skill_adj=0.0, mood_adj=0.0, seen=0, kind="deviated",
+            mistake=True, teach_on=True, last_taught_move=None, move_no=3))
+
+    def test_rate_one_always_shows(self):
+        """p=1 → 必说（不问 rng）。"""
+        rng = _FixedRng(0.999)                   # 掷得再大也压不过 p=1
+        self.assertTrue(joseki_gate.should_show(
+            rng=rng, rate=1.0, skill_adj=0.0, mood_adj=0.0, seen=0, kind="entered",
+            mistake=False, teach_on=True, last_taught_move=None, move_no=5))
+        # 族计数已到上限（只有走错才有资格）：走错照样必说
+        self.assertTrue(joseki_gate.should_show(
+            rng=rng, rate=1.0, skill_adj=0.0, mood_adj=0.0, seen=9, kind="deviated",
+            mistake=True, teach_on=True, last_taught_move=None, move_no=5))
+        self.assertEqual(rng.calls, 0, "p=1 连掷都不该掷（确定性）")
+
+    def test_adj_clamped_to_plus_minus_10pct(self):
+        """skill_adj / mood_adj 各自截断到 ±0.10（原始值可以超界，返回的必须不超）。"""
+        self.assertEqual(joseki_gate.skill_adj([-1, -1, -1, -1], 0), 0.10)    # 生疏 + 没见过
+        self.assertEqual(joseki_gate.skill_adj([0, 1, 2, 3], 9), -0.10)       # 熟练 + 见得多
+        self.assertEqual(joseki_gate.mood_adj({"name": "兴奋"}), 0.10)        # 积极 · 好奇
+        self.assertEqual(joseki_gate.mood_adj({"name": "难过"}), -0.10)       # 消极 · 平常
+        for ranks in ([0, 1, -1], [-1], [3, 4], [], None, "oops", [None, "x"]):
+            with self.subTest(ranks=ranks):
+                self.assertLessEqual(abs(joseki_gate.skill_adj(ranks, 2)), 0.10 + 1e-9)
+        for mood in ({"name": "好奇"}, {"name": "惊慌"}, {"name": "平静"}, {}, None, "x", 5):
+            with self.subTest(mood=mood):
+                self.assertLessEqual(abs(joseki_gate.mood_adj(mood)), 0.10 + 1e-9)
+
+    def test_rng_is_reproducible(self):
+        """注入固定 rng → 决策可复现（同种子同结果；同一次掷出的值决定这一次的结果）。"""
+        def run(seed):
+            rng = random.Random(seed)
+            return [joseki_gate.should_show(
+                rng=rng, rate=0.5, skill_adj=0.0, mood_adj=0.0, seen=0, kind="entered",
+                mistake=False, teach_on=True, last_taught_move=None, move_no=i + 1)
+                for i in range(16)]
+
+        self.assertEqual(run(2026), run(2026), "同种子必须给出同一串决策")
+        # rng 真的参与决策：0.1 < 0.5 命中、0.9 > 0.5 未命中（与种子无关，逐条确定）
+        low = joseki_gate.should_show(
+            rng=_FixedRng(0.1), rate=0.5, skill_adj=0.0, mood_adj=0.0, seen=0, kind="entered",
+            mistake=False, teach_on=True, last_taught_move=None, move_no=1)
+        high = joseki_gate.should_show(
+            rng=_FixedRng(0.9), rate=0.5, skill_adj=0.0, mood_adj=0.0, seen=0, kind="entered",
+            mistake=False, teach_on=True, last_taught_move=None, move_no=1)
+        self.assertTrue(low)
+        self.assertFalse(high)
+
+    def test_cooldown_suppresses_repeat(self):
+        """同族 N 手内不重复讲（窗口外恢复；走错绕过冷却）。"""
+        rng = _FixedRng(0.0)                     # p=0.5 下掷 0.0 ⇒ 必命中
+        self.assertTrue(joseki_gate.should_show(
+            rng=rng, rate=0.5, skill_adj=0.0, mood_adj=0.0, seen=0, kind="entered",
+            mistake=False, teach_on=True, last_taught_move=None, move_no=2))
+        for move_no in range(2, 10):             # 第 2 手讲过：第 2~9 手都在窗口内
+            with self.subTest(move_no=move_no):
+                self.assertFalse(joseki_gate.should_show(
+                    rng=rng, rate=0.5, skill_adj=0.0, mood_adj=0.0, seen=0, kind="entered",
+                    mistake=False, teach_on=True, last_taught_move=2, move_no=move_no))
+        self.assertTrue(joseki_gate.should_show(
+            rng=rng, rate=0.5, skill_adj=0.0, mood_adj=0.0, seen=0, kind="entered",
+            mistake=False, teach_on=True, last_taught_move=2, move_no=10), "窗口外恢复")
+        # 走错绕过冷却
+        self.assertTrue(joseki_gate.should_show(
+            rng=rng, rate=0.5, skill_adj=0.0, mood_adj=0.0, seen=0, kind="deviated",
+            mistake=True, teach_on=True, last_taught_move=9, move_no=9))
+
+    def test_mistake_bypasses_frequency(self):
+        """走错 → 必讲：rate=0 + 冷却窗口内 + 族计数超上限，照样讲。"""
+        self.assertTrue(joseki_gate.should_show(
+            rng=_FixedRng(0.99), rate=0.0, skill_adj=0.0, mood_adj=0.0, seen=99,
+            kind="deviated", mistake=True, teach_on=True, last_taught_move=5, move_no=5))
+        self.assertFalse(joseki_gate.should_show(
+            rng=_FixedRng(0.99), rate=0.0, skill_adj=0.0, mood_adj=0.0, seen=99,
+            kind="deviated", mistake=False, teach_on=True, last_taught_move=5, move_no=5))
+
+    def test_missing_profile_or_mood_degrades(self):
+        """画像 / 情绪缺失（或脏）→ adj=0，不抛；概率算式也照样出得来。"""
+        self.assertEqual(joseki_gate.skill_adj([], 3), 0.0)
+        self.assertEqual(joseki_gate.skill_adj(None, 0), 0.0)
+        self.assertEqual(joseki_gate.mood_adj({}), 0.0)
+        self.assertEqual(joseki_gate.mood_adj(None), 0.0)
+        for bad in ("oops", 5, [None, "x"]):
+            self.assertEqual(joseki_gate.skill_adj(bad, 1), 0.0)
+        for bad in ("oops", 5, {"name": None}, {"v": "x"}, [1, 2]):
+            self.assertEqual(joseki_gate.mood_adj(bad), 0.0)
+        self.assertEqual(joseki_gate.probability("x", 0.0, 0.0), 0.0)
+        self.assertEqual(joseki_gate.probability(-1.0, 0.0, 0.0), 0.0)
+        self.assertEqual(joseki_gate.probability(2.0, 0.0, 0.0), 1.0)
+        self.assertEqual(joseki_gate.probability(0.5, 0.10, -0.10), 0.5)
+        self.assertEqual(joseki_gate.probability(0.45, 0.10, 0.10), 0.65)
+
+    def test_teach_off_is_silent(self):
+        """``joseki_teach=false`` → 资格层一律不放行（也无 joseki / 讲解 / 卡片）。"""
+        for kind in ("entered", "branch", "formed", "deviated"):
+            with self.subTest(kind=kind):
+                self.assertFalse(joseki_gate.eligible(0, kind, True, False))
+                self.assertFalse(joseki_gate.should_show(
+                    rng=_FixedRng(0.0), rate=1.0, skill_adj=0.0, mood_adj=0.0, seen=0,
+                    kind=kind, mistake=True, teach_on=False, last_taught_move=None, move_no=1))
+
+        agent, _eng, llm, bus = mk_agent()
+        agent.joseki_teach = False
+        _seed(agent, [["W", "D17"]])
+        agent._new_turn()
+        state = asyncio.run(agent._turn(PHASE_AFTER_PLAYER, {"x": 5, "y": 2}))
+
+        self.assertEqual(state["data"]["jk"], {}, "总开关关掉：识别器自己不出结果")
+        self.assertNotIn("jk_show_card", state["data"], "门控连问都不问")
+        self.assertEqual(bus.of_type("joseki"), [], "不发 joseki 事件")
+        self.assertEqual(len(bus.messages()), 1, "仍有一条普通点评")
+        self.assertIn("用你自己的口吻评", _phase_text(llm), "走的是普通点评，不是讲解模板")
+
+
+# ================= ② 接线层（agent + 图） =================
+
+def _phase_text(llm):
+    """模型收到的**阶段提示词**那一份（经 ``with_context`` 装配的才带「【现在】」）。"""
+    for msgs, _mx, _nt in llm.calls:
+        for m in msgs:
+            if str(m.get("role", "")) == "user" and "【现在】" in str(m.get("content", "")):
+                return str(m["content"])
+    return ""
+
+
+class GateWiringTest(unittest.TestCase):
+    """门控接进 ``after_player``：命中才讲 / 上卡片 / 发事件；未命中＝没识别到定式。"""
+
+    # 角内先铺 1 手（白小目 D17），玩家再落 F17(5,2) ⇒ ``entered``（小目一间低挂只有一条 3 手线）
+    ENTER_SEED = [["W", "D17"]]
+
+    def _after_player(self, agent, x=5, y=2):
+        agent._new_turn()
+        return asyncio.run(agent._turn(PHASE_AFTER_PLAYER, {"x": x, "y": y}))
+
+    def test_miss_is_identical_to_no_match(self):
+        """未命中（门控不放行）与「识别器没出声」：**事件集合逐项相等**（同一出口）。"""
+        def run(gate_miss):
+            agent, _eng, llm, bus = mk_agent()
+            # 0.0 ⇒ 必未命中（`_FixedRng(1.0)` 连 p 到边界也压不过）；1.0 ⇒ 必命中
+            agent.joseki_rate = 0.0 if gate_miss else 1.0
+            agent.joseki_rng = _FixedRng(1.0)
+            _seed(agent, self.ENTER_SEED)
+            if gate_miss:                                     # 门控未命中：识别结果在，只是不讲
+                state = self._after_player(agent)
+            else:                                             # 识别器沉默：压根没有识别结果
+                with mock.patch.object(JosekiRecognizer, "scan",
+                                       staticmethod(lambda moves: {})):
+                    state = self._after_player(agent)
+            return agent, llm, bus, state
+
+        a_agent, a_llm, a_bus, a_state = run(True)
+        b_agent, b_llm, b_bus, b_state = run(False)
+
+        self.assertEqual(str(a_state["data"]["jk"]["kind"]), "entered",
+                         "门控未命中：识别结果仍在 data 里，只是不讲")
+        self.assertIs(a_state["data"]["jk_show_card"], False)
+        self.assertEqual(b_state["data"]["jk"], {})
+
+        self.assertEqual([str(e["type"]) for e in a_bus.events],
+                         [str(e["type"]) for e in b_bus.events], "事件种类逐项相等")
+        self.assertEqual(a_bus.of_type("joseki"), [])
+        self.assertEqual(b_bus.of_type("joseki"), [])
+        self.assertEqual([e for e in a_bus.messages()], [e for e in b_bus.messages()],
+                         "台词逐字段相等（同一出口、同一模板）")
+        self.assertEqual(_phase_text(a_llm), _phase_text(b_llm), "提示词也同构")
+
+    def test_hit_teaches_emits_and_shows_the_card(self):
+        """命中（测试装配 ``joseki_rate=1.0`` ⇒ p 被夹到 1.0）：讲解模板 + 卡片 + ``joseki`` 事件。"""
+        agent, _eng, llm, bus = mk_agent()
+        _seed(agent, self.ENTER_SEED)
+        state = self._after_player(agent)
+        jk = state["data"]["jk"]
+        self.assertEqual(str(jk["kind"]), "entered")
+        self.assertIs(state["data"]["jk_show_card"], True)
+        self.assertEqual(len(bus.of_type("joseki")), 1)
+        self.assertIs(bus.of_type("joseki")[-1]["show_card"], True)
+        self.assertIn(prompts.joseki_enter_prompt(str(jk["name"]), str(jk["key"]), str(jk["corner"])),
+                      _phase_text(llm))
+        self.assertNotIn("用你自己的口吻评", _phase_text(llm), "顶替：普通点评一个字都不在")
+
+    def test_player_ranks_are_recorded_in_game_and_roll_back(self):
+        """裁决 1：棋力画像只用**局内信号**——``player_ranks`` 每手纯追加、随快照回滚、不进 payload。"""
+        agent, _eng, _llm, _bus = mk_agent()
+        _seed(agent, self.ENTER_SEED)
+        self.assertNotIn("player_ranks", agent.st.payload(), "纯局内信号：不进对外快照 payload")
+        self.assertEqual(agent.st.make_snapshot()["player_ranks"], [], "快照带上它（供回滚）")
+        self._after_player(agent)
+        self.assertEqual(len(agent.st.player_ranks), 1, "本局玩家每一手记一个 rank")
+        self.assertIn(agent.st.player_ranks[0], (-1, 0, 1, 2, 3, 4))
+        agent.undo(0)
+        self.assertEqual(agent.st.player_ranks, [], "悔棋：随快照回到当时的样子")
+
+    def test_gate_records_the_cooldown_after_a_hit(self):
+        """命中要记「这一族最近讲过的手数」：窗口内同族不再重复讲，走出窗口恢复。"""
+        agent, _eng, _llm, _bus = mk_agent()
+        agent.joseki_rate = 1.0                              # p 被夹到 1.0 ⇒ 必定讲
+        agent.joseki_rng = _FixedRng(0.0)                    # 画像 / 情绪的浮动也压不过确定性
+        jk = {"kind": "entered", "family": "star_33", "corner": "左上", "cat": "star"}
+        self.assertTrue(asyncio.run(agent.joseki_gate_show(jk, None)))
+        agent.st.add_move("B", "pass")
+        agent.st.add_move("W", "pass")
+        self.assertFalse(asyncio.run(agent.joseki_gate_show(jk, None)), "冷却窗口内：按未命中处理")
+        for _ in range(8):
+            agent.st.add_move("B", "pass")
+        self.assertTrue(asyncio.run(agent.joseki_gate_show(jk, None)), "走出窗口：恢复")
+
+    def test_cooldown_is_not_written_by_a_dead_generation(self):
+        """修复波 #3：冷却表只许由**活代**写入。
+
+        门控在资格层（``_joseki_eligibility`` 会 ``to_thread`` 读族计数，慢库下可能卡住）之后、写冷却表
+        之前可能跨过看门狗：调用方（``agent_graph`` 的 ``_alive``）会把计数与事件一起丢掉，但
+        ``_joseki_taught`` 一旦记下，这一族在冷却窗口（8 手）内就会被静默压掉一次讲解。这里让资格层
+        在返回前把代数前推一代（模拟看门狗），断言冷却表没被写、结论也不放行。
+        """
+        agent, _eng, _llm, _bus = mk_agent()
+        agent.joseki_rate = 1.0                              # p 被夹到 1.0 ⇒ 本来必定讲
+        agent.joseki_rng = _FixedRng(0.0)
+        tok = agent.begin_epoch()
+        jk = {"kind": "entered", "family": "star_33", "corner": "左上", "cat": "star"}
+        real = agent._joseki_eligibility
+
+        async def eligibility(jk_, mistake_):
+            res = await real(jk_, mistake_)
+            agent.begin_epoch()                              # 看门狗在「资格层 await」之后触发
+            return res
+
+        with mock.patch.object(agent, "_joseki_eligibility", eligibility):
+            shown = asyncio.run(agent.joseki_gate_show(jk, None, epoch=tok))
+
+        self.assertFalse(shown, "死代：门控结论不放行")
+        self.assertEqual(agent._joseki_taught, {}, "冷却表不许由会被丢弃的那一代写入")
+
+        # 对照：活代照旧记（证明上面那条不是「什么都没发生」换来的）
+        tok2 = agent.begin_epoch()
+        self.assertTrue(asyncio.run(agent.joseki_gate_show(jk, None, epoch=tok2)))
+        self.assertEqual(agent._joseki_taught, {"star_33": 0})
+
+    def test_default_rate_is_half_and_still_rolls(self):
+        """默认 ``joseki_rate = 0.5``（与 config 字段一致）：**只有一条路径**——资格层过了就掷 ``p``。
+
+        R-T5-1：不再有「``rate`` 为 ``None`` ⇒ 跳过频率层」的第二种模式（漏接线不该静默退回
+        「每次都教」）。这里直接构造 agent（``mk_agent`` 是测试装配，显式把 rate 拉满到 1.0）。
+        """
+        agent = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus())
+        self.assertEqual(agent.joseki_rate, 0.5, "默认与 config 字段一致（没有 None 哨兵）")
+        jk = {"kind": "entered", "family": "star_33", "corner": "左上", "cat": "star"}
+        # 固定 rng：0.4 < 0.5 ⇒ 命中，且命中会记下冷却起点
+        agent.joseki_rng = _FixedRng(0.4)
+        self.assertTrue(asyncio.run(agent.joseki_gate_show(jk, None)))
+        self.assertEqual(agent._joseki_taught, {"star_33": 0}, "命中记下这一族的冷却起点")
+        self.assertFalse(asyncio.run(agent.joseki_gate_show(jk, None)), "冷却窗口内：按未命中处理")
+        # 掷不中（0.6 > 0.5）⇒ 不讲、也不记冷却
+        agent2 = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus())
+        agent2.joseki_rng = _FixedRng(0.6)
+        self.assertFalse(asyncio.run(agent2.joseki_gate_show(jk, None)))
+        self.assertEqual(agent2._joseki_taught, {})
+        # 资格层照常把关：这一族已教过 3 次（走错除外）
+        agent2.joseki_progress = _FakeProgress({"star_33": 3})
+        self.assertFalse(asyncio.run(agent2.joseki_gate_show(jk, None)))
+        # 脏 rate：退回默认 0.5（不是 0.0「永不讲」，也不是 None）
+        dirty = AzureAgent(StubEngine(), StubLLM(), events.RecordingBus(), joseki_rate="oops")
+        self.assertEqual(dirty.joseki_rate, 0.5)
+
+    def test_gate_only_decides_text_and_card(self):
+        """门控不改 ``busy``、不改事件配对、不改状态机：未命中时棋子照落、谱照走。"""
+        agent, _eng, _llm, bus = mk_agent()
+        agent.joseki_rate = 0.0
+        agent.joseki_rng = _FixedRng(1.0)        # 画像给的 +10% 浮动也压不过「必不命中」
+        _seed(agent, self.ENTER_SEED)
+        before = len(agent.st.moves)
+        state = self._after_player(agent)
+        self.assertEqual(len(agent.st.moves), before + 1, "玩家那一手照常入谱")
+        self.assertEqual(agent.st.board.grid[5][2], "black", "棋子照常落到棋盘上")
+        self.assertIs(agent.busy, False, "门控不碰 busy")
+        self.assertEqual([e for e in bus.of_type("speech")], [], "未接线 TTS：一条 speech 都不发")
+        self.assertEqual(state["data"]["jk_mistake"]["gtp"], "F17", "走错判定照常算出来")
+
+
+class CountEntryTest(unittest.TestCase):
+    """族计数的两条硬口径（与 ``test_joseki_progress`` 同源，这里按任务书用例名各钉一条）。"""
+
+    def test_same_family_counts_once_per_game(self):
+        """同一局第二次进同族，计数不再 +1。"""
+        fake = _FakeProgress()
+        agent = _agent(fake)
+        jk = {"kind": "entered", "family": "star_33", "corner": "左上", "cat": "star"}
+        asyncio.run(agent.joseki_count_entry(jk))
+        asyncio.run(agent.joseki_count_entry(jk))
+        self.assertEqual(fake.bumps, ["star_33"])
+        self.assertEqual(fake.seen("star_33"), 1)
+        self.assertEqual(agent.st.joseki_counted, ["star_33"])
+
+    def test_undo_returns_the_count(self):
+        """bump 后 undo → seen 回原值（快照之前的那一次不动）。"""
+        fake = _FakeProgress()
+        agent = _agent(fake)
+        asyncio.run(agent.joseki_count_entry({"kind": "entered", "family": "star_33"}))
+        self.assertEqual(fake.seen("star_33"), 1)
+        agent.st.snapshots.append(agent.st.make_snapshot())     # 快照＝这一手之前
+        agent.st.add_move("B", "D16")
+        asyncio.run(agent.joseki_count_entry({"kind": "entered", "family": "san_san"}))
+        self.assertEqual(fake.seen("san_san"), 1)
+
+        agent.undo(0)
+        self.assertEqual(fake.seen("san_san"), 0, "这一手计的那一次退回")
+        self.assertEqual(fake.seen("star_33"), 1, "快照之前的族不动")
+        self.assertEqual(agent.st.joseki_dropped, ["san_san"])
+
+
+class CountOnlyWhenTaughtTest(unittest.TestCase):
+    """修复轮 1（评审 Important #1）：族计数＝**教过几次**，不是「遇到几次」。
+
+    端到端走 ``after_player``（门控 → 计数 → ``joseki`` 事件全在图里），固定 rng 让每一次遭遇的
+    命中 / 未命中完全确定，**一条断言都不依赖真随机**。
+
+    回归拦截：把 ``agent_graph`` 的两个调用点改回「门控未命中也无条件计数」（修复前的样子）时，
+    本用例必须变红——它断言「**计数的次数 == 实际讲解的次数**」且「未命中的那几次一次都没记」，
+    而不是「遭遇几次就记几次」。回归版下 ``seen`` 会被频率层静默吃掉教学预算：默认 0.5 的前 3 次
+    遭遇期望只讲约 1.5 次，之后除走错就再也不讲。
+    """
+
+    # 白小目 D17，玩家再落 F17(5,2) ⇒ entered（与 GateWiringTest.ENTER_SEED 同一局面）。
+    ENTER_SEED = [["W", "D17"]]
+
+    # 六次遭遇的掷点：0.0 必命中、0.99 必未命中——``p = clamp(0.5 + skill + mood, 0, 1)`` 恒在
+    # ``[0.3, 0.7]``（画像 / 情绪各自最多 ±0.10），两个掷点都远离边界、逐次确定。
+    ROLLS = [0.0, 0.99, 0.0, 0.99, 0.0, 0.99]
+
+    def _encounter(self, progress, roll):
+        """一局里遭遇这一族一次，返回 ``(data, bus)``。
+
+        每局一个新 agent ⇒ ``st.joseki_counted`` 的同局去重不跨局，``_joseki_taught`` 冷却也从头开始，
+        于是六次遭遇共享的只有跨局的那个 ``progress``。
+        """
+        bus = events.RecordingBus()
+        agent = AzureAgent(StubEngine(), StubLLM(), bus, joseki_progress=progress,
+                           joseki_rate=0.5, joseki_rng=_FixedRng(roll))
+        _seed(agent, self.ENTER_SEED)
+        agent._new_turn()
+        state = asyncio.run(agent._turn(PHASE_AFTER_PLAYER, {"x": 5, "y": 2}))
+        return state["data"], bus
+
+    def test_family_counts_only_when_it_was_actually_taught(self):
+        progress = _FakeProgress()
+        taught, families = [], []
+        for i, roll in enumerate(self.ROLLS):
+            data, bus = self._encounter(progress, roll)
+            jk = data["jk"]
+            with self.subTest(round=i + 1):
+                self.assertEqual(str(jk.get("kind") or ""), "entered",
+                                 "每一轮都真的识别到了定式（排除「没识别」那条路）")
+                families.append(str(jk.get("family") or ""))
+                taught.append(bool(data.get("jk_show_card")))
+                self.assertEqual(len(bus.of_type("joseki")), 1 if taught[-1] else 0,
+                                 "讲了才有 joseki 事件（结论与讲解 / 卡片一致）")
+
+        self.assertTrue(families[0], "族 id 非空")
+        self.assertEqual(set(families), {families[0]}, "六次遭遇都是同一族")
+
+        # —— 核心断言：计数的次数 == 实际讲解的次数（不是遭遇次数）——
+        # 回归版（未命中也计数）这里会是 6，修复版是 3；先把这条放在最前面，失败信息一眼可读。
+        self.assertEqual(len(progress.bumps), sum(taught),
+                         "计数的次数必须等于讲解次数（回归版会等于遭遇次数）")
+        self.assertEqual(progress.bumps, [families[0]] * sum(taught),
+                         "未命中的那几次一次都没记")
+        self.assertEqual(progress.seen(families[0]), sum(taught), "seen 也等于讲解次数")
+        self.assertEqual(sum(taught), 3, "六次遭遇里真的讲了 3 次（固定 rng 交替）")
+        # 固定 rng 的契约：命中 / 未命中交替；第 6 次 ``seen`` 已到 3 ⇒ 资格层拦下（连掷都不掷）。
+        self.assertEqual(taught, [True, False, True, False, True, False])
+
+
+class HerSideCountOnlyWhenTaughtTest(unittest.TestCase):
+    """修复波（账本挂着的「她那一侧计数收窄缺对称门卫」）：她那一侧也只在**真的讲了**时计数。
+
+    ``CountOnlyWhenTaughtTest`` 的对称版——那一条走 ``after_player``（玩家侧），这一条走
+    ``own_turn``（她那一侧）：``agent_graph._joseki_own_move`` 里 ``if jk2 and data["jk_show_card"]``
+    是**唯一**的计数入口，未命中一次都不许 ``bump``。回归拦截：把它改回「门控未命中也计数」时，
+    ``progress.bumps`` 会等于遭遇次数（6）而不是讲解次数（3），本用例必红。
+    """
+
+    HER_JK = {"kind": "entered", "family": "komoku_low_kakari", "corner": "右下", "cat": "komoku"}
+
+    def _her_encounter(self, progress, roll):
+        """一局里她那一步遭遇这一族一次（她那一侧的识别用合成的结果驱动，只钉计数口径）。"""
+        agent = _agent(progress, joseki_rate=0.5, joseki_rng=_FixedRng(roll))
+        _seed(agent, [["B", "D16"]])             # 盘上有一手，她那一步才有地方落
+        agent._joseki_check = lambda: dict(self.HER_JK)
+        agent._new_turn()
+        state = asyncio.run(agent._turn(PHASE_OWN_TURN))
+        return state["data"]
+
+    def test_her_family_counts_only_when_it_was_actually_taught(self):
+        progress = _FakeProgress()
+        taught = []
+        for i, roll in enumerate((0.0, 0.99, 0.0, 0.99, 0.0, 0.99)):
+            data = self._her_encounter(progress, roll)
+            with self.subTest(round=i + 1):
+                self.assertEqual(str((data.get("jk2") or {}).get("family") or ""),
+                                 self.HER_JK["family"], "每一轮都真的识别到了定式")
+                taught.append(bool(data.get("jk_show_card")))
+
+        self.assertEqual(taught, [True, False, True, False, True, False],
+                         "固定 rng 交替命中；第 6 次 seen 已到 3 ⇒ 资格层拦下（连掷都不掷）")
+        self.assertEqual(len(progress.bumps), sum(taught),
+                         "她那一侧的计数次数必须等于讲解次数（回归版会等于遭遇次数）")
+        self.assertEqual(progress.bumps, [self.HER_JK["family"]] * sum(taught),
+                         "未命中的那几次一次都没记")
+        self.assertEqual(progress.seen(self.HER_JK["family"]), sum(taught))
+
+
+# ================= ③ 真库端到端 + 配置透传 =================
+
+class RealStoreGateTest(unittest.TestCase):
+    """真 ``JosekiProgress``：资格层的跨局口径（前 3 次有资格、第 4 次起只看走错）。"""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.progress = JosekiProgress(os.path.join(self.dir.name, "joseki_progress.db"))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_fourth_entry_is_not_eligible_without_a_mistake(self):
+        jk = {"kind": "entered", "family": "star_33", "corner": "左上", "cat": "star"}
+        for i in range(3):
+            agent = _agent(self.progress)
+            with self.subTest(round=i + 1):
+                self.assertTrue(asyncio.run(agent.joseki_show_card(jk)), "前 3 次有资格")
+                asyncio.run(agent.joseki_count_entry(jk))
+        self.assertEqual(self.progress.seen("star_33"), 3)
+        agent = _agent(self.progress)
+        self.assertFalse(asyncio.run(agent.joseki_show_card(jk)), "第 4 次进入：资格层不放行")
+        self.assertFalse(asyncio.run(agent.joseki_gate_show(jk, None)), "连频率层都到不了")
+
+
+class ConfigPassthroughTest(unittest.TestCase):
+    """``/api/config`` 透传 ``joseki_rate``（与 ``joseki_teach`` 同一条通道）。"""
+
+    def test_api_config_sets_joseki_rate(self):
+        from fastapi.testclient import TestClient
+        from app.main import create_app
+        agent, _eng, _llm, _bus = mk_agent()
+        app = create_app(agent=agent, autostart=False)
+        with TestClient(app) as client:
+            self.assertEqual(client.post("/api/config", json={"joseki_rate": 0.25}).status_code, 200)
+        self.assertAlmostEqual(agent.joseki_rate, 0.25)
+
+    def test_dirty_or_out_of_range_rate_is_clamped(self):
+        from app.config import AzureConfig
+        cfg = AzureConfig()
+        self.assertEqual(cfg.joseki_rate, 0.5, "字段默认值 0.5")
+        cfg._apply({"joseki_rate": 7})
+        self.assertEqual(cfg.joseki_rate, 1.0)
+        cfg._apply({"joseki_rate": -3})
+        self.assertEqual(cfg.joseki_rate, 0.0)
+        cfg._apply({"joseki_rate": "oops"})
+        self.assertEqual(cfg.joseki_rate, 0.5, "脏值退回默认：不因一个旋钮把启动搞崩")
+
+
+if __name__ == "__main__":
+    unittest.main()

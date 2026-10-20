@@ -4,7 +4,10 @@ extends Node
 ##
 ## 对 Main.gd 暴露的信号与方法面（Main 的 agent.* 调用点只认这套契约）：
 ##   - 命令：REST POST（/api/move /api/hint /api/analyze /api/chat ... 见 docs）
-##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool / memory；连上先收 hello 同步）
+##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool / token / speech / memory；连上先收 hello 同步）
+##     token 是可选（默认关闭）的流式增量：只影响气泡的显示过程，最终内容仍以 message 为准
+##     speech 是每条台词的**语音指令**（`mode=openai` 时按 id 去 GET /api/tts/audio/{id} 取音频；
+##     `mode=system` 时按 text 交给系统语音）——合成全在后端，前端只取音频 + 播放
 ##     memory 是长期记忆写入/召回的元数据：只记一行日志，不进台词、不产生任何信号
 ##
 ## 音画同步仍在客户端完成：`ai_move` 那条「落子宣告」的语音开始时，Main 调 reveal_move()，
@@ -21,16 +24,45 @@ signal mood_changed(payload: Dictionary)
 signal joseki_event(payload: Dictionary)
 ## 她自己查资料（phase=start/end）：只给状态栏用，工具返回的原文永远不会走到这里
 signal tool_event(payload: Dictionary)
+## 流式增量（可选、默认关闭：后端 `stream_tokens` 开启时才会收到这个事件）
+## `turn_id` 标识同一轮发言，`delta` 是这一块新增的文字；最终内容一律以 `message` 为准
+signal token_event(turn_id: String, delta: String)
+## 云端语音指令（计划 05）：紧随对应的 `message` 之后到达，`turn_id`+`seq` 标识它与哪条台词配对。
+## `mode=openai` 时用 `id` 去 GET /api/tts/audio/{id} 取音频；`mode=system` 时用 `text` 交系统语音。
+## 合成全在后端，前端不再自行合成——这里只把原样 payload 转给 Main。
+signal speech_event(payload: Dictionary)
 ## 连接状态提示（Main 接到状态栏）
 signal net_status(text: String, bad: bool)
+## 聊天排队内容变了（入队 / 出队 / 退回 / 清空）：Main 据此刷新右下角那行提示（计划 06）
+signal chat_queue_changed()
+## 后端明确拒绝了这一手（多半是「她还在应手」——`busy` 事件还没到客户端的竞态）：
+## 载荷是**权威快照**，前端拿它撤掉乐观落下的那颗子，而不是让幽灵子留在盘上。
+signal move_rejected(state: Dictionary)
 
 const RECONNECT_MIN := 1.0
 const RECONNECT_MAX := 8.0
 const POST_TIMEOUT := 30.0   # REST 请求超时：后端卡住时也能回调释放节点，避免泄漏
+const CHAT_RETRY_GAP_MS := 2000  # 聊天发送失败（含被后端挡下）后的重试间隔：Main 每帧催一次也不会变成请求风暴
 
 var base_url := "http://127.0.0.1:8000"
 
 var busy := false
+
+## 她忙时玩家发的聊天在这里排队（计划 06）：`chat()` 忙则入队，`Main` 在她空闲时调
+## `flush_queued_chat()` 续发；提示文案与「能不能发」的判据都在 `ChatQueue` 里（纯逻辑、有门卫）。
+var _chat_queue := ChatQueue.new()
+var _chat_retry_ms := 0                  # 发送失败后的重试闸：`CHAT_RETRY_GAP_MS` 内不重发同一条
+## 刚发出去一条聊天：等她这一轮**真的结束**（收到 `busy=false`）之前不再发下一条。
+## 「一条接一条」不能只看 `busy`——`busy` 事件有网络往返，本机可能刚好赶不上，远端后端就会两条并排发出去。
+var _chat_in_flight := false
+## 定式「开关 + 频率」批量写入中（v3.7.0 修复波）：期间两个 setter 都不各自推送，
+## 由 `set_joseki()` 收尾统一推一次（见那里的注释）。
+var _joseki_batch := false
+## 情绪波动「开关 + 基础概率」批量写入中（v3.8.0）：与 `_joseki_batch` 同理。
+var _drift_batch := false
+## 聊天摘要用 LLM（单字段）原子入口的批量写入中（v3.8.0）：与 `_drift_batch` 同理——单字段本可只靠
+## setter 推一次，这里保持与 `set_drift` / `set_joseki` 同一形状，将来加字段不会退回「两次 setter 各推一次」。
+var _digest_batch := false
 var limit_len := false:
 	set(v):
 		limit_len = v
@@ -38,7 +70,41 @@ var limit_len := false:
 var joseki_teach := true:
 	set(v):
 		joseki_teach = v
-		_push_settings()
+		if not _joseki_batch:
+			_push_settings()
+var joseki_rate := 0.5:
+	set(v):
+		joseki_rate = v
+		if not _joseki_batch:
+			_push_settings()
+var emotion_drift := false:
+	set(v):
+		emotion_drift = v
+		if not _drift_batch:
+			_push_settings()
+var drift_base := 0.03:
+	set(v):
+		drift_base = v
+		if not _drift_batch:
+			_push_settings()
+var chat_digest_llm := false:
+	set(v):
+		chat_digest_llm = v
+		if not _digest_batch:
+			_push_settings()
+## 玩家棋风画像 / 时间感知（v3.9.0）：两个开关**一次落定、只推一次** `/api/config`
+## （与 `set_joseki` / `set_drift` 同一个理由与同一个做法）。
+var _profile_batch := false
+var profile_enabled := false:
+	set(v):
+		profile_enabled = v
+		if not _profile_batch:
+			_push_settings()
+var time_aware_enabled := false:
+	set(v):
+		time_aware_enabled = v
+		if not _profile_batch:
+			_push_settings()
 
 var _ws: WebSocketPeer = null
 var _opened_once := false
@@ -119,8 +185,7 @@ func _handle_packet(raw: String) -> void:
 		"hello":
 			state_changed.emit(_dict(d.get("state", {})))
 			mood_changed.emit(_dict(d.get("mood", {})))
-			busy = bool(d.get("busy", false))
-			busy_changed.emit(busy)
+			_apply_busy(bool(d.get("busy", false)))
 		"message":
 			message.emit(str(d.get("kind", "ai")), str(d.get("text", "")))
 		"state":
@@ -128,14 +193,20 @@ func _handle_packet(raw: String) -> void:
 		"info":
 			info_changed.emit(float(d.get("winrate", 0.5)), float(d.get("score", 0.0)))
 		"busy":
-			busy = bool(d.get("busy", false))
-			busy_changed.emit(busy)
+			_apply_busy(bool(d.get("busy", false)))
 		"mood":
 			mood_changed.emit(_without_type(d))
 		"joseki":
 			joseki_event.emit(_without_type(d))
 		"tool":
 			tool_event.emit(_without_type(d))
+		"token":
+			# 流式增量（可选、默认关闭）：只喂气泡的显示过程，最终以 message 收口
+			token_event.emit(str(d.get("turn_id", "")), str(d.get("delta", "")))
+		"speech":
+			# 这条台词的语音指令（合成在后端）：Main 据此取音频 / 调系统语音，并把它与
+			# 待显示的那条台词配起来（turn_id + seq）
+			speech_event.emit(_without_type(d))
 		"memory":
 			# 长期记忆的写入 / 召回：元数据（不是台词）——只记一行日志，不产生任何界面信号
 			print("[NetClient] memory op=%s tag=%s score=%s text=%s" % [
@@ -152,7 +223,22 @@ static func _without_type(d: Dictionary) -> Dictionary:
 # ================= 命令（REST，与 Main 的调用点一一对应） =================
 
 func player_move(x: int, y: int) -> void:
-	_post("/api/move", {"x": x, "y": y})
+	# 这一手必须**看回包**：后端忙时会回 `{"ok": false, "busy": true, "state": …}`（HTTP 仍是 200），
+	# 而棋盘在她应手之前已经乐观画上了这颗子——不看回包那它就变成永远撤不掉的幽灵子
+	# （v3.9.5：玩家会以为「她还没下，我又下了一手」）。拒绝时把权威快照交回 Main。
+	fetch_bytes("/api/move", HTTPClient.METHOD_POST, {"x": x, "y": y},
+			func(ok: bool, _code: int, body: PackedByteArray) -> void:
+				if not ok:
+					return                       # 连不上：棋盘锁的超时兜底会放行，别在这里解锁
+				var d = JSON.parse_string(body.get_string_from_utf8())
+				if typeof(d) != TYPE_DICTIONARY:
+					return
+				if bool(d.get("ok", true)):
+					return                       # 正常受理：等 busy / state 事件
+				_apply_busy(bool(d.get("busy", false)))
+				var st = d.get("state", null)
+				if typeof(st) == TYPE_DICTIONARY:
+					move_rejected.emit(st))
 
 func hint() -> void:
 	_post("/api/hint")
@@ -160,8 +246,92 @@ func hint() -> void:
 func analyze_position() -> void:
 	_post("/api/analyze")
 
-func chat(text: String) -> void:
-	_post("/api/chat", {"text": text})
+## 自由聊天。她忙（后端 `POST /api/chat` 会挡下）时**先本地排队**，空闲时 `flush_queued_chat()` 续发。
+## 返回 `false` 表示**队列满了、这条没收** —— 调用方要保留输入框原文并在状态栏提示，绝不吞玩家的话。
+func chat(text: String) -> bool:
+	if text.strip_edges() == "":
+		return true                      # 空话后端也当没发：既不排队也不发（别占住队头）
+	if _can_send_now():
+		_chat_in_flight = true           # 这一条出去了：下一条要等她这一轮结束（busy=false）才放
+		_send_chat_now(text)
+		return true
+	return _enqueue_chat(text)
+
+## 能不能**直发**（而不是排队）：她这一轮没在跑、没有刚发出去还没结账的、队列是空的、后端也连着。
+## 只有这条路走直发 —— 于是 `_send_chat_now` 失败时的 `push_front` 一定是真正的队头（顺序不乱），
+## 上限也不会被绕过（未连接 / 忙 / 队里还有东西时一律走 `enqueue`，那里才有 `CHAT_QUEUE_MAX` 这道闸）。
+func _can_send_now() -> bool:
+	return not busy and not _chat_in_flight and _chat_queue.is_empty() and _ws_open()
+
+func _ws_open() -> bool:
+	return _ws != null and _ws.get_ready_state() == WebSocketPeer.STATE_OPEN
+
+## 忙闲同步（WS 的 `hello` / `busy` 事件都走这里）：`busy=false` 说明她这一轮结束了 ——
+## 排队聊天可以发下一条了（「一条接一条」的另一半：放行在 `chat()` / `flush_queued_chat()`）。
+func _apply_busy(v: bool) -> void:
+	busy = v
+	if not v:
+		_chat_in_flight = false
+	busy_changed.emit(v)
+
+## 入队（尾部）：满了/空文本 ⇒ `false`（队列不变）；成功 ⇒ 发一次 `chat_queue_changed`。
+func _enqueue_chat(text: String) -> bool:
+	if not _chat_queue.enqueue(text):
+		return false
+	chat_queue_changed.emit()
+	return true
+
+## 真发一条聊天（带回复判定）：**只有明确回 `ok: true` 才算收下**；忙（`busy=false` 事件还没到的竞态）、
+## 非 2xx、回包读不懂（代理 HTML 错误页一类）⇒ 这条**退回队头**（它本来是最该发的一条，退回也保序），
+## 并压一个重试闸防每帧重发。宁可极少数情况下重复发一次，也不吞玩家的话。
+func _send_chat_now(text: String) -> void:
+	fetch_bytes("/api/chat", HTTPClient.METHOD_POST, {"text": text},
+		func(ok: bool, _code: int, body: PackedByteArray):
+			if ok and _chat_reply_ok(body):
+				return                   # 收下了：`_chat_in_flight` 交给随后的 `busy` 事件清（她这一轮开始）
+			_chat_in_flight = false      # 没送出去：立刻放行（重试由节流窗口管）
+			_chat_retry_ms = Time.get_ticks_msec() + CHAT_RETRY_GAP_MS
+			_chat_queue.push_front(text)
+			chat_queue_changed.emit())
+
+## 回包是否表示「后端收下了这条聊天」（成功是 `{"ok": true}`；忙时是 `{"ok": false, "busy": true, …}`）。
+## 先看首字节再解析：空包 / HTML 错误页这类一眼就不是 JSON 对象的，直接判「没收下」，
+## 顺带避开 `JSON.parse_string` 对脏输入的报错噪音。
+static func _chat_reply_ok(body: PackedByteArray) -> bool:
+	if body.is_empty() or body[0] != 123:       # 123 = '{'
+		return false
+	var d = JSON.parse_string(body.get_string_from_utf8())
+	return typeof(d) == TYPE_DICTIONARY and bool((d as Dictionary).get("ok", false))
+
+## 催一次续发。`env` 是「她现在闲不闲」的外部事实（`{"busy": …, "speaking": …}`，由 Main 打包）。
+## 四道门禁：① 没有刚发出去还等她开播/结账的（`_chat_in_flight`，保证一条接一条）；② 状态机判据
+## （空 / 忙 / 还在朗读都不发）；③ WS 已连上（没连上不发请求，免得 Main 每帧催成请求风暴）；
+## ④ 失败节流窗口内不重发同一条。
+func flush_queued_chat(env: Dictionary) -> void:
+	if _chat_in_flight or not _chat_queue.should_flush(env):
+		return
+	if not _ws_open():
+		return                           # 没连上后端：消息留在队列里，等重连 + 空闲再自动补发
+	if Time.get_ticks_msec() < _chat_retry_ms:
+		return
+	_chat_in_flight = true
+	_send_chat_now(_chat_queue.pop())
+	chat_queue_changed.emit()
+
+## 清空排队（测试 / 收尾用）
+func clear_queued_chat() -> void:
+	_chat_queue.clear()
+	chat_queue_changed.emit()
+
+func has_queued_chat() -> bool:
+	return not _chat_queue.is_empty()
+
+func queued_chat_count() -> int:
+	return _chat_queue.size()
+
+## 右下角那行提示（`排队中 N 条 · 队头前 8 字`；队列空 ⇒ `""`）
+func queued_chat_hint() -> String:
+	return _chat_queue.hint_text()
 
 func summarize(note: String) -> void:
 	_post("/api/summarize", {"note": note})
@@ -197,11 +367,57 @@ func _push_settings() -> void:
 	if _ws != null and _ws.get_ready_state() == WebSocketPeer.STATE_OPEN:
 		_flush_settings()
 
+## 定式导学「开关 + 频率」**原子入口**（v3.7.0 修复波）：两个字段一次落定，**只推一次** `/api/config`。
+##
+## 分别赋 `joseki_teach` / `joseki_rate` 会各触发一次 setter → 两次 `_push_settings`；`_post` 每次
+## `HTTPRequest.new()` 各开一条连接，**到达顺序无保证**——极端情况下后端会留下「新开关 + 旧频率」，
+## 直到下次改配置才自纠。这里先落两个字段、再统一推一次，载荷与 `_flush_settings()` 完全一致。
+func set_joseki(teach: bool, rate: float) -> void:
+	_joseki_batch = true
+	joseki_teach = teach
+	joseki_rate = rate
+	_joseki_batch = false
+	_push_settings()
+
+## 情绪波动「开关 + 基础概率」**原子入口**（v3.8.0）：与 `set_joseki` 同一个理由与同一个做法——
+## 两个字段一次落定、**只推一次** `/api/config`（分两次赋 setter 会各推一条 POST，到达顺序无保证）。
+func set_drift(on: bool, base: float) -> void:
+	_drift_batch = true
+	emotion_drift = on
+	drift_base = base
+	_drift_batch = false
+	_push_settings()
+
+## 聊天摘要用 LLM **原子入口**（v3.8.0）：与 `set_drift` / `set_joseki` 同一个理由与同一个做法——
+## 一次落定、**只推一次** `/api/config`（默认关：摘要走规则式、零额外 LLM 调用；开启后只在局末 / 空闲补做）。
+func set_digest(on: bool) -> void:
+	_digest_batch = true
+	chat_digest_llm = on
+	_digest_batch = false
+	_push_settings()
+
+## 玩家棋风画像 / 时间感知两个开关的**原子入口**（v3.9.0）：与 `set_drift` / `set_joseki` 同一个理由与
+## 同一个做法——两个字段一次落定、**只推一次** `/api/config`（分两次赋 setter 会各推一条 POST，
+## 到达顺序无保证）。两个开关在界面上属于同一件事（画像面板那一格），所以一起推。
+func set_profile(profile_on: bool, time_on: bool) -> void:
+	_profile_batch = true
+	profile_enabled = profile_on
+	time_aware_enabled = time_on
+	_profile_batch = false
+	_push_settings()
+
+## 画像面板（**只读**，v3.9.0 / Q6）：`GET /api/profile` → 回调 `(ok, code, body)`。
+## 只读、无副作用（不写库、不改任何开关）；连不上后端时回调 `ok=false`（与 `fetch_bytes` 同一套收账）。
+func fetch_profile(callback: Callable) -> void:
+	fetch_bytes("/api/profile", HTTPClient.METHOD_GET, {}, callback)
+
 func _flush_settings() -> void:
 	if not _settings_dirty:
 		return
 	_settings_dirty = false
-	_post("/api/config", {"limit_len": limit_len, "joseki_teach": joseki_teach})
+	_post("/api/config", {"limit_len": limit_len, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate,
+		"emotion_drift": emotion_drift, "drift_base": drift_base, "chat_digest_llm": chat_digest_llm,
+		"profile_enabled": profile_enabled, "time_aware_enabled": time_aware_enabled})
 
 func _post(path: String, body: Dictionary = {}) -> void:
 	var req := HTTPRequest.new()
@@ -212,3 +428,24 @@ func _post(path: String, body: Dictionary = {}) -> void:
 			["Content-Type: application/json"], HTTPClient.METHOD_POST, JSON.stringify(body))
 	if err != OK:
 		req.queue_free()
+
+## 取一次响应体（GET 音频 / POST 试听合成）。与 _post 的「发完不管」不同，这里把结果交给回调：
+## `callback(ok: bool, code: int, body: PackedByteArray)`，只有 HTTP 2xx 才算 ok。
+## 连请求都发不出去（err != OK）时**立即**回调失败，不让调用方干等超时；节点用完自释放。
+## `timeout` 用秒（默认 POST_TIMEOUT）：试听要等后端合成，调用方可放宽。
+func fetch_bytes(path: String, method: int, body: Dictionary, callback: Callable,
+		timeout := POST_TIMEOUT) -> void:
+	var req := HTTPRequest.new()
+	req.timeout = timeout
+	add_child(req)
+	var payload := JSON.stringify(body) if method != HTTPClient.METHOD_GET else ""
+	req.request_completed.connect(func(result: int, code: int, _headers: PackedStringArray, data: PackedByteArray):
+		req.queue_free()
+		if callback.is_valid():
+			callback.call(result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300, code, data))
+	var err := req.request(_strip_slash(base_url) + path,
+			["Content-Type: application/json"], method, payload)
+	if err != OK:
+		req.queue_free()
+		if callback.is_valid():
+			callback.call(false, 0, PackedByteArray())

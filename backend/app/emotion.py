@@ -19,6 +19,9 @@ BAND_HI = 2.0 / 3.0     # 中/高带界
 HYST = 0.035            # 分带滞回：情绪值贴着边界时不来回横跳（防表情闪烁）
 DECAY_TAU = 150.0       # 向基线回落的时间常数（秒）
 DELTA_MAX = 0.4         # 单次增量上限（事件表与 LLM 都受此约束）
+# 基线（「平静」）：初始值 = 回落目标。**唯一一份数字**——别处（如情绪波动的 `agent.emotion_bias`）
+# 引用它而不是抄一份字面量（修复轮 1 / Minor #2：抄副本会各自静默漂移）。
+BASELINE = (0.58, 0.55, 0.30)
 
 # 区域索引 = v带*9 + c带*3 + a带（带 0/1/2 = 低/中/高）
 # morphs 只用 Fcl_ALL_*；filler 取自 TTS 预制语气词库；burst 复用现有一次性表情
@@ -120,12 +123,15 @@ class EmotionModel:
     HYST = HYST
     DECAY_TAU = DECAY_TAU
     DELTA_MAX = DELTA_MAX
+    # 基线（「平静」）：初始值与回落目标都是它。**类级常量**，供别处（如情绪波动的
+    # `agent.emotion_bias`）引用同一份数字，别抄字面量副本（修复轮 1 / Minor #2）。
+    BASELINE = BASELINE
 
     def __init__(self):
-        self.v = 0.58                  # 愉悦度
-        self.c = 0.55                  # 好奇度
-        self.a = 0.30                  # 唤醒度
-        self.baseline = (0.58, 0.55, 0.30)   # 初始值 / 回落目标（平静）
+        self.v = BASELINE[0]           # 愉悦度
+        self.c = BASELINE[1]           # 好奇度
+        self.a = BASELINE[2]           # 唤醒度
+        self.baseline = BASELINE       # 初始值 / 回落目标（平静）
 
         self._bands = [1, 1, 0]        # 当前各维分带（滞回比较用）
         self._region = 12              # 当前区域索引（baseline → 平静）

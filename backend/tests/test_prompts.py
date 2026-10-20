@@ -7,11 +7,17 @@
 仅 to_black_perspective 返回浮点数用 1e-9 容差比较。
 """
 
+import asyncio
 import json
 import os
+import re
+import sys
 import unittest
 
-from app import prompts
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from app import coords, prompts, time_ctx
 
 _GOLDEN = os.path.join(os.path.dirname(__file__), "golden", "prompts.json")
 
@@ -288,6 +294,518 @@ class TestConfigureOverride(_Base):
             prompts.configure(DEFAULT_CFG)   # 复原默认配置
         # 复原校验：默认态不含覆盖
         self.assertEqual(prompts.system_prompt(), self.data["system_prompt"], "复原后 system_prompt 应回到内置")
+
+
+# ===================== 计划 07 · Task 7：结构点开口（进入 / 分岔 / 收尾）=====================
+#
+# 三条新模板**只写素材 + 要求**（中文、一句话、用她自己的口吻、不要提胜率数值），不放可被照抄的
+# 范文；它们**不写进 golden**（golden 只锁既有函数，见 `TestGoldenFrozen`）。
+
+
+class TestJosekiActiveTemplates(_Base):
+    """T7：`joseki_enter_prompt` / `joseki_branch_prompt` / `joseki_close_prompt` 的形状。"""
+
+    NAME = JOSEKI_BASIC_NAME
+    KEY = JOSEKI_BASIC_KEY
+    CORNER = "左上"
+
+    def _assert_common(self, out):
+        """三条模板共有的要求句（U35）：一句话、用她自己的口吻、不要提胜率数值。"""
+        self.assertIn("一句话", out)
+        self.assertIn("你自己的口吻", out)
+        self.assertIn("不要提胜率数值", out)
+        for bad in ("%s", "%(", "（可选）", "例如"):
+            self.assertNotIn(bad, out)
+
+    def test_enter_prompt_is_material_plus_instruction(self):
+        out = prompts.joseki_enter_prompt(self.NAME, self.KEY, self.CORNER)
+        self._assert_common(out)
+        # 素材：角 + 这一课的名字 + 要点
+        self.assertIn(self.CORNER, out)
+        self.assertIn(self.NAME, out)
+        self.assertIn(self.KEY, out)
+        # 换一份素材 ⇒ 换一份输出（不是写死的范文）
+        other = prompts.joseki_enter_prompt(JOSEKI_KOMPA_NAME, JOSEKI_KOMPA_KEY, "右下")
+        self.assertNotEqual(out, other)
+        self.assertIn(JOSEKI_KOMPA_KEY, other)
+        self.assertNotIn(self.KEY, other)
+
+    def test_branch_prompt_gives_each_candidate_its_next_move(self):
+        cands = [{"name": JOSEKI_BASIC_NAME, "family": "star_33", "next": (4, 3), "line": []},
+                 {"name": JOSEKI_BASIC_NAME, "family": "star_33", "next": (5, 2), "line": []}]
+        out = prompts.joseki_branch_prompt(self.NAME, self.KEY, cands)
+        self._assert_common(out)
+        self.assertIn(self.NAME, out)
+        self.assertIn(self.KEY, out)
+        # 候选**各自**的下一手坐标（0 基元组 → GTP）必须进素材，否则模型没法说清岔口
+        self.assertIn(coords.xy_to_gtp(4, 3), out)
+        self.assertIn(coords.xy_to_gtp(5, 2), out)
+
+    def test_branch_prompt_without_candidates_has_no_stub_wording(self):
+        out = prompts.joseki_branch_prompt(self.NAME, self.KEY, [])
+        self._assert_common(out)
+        self.assertIn(self.NAME, out)
+        self.assertIn(self.KEY, out)
+        self.assertNotIn("另有走法", out)             # 没候选就不留半截句式
+        # …也不许反过来要求她说「别的走法」：没给她的东西，不能叫她说（U35：退回只说要点）
+        self.assertNotIn("别的走法", out)
+        self.assertNotIn("下一手在", out)
+
+    def test_branch_prompt_drops_dirty_candidates_without_raising(self):
+        """脏 `next`（缺值 / 非数字 / 出盘 / 不是元组）一律丢掉，**绝不抛**。
+
+        这段跑在 `_prepare_after_player` 里：抛一次就是整条 `player_move` 丢台词
+        （与 `agent.py` 的「缺键 / 脏值一律退化成 0，不抛」同一口径）。
+        """
+        dirty = [{"name": "点三三·定形", "next": (None, 3)},
+                 {"name": "点三三·定形", "next": ("x", 3)},
+                 {"name": "点三三·定形", "next": (99, 99)},      # 出盘（≥ 19）：不许变成假坐标
+                 {"name": "点三三·定形", "next": (-1, 4)},
+                 {"name": "点三三·定形", "next": "D17"},
+                 {"name": "点三三·定形", "next": (4,)},
+                 {"next": None},
+                 "（连 dict 都不是）"]
+        out = prompts.joseki_branch_prompt(self.NAME, self.KEY, dirty)
+        self.assertIn(self.NAME, out)
+        self.assertIn(self.KEY, out)
+        self.assertNotIn("另有走法", out)             # 一个能用的都没有 ⇒ 只讲要点
+        self.assertNotIn("下一手在", out)
+        self.assertNotIn("别的走法", out)
+
+        # 混一个合法的：只有它进文案；脏值不产生任何坐标
+        good = {"name": "小飞挂·靠压定形", "next": (4, 2)}
+        out2 = prompts.joseki_branch_prompt(self.NAME, self.KEY, dirty + [good])
+        self.assertEqual(out2.count("下一手在"), 1)
+        self.assertIn(coords.xy_to_gtp(4, 2), out2)
+        self.assertIn("别的走法", out2)               # 有候选才要求她说别的走法
+        self.assertNotIn("。。", out2)                # 要点本身以句号收尾时不许拼出「。。」
+
+    def test_close_prompt_says_which_side_finished(self):
+        player = prompts.joseki_close_prompt(self.NAME, self.KEY, self.CORNER, "player")
+        azure = prompts.joseki_close_prompt(self.NAME, self.KEY, self.CORNER, "azure")
+        self._assert_common(player)
+        self._assert_common(azure)
+        for out in (player, azure):
+            self.assertIn(self.NAME, out)
+            self.assertIn(self.KEY, out)
+            self.assertIn(self.CORNER, out)
+        # 谁走完的说清楚：玩家 / Azure 各一份，互不串味
+        self.assertIn("Estarth", player)
+        self.assertNotIn("Azure", player)
+        self.assertIn("Azure", azure)
+        self.assertNotIn("Estarth", azure)
+        self.assertNotEqual(player, azure)
+
+
+# ===================== 阶段三 · Task P5：提示词事件区块（v3.8.0）=====================
+#
+# 事件区块是**给模型看的素材**：插在长期记忆段之后、铁律段之前，空则逐字符不变；
+# 事件原文**永不进台词**。四个门卫用例名逐字照用（task-P5-brief）。
+
+
+def _ev(move_no, kind="chat", text="他和我聊过天", detail=None):
+    return {"move_no": move_no, "ts": 0.0, "kind": kind, "text": text, "detail": detail or {}}
+
+
+class TestEventBlock(_Base):
+    """`prompts.event_block` 的形状 / 预算 / 插入点，以及「原文不进台词」。"""
+
+    def test_empty_block_keeps_golden_identical(self):
+        """空 / 全部超出衰减窗口 → 空串；`context_block` 输出与 **golden** 逐字符一致。"""
+        self.assertEqual(prompts.event_block([], 10), "")
+        self.assertEqual(prompts.event_block(None, 10), "")
+        # 全部超出衰减窗口（> DECAY_DROP_AT = 12 手）→ 不进提示词
+        self.assertEqual(prompts.event_block([_ev(1, text="很早的事")], 20), "")
+        self.assertEqual(prompts.event_block([{"move_no": "脏", "kind": "chat"}], 0), "")
+        self.assertEqual(prompts.event_block(["不是 dict"], 0), "")
+
+        # 真的读 golden（`tests/golden/prompts.json` 的 context_block 样本）：事件为空时逐字符相等
+        for c in self.data["context_block"]:
+            board = None if c["board"] == "null" else _board(c["board"])
+            self.eq(prompts.context_block(
+                _moves(c["moves"]), _memory(c["memory"]), _chat(c["chat"]), c["phase"],
+                c["skip_last_chat"], c["katago"], board, events=[]),
+                c["result"], "events=[] vs golden board=%s phase=%s" % (c["board"], c["phase"]))
+
+        base = prompts.context_block(MOVES_SHORT, [], [], "observe")
+        self.eq(prompts.context_block(MOVES_SHORT, [], [], "observe", events=[]), base,
+                "events=[] 时 context_block 逐字符不变")
+        self.eq(prompts.context_block(MOVES_SHORT, [], [], "observe", False, "", None, "", [], None), base,
+                "events/now_move_no 缺省与显式空值都逐字符不变")
+        # 空区块不产生任何表头
+        self.assertNotIn("本局记事", base)
+
+    def test_block_sits_before_ironclad(self):
+        """只能插在**长期记忆段之后、铁律段之前**。"""
+        ev = _ev(4, "ai_bad",
+                 "我在第4手自主偏航：没走最优的Q16，选了D4（与最优的胜率差约3%）",
+                 {"line": "b", "gtp": "D4", "best": "Q16", "drop": 0.03, "mood": "平静"})
+        out = prompts.context_block(MOVES_SHORT, [], [], "observe",
+                                    long_term="他喜欢点三三", events=[ev])
+        self.assertIn("本局记事", out)
+        self.assertIn("自主偏航", out)              # P2 留白的「自主偏航」标注已接上
+        self.assertIn("走的是B线", out)             # 偏航选的线号（detail.line）也进区块
+        self.assertIn("D4", out)
+        self.assertIn("Q16", out)
+        self.assertLess(out.index("长期记忆"), out.index("本局记事"))
+        self.assertLess(out.index("本局记事"), out.index("铁律"))
+        self.assertIn("A→T 从左到右", out)          # 铁律段正文没被动过
+
+        # `with_context` 走同一条路（事件区块在【现在】之前）
+        full = prompts.with_context(MOVES_SHORT, [], [], "继续下吧", "observe",
+                                    long_term="他喜欢点三三", events=[ev])
+        self.assertLess(full.index("本局记事"), full.index("【现在】"))
+
+    def test_over_budget_drops_oldest_and_lowest(self):
+        """超 `max_chars` → 丢【最旧 → 最低档】：最新的留住，最旧的先走。"""
+        evs = [_ev(i, "player_good", "他在第%d手下的这步棋方向不错、形状也好、值得记一笔" % i)
+               for i in range(1, 9)]
+        out = prompts.event_block(evs, 12, max_chars=80)
+        self.assertNotEqual(out, "")
+        nums = [int(m) for m in re.findall(r"第(\d+)手", out)]
+        self.assertIn(8, nums, "最新的一条必须留住")
+        self.assertNotIn(1, nums, "最旧的一条先被丢")
+        self.assertEqual(nums, sorted(nums, reverse=True), "渲染顺序：新 → 旧")
+        self.assertEqual(len(nums) < len(evs), True, "确实发生了丢弃")
+        # 丢掉的都是「更旧 ⇒ 档位更低」的那些：留住的手数全部大于被丢的手数
+        self.assertGreater(min(nums), 1)
+
+        # 预算连表头都放不下 → 空串（不留半截区块）
+        self.assertEqual(prompts.event_block(evs, 12, max_chars=5), "")
+
+    def test_injected_events_do_not_enter_reply(self):
+        """事件原文只进提示词（user 消息），**永不进台词**、不产生 `speech`。"""
+        from helpers import mk_agent
+
+        async def run():
+            agent, _eng, llm, bus = mk_agent()
+            agent.event_log.add("chat", 0, "他和我聊了关于「定式」的话题", {"topic": "定式"})
+            await agent.chat("这手定式不错")
+            return llm, bus
+
+        llm, bus = asyncio.run(run())
+        prompt_text = " ".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertIn("本局记事", prompt_text)      # 素材进了提示词
+        self.assertIn("定式", prompt_text)
+        joined = " ".join(str(e.get("text", "")) for e in bus.messages())
+        self.assertNotIn("本局记事", joined)        # 但没进任何台词
+        self.assertNotIn("他和我聊了关于", joined)
+        self.assertEqual([e for e in bus.of_type("speech")], [], "未接 TTS：一条 speech 都不发")
+
+
+# ===================== 阶段四 · Task Q3：时间块 / 画像块（v3.9.0）=====================
+#
+# 两块都插在**事件区块之后、铁律段之前**（时间在上、画像在下），空则逐字符不变；
+# 它们只喂给模型（user 消息），**永不进台词**。两个开关（`profile_enabled` /
+# `time_aware_enabled`）由调用方把关（关着就传空 dict ⇒ 与「没有这个功能」逐字符同构）。
+
+
+def _facts(**over):
+    """一份「有全部事实」的时间事实（形状＝``time_ctx.facts()`` 的返回）。"""
+    base = {"now": 1792414980.0, "date": "2026-10-19", "weekday": "周一", "clock": "21:03",
+            "session_sec": 7380.0, "avg_move_sec": 42.0, "last_gap_days": 3.0, "streak_days": 4}
+    base.update(over)
+    return base
+
+
+_PROFILE = {
+    "open.star": {"value": 0.8, "confidence": 0.9, "updated_ts": 5},
+    "style.aggression": {"value": 0.6, "confidence": 0.8, "updated_ts": 4},
+    "persona.topic.定式": {"value": 0.5, "confidence": 0.7, "updated_ts": 1},
+    "blunder.rate": {"value": 0.30, "confidence": 0.3, "updated_ts": 3},
+    "weak.corner_tl": {"value": 0.40, "confidence": 0.25, "updated_ts": 3},
+    "blunder.top_type": {"value": "无理", "confidence": 0.2, "updated_ts": 2},
+    "persona.address_pref": {"value": "主人", "confidence": 1.0, "updated_ts": 9},
+}
+
+
+class TestProfileTimeBlocks(_Base):
+    """`profile_note` / `time_note` 的空串、插入点、预算与「只在相关时提」。"""
+
+    def test_empty_blocks_keep_golden_identical(self):
+        """两块为空 ⇒ 空串，且 `context_block` 输出与 **golden**（三块都空的样本）逐字符一致。"""
+        self.assertEqual(prompts.time_note({}), "")
+        self.assertEqual(prompts.time_note(None), "")
+        self.assertEqual(prompts.time_note("不是 dict"), "")
+        self.assertEqual(prompts.profile_note({}, 40), "")
+        self.assertEqual(prompts.profile_note(None, 40), "")
+        self.assertEqual(prompts.profile_note("不是 dict", 40), "")
+
+        # 新增的 golden 用例：同一份输入 + 两块都空 ⇒ 与既有 context_block 样本**逐字符相等**
+        for c in self.data["context_block_profile_time_empty"]:
+            board = None if c["board"] == "null" else _board(c["board"])
+            base = prompts.context_block(
+                _moves(c["moves"]), _memory(c["memory"]), _chat(c["chat"]), c["phase"],
+                c["skip_last_chat"], c["katago"], board)
+            self.eq(base, c["result"], "三块都空 vs golden board=%s phase=%s" % (c["board"], c["phase"]))
+            for kwargs in ({"profile": {}, "time_facts": {}}, {"profile": None, "time_facts": None}):
+                got = prompts.context_block(
+                    _moves(c["moves"]), _memory(c["memory"]), _chat(c["chat"]), c["phase"],
+                    c["skip_last_chat"], c["katago"], board, **kwargs)
+                self.eq(got, c["result"],
+                        "%r 时 context_block 逐字符不变 board=%s" % (sorted(kwargs), c["board"]))
+            self.assertNotIn("时间事实", base)
+            self.assertNotIn("她眼中的你", base)
+
+        # 既有 golden 条目（不带这两个参数）仍逐字符一致
+        for c in self.data["context_block"]:
+            board = None if c["board"] == "null" else _board(c["board"])
+            self.eq(prompts.context_block(
+                _moves(c["moves"]), _memory(c["memory"]), _chat(c["chat"]), c["phase"],
+                c["skip_last_chat"], c["katago"], board),
+                c["result"], "既有 golden board=%s phase=%s" % (c["board"], c["phase"]))
+
+    def test_blocks_sit_between_events_and_ironclad(self):
+        """插入顺序固定：长期记忆 → 事件区块 → **时间块** → **画像块** → 铁律段。"""
+        ev = _ev(4, "player_good", "他在第4手下的这步棋方向不错")
+        out = prompts.context_block(MOVES_SHORT, [], [], "observe", long_term="他喜欢点三三",
+                                    events=[ev], profile=_PROFILE, time_facts=_facts())
+        self.assertLess(out.index("长期记忆"), out.index("本局记事"))
+        self.assertLess(out.index("本局记事"), out.index("时间事实"))
+        self.assertLess(out.index("时间事实"), out.index("她眼中的你"))
+        self.assertLess(out.index("她眼中的你"), out.index("铁律"))
+        self.assertIn("A→T 从左到右", out)          # 铁律段正文没被动过
+        # 两块真的进了提示词
+        self.assertIn("现在是 2026-10-19 周一 21:03", out)
+        self.assertIn("开局爱走「星位」", out)
+
+        # `with_context` 走同一条路（两块都在【现在】之前）
+        full = prompts.with_context(MOVES_SHORT, [], [], "继续下吧", "observe",
+                                    profile=_PROFILE, time_facts=_facts())
+        self.assertLess(full.index("她眼中的你"), full.index("【现在】"))
+
+    def test_time_note_drops_the_oldest_fact_first(self):
+        """超预算：**从最旧的事实开始丢**（连续天数 → 间隔 → 单手用时 → 本局时长 → 当前时间）。"""
+        full = prompts.time_note(_facts())
+        self.assertIn("现在是 2026-10-19 周一 21:03", full)
+        self.assertIn("本局已下 2 小时 3 分", full)
+        self.assertIn("他平均每手 42 秒", full)
+        self.assertIn("距上次对局 3 天", full)
+        self.assertIn("连续第 4 天在陪 Estarth", full)
+
+        # 只差「连续天数」那一行放不下 ⇒ 丢它，其余全留
+        out = prompts.time_note(_facts(), max_chars=len(full) - len("连续第 4 天在陪 Estarth") - 1)
+        self.assertEqual(out, full.replace("\n连续第 4 天在陪 Estarth", ""))
+        # 再收紧一行 ⇒ 「距上次对局」也先走，当前时间留住
+        out2 = prompts.time_note(_facts(), max_chars=len(out) - len("距上次对局 3 天") - 1)
+        self.assertNotIn("距上次对局", out2)
+        self.assertIn("现在是", out2)
+        self.assertIn("本局已下", out2)
+        # 预算连表头 + 说明句都放不下 ⇒ 空串（不留半截区块）
+        self.assertEqual(prompts.time_note(_facts(), max_chars=5), "")
+
+    def test_profile_note_drops_the_lowest_confidence_first(self):
+        """超预算：丢**最低置信 / 最旧维度**（渲染顺序＝置信度高 → 低）。"""
+        full = prompts.profile_note(_PROFILE, 40)
+        # 渲染顺序：置信度高 → 低
+        self.assertLess(full.index("开局爱走「星位」"), full.index("下得敢接触"))
+        self.assertLess(full.index("下得敢接触"), full.index("常聊的话题"))
+        self.assertLess(full.index("常聊的话题"), full.index("失误偏多"))
+        self.assertLess(full.index("失误偏多"), full.index("「左上角」"))
+        self.assertLess(full.index("「左上角」"), full.index("亏得最多的那一手"))
+
+        # 只放得下最高置信的那一条 ⇒ 最低置信的（blunder.top_type）先走
+        one = "开局爱走「星位」"
+        out = prompts.profile_note(_PROFILE, 40, max_chars=len(prompts._PROFILE_HEADER)
+                                   + len(prompts._PROFILE_TAIL) + len(one))
+        self.assertEqual(out, prompts._PROFILE_HEADER + one + prompts._PROFILE_TAIL)
+        self.assertNotIn("亏得最多的那一手", out)
+        # 连表头 + 说明句都放不下 ⇒ 空串
+        self.assertEqual(prompts.profile_note(_PROFILE, 40, max_chars=5), "")
+
+    def test_profile_note_early_game_hides_the_blunder_group(self):
+        """「失误与薄弱方位」只在这一局下够 ``PROFILE_BLUNDER_MIN_MOVE`` 手之后才提（只在相关时提）。"""
+        early = prompts.profile_note(_PROFILE, prompts.PROFILE_BLUNDER_MIN_MOVE - 1)
+        self.assertNotIn("失误", early)
+        self.assertNotIn("亏得最多的那一手", early)
+        self.assertNotIn("吃亏", early)
+        self.assertIn("开局爱走「星位」", early)
+        late = prompts.profile_note(_PROFILE, prompts.PROFILE_BLUNDER_MIN_MOVE)
+        self.assertIn("失误偏多", late)
+        self.assertIn("亏得最多的那一手", late)
+        self.assertIn("「左上角」", late)
+        # 手数脏值 ⇒ 当 0（不提这一组），不抛
+        self.assertNotIn("失误", prompts.profile_note(_PROFILE, "脏"))
+
+    def test_profile_note_ignores_unknown_keys_and_never_renders_address_pref(self):
+        """未知键忽略；``persona.address_pref`` **不留措辞位**（真实链路永不产出）。"""
+        self.assertEqual(prompts.profile_note({"not.an.axis": 0.9}, 40), "")
+        self.assertEqual(prompts.profile_note({"persona.address_pref": {"value": "主人"}}, 40), "")
+        self.assertNotIn("主人", prompts.profile_note(_PROFILE, 40))
+        # 扁平形状（只给值）也收；脏值不抛
+        flat = prompts.profile_note({"open.komoku": 0.5, "style.aggression": "脏"}, 40)
+        self.assertIn("开局爱走「小目」", flat)
+        self.assertNotIn("敢接触", flat)
+
+    def test_profile_note_uses_the_current_scales(self):
+        """Q2 收口后的刻度：``blunder.rate`` 是玩家口径（翻倍）、``territory_vs_influence`` ≈ [0, 0.5]。"""
+        def note(axis, value):
+            return prompts.profile_note({axis: value}, 40)
+
+        self.assertIn("失误偏多", note("blunder.rate", 0.25))
+        self.assertIn("偶尔会有明显亏损", note("blunder.rate", 0.15))
+        self.assertIn("很少下出明显亏损", note("blunder.rate", 0.05))
+        self.assertEqual(note("blunder.rate", 0.09), "", "中间地带不开口（只在相关时提）")
+
+        self.assertIn("更偏势力与模样", note("style.territory_vs_influence", 0.5))
+        self.assertIn("更偏实地", note("style.territory_vs_influence", 0.1))
+        self.assertEqual(note("style.territory_vs_influence", 0.3), "")
+
+        self.assertIn("敢接触", note("style.aggression", 0.5))
+        self.assertIn("下得偏稳", note("style.aggression", 0.1))
+        self.assertIn("常脱先", note("style.tenuki", 0.4))
+        self.assertIn("很少脱先", note("style.tenuki", 0.05))
+        self.assertIn("挂角比守角更主动", note("open.favorite_kakari", 0.7))
+        self.assertIn("更爱先守角", note("open.favorite_kakari", 0.3))
+        self.assertIn("孤军深入", note("blunder.top_type", "深入"))
+        self.assertIn("硬碰硬", note("blunder.top_type", "无理"))
+
+    def test_time_note_reads_only_the_keys_that_are_there(self):
+        """缺哪个事实就不说哪个（不补 0）；空壳 / 只有 ``now`` ⇒ 空串。"""
+        self.assertEqual(prompts.time_note({"now": 1.0}), "")
+        only_now = prompts.time_note({"date": "2026-10-19", "weekday": "周一", "clock": "21:03"})
+        self.assertIn("现在是 2026-10-19 周一 21:03", only_now)
+        for gone in ("本局", "平均每手", "距上次对局", "连续第"):
+            self.assertNotIn(gone, only_now)
+        # 直接吃 `time_ctx.facts()` 的产出（两端字段名必须对得上）
+        facts = time_ctx.facts(now=1792414980.0, session_start=1792414980.0 - 7380.0,
+                               last_game_ts=1792414980.0 - 3 * 86400.0,
+                               move_ts_list=[1792414980.0 - 84.0, 1792414980.0],
+                               game_ts_list=[1792414980.0])
+        out = prompts.time_note(facts)
+        self.assertIn("本局已下 2 小时 3 分", out)
+        self.assertIn("他平均每手 1 分 24 秒", out)
+        self.assertIn("距上次对局 3 天", out)
+        self.assertIn("连续第 1 天在陪 Estarth", out)
+
+    def test_missing_axes_are_not_read_as_the_opposite(self):
+        """修复轮 1 / I-2：**缺键 ⇒ 该句不出现**（不是被念成 0 那一侧）。"""
+        out = prompts.profile_note({"style.aggression": 0.6, "blunder.rate": 0.3}, 40)
+        self.assertIn("敢接触", out)
+        for gone in ("很少脱先", "更爱先守角", "更偏实地", "很少下出明显亏损"):
+            self.assertNotIn(gone, out, "缺键不许被念成 0 那一侧：%s" % gone)
+        # 真·0.0（有信号）仍要念出来——「缺键」与「量到 0」必须分得开
+        self.assertIn("更爱先守角", prompts.profile_note({"open.favorite_kakari": 0.0}, 40))
+        self.assertIn("很少脱先", prompts.profile_note({"style.tenuki": 0.0}, 40))
+        # 端到端：真实 `extract_axes` 对「没识别出挂角 / 守角族」的对局不产出该键 ⇒ 不出现那句话
+        from app.profile import extract_axes
+        axes = extract_axes({"moves": [["B", "Q16"], ["W", "D4"]]})
+        self.assertNotIn("open.favorite_kakari", axes)
+        self.assertNotIn("更爱先守角", prompts.profile_note(axes, 40))
+        self.assertNotIn("很少脱先", prompts.profile_note(axes, 40), "只落 1 手 ⇒ 脱先无信号")
+
+    def test_infinite_values_do_not_produce_broken_lines(self):
+        """修复轮 1 / Minor #5：``inf`` 不许抛、也不许拼出「他平均每手 」这种半句话。"""
+        inf = float("inf")
+        t = {"date": "2026-10-19", "weekday": "周一", "clock": "21:03",
+             "session_sec": inf, "avg_move_sec": inf, "last_gap_days": inf, "streak_days": inf}
+        out = prompts.time_note(t)
+        self.assertIn("现在是 2026-10-19 周一 21:03", out)
+        for gone in ("本局", "平均每手", "距上次对局", "连续第"):
+            self.assertNotIn(gone, out)
+        self.assertNotIn("  \n", out)                # 不留下半句话 / 尾随空格
+        self.assertEqual(prompts.profile_note({"style.aggression": inf, "blunder.rate": inf}, 40), "")
+        # 超大（但有限）的时长也一样安全
+        self.assertEqual(prompts.time_note({"session_sec": 1e300}), "")
+
+    def test_blocks_carry_the_instruction_and_no_copyable_example(self):
+        """两块都必须带说明句（只在相关时提 / 别把数字当口头禅），且不放可照抄的示例句。"""
+        t = prompts.time_note(_facts())
+        p = prompts.profile_note(_PROFILE, 40)
+        self.assertIn("不必每句都说", t)
+        self.assertIn("口头禅", t)
+        self.assertIn("只在相关时", p)
+        self.assertIn("口头禅", p)
+        for out in (t, p):
+            for bad in ("例如", "%s", "%(", "（可选）"):
+                self.assertNotIn(bad, out)
+
+
+class TestGoldenFrozen(_Base):
+    """T7 门卫：本任务只**新增**三条模板，golden 锁定的既有输出一字未改。"""
+
+    def test_context_block_golden_unchanged(self):
+        for c in self.data["context_block"]:
+            board = None if c["board"] == "null" else _board(c["board"])
+            self.eq(prompts.context_block(
+                _moves(c["moves"]), _memory(c["memory"]), _chat(c["chat"]), c["phase"],
+                c["skip_last_chat"], c["katago"], board),
+                c["result"], "context_block board=%s phase=%s" % (c["board"], c["phase"]))
+
+    def test_existing_joseki_helpers_output_unchanged(self):
+        for c in self.data["joseki_teach_prompt"]:
+            key = JOSEKI_BASIC_KEY if c["name"] == JOSEKI_BASIC_NAME else JOSEKI_KOMPA_KEY
+            self.eq(prompts.joseki_teach_prompt(c["name"], key, c["corner"]),
+                    c["result"], "teach name=%s" % c["name"])
+        for c in self.data["joseki_short_prompt"]:
+            self.eq(prompts.joseki_short_prompt(c["name"], JOSEKI_BASIC_KEY, c["gtp"]),
+                    c["result"], "short gtp=%s" % c["gtp"])
+        for c in self.data["joseki_hint_clause"]:
+            self.eq(prompts.joseki_hint_clause(c["name"], c["expect_gtp"]),
+                    c["result"], "hint name=%s" % c["name"])
+        for c in self.data["joseki_fallback"]:
+            self.eq(prompts.joseki_fallback(c["name"], JOSEKI_BASIC_KEY),
+                    c["result"], "fallback name=%s" % c["name"])
+
+    def test_new_templates_are_not_written_into_golden(self):
+        for name in ("joseki_enter_prompt", "joseki_branch_prompt", "joseki_close_prompt"):
+            self.assertNotIn(name, self.data, "新模板不写进 golden（golden 只锁既有函数）")
+
+
+class TestProgressNote(_Base):
+    """``progress_note``（v3.9.0 / Q7）：局末进步报告的素材块——**上一版画像 + 本局记录**。
+
+    它只并进**现有** ``summarize()`` 提示词（不新增 LLM 调用）；空 ⇒ 空串（提示词逐字符不变）。
+    """
+
+    REC = {
+        "move_count": 40, "final_black_wr": 0.42, "final_score": -3.5,
+        "moves": [{"color": "B", "gtp": "Q16", "drop": 0.30},
+                  {"color": "W", "gtp": "D4"},
+                  {"color": "B", "gtp": "C3", "drop": 0.0}],
+        "joseki_families": ["star_kakari_small", "star_shimori"],
+        "chat_topics": [["定式", "聊了点三三"], ["闲聊", ""]],
+    }
+    PREV = {"open.star": {"value": 0.9, "confidence": 0.4, "n_games": 8}}
+
+    def test_empty_inputs_give_an_empty_string(self):
+        for prev, rec in (({}, {}), (None, None), ({}, {"move_count": 0}), (None, {"summary": "x"})):
+            with self.subTest(prev=prev, rec=rec):
+                self.assertEqual(prompts.progress_note(prev, rec), "", "空素材 ⇒ 空串（逐字符不变）")
+
+    def test_carries_the_record_and_the_previous_impression(self):
+        got = prompts.progress_note(self.PREV, self.REC)
+        self.assertIn("共 40 手", got)
+        self.assertIn("胜率约 42%", got)
+        self.assertIn("目差 -3.5", got)
+        self.assertIn("明显亏损", got, "失误面与画像同源（profile.extract_axes）")
+        self.assertIn("本局走过的定式族：star_kakari_small、star_shimori", got)
+        self.assertIn("本局聊过：定式、闲聊", got)
+        self.assertIn("上一版印象", got)
+        self.assertIn("开局爱走「星位」", got)
+        # 素材块**不进台词**：它只喂模型（这条断言守的是「别把它当话说出来」的前提）
+        self.assertNotIn("他说", got)
+
+    def test_dirty_inputs_never_raise(self):
+        for rec in ("oops", [], {"move_count": "x", "final_black_wr": float("nan"),
+                                "final_score": float("inf"), "moves": {"bad": 1},
+                                "joseki_families": "not json", "chat_topics": 5},
+                    {"moves": [{"color": "B", "gtp": "zzz", "drop": "x"}]}):
+            with self.subTest(rec=rec):
+                out = prompts.progress_note({"open.star": "dirty"}, rec)
+                self.assertIsInstance(out, str)
+
+    def test_over_budget_drops_the_previous_impression_first(self):
+        """超预算时从尾部往回丢 ⇒ **先丢「上一版印象」**（本局记录更要紧）。"""
+        tiny = prompts.progress_note(self.PREV, self.REC, max_chars=120)
+        self.assertNotEqual(tiny, "")
+        self.assertNotIn("开局爱走", tiny, "先丢上一版印象（表头里那四个字不算：它只是标题）")
+        self.assertIn("本局", tiny)
+        self.assertEqual(prompts.progress_note(self.PREV, self.REC, max_chars=1), "",
+                         "预算连表头都放不下 ⇒ 空串（不留半截区块）")
+
+    def test_this_helper_is_not_written_into_golden(self):
+        self.assertNotIn("progress_note", self.data, "新函数不写进 golden（golden 只锁既有函数）")
 
 
 if __name__ == "__main__":
