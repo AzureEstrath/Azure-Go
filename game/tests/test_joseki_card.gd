@@ -306,21 +306,30 @@ func _run() -> void:
 	_check("⑮ 换了结构点照常弹", cx.state() == "shown")
 	cx.free()
 
-	# —— ⑯ 角内取景窗口：13 路局部放大，有子越界就退回 19 路（绝不裁子）——
+	# —— ⑯ 角内取景窗口：9 路局部放大，任一点越界就退回 19 路（绝不裁子、不把候选画到画外）——
 	var cy := JosekiCard.new()
 	cy.apply_event({"kind": "entered", "name": "丙", "corner": "左上", "k": 1,
 			"line": [{"x": 3, "y": 3, "c": "B"}, {"x": 3, "y": 2, "c": "B"}]})
 	var win1 := cy.view_window()
-	_check("⑯ 左上角内两手 ⇒ 13 路取景、原点 (0,0)",
-			int(win1["size"]) == 13 and win1["origin"] == Vector2i(0, 0))
+	_check("⑯ 左上角内两手 ⇒ 9 路取景、原点 (0,0)",
+			int(win1["size"]) == 9 and win1["origin"] == Vector2i(0, 0))
 	cy.apply_event({"kind": "entered", "name": "丁", "corner": "右下", "k": 1,
 			"line": [{"x": 15, "y": 15, "c": "B"}, {"x": 16, "y": 14, "c": "W"}]})
 	var win2 := cy.view_window()
-	_check("⑯ 右下角 ⇒ 窗口原点 (6,6)",
-			int(win2["size"]) == 13 and win2["origin"] == Vector2i(6, 6))
+	_check("⑯ 右下角 ⇒ 窗口原点 (10,10)",
+			int(win2["size"]) == 9 and win2["origin"] == Vector2i(10, 10))
 	cy.apply_event({"kind": "entered", "name": "戊", "corner": "左上", "k": 1,
 			"line": [{"x": 3, "y": 3, "c": "B"}, {"x": 15, "y": 15, "c": "W"}]})
 	_check("⑯ 有子跑出角内 ⇒ 退回 19 路（不裁子）", int(cy.view_window()["size"]) == 19)
+	cy.apply_event({"kind": "entered", "name": "戊2", "corner": "左上", "k": 0,
+			"line": [{"x": 3, "y": 3, "c": "B"}],
+			"candidates": [{"name": "远候", "next": [12, 3]}]})
+	_check("⑯ 候选点跑出角内 ⇒ 同样退回 19 路（不把候选画到画外）",
+			int(cy.view_window()["size"]) == 19)
+	cy.apply_event({"kind": "deviated", "name": "戊3", "corner": "左上", "k": 0,
+			"line": [{"x": 3, "y": 3, "c": "B"}],
+			"mistake": {"move_no": 2, "x": 12, "y": 12, "drop": 3.0}})
+	_check("⑯ 走错点跑出角内 ⇒ 同样退回 19 路", int(cy.view_window()["size"]) == 19)
 	cy.apply_event({"kind": "entered", "name": "己", "corner": "?", "k": 1,
 			"line": [{"x": 3, "y": 3, "c": "B"}]})
 	_check("⑯ 角名不认识 ⇒ 19 路全盘", int(cy.view_window()["size"]) == 19)

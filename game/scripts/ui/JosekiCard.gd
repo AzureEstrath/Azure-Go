@@ -24,9 +24,10 @@ const GRID_GAP := 6.0         # 头部与棋盘之间的留白
 const TITLE_SIZE := 15        # 标题字号（12px 在 1280×800 下读不清）
 const CLOSE_SIZE := 22.0      # 关闭热区边长（自绘 ×，不建子节点：五条不变量都靠 `_draw`）
 const GRID := 19              # 小棋盘路数：后端坐标就是 19 路
-# 角内取景窗口：定式只看一个角，19 路全盘会把 3~8 颗子摊成一片；按角截 13 路放大。
-# **任何一颗子落在窗口外就退回 19 路全盘**——参考图绝不裁子。
-const WINDOW := 13
+# 角内取景窗口：定式只看一个角，19 路全盘会把 3~8 颗子摊成一片；按角截 9 路放大。
+# 实测 25 条库线最宽只用 8 路，9 路窗口装得下全部；**任何一点（手顺 / 候选 / 走错）落在窗外就退回
+# 19 路全盘**——参考图绝不裁子，也绝不把候选点画到画外。
+const WINDOW := 9
 # 避让时**只把外壳**（底色 / 网格 / 边框）压到这个系数：整卡一起压透明会把文字连同棋子糊成一片
 # 灰影（v3.9.2 修复的正是这个——参考图是要读的，不是要藏的）。
 const FADED_SHELL := 0.40
@@ -200,8 +201,9 @@ func legend_items() -> Array:
 			out.append(nm)
 	return out
 
-## 角内取景窗口：`{origin: Vector2i, size: int}`。按 `_corner` 取 13 路局部放大；
-## **任何一颗子落在窗口外就退回 19 路全盘**（参考图绝不裁子）；角名不认识也退回全盘。
+## 角内取景窗口：`{origin: Vector2i, size: int}`。按 `_corner` 取 9 路局部放大；
+## **手顺 / 候选 / 走错任何一点落在窗口外就退回 19 路全盘**（参考图绝不裁子，也不把候选画到画外）；
+## 角名不认识也退回全盘。
 func view_window() -> Dictionary:
 	var size := WINDOW
 	var origin := Vector2i.ZERO
@@ -211,8 +213,15 @@ func view_window() -> Dictionary:
 		"右下": origin = Vector2i(GRID - size, GRID - size)
 		"左上": origin = Vector2i.ZERO
 		_: return {"origin": Vector2i.ZERO, "size": GRID}
+	var pts: Array[Vector2i] = []
 	for it in _line:
-		var p := _pos_of(it)
+		pts.append(_pos_of(it))
+	for cand in _candidates:
+		if typeof(cand) == TYPE_DICTIONARY:
+			pts.append(_pos_of_next((cand as Dictionary).get("next", null)))
+	if _mistake != null:
+		pts.append(_pos_of(_mistake))
+	for p in pts:
 		if p == INVALID:
 			continue
 		if p.x < origin.x or p.y < origin.y or p.x >= origin.x + size or p.y >= origin.y + size:
@@ -420,16 +429,22 @@ func _draw_grid(f: Font) -> void:
 	if pk != INVALID:
 		draw_arc(_cell_pos(pk), r + 3.0, 0.0, TAU, 24, RING, 2.0)
 
-	# 候选点：各自 next 位置画菱形 + 序号（与高亮环形状不同，一眼分得开）
+	# 候选点：画成**白子** + 琥珀外环（提示「这是待选的一手，不是已经落下的子」）+ 序号。
+	# 退回 19 路时石子直径只有 ~10px，白子+数字糊成一团：那时只画一圈琥珀环，序号交给底部图例。
 	var cells := _candidate_cells()
 	for i in cells.size():
 		var q := _cell_pos(cells[i])
-		var d := r * 0.95
-		draw_colored_polygon(PackedVector2Array([q + Vector2(0.0, -d), q + Vector2(d, 0.0),
-				q + Vector2(0.0, d), q + Vector2(-d, 0.0)]), CAND)
-		if f != null:
-			draw_string(f, q + Vector2(-2.5, 3.0), str(i + 1),
-					HORIZONTAL_ALIGNMENT_LEFT, 0.0, 9, CAND_FG)
+		var rq := r * 0.92
+		if rq >= 6.5:
+			draw_circle(q, rq, STONE_W)
+			draw_arc(q, rq, 0.0, TAU, 20, Color(0.0, 0.0, 0.0, 0.30), 1.0)
+			draw_arc(q, rq + 1.8, 0.0, TAU, 24, CAND, 1.6)
+			if f != null:
+				var fs2 := clampi(int(round(step * 0.52)), 9, 12)
+				draw_string(f, q + Vector2(-float(fs2) * 0.5, float(fs2) * 0.36), str(i + 1),
+						HORIZONTAL_ALIGNMENT_LEFT, 0.0, fs2, CAND_FG)
+		else:
+			draw_arc(q, maxf(2.5, rq), 0.0, TAU, 16, CAND, 2.0)
 
 	# 走错那一手：坐标匹配才标红（后端只在真是走错时才给 mistake）
 	var pm := _mistake_cell()
