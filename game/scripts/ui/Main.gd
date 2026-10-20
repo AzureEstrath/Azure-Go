@@ -185,24 +185,16 @@ func _build_pairing() -> void:
 # ================= 世界与棋盘 =================
 
 func _make_cjk_font() -> Font:
-	var f := SystemFont.new()
-	f.font_names = PackedStringArray([
-		"Microsoft YaHei UI", "Microsoft YaHei", "SimHei",
-		"Noto Sans CJK SC", "PingFang SC", "sans-serif",
-	])
-	# 让 ♟️💡📊 等 emoji 也能显示
-	var emoji := SystemFont.new()
-	emoji.font_names = PackedStringArray(["Segoe UI Emoji", "Noto Color Emoji"])
-	f.fallbacks = [emoji]
-	return f
+	# 古风主题：楷体优先（字体定义只在 GufengTheme 一处）
+	return GufengTheme.font()
 
 func _build_world() -> void:
 	var we := WorldEnvironment.new()
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
-	env.background_color = Color(0.910, 0.957, 0.957)
+	env.background_color = Color(0.945, 0.918, 0.855)   # 暖宣纸（古风主题的一部分）
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = Color(0.85, 0.89, 0.91)
+	env.ambient_light_color = Color(0.95, 0.91, 0.84)
 	env.ambient_light_energy = 0.95
 	we.environment = env
 	add_child(we)
@@ -234,16 +226,6 @@ func _build_board() -> void:
 
 # ================= 界面 =================
 
-func _style(bg: Color, radius := 10, pad := 10) -> StyleBoxFlat:
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = bg
-	sb.set_corner_radius_all(radius)
-	sb.content_margin_left = pad
-	sb.content_margin_right = pad
-	sb.content_margin_top = int(pad * 0.7)
-	sb.content_margin_bottom = int(pad * 0.7)
-	return sb
-
 func _build_ui() -> void:
 	var layer := CanvasLayer.new()
 	add_child(layer)
@@ -251,9 +233,7 @@ func _build_ui() -> void:
 	var root := Control.new()
 	root.set_anchors_preset(Control.PRESET_FULL_RECT)
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var th := Theme.new()
-	th.default_font = _font
-	th.default_font_size = 14
+	var th := GufengTheme.build_theme(_font)   # 古风主题：没被单独覆盖的控件也吃到这套皮
 	root.theme = th
 	layer.add_child(root)
 	_ui_root = root
@@ -300,11 +280,13 @@ func _follow_joseki_card() -> void:
 	var card := Vector2(JosekiCard.CARD_W, JosekiCard.CARD_H)
 	var r := Rect2(_joseki_card.position, card)
 	var on_screen := Rect2(Vector2.ZERO, vp).encloses(r)
-	if on_screen and not _hits_rect(r, _board_cell_rects()):
+	var panels := _panel_rects()
+	if on_screen and not _hits_rect(r, _board_cell_rects()) and not _hits_rect(r, panels):
 		return                                    # 现在的位置就没事：不挪（避免画面一抖卡片横跳）
 	var target := _joseki_card_anchor()
-	if on_screen and _hits_rect(Rect2(target, card), _board_cell_rects()):
-		return                                    # 哪都放不下：留在原地，别做「从一个被压住的地方跳到另一个」的无用移动
+	if on_screen and _hits_rect(Rect2(target, card), _board_cell_rects()) \
+			and _hits_rect(Rect2(target, card), panels):
+		return                                    # 哪都放不下：留在原地，别做无用移动
 	_joseki_card.position = target
 	_joseki_card_home = target
 
@@ -389,7 +371,7 @@ func _build_right_panel(root: Control) -> void:
 	panel.anchor_bottom = 1.0
 	panel.offset_left = -PANEL_W
 	panel.offset_right = 0
-	panel.add_theme_stylebox_override("panel", _style(Color(1, 1, 1), 0, 12))
+	panel.add_theme_stylebox_override("panel", GufengTheme.panel(12))
 	root.add_child(panel)
 
 	var vb := VBoxContainer.new()
@@ -398,21 +380,27 @@ func _build_right_panel(root: Control) -> void:
 
 	# 标题
 	var head := PanelContainer.new()
-	head.add_theme_stylebox_override("panel", _style(TEAL_DARK, 8, 12))
+	head.add_theme_stylebox_override("panel", GufengTheme.header())
 	vb.add_child(head)
+	var hrow := HBoxContainer.new()
+	hrow.add_theme_constant_override("separation", 10)
+	head.add_child(hrow)
 	var hv := VBoxContainer.new()
-	head.add_child(hv)
+	hv.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hrow.add_child(hv)
 	var t1 := Label.new()
-	t1.text = "♟️ Azure · 围棋陪练"
-	t1.add_theme_font_size_override("font_size", 18)
-	t1.add_theme_color_override("font_color", Color.WHITE)
+	t1.text = "Azure · 围棋陪练"
+	t1.add_theme_font_size_override("font_size", 20)
+	t1.add_theme_color_override("font_color", GufengTheme.PAPER_WARM)
 	hv.add_child(t1)
 	var t2 := Label.new()
 	t2.text = "青蓝色 · 永恒17岁 · 天才少女 · 右键拖拽旋转视角 · 滚轮缩放"
 	t2.add_theme_font_size_override("font_size", 11)
-	t2.add_theme_color_override("font_color", Color(1, 1, 1, 0.85))
+	t2.add_theme_color_override("font_color", Color(GufengTheme.PAPER_WARM, 0.72))
 	t2.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hv.add_child(t2)
+	hrow.add_child(GufengTheme.seal_char("弈"))      # 朱砂单字印：整块面板最重的一笔
+	_rule(vb)
 
 	# 信息栏
 	var info := HBoxContainer.new()
@@ -424,7 +412,7 @@ func _build_right_panel(root: Control) -> void:
 	info.add_child(_lbl_moves)
 	_lbl_wr = Label.new()
 	_lbl_wr.text = "黑胜率: --"
-	_lbl_wr.add_theme_color_override("font_color", TEAL_DARK)
+	_lbl_wr.add_theme_color_override("font_color", GufengTheme.DAI)
 	info.add_child(_lbl_wr)
 	# 目差：数字照旧保留（精度不丢）+ 下面一行 11px 小字给量级人话。**竖排不并排**——这一行已经贴着
 	# 380 面板的宽度上限，并排会把「允许 Azure 虚着」挤出面板（同 Task F 里定式那一格挪行的理由）。
@@ -474,7 +462,7 @@ func _build_right_panel(root: Control) -> void:
 	_acc_check(acc, "短回复", cfg.tts_limit_len, "len",
 		"限制 Azure 每次只说 1~2 句：语音等待时间随字数下降（立即生效）")
 	_btn_settings = Button.new()
-	_btn_settings.text = "⚙ 设置 ▸"
+	_btn_settings.text = "设置 ▸"
 	_btn_settings.toggle_mode = true
 	_btn_settings.tooltip_text = "一次性设置：同步说话 / 整段合成（立即生效）、长句合并（重启后端后生效）；" \
 		+ "改动都写回 config.json"
@@ -483,7 +471,7 @@ func _build_right_panel(root: Control) -> void:
 
 	_settings_box = PanelContainer.new()
 	_settings_box.visible = false                  # 默认收起：右栏只留对局常用项
-	_settings_box.add_theme_stylebox_override("panel", _style(Color(0.965, 0.98, 0.98), 6, 10))
+	_settings_box.add_theme_stylebox_override("panel", GufengTheme.slip(GufengTheme.PAPER, 10))
 	vb.add_child(_settings_box)
 	var drawer := VBoxContainer.new()
 	drawer.add_theme_constant_override("separation", 6)
@@ -519,7 +507,7 @@ func _build_right_panel(root: Control) -> void:
 	# 玩家棋风画像 + 时间感知（v3.9.0）：两个开关与只读面板**同一件事**，一起放在这一格
 	# （控制者倾向：与 emotion_drift / chat_digest_llm 同形；两个开关**一次推一次** `/api/config`）。
 	_acc_check(drawer, "玩家棋风画像", cfg.profile_enabled, "profile",
-		"默认关。开启后，每次点「🏁 结束」会把这局记进后端的 profile.db，并跨局攒出「她眼中的你」"
+		"默认关。开启后，每次点「结束」会把这局记进后端的 profile.db，并跨局攒出「她眼中的你」"
 		+ "（开局偏好 / 行棋风格 / 常见失误 / 常聊话题）；她只在相关时自然参考这份印象 → 立即生效")
 	_acc_check(drawer, "时间感知", cfg.time_aware_enabled, "time_aware",
 		"默认关。开启后她知道现在几点、这一局下了多久、你多久没来、连续第几天——只在相关时提，"
@@ -529,7 +517,7 @@ func _build_right_panel(root: Control) -> void:
 	var prof_row := HBoxContainer.new()
 	prof_row.add_theme_constant_override("separation", 6)
 	drawer.add_child(prof_row)
-	_button(prof_row, "🪞 她眼中的你", _on_profile_panel)
+	_button(prof_row, "她眼中的你", _on_profile_panel)
 	_lbl_profile = Label.new()
 	_lbl_profile.add_theme_font_size_override("font_size", 11)
 	_lbl_profile.add_theme_color_override("font_color", PANEL_TEXT_DARK)
@@ -570,18 +558,21 @@ func _build_right_panel(root: Control) -> void:
 	_lbl_queue.visible = false
 	vb.add_child(_lbl_queue)
 
+	_rule(vb, 0.18)
 	# 功能按钮
 	var btn_row := HBoxContainer.new()
 	btn_row.add_theme_constant_override("separation", 6)
 	vb.add_child(btn_row)
-	_buttons.append(_button(btn_row, "💡 提示", func():
+	_buttons.append(_button(btn_row, "提示", func():
 		_allow_tts_fillers()
 		agent.hint()))
-	_buttons.append(_button(btn_row, "📊 局面分析", func():
+	_buttons.append(_button(btn_row, "局面分析", func():
 		_allow_tts_fillers()
 		agent.analyze_position()))
-	_buttons.append(_button(btn_row, "🔄 重来", _ask_reset))
-	_buttons.append(_button(btn_row, "🏁 结束", _ask_end))
+	_buttons.append(_button(btn_row, "重来", _ask_reset))
+	var end_btn := _button(btn_row, "结束", _ask_end)
+	GufengTheme.apply_seal_button(end_btn)          # 主操作：朱砂印（古风里唯一的高饱和块）
+	_buttons.append(end_btn)
 
 	# 复盘（v3.7.0）：**只在对局结束后**出现（未结束整组隐藏 ⇒ 界面不变挤，V19）。
 	# 进复盘后棋盘只读、上面四个按钮置灰、聊天禁用；◀ / ▶ 与 ← / → 只在复盘模式内生效。
@@ -589,16 +580,16 @@ func _build_right_panel(root: Control) -> void:
 	_review_box.add_theme_constant_override("separation", 6)
 	_review_box.visible = false
 	vb.add_child(_review_box)
-	_btn_prev = _button(_review_box, "◀ 上一手", func(): _review_step(-1))
-	_btn_next = _button(_review_box, "下一手 ▶", func(): _review_step(1))
+	_btn_prev = _button(_review_box, "上一手", func(): _review_step(-1))
+	_btn_next = _button(_review_box, "下一手", func(): _review_step(1))
 	_btn_prev.visible = false
 	_btn_next.visible = false
-	_btn_review = _button(_review_box, "📖 复盘", _on_review_toggle)
+	_btn_review = _button(_review_box, "复盘", _on_review_toggle)
 	_btn_review.tooltip_text = "只读回看这一局：棋盘不接受落子与摸头，她也不开口（← / → 翻页）"
 
 	# 俗手回档
 	var bad_title := Label.new()
-	bad_title.text = "⏪ 俗手回档（点一下回到那手之前）"
+	bad_title.text = "俗手回档（点一下回到那手之前）"
 	bad_title.add_theme_font_size_override("font_size", 12)
 	bad_title.add_theme_color_override("font_color", Color(0.627, 0.416, 0.173))
 	vb.add_child(bad_title)
@@ -622,7 +613,7 @@ func _build_left_panel(root: Control) -> void:
 	panel.anchor_bottom = 1.0
 	panel.offset_left = -PANEL_W
 	panel.offset_right = 0
-	panel.add_theme_stylebox_override("panel", _style(Color(1, 1, 1), 0, 12))
+	panel.add_theme_stylebox_override("panel", GufengTheme.panel(12))
 	root.add_child(panel)
 
 	var vb := VBoxContainer.new()
@@ -630,21 +621,27 @@ func _build_left_panel(root: Control) -> void:
 	panel.add_child(vb)
 
 	var head := PanelContainer.new()
-	head.add_theme_stylebox_override("panel", _style(TEAL_DARK, 8, 12))
+	head.add_theme_stylebox_override("panel", GufengTheme.header())
 	vb.add_child(head)
+	var hrow := HBoxContainer.new()
+	hrow.add_theme_constant_override("separation", 10)
+	head.add_child(hrow)
 	var hv := VBoxContainer.new()
-	head.add_child(hv)
+	hv.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hrow.add_child(hv)
 	var t1 := Label.new()
-	t1.text = "🔊 语音朗读"
-	t1.add_theme_font_size_override("font_size", 16)
-	t1.add_theme_color_override("font_color", Color.WHITE)
+	t1.text = "语音朗读"
+	t1.add_theme_font_size_override("font_size", 18)
+	t1.add_theme_color_override("font_color", GufengTheme.PAPER_WARM)
 	hv.add_child(t1)
 	var t2 := Label.new()
 	t2.text = "云端 OpenAI 兼容语音服务 / Windows 系统语音 · 侧栏收起后依然朗读"
 	t2.add_theme_font_size_override("font_size", 11)
-	t2.add_theme_color_override("font_color", Color(1, 1, 1, 0.85))
+	t2.add_theme_color_override("font_color", Color(GufengTheme.PAPER_WARM, 0.72))
 	t2.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hv.add_child(t2)
+	hrow.add_child(GufengTheme.seal_char("音"))
+	_rule(vb)
 
 	var chk := CheckBox.new()
 	chk.button_pressed = cfg.tts_enabled
@@ -777,10 +774,18 @@ func _field_label(text: String) -> Label:
 	return l
 
 ## 统一勾选项样式：面板是白底，默认主题的浅色字/浅色勾选框几乎看不见 → 全部改成深色
+## 一条发丝墨线（分节用）：古风版式靠直线与留白分区，不靠卡片阴影
+func _rule(parent: Node, alpha := 0.26) -> void:
+	var r := ColorRect.new()
+	r.color = Color(GufengTheme.INK, alpha)
+	r.custom_minimum_size = Vector2(0, 1)
+	r.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	parent.add_child(r)
+
 func _style_check(chk: CheckBox, txt := "") -> void:
 	if txt != "":
 		chk.text = txt
-	var dark := PANEL_TEXT_DARK
+	var dark := GufengTheme.INK
 	chk.add_theme_font_size_override("font_size", 12)
 	for k in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color"]:
 		chk.add_theme_color_override(k, dark)
@@ -808,6 +813,7 @@ func _build_toggles(root: Control) -> void:
 	_right_toggle.offset_bottom = 40
 	_right_toggle.tooltip_text = "收起 / 展开右侧面板"
 	_right_toggle.pressed.connect(func(): _set_panel_open("right", not _right_open))
+	GufengTheme.apply_bare_button(_right_toggle)
 	root.add_child(_right_toggle)
 
 	_left_toggle = Button.new()
@@ -819,6 +825,7 @@ func _build_toggles(root: Control) -> void:
 	_left_toggle.offset_bottom = 40
 	_left_toggle.tooltip_text = "收起 / 展开语音设置"
 	_left_toggle.pressed.connect(func(): _set_panel_open("left", not _left_open))
+	GufengTheme.apply_bare_button(_left_toggle)
 	root.add_child(_left_toggle)
 
 func _set_panel_open(which: String, open: bool) -> void:
@@ -1084,7 +1091,7 @@ func _add_stream_bubble() -> void:
 	row.add_theme_constant_override("separation", 0)
 	row.alignment = BoxContainer.ALIGNMENT_BEGIN
 	var bubble := PanelContainer.new()
-	bubble.add_theme_stylebox_override("panel", _style(BUBBLE_AI, 10, 10))
+	bubble.add_theme_stylebox_override("panel", GufengTheme.bubble_ai())
 	row.add_child(bubble)
 	var inner := VBoxContainer.new()
 	inner.add_theme_constant_override("separation", 2)
@@ -1248,13 +1255,13 @@ func _add_msg_now(kind: String, text: String) -> void:
 	row.add_theme_constant_override("separation", 0)
 	var bubble := PanelContainer.new()
 	if kind == "user":
-		bubble.add_theme_stylebox_override("panel", _style(TEAL, 10, 10))
+		bubble.add_theme_stylebox_override("panel", GufengTheme.bubble_user())
 		row.alignment = BoxContainer.ALIGNMENT_END
 	elif kind == "system":
-		bubble.add_theme_stylebox_override("panel", _style(BUBBLE_SYS, 10, 10))
+		bubble.add_theme_stylebox_override("panel", GufengTheme.bubble_sys())
 		row.alignment = BoxContainer.ALIGNMENT_BEGIN
 	else:
-		bubble.add_theme_stylebox_override("panel", _style(BUBBLE_AI, 10, 10))
+		bubble.add_theme_stylebox_override("panel", GufengTheme.bubble_ai())
 		row.alignment = BoxContainer.ALIGNMENT_BEGIN
 	row.add_child(bubble)
 
@@ -1356,7 +1363,7 @@ func _show_thinking() -> void:
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	var bubble := PanelContainer.new()
-	bubble.add_theme_stylebox_override("panel", _style(BUBBLE_AI, 10, 10))
+	bubble.add_theme_stylebox_override("panel", GufengTheme.bubble_ai())
 	row.add_child(bubble)
 	var inner := VBoxContainer.new()
 	inner.add_theme_constant_override("separation", 2)
@@ -1448,7 +1455,7 @@ static func review_lock_state(reviewing: bool, busy: bool, speech_hold: bool,
 		"extra_disabled": reviewing,
 	}
 
-## 能不能进复盘（I2）：正在跑回合（如「🏁 结束」的总结还在途中）或她还有语音没播完时**先别进**。
+## 能不能进复盘（I2）：正在跑回合（如「结束」的总结还在途中）或她还有语音没播完时**先别进**。
 ## 后端 `set_review` 允许 busy 进入、且**不取消**在途回合 ⇒ 那段台词 + 语音 + 气泡会落到复盘期间，
 ## 破掉「回看全程不出声」。纯函数、门卫可直接断言。
 static func review_can_enter(busy: bool, speech_hold: bool) -> bool:
@@ -1520,7 +1527,7 @@ func _ask_note(title_text: String, on_ok: Callable) -> void:
 	box.offset_right = 190
 	box.offset_top = -80
 	box.offset_bottom = 80
-	box.add_theme_stylebox_override("panel", _style(Color.WHITE, 10, 14))
+	box.add_theme_stylebox_override("panel", GufengTheme.panel(14))
 	back.add_child(box)
 
 	var vb := VBoxContainer.new()
@@ -1588,7 +1595,7 @@ func _build_setup_panel() -> void:
 	box.offset_right = 280
 	box.offset_top = -290
 	box.offset_bottom = 290
-	box.add_theme_stylebox_override("panel", _style(Color.WHITE, 12, 16))
+	box.add_theme_stylebox_override("panel", GufengTheme.panel(16))
 	back.add_child(box)
 
 	var scroll := ScrollContainer.new()
@@ -1600,7 +1607,7 @@ func _build_setup_panel() -> void:
 	scroll.add_child(vb)
 
 	var title := Label.new()
-	title.text = "⚙️ 出发前的准备"
+	title.text = "出发前的准备"
 	title.add_theme_font_size_override("font_size", 20)
 	title.add_theme_color_override("font_color", TEAL_DARK)
 	vb.add_child(title)
@@ -2081,7 +2088,7 @@ func _on_settings_toggled(on: bool) -> void:
 	if _settings_box != null:
 		_settings_box.visible = on
 	if _btn_settings != null:
-		_btn_settings.text = "⚙ 设置 ▾" if on else "⚙ 设置 ▸"
+		_btn_settings.text = "设置 ▾" if on else "设置 ▸"
 
 # ================= 画像面板（只读，v3.9.0 / Q6） =================
 
@@ -2138,7 +2145,7 @@ static func profile_panel_text(payload) -> String:
 	if not bool(p.get("ok", false)):
 		return "读取失败：后端拒绝了这次请求"
 	if not bool(p.get("enabled", false)):
-		return "画像功能关着。打开上面的「玩家棋风画像」，下完一局并点「🏁 结束」之后，这里就会有内容。"
+		return "画像功能关着。打开上面的「玩家棋风画像」，下完一局并点「结束」之后，这里就会有内容。"
 	var axes = p.get("axes", {})
 	var lines := ""
 	var n_axes := 0
@@ -2164,7 +2171,7 @@ static func profile_panel_text(payload) -> String:
 			lines += ("\n" if lines != "" else "") + row
 			n_axes += 1
 	if n_axes == 0:
-		return "还没有攒下画像——下完一局并点「🏁 结束」之后就会有一条。"
+		return "还没有攒下画像——下完一局并点「结束」之后就会有一条。"
 	var games = p.get("games", [])
 	var n_games := (games as Array).size() if typeof(games) == TYPE_ARRAY else 0
 	return "她眼中的你（最近 %d 局记录）" % n_games + lines
@@ -2290,7 +2297,7 @@ func _ask_reset() -> void:
 func _ask_end() -> void:
 	_ask_note("对局总结：想对Azure说什么吗？（可留空直接确定）", func(note):
 		_allow_tts_fillers()
-		_game_ended = true                   # 「🏁 结束」流程走完：复盘入口出现（V19；不读 st.finished）
+		_game_ended = true                   # 「结束」流程走完：复盘入口出现（V19；不读 st.finished）
 		_refresh_review_entry()
 		agent.summarize(note))
 
@@ -2329,7 +2336,7 @@ func _enter_review() -> void:
 			_review_cur = _review_total
 			_btn_prev.visible = true
 			_btn_next.visible = true
-			_btn_review.text = "✅ 退出复盘"
+			_btn_review.text = "退出复盘"
 			_refresh_lock()                             # 冻结（只读 / 置灰 / 禁聊天 / 俗手回档与开关）在这里一处收口
 			_set_status("复盘：只读回看中 · 第 %d / %d 手（← → 或按钮翻页）"
 					% [_review_cur, _review_total])
@@ -2361,7 +2368,7 @@ func _exit_review() -> void:
 			_reviewing = false
 			_btn_prev.visible = false
 			_btn_next.visible = false
-			_btn_review.text = "📖 复盘"
+			_btn_review.text = "复盘"
 			_refresh_lock()                             # 只读 / 四个按钮 / 聊天逐项回到进入前（V21）
 			agent.fetch_bytes("/api/state", HTTPClient.METHOD_GET, {},
 				func(ok2: bool, code2: int, body2: PackedByteArray):
@@ -2524,11 +2531,17 @@ func _tick_joseki_card() -> void:
 	if rects.is_empty():
 		rects.append(_board_screen_rect())             # 相机没就位：退回外接矩形（可能是空矩形 = 不管）
 	rects.append(Rect2(mp - Vector2(48.0, 48.0), Vector2(96.0, 96.0)))
-	if _left_open and _left_panel != null:
-		rects.append(_left_panel.get_global_rect())    # 展开的左侧栏也算「别挡」：不挤压既有控件
-	if _right_open and _right_panel != null:
-		rects.append(_right_panel.get_global_rect())
+	rects.append_array(_panel_rects())                 # 展开的侧栏也算「别挡」：不挤压既有控件
 	_joseki_card.set_panel_overlap(rects)
+
+## 已展开的侧栏矩形（避让与「跟随落位」共用同一份判据）
+func _panel_rects() -> Array:
+	var out: Array = []
+	if _left_open and _left_panel != null:
+		out.append(_left_panel.get_global_rect())
+	if _right_open and _right_panel != null:
+		out.append(_right_panel.get_global_rect())
+	return out
 
 ## 棋盘在屏幕上的**格子矩形**（BOARD_CELLS×BOARD_CELLS 片）：旋转后的棋盘是菱形，用外接矩形判重叠
 ## 会把两腰的空白三角也算成「棋盘」——卡片落在空地上也会被判 faded。按格子切碎后误判基本消失，

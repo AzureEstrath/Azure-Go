@@ -21,7 +21,7 @@ const CARD_H := 288.0         # 卡片高：头部 + 小棋盘 + 候选图例 + 
 const PAD := 14.0             # 卡片内边距
 const HEAD_H := 34.0          # 头部占高（课名 / 结构点徽标 / 关闭）
 const GRID_GAP := 6.0         # 头部与棋盘之间的留白
-const TITLE_SIZE := 15        # 标题字号（12px 在 1280×800 下读不清）
+const TITLE_SIZE := 16        # 标题字号（楷体在 16px 起才有笔锋）
 const CLOSE_SIZE := 22.0      # 关闭热区边长（自绘 ×，不建子节点：五条不变量都靠 `_draw`）
 const GRID := 19              # 小棋盘路数：后端坐标就是 19 路
 # 角内取景窗口：定式只看一个角，19 路全盘会把 3~8 颗子摊成一片；按角截 9 路放大。
@@ -32,29 +32,29 @@ const WINDOW := 9
 # 灰影（v3.9.2 修复的正是这个——参考图是要读的，不是要藏的）。
 const FADED_SHELL := 0.40
 
-const BG := Color(0.07, 0.16, 0.18, 1.0)           # **不透明**深色底（v3.9.6：半透明底压在浅色棋盘上发灰，
-#                                                    参考图要的是"一块实心黑板"，不是玻璃）
-const BORDER := Color(0.306, 0.804, 0.769, 0.85)   # 与主界面同一套青蓝
-const GRID_LINE := Color(0.83, 0.91, 0.90, 0.70)
-# 结构点徽标：颜色 + 文案（`kind` 是后端给的四个值之一）
-const BADGE_COLORS := {
-	"entered": Color(0.31, 0.96, 0.90),
-	"branch": Color(1.0, 0.72, 0.20),
-	"deviated": Color(0.95, 0.30, 0.24),
-	"formed": Color(0.75, 0.82, 0.82),
-}
-const BADGE_TEXT := {"entered": "进入", "branch": "分岔", "deviated": "走错", "formed": "收尾"}
-const BADGE_W := 46.0         # 徽标胶囊宽（两个汉字 + 内边距）
+const BG := Color(0.961, 0.937, 0.878, 1.0)       # 宣纸（纹理加载失败时的兜底填充；**不透明**）
+const BORDER := Color(0.173, 0.165, 0.149, 0.85)   # 墨线
+const GRID_LINE := Color(0.173, 0.165, 0.149, 0.55)  # 墨色棋盘格线
+const STONE_B := Color(0.129, 0.122, 0.110)        # 墨黑
+const STONE_W := Color(0.980, 0.953, 0.886)        # 象牙白
+const RING := Color(0.651, 0.231, 0.180)           # 朱砂：第 k 手高亮环
+const CAND := Color(0.651, 0.231, 0.180)           # 朱砂：候选点的外环
+const CAND_FG := Color(0.173, 0.165, 0.149)        # 候选点序号（墨）
+const BAD := Color(0.651, 0.231, 0.180)            # 走错那一手（朱砂）
+const TITLE_FG := Color(0.173, 0.165, 0.149)       # 标题墨色
 const HOSHI := [Vector2i(3, 3), Vector2i(3, 9), Vector2i(3, 15), Vector2i(9, 3),
 		Vector2i(9, 9), Vector2i(9, 15), Vector2i(15, 3), Vector2i(15, 9), Vector2i(15, 15)]
-const STONE_B := Color(0.10, 0.11, 0.12)
-const STONE_W := Color(0.97, 0.97, 0.95)
-const RING := Color(0.31, 0.96, 0.90)              # 第 k 手的高亮环
-const CAND := Color(1.0, 0.72, 0.20)               # 候选点记号（菱形，与高亮环区分开）
-const CAND_FG := Color(0.12, 0.10, 0.03)           # 候选点序号（画在菱形上）
-const BAD := Color(0.95, 0.30, 0.24)               # 走错那一手
-const TITLE_FG := Color(0.90, 0.98, 0.97)
 const INVALID := Vector2i(-1, -1)                  # 非法坐标哨兵（棋盘坐标为 0..18，不会撞上）
+
+## 结构点徽标：**印章**（实心方块 + 纸白字），靠印色分四类
+const BADGE_SEAL := {
+	"entered": Color(0.243, 0.361, 0.345),   # 黛印
+	"branch": Color(0.690, 0.478, 0.165),    # 赭石印
+	"deviated": Color(0.651, 0.231, 0.180),  # 朱砂印
+	"formed": Color(0.420, 0.384, 0.341),    # 淡墨印
+}
+const BADGE_TEXT := {"entered": "进入", "branch": "分岔", "deviated": "走错", "formed": "收尾"}
+const BADGE_W := 40.0         # 印章宽（两个汉字 + 内边距）
 
 ## —— 状态机（数组/缺省一律写在成员声明处：门卫 `.new()` 后即可用）——
 var _active := false           # 有没有卡片内容：apply_event 置真，clear / 兜底 TTL 置假
@@ -335,15 +335,18 @@ func _mistake_cell() -> Vector2i:
 
 func _draw() -> void:
 	var whole := Rect2(Vector2.ZERO, Vector2(CARD_W, CARD_H))
-	# 只有「壳」吃 dim：底色 / 边框 / 网格。文字与棋子一律原色（见 `dim()` 的注释）。
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(BG, BG.a * _dim)
-	sb.border_color = Color(BORDER, BORDER.a * _dim)
-	sb.set_border_width_all(1)
-	sb.set_corner_radius_all(10)
-	sb.shadow_color = Color(0.0, 0.0, 0.0, 0.22 * _dim)
-	sb.shadow_size = 8
-	sb.shadow_offset = Vector2(0, 3)
+	# 投影（壳的一部分，跟着 dim 一起淡）：纸压在桌面上的一点点厚度
+	var sh := StyleBoxFlat.new()
+	sh.bg_color = Color(0, 0, 0, 0)
+	sh.shadow_color = Color(0.18, 0.13, 0.07, 0.22 * _dim)
+	sh.shadow_size = 10
+	sh.shadow_offset = Vector2(2, 5)
+	draw_style_box(sh, whole)
+	# 只有「壳」吃 dim：宣纸 + 墨框 + 网格。文字与棋子一律原色（见 `dim()` 的注释）。
+	var sb := StyleBoxTexture.new()
+	sb.texture = GufengTheme.FRAME_TEX                     # 宣纸底 + 手绘墨框（九宫格）
+	sb.set_texture_margin_all(GufengTheme.FRAME_MARGIN)
+	sb.modulate_color = Color(1.0, 1.0, 1.0, _dim)         # 避让：整层按 _dim 淡出
 	draw_style_box(sb, whole)
 
 	var f := get_theme_default_font()
@@ -351,7 +354,7 @@ func _draw() -> void:
 	_draw_grid(f)
 	_draw_legend(f)
 
-## 头部：课名 + 结构点徽标 + 关闭 ×（自绘，不建子节点：五条不变量都靠 `_draw` 与纯函数）
+## 头部：课名 + 结构点**印章** + 关闭 ×（自绘，不建子节点：五条不变量都靠 `_draw` 与纯函数）
 func _draw_header(f: Font) -> void:
 	var cr := close_rect()
 	if f != null:
@@ -362,25 +365,22 @@ func _draw_header(f: Font) -> void:
 		draw_string(f, Vector2(PAD, HEAD_H * 0.5 + 5.0), _title if _title != "" else "定式参考",
 				HORIZONTAL_ALIGNMENT_LEFT, title_w, TITLE_SIZE, TITLE_FG)
 		if badge != "":
-			var col: Color = BADGE_COLORS.get(_kind, Color(0.75, 0.82, 0.82))
-			var pill := StyleBoxFlat.new()
-			pill.bg_color = Color(col, 0.16)
-			pill.border_color = Color(col, 0.70)
-			pill.set_border_width_all(1)
-			pill.set_corner_radius_all(10)
-			var br := Rect2(badge_x, (HEAD_H - 20.0) * 0.5, BADGE_W, 20.0)
-			draw_style_box(pill, br)
-			draw_string(f, Vector2(br.position.x, br.position.y + 15.0), badge,
-					HORIZONTAL_ALIGNMENT_CENTER, br.size.x, 12, col)
-	# 关闭 ×：悬停时给一层浅底（光标形状在 `_gui_input` 里切）
+			# 朱砂印：实心方印 + 纸白字，四类靠印色区分（黛 / 赭石 / 朱砂 / 淡墨）
+			var seal_col: Color = BADGE_SEAL.get(_kind, Color(0.420, 0.384, 0.341))
+			var seal := Rect2(badge_x, (HEAD_H - 20.0) * 0.5, BADGE_W, 20.0)
+			draw_rect(seal, Color(seal_col, _dim), true)
+			draw_rect(seal, Color(seal_col.darkened(0.35), _dim), false, 1.0)
+			draw_string(f, Vector2(seal.position.x, seal.position.y + 15.0), badge,
+					HORIZONTAL_ALIGNMENT_CENTER, seal.size.x, 12, GufengTheme.PAPER_WARM)
+	# 关闭 ×：悬停时给一层淡墨底（光标形状在 `_gui_input` 里切）
 	if _hover_close:
 		var hsb := StyleBoxFlat.new()
-		hsb.bg_color = Color(1.0, 1.0, 1.0, 0.16)
-		hsb.set_corner_radius_all(6)
+		hsb.bg_color = Color(GufengTheme.INK, 0.10)
+		hsb.set_corner_radius_all(2)
 		draw_style_box(hsb, cr.grow(2.0))
 	var c := cr.position + cr.size * 0.5
 	var q := cr.size.x * 0.26
-	var xc := Color(TITLE_FG, 0.95 if _hover_close else 0.70)
+	var xc := Color(GufengTheme.INK_SOFT, 0.55 if _hover_close else 0.38)
 	draw_line(c + Vector2(-q, -q), c + Vector2(q, q), xc, 1.6)
 	draw_line(c + Vector2(-q, q), c + Vector2(q, -q), xc, 1.6)
 	draw_line(Vector2(PAD, HEAD_H), Vector2(CARD_W - PAD, HEAD_H), Color(BORDER, 0.35 * _dim), 1.0)
