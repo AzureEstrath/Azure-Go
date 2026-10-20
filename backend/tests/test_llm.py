@@ -17,7 +17,7 @@ import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.llm import LLMClient
+from app.llm import LLMClient, REASON_HEADROOM_DEFAULT
 
 
 def _reply(content):
@@ -70,7 +70,7 @@ class ChatTest(unittest.TestCase):
         out = asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100))
         self.assertEqual(out, "好")
         # 输出上限的线上键就是 max_tokens（不是 langchain-openai 默认改的 max_completion_tokens）
-        self.assertEqual(seen[0]["max_tokens"], 100)
+        self.assertEqual(seen[0]["max_tokens"], 100 + REASON_HEADROOM_DEFAULT)
         self.assertNotIn("max_completion_tokens", seen[0])
 
     def test_reasoning_content_not_shown(self):
@@ -86,9 +86,113 @@ class ChatTest(unittest.TestCase):
         self.assertNotIn("内心戏", out)
 
     def test_empty_content_returns_fail_text(self):
-        c = _client(lambda req: httpx.Response(200, json=_reply("")))
+        """空内容 + ``finish_reason=stop``（不是 length）：直接兜底，**不许**重试。"""
+        calls = []
+
+        def handler(req):
+            calls.append(1)
+            return httpx.Response(200, json=_reply(""))
+
+        c = _client(handler)
         self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}])),
                          "唔...我脑子有点转不过来了")
+        self.assertEqual(len(calls), 1)
+
+    def test_length_finish_with_empty_content_retries_without_budget(self):
+        """推理段烧光预算（finish_reason=length + 空 content）⇒ 去掉输出上限重试一次，台词照常。"""
+        seen = []
+
+        def handler(req):
+            seen.append(json.loads(req.content.decode("utf-8")))
+            if len(seen) == 1:
+                return httpx.Response(200, json={
+                    "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                    "choices": [{"index": 0, "finish_reason": "length",
+                                 "message": {"role": "assistant", "content": ""}}]})
+            return httpx.Response(200, json=_reply("重试后的台词"))
+
+        c = _client(handler)
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80)),
+                         "重试后的台词")
+        self.assertEqual(len(seen), 2)
+        self.assertIn("max_tokens", seen[0])
+        self.assertNotIn("max_tokens", seen[1])        # 重试这一次不许再带上限
+
+    def test_length_finish_retry_also_empty_falls_back(self):
+        """重试仍空 ⇒ 落兜底台词（只重试一次，不许循环）。"""
+        calls = []
+
+        def handler(req):
+            calls.append(1)
+            return httpx.Response(200, json={
+                "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "length",
+                             "message": {"role": "assistant", "content": ""}}]})
+
+        c = _client(handler)
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80)),
+                         "唔...我脑子有点转不过来了")
+        self.assertEqual(len(calls), 2)
+
+    def test_length_retry_failure_is_readable(self):
+        """重试那一次失败（HTTP 500）：返回可读错误、总共 2 次请求。"""
+        calls = []
+
+        def handler(req):
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(200, json={
+                    "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                    "choices": [{"index": 0, "finish_reason": "length",
+                                 "message": {"role": "assistant", "content": ""}}]})
+            return httpx.Response(500, json={"error": {"message": "boom"}})
+
+        c = _client(handler)
+        out = asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80))
+        self.assertTrue(out.startswith("调用出错："))
+        self.assertIn("HTTP 500", out)
+        self.assertEqual(len(calls), 2)
+
+    def test_length_after_rejected_params_does_not_resend_same_request(self):
+        """400 之后的重试本身就是裸请求：再命中「空 + length」不许把同形请求再发一遍。"""
+        seen = []
+
+        def handler(req):
+            body = json.loads(req.content.decode("utf-8"))
+            seen.append(body)
+            if "max_tokens" in body:
+                return httpx.Response(400, json={"error": {"message": "Unsupported parameter: max_tokens"}})
+            return httpx.Response(200, json={
+                "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "length",
+                             "message": {"role": "assistant", "content": ""}}]})
+
+        c = _client(handler)
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80)),
+                         "唔...我脑子有点转不过来了")
+        self.assertEqual(len(seen), 2)              # 400 + 一条裸重试，到此为止
+
+    def test_budget_for_public_entry_matches_ladder(self):
+        """工具轮 / 流式通道共用 ``budget_for``：与 ``chat()`` 同一套推理余量（== _budget(n, False)）。"""
+        c = _client(lambda req: httpx.Response(200, json=_reply("好")))
+        self.assertEqual(c.budget_for(80), 80 + REASON_HEADROOM_DEFAULT)
+        c.think_mode = 2
+        self.assertEqual(c.budget_for(80), 80 + REASON_HEADROOM_DEFAULT + 800)
+
+    def test_truncated_but_nonempty_reply_is_used_as_is(self):
+        """现状契约（防回归）：有内容就算被截断也照用，不许重试——重试只针对「空 content」。"""
+        calls = []
+
+        def handler(req):
+            calls.append(1)
+            return httpx.Response(200, json={
+                "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "length",
+                             "message": {"role": "assistant", "content": "这手很实"}}]})
+
+        c = _client(handler)
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80)), "这手很实")
+        self.assertEqual(len(calls), 1)
 
     def test_http_401_is_readable(self):
         c = _client(lambda req: httpx.Response(401, json={"error": {"message": "bad key"}}))
@@ -187,7 +291,7 @@ class ChatTest(unittest.TestCase):
         c = _client(handler, extra_body={"top_k": 40})
         self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100)), "好")
         self.assertEqual(seen[0]["top_k"], 40)
-        self.assertEqual(seen[0]["max_tokens"], 100)
+        self.assertEqual(seen[0]["max_tokens"], 100 + REASON_HEADROOM_DEFAULT)
 
     def test_explicit_max_tokens_wins(self):
         """配置里写死了 max_tokens：注入的预算必须让位（尊重显式配置）。"""
@@ -228,7 +332,7 @@ class ChatTest(unittest.TestCase):
         c = _client(handler)          # 用户没配扩展字段：注入的 max_tokens 就是唯一的「加料」
         out = asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100))
         self.assertEqual(out, "好")
-        self.assertEqual(seen[0]["max_tokens"], 100)
+        self.assertEqual(seen[0]["max_tokens"], 100 + REASON_HEADROOM_DEFAULT)
         self.assertNotIn("max_tokens", seen[1])
         self.assertTrue(c._extra_body_unsupported)
 
@@ -259,15 +363,15 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(seen[0]["max_tokens"], 32)   # no_think：不加推理预算
 
     def test_reason_budget_ladder(self):
-        """思考档位 1/2 各追加一段推理预算（+160 / +800）；档位 0 与 no_think 都不追加。"""
+        """推理余量是**底**，思考档位 1/2 再各叠加 +160 / +800；no_think 一个都不加（阶梯必须单调）。"""
         from app.llm import REASON_BUDGET_MED, REASON_BUDGET_STRONG
         self.assertEqual((REASON_BUDGET_MED, REASON_BUDGET_STRONG), (160, 800))
         c = _client(lambda req: httpx.Response(200, json=_reply("好")))
-        self.assertEqual(c._budget(100, False), 100)
+        self.assertEqual(c._budget(100, False), 100 + REASON_HEADROOM_DEFAULT)
         c.think_mode = 1
-        self.assertEqual(c._budget(100, False), 260)
+        self.assertEqual(c._budget(100, False), 100 + REASON_HEADROOM_DEFAULT + 160)
         c.think_mode = 2
-        self.assertEqual(c._budget(100, False), 900)
+        self.assertEqual(c._budget(100, False), 100 + REASON_HEADROOM_DEFAULT + 800)
         self.assertEqual(c._budget(100, True), 100)   # no_think 优先：强思考也不追加
 
 

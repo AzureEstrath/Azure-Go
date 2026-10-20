@@ -270,3 +270,50 @@ class MiscTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# —— 以下为阶段三（v3.8.0）追加：分析深度**按调用可调**（既有断言一字未改；追加在文件末尾，
+#    是因为本仓的唯一跑法 `python -m unittest discover -s tests` 不执行上面的 `unittest.main()`）——
+
+
+class PerCallMaxVisitsTest(unittest.TestCase):
+    """``analyze(moves, max_visits=…)``：默认语义**一字不变**，显式传入才覆盖本次搜索深度。
+
+    预测线 A/B/C 只吃既有 ``moveInfos``（零额外调用），但要求更深的搜索才拿得到足够长的 ``pv``；
+    深度**只给「玩家落子后局面」那一次**（调用点由 ``test_agent_graph.PvDepthCallSiteTest`` 钉住）。
+    ``None`` / 0 一律回退实例默认（与旧版逐字同构）。
+    """
+
+    def _body(self, *, engine_kw=None, analyze_kw=None):
+        seen = {}
+
+        def handler(req):
+            seen["body"] = json.loads(req.content.decode("utf-8"))
+            return httpx.Response(200, json=ANALYSIS)
+
+        async def run():
+            eng = _engine(handler, **(engine_kw or {}))
+            await eng.start()
+            await eng.analyze([["B", "Q16"]], **(analyze_kw or {}))
+
+        asyncio.run(run())
+        return seen["body"]
+
+    def test_default_call_keeps_engine_max_visits(self):
+        body = self._body(engine_kw={"max_visits": 123})
+        self.assertEqual(body["maxVisits"], 123)
+
+    def test_explicit_max_visits_overrides_this_call_only(self):
+        body = self._body(engine_kw={"max_visits": 123}, analyze_kw={"max_visits": 150})
+        self.assertEqual(body["maxVisits"], 150)
+
+    def test_none_and_zero_fall_back_to_engine_default(self):
+        for v in (None, 0):
+            body = self._body(engine_kw={"max_visits": 123}, analyze_kw={"max_visits": v})
+            self.assertEqual(body["maxVisits"], 123, "max_visits=%r 必须回退实例默认" % (v,))
+
+    def test_dirty_and_negative_values_fall_back_without_raising(self):
+        """非数值 / 负值也一律回退实例默认：异常不许逃出 ``analyze`` 的 ``{"error": …}`` 契约。"""
+        for v in ("abc", -5, [], {}):
+            body = self._body(engine_kw={"max_visits": 123}, analyze_kw={"max_visits": v})
+            self.assertEqual(body["maxVisits"], 123, "max_visits=%r" % (v,))

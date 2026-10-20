@@ -24,7 +24,7 @@ from app.llm import LLMClient
 class _StubEngine:
     """假引擎：情绪小调用根本不碰引擎，这里只为把 AzureAgent 装配起来。"""
 
-    async def analyze(self, moves):
+    async def analyze(self, moves, max_visits=None):
         return {"rootInfo": {"winrate": 0.5, "scoreLead": 0.0}, "moveInfos": [], "ownership": []}
 
 

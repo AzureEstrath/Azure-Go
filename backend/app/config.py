@@ -10,14 +10,45 @@ KataGo 由独立的云服务提供（见 ``katago_service/``）：这里只存�
 import json
 import os
 
+# 情绪波动的「小概率」上限（v3.8.0 / 修复轮 1 / Minor #3）：`drift_max` **不许**开到 1.0——
+# 它是 `p_drift` 的天花板，而阶梯是 `P(A)=1-p`、`P(B)=2p/3`、`P(C)=p/3`：`p ≥ 0.6` 时
+# `P(A) ≤ P(B)`、`p = 1.0` 时她**恒偏航**，正是 spec §5-C 要防的「变成乱下」。
+# 0.2 的余量：`P(A) ≥ 0.8 > P(B) ≤ 0.133`，且比默认 `drift_max=0.08` 宽一倍多，够用不越界。
+DRIFT_MAX_LIMIT = 0.2
+
+
+def _clamp01(v, fallback):
+    """``[0, 1]`` 的安全取值：缺失 / 脏值 → ``fallback``（不抛，不因一个旋钮把启动搞崩）。"""
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return float(fallback)
+
 
 class AzureConfig:
     def __init__(self):
         self.katago_url = "http://127.0.0.1:8100"   # KataGo 云服务地址（与 katago_service 默认端口一致）
         self.katago_token = ""                      # Bearer token；留空＝不鉴权（本机回环调试）
-        self.katago_timeout_ms = 30000              # 单次 /analyze 超时
+        self.katago_timeout_ms = 45000              # 单次 /analyze 超时（代码默认，v3.8.0：30000 → 45000，给深搜那一次留余量；随包 game/config.json 仍写 30000）
         self.max_visits = 500
+        self.pv_max_visits = 150                    # 预测线 A/B/C 那一次分析的深度**下限**（只增不减，见 agent_graph._deep_visits）
         self.joseki_teach = True
+        self.joseki_rate = 0.5                      # 定式提示频率（0~1）：与开关同一格；门控唯一路径 p=clamp(rate+adj,0,1)
+        # —— 情绪波动（v3.8.0）：开启后她小概率走偏优解（默认关，关闭时行为与现状逐项一致）——
+        self.emotion_drift = False
+        self.drift_base = 0.03                      # 基础偏航概率（平静时的 p_drift）
+        self.drift_max = 0.08                       # p_drift 上限
+        self.pv_max_drop = 0.05                     # 偏航线与最优线的胜率差上限（超了整条不用）
+        # —— 聊天事件摘要（v3.8.0）：默认规则式（零 LLM）；开启后只在局末 / 空闲补做 LLM 分段 ——
+        self.chat_digest_llm = False
+        # —— 玩家棋风画像 + 时间感知（v3.9.0，设计 §6.4）：两个开关**默认都关**（关掉＝现状）——
+        #    关着时提示词里的画像块 / 时间块都不注入（与没有这两个功能逐字符同构）；
+        #    读入口径与 `emotion_drift` / `chat_digest_llm` 同形：只认 JSON 的 true / false。
+        self.profile_enabled = False
+        self.time_aware_enabled = False
+        # 画像库路径：留空＝<backend>/data/profile.db（由 profile_store.DEFAULT_DB_PATH 决定，
+        # 已 gitignore、属运行产物）。与 memory_db_path 同一形状：只存路径、不在这里碰盘。
+        self.profile_db_path = ""
         self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
@@ -28,6 +59,8 @@ class AzureConfig:
         # —— 发言侧工具（她自己查盘/复算/查定式；只影响怎么说，不影响下哪里）——
         self.tools_enabled = False          # 默认关闭：行为与没有工具时完全一致
         self.max_tool_calls = 2             # 一次发言的工具次数上限（agent 侧还有硬上限）
+        # —— 流式输出（默认关闭）：开启后 speak 阶段逐块推 `token` 事件，最终仍以完整 message 收口 ——
+        self.stream_tokens = False
         # —— 长期记忆（跨局记得玩家；默认关闭，关闭时不建库、不调 embedding）——
         self.memory_enabled = False
         self.memory_db_path = ""            # 留空＝<backend>/data/memory.db（由 memory_service 决定）
@@ -37,6 +70,17 @@ class AzureConfig:
         self.memory_top_k = 3               # 每次召回条数上限
         self.memory_max_inject_chars = 240  # 注入提示词的总字数上限（单条另截到 120 字）
         self.embed_timeout = 10.0           # 单次 embedding 超时（秒）；可收紧，memory_service 用它装配云端客户端
+        # —— 云端语音合成（后端合成 + 缓存；Task 2 起）：默认关闭、默认系统语音兜底 ——
+        self.tts_enabled = False            # 关闭时零开销：不发请求、不发 speech 事件，文字照常
+        self.tts_mode = "system"            # "openai"＝云端合成；"system"＝让前端用系统语音念
+        self.tts_base_url = ""              # OpenAI 兼容地址；openai 模式未配置时视为未启用
+        self.tts_model = "tts-1"
+        self.tts_api_key = ""               # 留空＝不带 Authorization（本机回环调试）
+        self.tts_voice = ""
+        self.tts_speed = 1.0
+        self.tts_volume = 1.0
+        self.tts_timeout_sec = 30           # 单次合成超时；超时整条降级为系统语音
+        self.tts_long_chunk = False         # 打开后单块字数上限放宽（templates 里该键已在）
         # —— 提示词自定义（留空则用内置 Azure 人设）——
         self.prompt_system = ""
         self.prompt_user_name = "Estarth"
@@ -75,7 +119,39 @@ class AzureConfig:
         self.katago_token = str(d.get("katago_token", self.katago_token))
         self.katago_timeout_ms = int(d.get("katago_timeout_ms", self.katago_timeout_ms))
         self.max_visits = int(d.get("max_visits", self.max_visits))
+        # 预测线 A/B/C 那一次分析的深度**下限**（修复轮 1 起**只增不减**）：调用点取
+        # ``max(pv_max_visits, 引擎的 max_visits)``——随包模板 max_visits=100 时 150 是加深；
+        # 代码默认 max_visits=500 时那一次照旧 500（绝不被砍浅：那同一次分析的产物还是
+        # 「玩家这手亏没亏」的判据源）。脏值保留 ``__init__`` 的默认（不因一个旋钮把启动搞崩）。
+        try:
+            self.pv_max_visits = max(1, int(d.get("pv_max_visits", self.pv_max_visits)))
+        except (TypeError, ValueError):
+            pass
         self.joseki_teach = bool(d.get("joseki_teach", self.joseki_teach))
+        try:
+            self.joseki_rate = max(0.0, min(1.0, float(d.get("joseki_rate", self.joseki_rate))))
+        except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把启动搞崩
+            self.joseki_rate = 0.5
+        # 情绪波动（v3.8.0）：开关**只认 JSON 的 true / false**——字符串 `"false"` / 数字 / null
+        # 一律当脏值 → 默认关（修复轮 1 / Minor #7：`bool("false")` 是 True，会把脏值读成「开」）。
+        v = d.get("emotion_drift")
+        self.emotion_drift = v if isinstance(v, bool) else self.emotion_drift
+        # 三个数值：脏值退回默认；`drift_max` 再夹到「小概率」上限 `DRIFT_MAX_LIMIT`（不是 1.0），
+        # `drift_base` 夹到 `[0, drift_max]`（修复轮 1 / Minor #3）。
+        self.drift_max = min(_clamp01(d.get("drift_max"), 0.08), DRIFT_MAX_LIMIT)
+        self.drift_base = min(_clamp01(d.get("drift_base"), 0.03), self.drift_max)
+        self.pv_max_drop = _clamp01(d.get("pv_max_drop"), 0.05)
+        # 聊天事件摘要（v3.8.0）：开关**只认 JSON 的 true / false**（与 `emotion_drift` 同一口径，
+        # 字符串 `"false"` 是脏值 → 保留默认关）。
+        v = d.get("chat_digest_llm")
+        self.chat_digest_llm = v if isinstance(v, bool) else self.chat_digest_llm
+        # 画像 / 时间感知开关（v3.9.0）：同样**只认 JSON 的 true / false**（字符串 `"false"` /
+        # 数字 / null 是脏值 → 保留默认关）。
+        v = d.get("profile_enabled")
+        self.profile_enabled = v if isinstance(v, bool) else self.profile_enabled
+        v = d.get("time_aware_enabled")
+        self.time_aware_enabled = v if isinstance(v, bool) else self.time_aware_enabled
+        self.profile_db_path = str(d.get("profile_db_path", self.profile_db_path))
         self.llm_base_url = str(d.get("llm_base_url", self.llm_base_url))
         self.llm_model = str(d.get("llm_model", self.llm_model))
         self.llm_api_key = str(d.get("llm_api_key", self.llm_api_key))
@@ -91,6 +167,7 @@ class AzureConfig:
             self.llm_think_extra_body = dict(tb)
         self.tools_enabled = bool(d.get("tools_enabled", self.tools_enabled))
         self.max_tool_calls = max(0, int(d.get("max_tool_calls", self.max_tool_calls)))
+        self.stream_tokens = bool(d.get("stream_tokens", self.stream_tokens))
         self.memory_enabled = bool(d.get("memory_enabled", self.memory_enabled))
         self.memory_db_path = str(d.get("memory_db_path", self.memory_db_path))
         self.embed_base_url = str(d.get("embed_base_url", self.embed_base_url))
@@ -102,6 +179,25 @@ class AzureConfig:
             self.embed_timeout = max(0.0, float(d.get("embed_timeout", self.embed_timeout)))
         except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把启动搞崩
             self.embed_timeout = 10.0
+        self.tts_enabled = bool(d.get("tts_enabled", self.tts_enabled))
+        self.tts_mode = str(d.get("tts_mode", self.tts_mode))
+        self.tts_base_url = str(d.get("tts_base_url", self.tts_base_url))
+        self.tts_model = str(d.get("tts_model", self.tts_model))
+        self.tts_api_key = str(d.get("tts_api_key", self.tts_api_key))
+        self.tts_voice = str(d.get("tts_voice", self.tts_voice))
+        try:
+            self.tts_speed = max(0.0, float(d.get("tts_speed", self.tts_speed)))
+        except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把后端启动搞崩
+            self.tts_speed = 1.0
+        try:
+            self.tts_volume = max(0.0, float(d.get("tts_volume", self.tts_volume)))
+        except (TypeError, ValueError):
+            self.tts_volume = 1.0
+        try:
+            self.tts_timeout_sec = max(1.0, float(d.get("tts_timeout_sec", self.tts_timeout_sec)))
+        except (TypeError, ValueError):
+            self.tts_timeout_sec = 30.0
+        self.tts_long_chunk = bool(d.get("tts_long_chunk", self.tts_long_chunk))
         self.prompt_system = str(d.get("prompt_system", self.prompt_system))
         self.prompt_user_name = str(d.get("prompt_user_name", self.prompt_user_name))
         pn = d.get("prompt_phase_notes")

@@ -43,7 +43,9 @@ func _build_floor() -> void:
 	mi.mesh = plane
 	mi.position = Vector3(0, FLOOR_Y, 0)
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.945, 0.960, 0.950)
+	# 桌面（不是纯白）：比侧栏的宣纸（#F5EFE0）深一档，面板才立得起来；
+	# 也不用荧光/高饱和色——古风里"桌面"就是一张压暗的纸。
+	mat.albedo_color = Color(0.741, 0.706, 0.627)   # 受光后会亮到 ≈ #D6CCB5（不刺眼、也不发白）
 	mat.roughness = 1.0
 	mi.material_override = mat
 	add_child(mi)

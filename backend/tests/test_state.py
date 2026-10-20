@@ -1,5 +1,9 @@
-"""GameState 黄金样本比对：逐项对照 tests/golden/state.json。"""
+"""GameState 黄金样本比对：逐项对照 tests/golden/state.json。
 
+另含 v3.7.0 的两份「本局完整账」门卫：``move_notes``（逐手存档）与 ``losses``（真亏手）。
+"""
+
+import copy
 import json
 import os
 import unittest
@@ -92,6 +96,120 @@ class GameStateTest(unittest.TestCase):
         snap = st.make_snapshot()
         snap["board"].play(0, 0, "black")
         self.assertEqual(st.board.grid[0][0], "", "snapshot 棋盘应为主棋盘的克隆")
+
+
+class MoveNotesTest(unittest.TestCase):
+    """A：本局逐手存档 ``move_notes`` —— 纯追加、不滚动、不截断。"""
+
+    def test_not_rolling_and_not_truncated(self):
+        """① 连记 40 条、每条 300 字 → 一条不少、一字不截。"""
+        st = GameState()
+        long_text = "长" * 300
+        for i in range(1, 41):
+            st.note_move(i, "aim", "A", long_text)
+        self.assertEqual(len(st.move_notes), 40, "不滚动：40 条应全在")
+        self.assertEqual(len(st.move_notes[0]["text"]), 300, "不截断：首条仍是 300 字")
+        self.assertEqual(st.move_notes[0]["move_no"], 1)
+        self.assertEqual(st.move_notes[-1]["move_no"], 40)
+
+    def test_two_kinds_on_same_move(self):
+        """② 同一手可以既记 'aim'（用意）又记 'review'（感想）。"""
+        st = GameState()
+        st.note_move(3, "aim", "A", "她这一手的用意")
+        st.note_move(3, "review", "A", "她这一手的感想")
+        self.assertEqual([m["kind"] for m in st.move_notes], ["aim", "review"])
+        self.assertEqual([m["side"] for m in st.move_notes], ["A", "A"])
+        self.assertEqual([m["move_no"] for m in st.move_notes], [3, 3])
+
+    def test_element_shape(self):
+        st = GameState()
+        st.note_move(2, "review", "E", "玩家那手的点评原文")
+        self.assertEqual(
+            st.move_notes[0],
+            {"move_no": 2, "kind": "review", "side": "E", "text": "玩家那手的点评原文"},
+        )
+
+    def test_reset_clears_move_notes(self):
+        """③ ``reset()`` 清空逐手存档。"""
+        st = GameState()
+        st.note_move(1, "aim", "A", "用意")
+        st.note_move(1, "review", "E", "点评")
+        st.reset()
+        self.assertEqual(st.move_notes, [])
+
+    def test_snapshot_and_rollback_do_not_touch_move_notes(self):
+        """④ 快照 / 回滚不涉及 ``move_notes``（它不是状态机的一部分，悔棋不清账）。"""
+        st = GameState()
+        st.add_move("B", "D4")
+        st.note_move(1, "review", "E", "第一手点评")
+        snap = st.make_snapshot()
+        self.assertNotIn("move_notes", snap, "快照不带走逐手存档")
+        self.assertNotIn("losses", snap, "快照不带走亏损手账")
+        st.add_move("W", "Q16")
+        st.note_move(2, "aim", "A", "第二手用意")
+        # 模拟悔棋：从快照恢复的那几项里没有 move_notes ⇒ 存档不受回滚影响
+        st.moves = copy.deepcopy(snap["moves"])
+        st.move_seq = list(snap["move_seq"])
+        self.assertEqual(len(st.move_notes), 2, "回滚不截断逐手存档")
+
+
+class LossesTest(unittest.TestCase):
+    """B：本局全部真亏手 ``losses`` —— 与俗手 ``bad_moves`` 各自记账。"""
+
+    def test_bad_moves_still_capped_at_three(self):
+        st = GameState()
+        for i in range(5):
+            st.record_bad_move(i, "D4", "不在我算的前5候选")
+        self.assertEqual(len(st.bad_moves), 3, "俗手仍是最近 3 条（右侧栏回档行为不变）")
+
+    def test_losses_are_not_capped(self):
+        st = GameState()
+        for i in range(5):
+            st.record_loss("D4", 0.3, "胜率下滑30%")
+        self.assertEqual(len(st.losses), 5, "真亏手不封顶")
+
+    def test_rank_only_bad_move_is_not_a_loss(self):
+        """只掉名次不掉胜率 ⇒ 不算真亏。"""
+        st = GameState()
+        st.record_loss("D4", 0.0, "不在我算的前5候选")
+        self.assertEqual(st.losses, [])
+
+    def test_element_shape(self):
+        st = GameState()
+        st.add_move("B", "D4")
+        st.add_move("W", "Q16")
+        st.add_move("B", "C3")
+        st.record_loss("C3", 0.25, "胜率下滑25%")
+        self.assertEqual(
+            st.losses[0],
+            {"move_no": 3, "gtp": "C3", "drop": 0.25, "reason": "胜率下滑25%"},
+        )
+
+    def test_losses_append_in_order_with_player_move_no(self):
+        """接线（形状）：按发生顺序追加，``move_no`` 是玩家那手的 1 基序号。"""
+        st = GameState()
+        st.add_move("B", "D4")                      # 玩家第 1 手
+        st.record_loss("D4", 0.2, "胜率下滑20%")
+        st.add_move("W", "Q16")                     # 她第 2 手
+        st.add_move("B", "C3")                      # 玩家第 3 手
+        st.record_loss("C3", 0.15, "胜率下滑15%")
+        self.assertEqual([x["move_no"] for x in st.losses], [1, 3])
+        self.assertEqual([x["gtp"] for x in st.losses], ["D4", "C3"])
+        self.assertEqual([x["drop"] for x in st.losses], [0.2, 0.15])
+
+    def test_drop_exactly_point_one_is_not_a_loss(self):
+        """接线（边界）：``drop == 0.10`` 整不记，``> 0.10`` 才记。"""
+        st = GameState()
+        st.record_loss("D4", 0.10, "胜率下滑10%")
+        self.assertEqual(st.losses, [], "整 0.10 不入账")
+        st.record_loss("D4", 0.100001, "胜率下滑10%")
+        self.assertEqual(len(st.losses), 1)
+
+    def test_reset_clears_losses(self):
+        st = GameState()
+        st.record_loss("D4", 0.4, "胜率下滑40%")
+        st.reset()
+        self.assertEqual(st.losses, [])
 
 
 if __name__ == "__main__":

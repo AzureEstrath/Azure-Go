@@ -1,8 +1,11 @@
 class_name Board3D
 extends Node3D
 ## 真实 3D 棋盘：棋盘面/侧厚/网格/星位/坐标、扁形棋子、射线拾取、右键拖拽旋转视角
+##
+## 键盘：`Home` 回初始取景，`C` 依次看四个角（都不与聊天输入框冲突——输入框有焦点时按键归它）。
 
 signal intersection_clicked(x: int, y: int)
+signal view_changed(desc: String)   # 视角便捷键动了视角：给状态栏一句话反馈（文案在 Main 的 _set_status）
 
 const CELL := 1.0
 const HALF := 9.0
@@ -21,6 +24,10 @@ const PANEL_W := 380.0
 const VIEW_LIFT := 3.0
 ## 旋转视角结束后的注视锁定：先看玩家 1 秒，再交回鼠标跟随
 const GAZE_LOCK_AFTER_ROTATE := 1.0
+## 四角轮转：0=西北(A19) 1=西南(A1) 2=东南(T1) 3=东北(T19)
+const CORNER_COUNT := 4
+const CORNER_NAMES := ["西北", "西南", "东南", "东北"]
+const CORNER_GTPS := ["A19", "A1", "T1", "T19"]
 ## 调试用：直接设定视角
 func set_view(yaw_deg: float, pitch_deg: float, dist := 0.0) -> void:
 	_yaw = deg_to_rad(yaw_deg)
@@ -29,7 +36,44 @@ func set_view(yaw_deg: float, pitch_deg: float, dist := 0.0) -> void:
 		_dist = clampf(dist, DIST_MIN, DIST_MAX)
 	_update_camera()
 
+# ================= 视角便捷（Home 回初始取景 / C 四角轮转） =================
+
+var _home_yaw := 0.0             # 启动时捕获的取景（reset_view 的目标）
+var _home_pitch := deg_to_rad(38.0)
+var _home_dist := 42.0
+var _corner := -1                # 上次看过的角（-1=还没看过；C 键从西北角开始轮转）
+
+## 把当前视角记成「初始取景」。`_ready` 里记一次；`Main._handle_cli` 应用完
+## `--yaw/--pitch/--dist` 再记一次——调试参数就是现成的目标值来源（spec B3）。
+func capture_home_view() -> void:
+	_home_yaw = _yaw
+	_home_pitch = _pitch
+	_home_dist = _dist
+
+## 一键回初始取景（yaw / pitch / dist 三项；棋盘没有「tilt」这个量——`--tilt=` 是化身的歪头）
+func reset_view() -> void:
+	_yaw = _home_yaw
+	_pitch = _home_pitch
+	_dist = _home_dist
+	_update_camera()
+
+## 四角的相机方位角（度）：角 0 在 45°（从东南看西北角），每 +1 顺时针走一个角。
+## 越界按 4 取模、负数也绕回来（脏值不越界）；纯函数、不碰场景树（门卫可直接断言）。
+static func corner_yaw_deg(corner: int) -> float:
+	return 45.0 + 90.0 * float(posmod(corner, CORNER_COUNT))
+
+## 看某个角：只转方位角，**不动俯仰与距离**（玩家的缩放/俯仰不被抢走）
+func look_at_corner(corner: int) -> void:
+	_corner = posmod(corner, CORNER_COUNT)
+	_yaw = deg_to_rad(corner_yaw_deg(_corner))
+	_update_camera()
+
+## 当前视角（度 / 距离）：门卫与调试核对用（纯读，不碰场景树）
+func view_state() -> Dictionary:
+	return {"yaw_deg": rad_to_deg(_yaw), "pitch_deg": rad_to_deg(_pitch), "dist": _dist}
+
 var locked := false              # Azure 思考中时禁止落子
+var readonly := false            # 复盘回看（v3.7.0）：棋盘整体只读——**落子与摸头都不接受**（与 locked 独立）
 var idle_attention := false      # 玩家长时间无操作：化身转为看向玩家
 var cam: Camera3D = null
 
@@ -57,6 +101,7 @@ var _occupied := {}
 var _displayed: Array = []       # 当前显示的棋子（权威 + 乐观）
 var _optimistic: Array = []
 var _hover := Vector2i(-1, -1)
+var _move_seq_map := {}          # 后端 state 的 GTP 手顺**预建查表** {归一化 GTP: 手数}：悬停热路径只做一次 lookup
 var _font: Font = null
 var _black_mat: StandardMaterial3D
 var _white_mat: StandardMaterial3D
@@ -85,6 +130,7 @@ func _ready() -> void:
 	_stones_root = Node3D.new()
 	add_child(_stones_root)
 	_build_ghost()
+	capture_home_view()              # 启动取景就是「初始视角」（Main._handle_cli 里应用完调试参数会再记一次）
 
 ## 生成一个小圆点贴图，供「最后一手」标记使用
 func _make_dot_texture() -> ImageTexture:
@@ -123,6 +169,8 @@ func set_panels(left_open: bool, right_open: bool) -> void:
 	_update_camera()
 
 func _update_camera() -> void:
+	if cam == null:
+		return                                   # 还没建相机（`Board3D.new()` 的门卫 / 视角便捷键的纯逻辑）
 	var vp := get_viewport().get_visible_rect().size
 	var vh := vp.y
 	var free_l := PANEL_W if _panel_left else 0.0
@@ -152,7 +200,7 @@ func _build_board() -> void:
 	bmi.mesh = box
 	bmi.position = Vector3(0, -0.3, 0)
 	var bmat := StandardMaterial3D.new()
-	bmat.albedo_color = Color(0.804, 0.722, 0.541)
+	bmat.albedo_color = Color(0.722, 0.635, 0.463)
 	bmat.roughness = 0.85
 	bmi.material_override = bmat
 	add_child(bmi)
@@ -216,7 +264,7 @@ func _label(text: String, pos: Vector3) -> void:
 	l.text = text
 	l.font_size = 64
 	l.pixel_size = 0.008
-	l.modulate = Color(0.24, 0.29, 0.24)
+	l.modulate = Color(0.20, 0.18, 0.15)
 	l.rotation_degrees = Vector3(-90, 0, 0)
 	l.position = pos
 	add_child(l)
@@ -235,7 +283,7 @@ func _build_ghost() -> void:
 	_tip.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	_tip.font_size = 48
 	_tip.pixel_size = 0.006
-	_tip.modulate = Color(0.09, 0.42, 0.42)
+	_tip.modulate = Color(0.20, 0.28, 0.26)
 	_tip.outline_size = 12
 	_tip.no_depth_test = true
 	_tip.visible = false
@@ -279,12 +327,62 @@ func _make_stone(x: int, y: int, color: String, last: bool) -> void:
 		dot.texture = _dot_tex
 		dot.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 		dot.pixel_size = 0.004
-		dot.modulate = Color(0.306, 0.804, 0.769) if color == "black" else Color(0.906, 0.298, 0.235)
+		dot.modulate = Color(0.984, 0.965, 0.918) if color == "black" else Color(0.651, 0.231, 0.180)
 		dot.position = _world(x, y, STONE_H + 0.05)
 		_stones_root.add_child(dot)
 
 func is_occupied(x: int, y: int) -> bool:
 	return _occupied.has(Vector2i(x, y))
+
+# ================= 悬停提示：坐标 + 手数 =================
+
+## 后端 state 的 `move_seq`（GTP 手顺，含 "pass"）：每次 state 事件对齐一次。
+## 这里**预建查表** `{归一化 GTP: 手数}`（同一交叉点取**最后一次**出现 ⇒ 后面的覆盖前面的）：
+## 悬停是每次鼠标移动都会走的热路径，原先每次都把整条手顺 `strip_edges().to_upper()` 扫一遍
+## （300 手 × 100Hz），现在只在 state 变更时扫一次。脏值（非数组 / 元素非字符串）一律跳过。
+func set_move_seq(seq) -> void:
+	_move_seq_map.clear()
+	if typeof(seq) != TYPE_ARRAY:
+		return
+	var arr := seq as Array
+	for i in arr.size():
+		var v = arr[i]
+		if typeof(v) == TYPE_STRING:
+			_move_seq_map[str(v).strip_edges().to_upper()] = i + 1
+
+## 某交叉点在 `move_seq` 里的手数（1 基）：查 `set_move_seq` 预建的表；不在表里 / 盘外 ⇒ 0。
+func move_no_at(x: int, y: int) -> int:
+	if not Coords.valid(x, y):
+		return 0
+	return int(_move_seq_map.get(Coords.xy_to_gtp(x, y), 0))
+
+## 手数推法的**纯函数参照实现**（静态、不碰场景树，门卫可直接断言；语义与上面的预建表逐字一致）：
+## 取**最后一次**出现——同一交叉点被提后再下时以最近一手为准；复盘快照的 `move_seq` 已截到当前
+## 回看手，天然对齐。不在序列里 / 脏值 / 盘外 ⇒ 0。实例路径走 `move_no_at`（O(1) 查表）。
+static func move_no_in_seq(x: int, y: int, move_seq) -> int:
+	if typeof(move_seq) != TYPE_ARRAY or not Coords.valid(x, y):
+		return 0
+	var want := Coords.xy_to_gtp(x, y)
+	var found := 0
+	for i in (move_seq as Array).size():
+		var v = (move_seq as Array)[i]
+		if typeof(v) == TYPE_STRING and str(v).strip_edges().to_upper() == want:
+			found = i + 1
+	return found
+
+## 悬停文案的**纯逻辑核心**（静态、不碰场景树）：盘外 ⇒ 空串；`move_no > 0`（已有棋子）⇒
+## 「D4 · 第 3 手」；否则（空点）⇒ 既有措辞「D4 · 点击落子」（逐字符沿用，不许改）。
+static func tip_text_at(x: int, y: int, move_no: int) -> String:
+	if not Coords.valid(x, y):
+		return ""
+	var label := Coords.xy_to_gtp(x, y)
+	if move_no > 0:
+		return "%s · 第 %d 手" % [label, move_no]
+	return "%s · 点击落子" % label
+
+## 悬停文案（实例入口）：已有棋子给坐标 + 手数，空点给「点击落子」
+func tip_text(x: int, y: int) -> String:
+	return tip_text_at(x, y, move_no_at(x, y) if is_occupied(x, y) else 0)
 
 # ================= 定式高亮轨迹 =================
 
@@ -307,7 +405,7 @@ func highlight_points(points: Array, kind := "formed") -> void:
 		dot.texture = _dot_tex
 		dot.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 		dot.pixel_size = 0.0064
-		dot.modulate = Color(0.32, 0.94, 0.92, 0.0) if kind == "formed" else Color(0.95, 0.78, 0.32, 0.0)
+		dot.modulate = Color(0.243, 0.361, 0.345, 0.0) if kind == "formed" else Color(0.557, 0.400, 0.169, 0.0)
 		dot.position = _world(px.x, px.y, STONE_H + 0.42)
 		_joseki_root.add_child(dot)
 		_joseki_marks.append(dot)
@@ -321,8 +419,8 @@ func highlight_points(points: Array, kind := "formed") -> void:
 			lb.pixel_size = 0.0026
 			lb.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 			lb.no_depth_test = true
-			lb.modulate = Color(0.88, 1.0, 1.0, 0.0)
-			lb.outline_modulate = Color(0.03, 0.22, 0.26, 0.9)
+			lb.modulate = Color(0.984, 0.965, 0.918, 0.0)
+			lb.outline_modulate = Color(0.173, 0.165, 0.149, 0.92)
 			lb.position = _world(px.x, px.y, STONE_H + 1.25)
 			_joseki_root.add_child(lb)
 			_joseki_marks.append(lb)
@@ -449,11 +547,25 @@ func pick(mouse_pos: Vector2) -> Vector2i:
 		return Vector2i(-1, -1)
 	return Vector2i(bx, by)
 
+## 能不能在棋盘上动手（**落子与摸头同源**，V20）：复盘只读或她思考中都不行。
+## 纯函数、只读两个标志、不碰场景树 ⇒ `Board3D.new()` 就能断言（V11，不必合成输入事件）。
+func placement_allowed() -> bool:
+	return not readonly and not locked
+
+## 复盘只读开关（进入/退出复盘时由 `Main._refresh_lock()` 逐次对齐）：
+## 顺手作废进行中的摸头手势——否则手势的松手与 `_process` 触发会落到只读期间。
+func set_readonly(v: bool) -> void:
+	readonly = v
+	if v:
+		_pat_active = false
+
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
 		var mb := event as InputEventMouseButton
 		if mb.button_index == MOUSE_BUTTON_LEFT:
 			if mb.pressed:
+				if not placement_allowed():
+					return                     # 复盘只读 / 她思考中：落子与摸头一起被挡（V20）
 				if _in_head_zone(mb.position):
 					# 摸头模式：视角不动，头部/视线跟着鼠标微动；滑动/按住在 _process 里触发，快速点一下松手补一次
 					_pat_active = true
@@ -462,12 +574,11 @@ func _unhandled_input(event: InputEvent) -> void:
 					_pat_down_ms = Time.get_ticks_msec()
 					get_viewport().set_input_as_handled()
 					return
-				if not locked:
-					var hit := pick(mb.position)
-					if hit.x >= 0 and not is_occupied(hit.x, hit.y):
-						add_optimistic(hit.x, hit.y, "black")
-						intersection_clicked.emit(hit.x, hit.y)
-						get_viewport().set_input_as_handled()
+				var hit := pick(mb.position)
+				if hit.x >= 0 and not is_occupied(hit.x, hit.y):
+					add_optimistic(hit.x, hit.y, "black")
+					intersection_clicked.emit(hit.x, hit.y)
+					get_viewport().set_input_as_handled()
 				return
 			if _pat_active:
 				if not _pat_fired:
@@ -507,14 +618,38 @@ func _unhandled_input(event: InputEvent) -> void:
 			_update_camera()
 			return
 		_update_hover(get_viewport().get_mouse_position())
+		return
+	if event is InputEventKey:
+		var k := event as InputEventKey
+		if not k.pressed or k.echo:
+			return
+		# 修饰键一律不参与（R-GH-2）：`Ctrl+C` / `Shift+C` / `Alt+C` 都不是「看角」的意思——
+		# 这两个快捷键是**裸键**手势，带上修饰键多半是别处的组合键（复制 / 输入大写），与「不易误触」一致。
+		if k.ctrl_pressed or k.alt_pressed or k.meta_pressed or k.shift_pressed:
+			return
+		match k.keycode:
+			KEY_HOME:
+				reset_view()
+				view_changed.emit("视角：已回到初始取景")
+			KEY_C:
+				look_at_corner(_corner + 1)
+				view_changed.emit("视角：看%s角（%s）" % [CORNER_NAMES[_corner], CORNER_GTPS[_corner]])
+			_:
+				return
+		_rotate_hold = GAZE_LOCK_AFTER_ROTATE          # 视角动了：跟手动旋转一样先看玩家 1 秒
+		get_viewport().set_input_as_handled()
 
 func _update_hover(mouse_pos: Vector2) -> void:
 	_hover = pick(mouse_pos)
-	var valid := _hover.x >= 0 and not is_occupied(_hover.x, _hover.y) and not locked \
-			and not _in_head_zone(mouse_pos)   # 头部附近左键是摸头，不提示落子
-	_ghost.visible = valid
-	_tip.visible = valid
-	if valid:
+	var on_board := _hover.x >= 0 and not _in_head_zone(mouse_pos)   # 头部附近左键是摸头，不提示落子
+	var occupied := on_board and is_occupied(_hover.x, _hover.y)
+	var placeable := on_board and not occupied and placement_allowed()
+	# 提示分三种：已有棋子（任何状态下都给坐标 + 手数）、空点且真能落子（沿用既有「点击落子」）、
+	# 其余（盘外 / 她思考中 / 只读复盘的空点）不提示。
+	_ghost.visible = placeable
+	_tip.visible = on_board and (occupied or placement_allowed())
+	if placeable:
 		_ghost.position = _world(_hover.x, _hover.y, STONE_H * 0.5)
-		_tip.text = "%s%d · 点击落子" % [Coords.letter(_hover.x), 19 - _hover.y]
+	if _tip.visible:
+		_tip.text = tip_text(_hover.x, _hover.y)
 		_tip.position = _world(_hover.x, _hover.y, STONE_H + 0.55)

@@ -14,16 +14,25 @@ from app.agent import AzureAgent
 
 
 class StubEngine:
-    """固定返回的假引擎：候选点覆盖常见位置，便于断言确定性的应手。"""
+    """固定返回的假引擎：候选点覆盖常见位置，便于断言确定性的应手。
+
+    ``analyze`` 收 ``max_visits``（v3.8.0 的按调用深度）：既有的 ``calls`` 语义一字不变，
+    另外把每次的 ``max_visits`` 记进 ``visits``（与 ``calls`` 同序），供「深搜只给哪一次」的门卫用。
+    ``max_visits`` 是实例的**默认深度**（镜像真引擎 ``KataGoEngine(max_visits=500)`` 的代码默认），
+    调用点拿它做「只增不减」的 ``max()``。
+    """
 
     CAND = ["Q16", "D4", "Q4", "D16", "K10", "C3", "R14", "F16", "J3", "O16", "C16", "R4"]
 
-    def __init__(self):
+    def __init__(self, max_visits=500):
         self.calls = []
+        self.visits = []
+        self.max_visits = int(max_visits)
         self.dead = False
 
-    async def analyze(self, moves):
+    async def analyze(self, moves, max_visits=None):
         self.calls.append([list(m) for m in moves])
+        self.visits.append(max_visits)
         return {
             "rootInfo": {"winrate": 0.5, "scoreLead": 0.0},
             "moveInfos": [{"move": m, "visits": 1} for m in self.CAND],
@@ -35,6 +44,49 @@ class StubEngine:
 
     def last_error(self):
         return ""
+
+
+class PvStubEngine(StubEngine):
+    """带 ``pv`` 的假引擎：预测线 A / B / C 都凑得出来（``StubEngine`` 没有 ``pv`` ⇒ 只有 A）。
+
+    前三个候选各配一条 5 手的 ``pv``：A = ``Q16`` 那条；B = ``D4`` 那条（与 A 逐手全不同）；
+    C = ``Q4`` 那条（与 A、B 也都不同）。三条线胜率相同（都取默认 0.5）⇒ ``drop == 0``，
+    不会被 ``pv_max_drop`` 挡掉。情绪波动（v3.8.0）与事件表（v3.8.0）的门卫都靠它做端到端。
+    """
+
+    PVS = {
+        "Q16": ["Q16", "D4", "Q4", "D16", "K10"],
+        "D4": ["D4", "C3", "R14", "F16", "J3"],
+        "Q4": ["Q4", "R4", "C16", "K10", "O16"],
+    }
+
+    def move_infos(self):
+        """引擎形状的 ``moveInfos``（前三个候选带 ``pv``）——不经 ``analyze`` 也能测纯函数路径。"""
+        infos = []
+        for m in self.CAND:
+            info = {"move": m, "visits": 1, "winrate": 0.5, "scoreLead": 0.0}
+            if m in self.PVS:
+                info["pv"] = list(self.PVS[m])
+            infos.append(info)
+        return infos
+
+    async def analyze(self, moves, max_visits=None):
+        out = await super().analyze(moves, max_visits)
+        out["moveInfos"] = self.move_infos()
+        return out
+
+
+class FixedRng:
+    """固定随机源：``random()`` 恒返回同一个值（门卫用它把「落在哪一段」钉死）。
+
+    ``ZeroRng`` 是它 ``v=0.0`` 的特例（保留旧名：既有门卫按名字引用它）。
+    """
+
+    def __init__(self, v):
+        self.v = float(v)
+
+    def random(self):
+        return self.v
 
 
 class StubLLM:
@@ -69,9 +121,26 @@ class ErrLLM:
         return "调用出错：HTTP 401（检查模型名是否为 qwen3.5）"
 
 
+class ZeroRng:
+    """固定随机源：``random()`` 恒为 ``0.0`` ⇒ 只要 ``p > 0`` 就一定命中。
+
+    测试装配「必定讲」用它而不是靠 ``joseki_rate=1.0`` 单独兜底：画像 / 情绪的浮动是**负**的时候
+    （熟练 / 见得多 / 低落）``p = clamp(1.0 + adj, 0, 1)`` 会小于 1，仍然会掷一次；把 rng 钉成 0.0
+    才是真正的确定（不依赖真随机，也不受 adj 正负影响）。无状态，可多实例共用。
+    """
+
+    def random(self):
+        return 0.0
+
+
 def mk_agent():
-    """造一套 stub 装配：返回 (agent, engine, llm, bus)。"""
+    """造一套 stub 装配：返回 (agent, engine, llm, bus)。
+
+    ``joseki_rate=1.0`` + ``ZeroRng()`` 是**测试装配的约定**：既有门卫要的是「有资格就必定讲」的
+    确定性场景；定式提示门控本身的频率层行为（0.5 / 冷却 / 画像 / 情绪 / 走错绕过）由
+    ``test_joseki_gate.py`` 显式设 rate 与注入 rng 覆盖。
+    """
     eng = StubEngine()
     llm = StubLLM()
     bus = events.RecordingBus()
-    return AzureAgent(eng, llm, bus), eng, llm, bus
+    return AzureAgent(eng, llm, bus, joseki_rate=1.0, joseki_rng=ZeroRng()), eng, llm, bus
