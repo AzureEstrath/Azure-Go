@@ -248,6 +248,44 @@ func _run() -> void:
 	_check("⑫ points 非列表（脏值）→ 空数组、不抛", main_script.joseki_points({"points": "oops"}).is_empty())
 	_check("⑫ payload 没有 points 键 → 空数组", main_script.joseki_points({}).is_empty())
 
+	# —— ⑬ 避让只淡「壳」：整卡 modulate 不许再动（v3.9.2）——
+	# 症状（用户截图）：卡片被棋盘压住时整卡压到 28% → 12px 标题在浅底上等于消失，
+	# 参考图变成一块灰影。现在只淡底色 / 网格 / 边框，标题与棋子保持不透明。
+	var cb := JosekiCard.new()
+	cb.apply_event({"kind": "entered", "name": "甲", "line": [{"x": 3, "y": 3, "c": "B"}], "k": 0})
+	_check("⑬ 新卡：dim=1（正常）", is_equal_approx(cb.dim(), 1.0))
+	cb.set_panel_overlap([Rect2(cb.card_rect().position + Vector2(10, 10), Vector2(20, 20))])
+	_check("⑬ 被压住 ⇒ faded，且只有外壳变淡", cb.state() == "faded" and cb.dim() < 0.6)
+	_check("⑬ 淡出不许动整卡透明度（否则字跟着一起糊）",
+			is_equal_approx(cb.modulate.a, 1.0))
+	cb.set_panel_overlap([])
+	_check("⑬ 不压 ⇒ 外壳恢复不透明", is_equal_approx(cb.dim(), 1.0))
+	cb.free()
+
+	# —— ⑭ 落位是纯函数：可行位既不压棋盘格、也不出窗（v3.9.2）——
+	# 旋转后的棋盘是菱形，用外接矩形判重叠会把两腰的空白也算成棋盘；这里按「格子矩形」判定，
+	# 并挑**离当前位置最近**的可行位（画面轻微移动时卡片不会来回横跳）。
+	var vp := Vector2(1280.0, 800.0)
+	var card := Vector2(JosekiCard.CARD_W, JosekiCard.CARD_H)
+	var cells: Array[Rect2] = [Rect2(Vector2(150, 323), Vector2(543, 304))]
+	var a1: Vector2 = main_script.joseki_anchor(vp, cells, [], Vector2.ZERO, card, false, true)
+	_check("⑭ 有棋盘格时落位不压棋盘", not Rect2(a1, card).intersects(cells[0]))
+	_check("⑭ 落位完整在窗口内（四边各留 12px）",
+			Rect2(Vector2(12, 12), vp - Vector2(24, 24)).encloses(Rect2(a1, card)))
+	_check("⑭ 右栏展开 ⇒ 不压右栏", a1.x + card.x <= vp.x - 380.0 - 12.0 + 0.01)
+
+	var small: Array[Rect2] = [Rect2(Vector2(600, 350), Vector2(100, 100))]
+	_check("⑭ 当前位置靠上 ⇒ 挑上方候选",
+			main_script.joseki_anchor(vp, small, [], Vector2(640, 0), card, false, false).y < 200.0)
+	_check("⑭ 当前位置靠左 ⇒ 挑左侧候选",
+			main_script.joseki_anchor(vp, small, [], Vector2(0, 420), card, false, false).x < 400.0)
+	_check("⑭ 当前位置靠下 ⇒ 挑下方候选",
+			main_script.joseki_anchor(vp, small, [], Vector2(640, 790), card, false, false).y > 400.0)
+	var blocked: Array[Rect2] = [Rect2(Vector2.ZERO, vp)]
+	_check("⑭ 哪都放不下 ⇒ 退回左下角兜底（且不抛）",
+			main_script.joseki_anchor(vp, blocked, [], Vector2.ZERO, card, false, false)
+			== Vector2(24.0, vp.y - card.y - 24.0))
+
 	if _fail == 0:
 		print("[josekicard] PASS：", _total, " 项断言全部通过")
 	else:

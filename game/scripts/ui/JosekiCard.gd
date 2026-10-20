@@ -14,16 +14,19 @@ extends Control
 ##     而收尾**只有** `formed`（库线走完）一种，`deviated` 是「走错」→ 照常上卡片并把那一手标红（U45）。
 
 const CARD_TTL_SEC := 120.0   # 兜底 TTL：距最后一次 apply_event 超过这么久仍没新事件 → 自动收起（U38）
-const CARD_W := 200.0         # 卡片宽（含内边距），Main 的默认落位与避让几何都用它
-const CARD_H := 222.0         # 卡片高：上边距 + 标题 + 小棋盘 + 下边距
-const PAD := 14.0             # 卡片内边距
-const HEAD_H := 22.0          # 标题占高
+const CARD_W := 240.0         # 卡片宽（含内边距），Main 的默认落位与避让几何都用它
+const CARD_H := 260.0         # 卡片高：上边距 + 标题 + 小棋盘 + 下边距
+const PAD := 16.0             # 卡片内边距
+const HEAD_H := 26.0          # 标题占高
+const TITLE_SIZE := 14        # 标题字号（12px 在 1280×800 下读不清）
 const GRID := 19              # 小棋盘路数：后端坐标就是 19 路
-const FADED_ALPHA := 0.28     # 避让时的透明度（半透明：还看得见，但不挡事）
+# 避让时**只把外壳**（底色 / 网格 / 边框）压到这个系数：整卡一起压透明会把文字连同棋子糊成一片
+# 灰影（v3.9.2 修复的正是这个——参考图是要读的，不是要藏的）。
+const FADED_SHELL := 0.40
 
-const BG := Color(0.07, 0.16, 0.18, 0.72)          # 半透明深色底（不切断棋盘视线）
+const BG := Color(0.07, 0.16, 0.18, 0.82)          # 半透明深色底（不切断棋盘视线）
 const BORDER := Color(0.306, 0.804, 0.769, 0.85)   # 与主界面同一套青蓝
-const GRID_LINE := Color(0.83, 0.91, 0.90, 0.55)
+const GRID_LINE := Color(0.83, 0.91, 0.90, 0.70)
 const STONE_B := Color(0.10, 0.11, 0.12)
 const STONE_W := Color(0.97, 0.97, 0.95)
 const RING := Color(0.31, 0.96, 0.90)              # 第 k 手的高亮环
@@ -36,6 +39,7 @@ const INVALID := Vector2i(-1, -1)                  # 非法坐标哨兵（棋盘
 ## —— 状态机（数组/缺省一律写在成员声明处：门卫 `.new()` 后即可用）——
 var _active := false           # 有没有卡片内容：apply_event 置真，clear / 兜底 TTL 置假
 var _faded := false            # 避让：被喂进来的矩形压住时淡出
+var _dim := 1.0                # 外壳亮度系数：1.0 = 正常，避让时 = FADED_SHELL（**不动整卡 modulate**）
 var _since_event := 0.0        # 距上次 apply_event 的秒数，只由 _tick 推进（门卫注入，不真 sleep）
 
 ## —— 要画的字段（全部原样来自后端事件，卡片不加工）——
@@ -125,6 +129,11 @@ func state() -> String:
 		return "hidden"
 	return "faded" if _faded else "shown"
 
+## 外壳亮度系数（纯逻辑、树外可读）：1.0 = 正常，避让时 = FADED_SHELL。
+## 只作用于底色 / 网格 / 边框；标题与棋子**恒为不透明**（淡出不许把参考图变成灰影）。
+func dim() -> float:
+	return _dim
+
 ## 当前画得出来的合法棋子数（非法坐标不计；供门卫断言）
 func stone_count() -> int:
 	var n := 0
@@ -194,13 +203,13 @@ func _sync_visual() -> void:
 	if not is_inside_tree():
 		return
 	visible = _active
-	modulate.a = FADED_ALPHA if _faded else 1.0
-	queue_redraw()
+	queue_redraw()                             # 不动 modulate：淡出只由 `_dim` 作用在外壳上
 
 func _set_faded(v: bool) -> void:
 	if _faded == v:
 		return
 	_faded = v
+	_dim = FADED_SHELL if v else 1.0
 	_sync_visual()
 
 ## 第 k 手要画高亮环的那一格：`k` 越界 / 脏值 / 该手坐标非法 → 哨兵（`_draw` 与门卫共用同一个判据）。
@@ -231,8 +240,10 @@ func _mistake_cell() -> Vector2i:
 
 func _draw() -> void:
 	var whole := Rect2(Vector2.ZERO, Vector2(CARD_W, CARD_H))
-	draw_rect(whole, BG, true)
-	draw_rect(whole, BORDER, false, 1.0)
+	# 只有「壳」吃 dim：底色 / 边框 / 网格。文字与棋子一律原色（见 `dim()` 的注释）。
+	draw_rect(whole, Color(BG, BG.a * _dim), true)
+	draw_rect(whole, Color(BORDER, BORDER.a * _dim), false, 1.0)
+	var grid_fg := Color(GRID_LINE, GRID_LINE.a * _dim)
 
 	var f := get_theme_default_font()
 	var step := _grid_step()
@@ -240,15 +251,15 @@ func _draw() -> void:
 	var y0 := PAD + HEAD_H
 	if f != null:
 		# 标题用后端给的课名；没有就给个中性占位（卡片不自己编台词）
-		draw_string(f, Vector2(x0, PAD + 12.0), _title if _title != "" else "定式参考",
-				HORIZONTAL_ALIGNMENT_LEFT, CARD_W - PAD * 2.0, 12, TITLE_FG)
+		draw_string(f, Vector2(x0, PAD + 14.0), _title if _title != "" else "定式参考",
+				HORIZONTAL_ALIGNMENT_LEFT, CARD_W - PAD * 2.0, TITLE_SIZE, TITLE_FG)
 
 	# 小棋盘网格（19 路）
 	var side := step * float(GRID - 1)
 	for i in GRID:
 		var t := float(i) * step
-		draw_line(Vector2(x0 + t, y0), Vector2(x0 + t, y0 + side), GRID_LINE, 1.0)
-		draw_line(Vector2(x0, y0 + t), Vector2(x0 + side, y0 + t), GRID_LINE, 1.0)
+		draw_line(Vector2(x0 + t, y0), Vector2(x0 + t, y0 + side), grid_fg, 1.0)
+		draw_line(Vector2(x0, y0 + t), Vector2(x0 + side, y0 + t), grid_fg, 1.0)
 
 	# 手顺着子：黑 B / 白 W（c 不认识按黑画，不抛）
 	var r := step * 0.42

@@ -3,6 +3,9 @@ extends Node3D
 ## 调试：`-- --shot=输出.png` 可在渲染数帧后自动截图并退出
 
 const PANEL_W := 380
+const BOARD_CELLS := 4                      # 棋盘切成 4×4 个格子矩形判重叠：菱形棋盘的外接矩形太"虚胖"
+const BOARD_LAST := 18                      # 19 路棋盘的最大下标
+const CARD_FOLLOW_SEC := 0.25                # 「卡片跟随取景」的节流间隔（秒）
 const TEAL := Color(0.306, 0.804, 0.769)
 const TEAL_DARK := Color(0.173, 0.620, 0.620)
 ## 白底面板上的深色文字（手数 / 勾选项等）：与 TEAL_DARK 同一深色系。
@@ -26,6 +29,7 @@ var _left_panel: PanelContainer            # 左侧：语音设置
 var _right_panel: PanelContainer           # 右侧：对局 / 聊天
 var _joseki_card: JosekiCard = null        # 定式浮层参考图卡片（浮在棋盘上方，不进任何侧栏）
 var _joseki_card_home := Vector2.ZERO      # 我们最后一次给卡片摆的位置（用户拖走后不再接管）
+var _card_check := 0.0                     # 「跟随取景」的节流计时（见 _follow_joseki_card）
 var _left_open := false                    # 左侧默认收起，保持棋盘视野
 var _right_open := true
 var _left_toggle: Button
@@ -267,7 +271,7 @@ func _build_joseki_card(root: Control) -> void:
 	root.add_child(_joseki_card)
 	get_viewport().size_changed.connect(_on_viewport_resized)
 
-## 默认落位：按**棋盘投影**挑第一个不与棋盘 / 已展开侧栏相交、且完整落在窗口内的空白角落。
+## 默认落位：按**棋盘格子**挑一个不与棋盘 / 已展开侧栏相交、且完整落在窗口内的空白角。
 ## 原先硬编码「左下角」在 1280×800 下正压棋盘（棋盘近左角伸进卡片)，卡片一出生就被判 faded——故现算。
 func _place_joseki_card() -> void:
 	if _joseki_card == null:
@@ -281,26 +285,63 @@ func _on_viewport_resized() -> void:
 		return
 	_place_joseki_card()
 
-## 候选落位，按序取第一个可行的；全都不可行就退回左下角（会被避让判成 faded，但至少完整在窗口内）。
-## 棋盘投影拿不到（没棋盘 / 没相机）时直接退回左下角，保持旧行为。
+## 跟随取景（每 CARD_FOLLOW_SEC 一次）：右键旋转 / 滚轮缩放 / C·Home 换视角 / 侧栏开合之后，
+## 棋盘会长到卡片下面。只在**用户没拖过**（位置仍是我们摆的）且卡片真的被盖住或露不全时才重摆；
+## 轻微移动不挪它——否则画面一抖卡片就在屏幕上横跳。
+func _follow_joseki_card() -> void:
+	if _joseki_card == null or not _joseki_card.visible:
+		return
+	if _joseki_card.position != _joseki_card_home:
+		return                                    # 用户拖过：接管权归玩家
+	var vp := get_viewport().get_visible_rect().size
+	var card := Vector2(JosekiCard.CARD_W, JosekiCard.CARD_H)
+	var r := Rect2(_joseki_card.position, card)
+	var on_screen := Rect2(Vector2.ZERO, vp).encloses(r)
+	if on_screen and not _hits_rect(r, _board_cell_rects()):
+		return                                    # 现在的位置就没事：不挪（避免画面一抖卡片横跳）
+	var target := _joseki_card_anchor()
+	if on_screen and _hits_rect(Rect2(target, card), _board_cell_rects()):
+		return                                    # 哪都放不下：留在原地，别做「从一个被压住的地方跳到另一个」的无用移动
+	_joseki_card.position = target
+	_joseki_card_home = target
+
 func _joseki_card_anchor() -> Vector2:
 	var vp := get_viewport().get_visible_rect().size
-	var fallback := Vector2(24.0, maxf(24.0, vp.y - JosekiCard.CARD_H - 24.0))
-	var br := _board_screen_rect()
-	if not br.has_area():
-		return fallback
-	var w := JosekiCard.CARD_W
-	var h := JosekiCard.CARD_H
-	var lx := float(PANEL_W) if _left_open else 0.0            # 展开的侧栏占掉的左右边界
-	var rx := vp.x - (float(PANEL_W) if _right_open else 0.0)
+	var board_cells := _board_cell_rects()
+	if board_cells.is_empty():
+		var br := _board_screen_rect()             # 拿不到格子（相机没就位）：退回外接矩形
+		if br.has_area():
+			board_cells.append(br)
+	var panels: Array = []
+	if _left_open and _left_panel != null:
+		panels.append(_left_panel.get_global_rect())
+	if _right_open and _right_panel != null:
+		panels.append(_right_panel.get_global_rect())
+	var prefer := _joseki_card.position if _joseki_card != null else Vector2.ZERO
+	return joseki_anchor(vp, board_cells, panels, prefer,
+			Vector2(JosekiCard.CARD_W, JosekiCard.CARD_H), _left_open, _right_open)
+
+## 落位纯函数（门卫可直接断言）：五个候选位里挑**可行且离 `prefer` 最近**的那个。
+## 可行 = 完整落在窗口内（四边各留 12px）、不与任何棋盘格子 / 已展开侧栏相交。
+## 挑「最近的」而不是「第一个」：画面小幅移动时卡片不会在两个候选位之间来回跳。
+static func joseki_anchor(vp: Vector2, board: Array, panels: Array, prefer: Vector2,
+		card: Vector2, left_open: bool, right_open: bool) -> Vector2:
+	var fallback := Vector2(24.0, maxf(24.0, vp.y - card.y - 24.0))
+	var w := card.x
+	var h := card.y
+	var lx := float(PANEL_W) if left_open else 0.0            # 展开的侧栏占掉的左右边界
+	var rx := vp.x - (float(PANEL_W) if right_open else 0.0)
 	var x_lo := lx + 12.0
 	var x_hi := maxf(x_lo, rx - w - 12.0)
-	# 躲的东西：棋盘投影 + 已展开的侧栏（卡片不得挤压既有控件）
-	var forbid: Array[Rect2] = [br]
-	if _left_open and _left_panel != null:
-		forbid.append(_left_panel.get_global_rect())
-	if _right_open and _right_panel != null:
-		forbid.append(_right_panel.get_global_rect())
+	var br := Rect2()
+	var has_board := false
+	for it in board:
+		if typeof(it) != TYPE_RECT2 or not (it as Rect2).has_area():
+			continue
+		br = (it as Rect2) if not has_board else br.merge(it as Rect2)
+		has_board = true
+	if not has_board:
+		return fallback                                      # 没棋盘投影：退回左下角（旧行为）
 	var inside := Rect2(Vector2(12.0, 12.0), vp - Vector2(24.0, 24.0))
 	var anchors: Array[Vector2] = [
 		Vector2(clampf(br.position.x, x_lo, x_hi), br.end.y + 12.0),                       # ① 棋盘左下外侧
@@ -309,18 +350,31 @@ func _joseki_card_anchor() -> Vector2:
 		Vector2(clampf(br.get_center().x - w * 0.5, x_lo, x_hi), br.end.y + 12.0),         # ④ 棋盘正下方
 		Vector2(clampf(br.position.x, x_lo, x_hi), br.position.y - h - 12.0),              # ⑤ 棋盘左上外侧
 	]
+	var best := fallback
+	var best_d := INF
+	var found := false
 	for a in anchors:
-		var r := Rect2(a, Vector2(w, h))
+		var r := Rect2(a, card)
 		if not inside.encloses(r):
-			continue                                  # 露不全（窗口太矮/太窄）：换下一个
-		var clash := false
-		for f in forbid:
-			if f.intersects(r):
-				clash = true
-				break
-		if not clash:
-			return a
-	return fallback
+			continue                                          # 露不全（窗口太矮/太窄）：换下一个
+		if _hits_rect(r, board) or _hits_rect(r, panels):
+			continue                                          # 压棋盘 / 压侧栏：换下一个
+		var d := a.distance_to(prefer)
+		if not found or d < best_d:
+			found = true
+			best_d = d
+			best = a
+	return best
+
+## 矩形与一组矩形是否相交（空矩形 / 非 Rect2 项一律跳过，不抛）
+static func _hits_rect(r: Rect2, rects: Array) -> bool:
+	for it in rects:
+		if typeof(it) != TYPE_RECT2:
+			continue
+		var q: Rect2 = it
+		if q.has_area() and q.intersects(r):
+			return true
+	return false
 
 ## 右侧：对局信息 / 聊天 / 功能按钮 / 俗手回档
 func _build_right_panel(root: Control) -> void:
@@ -2416,6 +2470,10 @@ func _process(delta: float) -> void:
 	_update_thinking(now)
 	_tick_typing(delta)                                 # 打字节奏推进（AI 消息逐字显示）
 	_tick_joseki_card()                                 # 浮层卡片的避让重算（几何算在这里，卡片只认矩形）
+	_card_check += delta
+	if _card_check >= CARD_FOLLOW_SEC:
+		_card_check = 0.0
+		_follow_joseki_card()                           # 取景变了就把卡片挪出棋盘（用户拖过则不动）
 
 ## 定式浮层卡片的每帧避让：把「棋盘落点热区」「鼠标附近的小方块」「展开的侧栏」喂给卡片。
 ## 几何计算留在本文件（U39：卡片只认矩形，U39 里那两个是最小集）；兜底 TTL 由卡片自己的 `_process` 推进。
@@ -2423,15 +2481,46 @@ func _tick_joseki_card() -> void:
 	if _joseki_card == null:
 		return
 	var mp := get_viewport().get_mouse_position()
-	var rects: Array = [
-		_board_screen_rect(),
-		Rect2(mp - Vector2(48.0, 48.0), Vector2(96.0, 96.0)),
-	]
+	var rects: Array = _board_cell_rects()
+	if rects.is_empty():
+		rects.append(_board_screen_rect())             # 相机没就位：退回外接矩形（可能是空矩形 = 不管）
+	rects.append(Rect2(mp - Vector2(48.0, 48.0), Vector2(96.0, 96.0)))
 	if _left_open and _left_panel != null:
 		rects.append(_left_panel.get_global_rect())    # 展开的左侧栏也算「别挡」：不挤压既有控件
 	if _right_open and _right_panel != null:
 		rects.append(_right_panel.get_global_rect())
 	_joseki_card.set_panel_overlap(rects)
+
+## 棋盘在屏幕上的**格子矩形**（BOARD_CELLS×BOARD_CELLS 片）：旋转后的棋盘是菱形，用外接矩形判重叠
+## 会把两腰的空白三角也算成「棋盘」——卡片落在空地上也会被判 faded。按格子切碎后误判基本消失，
+## 而「卡片只认矩形」（U39）这条契约不变。相机背后的角所在的格子直接丢掉（同 `_board_screen_rect` 的守卫）。
+func _board_cell_rects() -> Array[Rect2]:
+	var out: Array[Rect2] = []
+	if board == null or board.cam == null:
+		return out
+	var cam := board.cam
+	var n := BOARD_CELLS
+	var rows: Array = []
+	for iy in n + 1:
+		var row: Array = []
+		for ix in n + 1:
+			var bx := int(round(float(ix) * float(BOARD_LAST) / float(n)))
+			var by := int(round(float(iy) * float(BOARD_LAST) / float(n)))
+			var w := board.stone_world(bx, by)
+			row.append(Vector2.INF if cam.is_position_behind(w) else cam.unproject_position(w))
+		rows.append(row)
+	for iy in n:
+		for ix in n:
+			var a: Vector2 = rows[iy][ix]
+			var b: Vector2 = rows[iy][ix + 1]
+			var c: Vector2 = rows[iy + 1][ix + 1]
+			var d: Vector2 = rows[iy + 1][ix]
+			if a == Vector2.INF or b == Vector2.INF or c == Vector2.INF or d == Vector2.INF:
+				continue
+			var lo := Vector2(minf(minf(a.x, b.x), minf(c.x, d.x)), minf(minf(a.y, b.y), minf(c.y, d.y)))
+			var hi := Vector2(maxf(maxf(a.x, b.x), maxf(c.x, d.x)), maxf(maxf(a.y, b.y), maxf(c.y, d.y)))
+			out.append(Rect2(lo, hi - lo))
+	return out
 
 ## 棋盘（19 路）在屏幕上的包围盒：四角经棋盘相机 `unproject_position` 出来再取包围盒。
 ## 相机背后的角要丢掉：它的 unproject 会翻到画面另一侧，把包围盒撑到整个视口（＝永久 faded），
