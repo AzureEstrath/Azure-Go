@@ -260,6 +260,8 @@ func _run() -> void:
 			is_equal_approx(cb.modulate.a, 1.0))
 	cb.set_panel_overlap([])
 	_check("⑬ 不压 ⇒ 外壳恢复不透明", is_equal_approx(cb.dim(), 1.0))
+	_check("⑬ 底色不透明（v3.9.6：参考图是实心面板，不是玻璃）",
+			is_equal_approx(JosekiCard.BG.a, 1.0))
 	cb.free()
 
 	# —— ⑭ 落位是纯函数：可行位既不压棋盘格、也不出窗（v3.9.2）——
