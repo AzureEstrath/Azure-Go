@@ -2,11 +2,13 @@
 
 链的装配（模型参数、扩展字段合并）全在 ``llm_chain.py``；本模块只负责四件事（都在 ``chat()`` 这条线上）：
 - 把 ``LLMClient`` 的参数映射成链（``extra_body`` 被外部改写时重建）；
-- 每次调用的输出上限（思考档位 1/2 各追加一段推理预算）：以线上键 ``max_tokens`` 顶层发出
-  （按调用 ``bind(extra_body=...)`` 合并，用户配置打底、显式写死上限则让位）——``ChatOpenAI``
-  自己的 ``max_tokens`` 会被改名成 ``max_completion_tokens``，而 DeepSeek 等目标服务端认的是前者；
+- 每次调用的输出上限（**推理余量 `REASON_HEADROOM_DEFAULT` 打底，思考档位 1/2 再各叠 +160 / +800**）：
+  以线上键 ``max_tokens`` 顶层发出（按调用 ``bind(extra_body=...)`` 合并，用户配置打底、显式写死上限则让位）
+  ——``ChatOpenAI`` 自己的 ``max_tokens`` 会被改名成 ``max_completion_tokens``，而 DeepSeek 等目标服务端
+  认的是前者；工具轮 / 流式通道在 ``agent._bind_tools`` / ``_bind_stream`` 里走同一个公开入口 ``budget_for``；
 - 把链抛出的异常映射成「调用出错：…」可读中文（绝不抛给上层）；
-- 服务端拒绝参数（HTTP 400/422）时去掉扩展字段与注入的上限重试一次的安全网。
+- 两条**不同的**恢复：服务端拒绝参数（HTTP 400/422）时去掉扩展字段重试一次（``_strip_on_reject``，本会话
+  内不再加料）；空内容且 ``finish_reason=length``（推理段吃光上限）时去掉全部扩展字段重试**一次**。
 
 推理段永不显示给玩家：台词一律经 ``llm_chain.content_of``（只取 ``content``）。
 
@@ -148,6 +150,14 @@ class LLMClient:
             return max_tokens + REASON_HEADROOM_DEFAULT + REASON_BUDGET_MED
         return max_tokens + REASON_HEADROOM_DEFAULT
 
+    def budget_for(self, max_tokens) -> int:
+        """公开的预算入口（含推理余量）：工具轮 / 流式通道与 ``chat()`` 必须用同一套上限。
+
+        ``no_think`` 是「不给余量」，**不是**「关掉推理」——推理型模型照样会想，只是我们不再为
+        它预留空间；那条路径的调用方（情绪小调用）本就只接受极短输出。
+        """
+        return self._budget(max_tokens, False)
+
     @staticmethod
     def _pins_budget(body) -> bool:
         """用户在 ``extra_body`` 里显式写死了输出上限：注入的预算必须让位（尊重配置）。"""
@@ -230,10 +240,12 @@ class LLMClient:
             return "调用出错：" + self._reason_of(e)
 
         text = content_of(ai)
-        if text == "" and self._finish_reason(ai) == "length":
+        if text == "" and self._finish_reason(ai) == "length" and not self._extra_body_unsupported:
             # 推理型模型把推理 token 也计入 max_tokens：上限被推理段吃光时 content 恒为空。
             # 去掉**所有**扩展字段（含用户写死的上限）重试一次——这是恢复，不是重试风暴
             # （max_retries 仍是 0）；代价是这一次请求丢掉用户的额外参数（top_k 等）。
+            # 已经因 400/422 去过一次扩展字段（_extra_body_unsupported）就不再重试：那时请求本来
+            # 就是裸的，再发一遍只会白等一个 round-trip 并拿到同样的空内容。
             print("[LLM] 输出上限被推理段吃光（finish_reason=length），去掉上限重试一次")
             try:
                 ai = await self._sync_chain().bind(extra_body={}).ainvoke(messages)

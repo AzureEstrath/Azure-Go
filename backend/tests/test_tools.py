@@ -345,5 +345,25 @@ class ExtraBodyRejectTest(unittest.TestCase):
         self.assertEqual(chain.calls, 2)                 # 两次都是模型往返，没有 400 重试
 
 
+class ToolBudgetHeadroomTest(unittest.TestCase):
+    """工具轮 / 流式通道的输出上限必须走 ``LLMClient.budget_for``（含推理余量）。
+
+    少了这一步，`tools_enabled=true` 时工具轮仍按 80 发上限 ⇒ 推理段照样吃光 ⇒ 台词照样是兜底句。
+    """
+
+    def test_uses_llm_budget_entry(self):
+        from types import SimpleNamespace
+        from app.agent import AzureAgent
+        a = AzureAgent(StubEngine(), llm=None, bus=events.RecordingBus())
+        a.llm = SimpleNamespace(budget_for=lambda n: n + 4096)
+        self.assertEqual(a._budget_of(80), 4176)
+        self.assertEqual(a._budget_of(300), 4396)
+
+    def test_falls_back_to_raw_value_without_llm(self):
+        from app.agent import AzureAgent
+        a = AzureAgent(StubEngine(), llm=None, bus=events.RecordingBus())
+        self.assertEqual(a._budget_of(300), 300)
+
+
 if __name__ == "__main__":
     unittest.main()

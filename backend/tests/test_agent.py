@@ -845,7 +845,7 @@ class RealChainStreamTest(unittest.TestCase):
         import json
         import time
         import httpx
-        from app.llm import LLMClient
+        from app.llm import LLMClient, REASON_HEADROOM_DEFAULT
 
         seen = []
 
@@ -870,7 +870,7 @@ class RealChainStreamTest(unittest.TestCase):
 
         self.assertEqual(len(seen), 1)
         self.assertIs(seen[0].get("stream"), True)                          # 走的真是流式
-        self.assertEqual(seen[0]["max_tokens"], 400)                        # 输出上限照旧注入
+        self.assertEqual(seen[0]["max_tokens"], 400 + REASON_HEADROOM_DEFAULT)   # 输出上限照旧注入（含推理余量）
         toks = bus.of_type("token")
         self.assertEqual("".join(str(e["delta"]) for e in toks), "你好~")
         self.assertTrue(all(str(e["turn_id"]) == agent.turn_id for e in toks))

@@ -861,6 +861,15 @@ class AzureAgent:
             out["moves"] = [list(m) for m in self.st.moves]
         return out
 
+    def _budget_of(self, max_tokens) -> int:
+        """工具轮 / 流式通道的输出上限：有 ``LLMClient`` 就走它含推理余量的入口（与 ``chat()`` 同一套）。
+
+        测试里的鸭子类型替身（``llm=None`` 或简易假链）没有 ``budget_for``，按原值发——那些用例
+        钉的是绑定形状，不是预算数值。
+        """
+        fn = getattr(self.llm, "budget_for", None)
+        return int(fn(max_tokens)) if callable(fn) else int(max_tokens)
+
     def _bind_tools(self, pool, max_tokens) -> tuple:
         """给链绑上工具与本次输出上限，返回 ``(可调用的链, ainvoke 的调用参数)``。
 
@@ -879,7 +888,7 @@ class AzureAgent:
             return bound.bind(extra_body={}), {}
         body = dict(getattr(self.chain, "extra_body", None) or {})
         if "max_tokens" not in body and "max_completion_tokens" not in body:
-            body["max_tokens"] = max_tokens
+            body["max_tokens"] = self._budget_of(max_tokens)
         return bound.bind(extra_body=body), {}
 
     async def _chain_invoke(self, bound, msgs, kwargs):
@@ -906,7 +915,7 @@ class AzureAgent:
             return src.bind(extra_body={})          # 服务端拒绝过扩展字段：什么都不加
         body = dict(getattr(src, "extra_body", None) or {})
         if "max_tokens" not in body and "max_completion_tokens" not in body:
-            body["max_tokens"] = max_tokens
+            body["max_tokens"] = self._budget_of(max_tokens)
         return src.bind(extra_body=body)
 
     def _stream_chunks(self, messages, max_tokens=300):

@@ -86,9 +86,17 @@ class ChatTest(unittest.TestCase):
         self.assertNotIn("内心戏", out)
 
     def test_empty_content_returns_fail_text(self):
-        c = _client(lambda req: httpx.Response(200, json=_reply("")))
+        """空内容 + ``finish_reason=stop``（不是 length）：直接兜底，**不许**重试。"""
+        calls = []
+
+        def handler(req):
+            calls.append(1)
+            return httpx.Response(200, json=_reply(""))
+
+        c = _client(handler)
         self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}])),
                          "唔...我脑子有点转不过来了")
+        self.assertEqual(len(calls), 1)
 
     def test_length_finish_with_empty_content_retries_without_budget(self):
         """推理段烧光预算（finish_reason=length + 空 content）⇒ 去掉输出上限重试一次，台词照常。"""
@@ -125,6 +133,51 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80)),
                          "唔...我脑子有点转不过来了")
         self.assertEqual(len(calls), 2)
+
+    def test_length_retry_failure_is_readable(self):
+        """重试那一次失败（HTTP 500）：返回可读错误、总共 2 次请求。"""
+        calls = []
+
+        def handler(req):
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(200, json={
+                    "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                    "choices": [{"index": 0, "finish_reason": "length",
+                                 "message": {"role": "assistant", "content": ""}}]})
+            return httpx.Response(500, json={"error": {"message": "boom"}})
+
+        c = _client(handler)
+        out = asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80))
+        self.assertTrue(out.startswith("调用出错："))
+        self.assertIn("HTTP 500", out)
+        self.assertEqual(len(calls), 2)
+
+    def test_length_after_rejected_params_does_not_resend_same_request(self):
+        """400 之后的重试本身就是裸请求：再命中「空 + length」不许把同形请求再发一遍。"""
+        seen = []
+
+        def handler(req):
+            body = json.loads(req.content.decode("utf-8"))
+            seen.append(body)
+            if "max_tokens" in body:
+                return httpx.Response(400, json={"error": {"message": "Unsupported parameter: max_tokens"}})
+            return httpx.Response(200, json={
+                "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "length",
+                             "message": {"role": "assistant", "content": ""}}]})
+
+        c = _client(handler)
+        self.assertEqual(asyncio.run(c.chat([{"role": "user", "content": "hi"}], 80)),
+                         "唔...我脑子有点转不过来了")
+        self.assertEqual(len(seen), 2)              # 400 + 一条裸重试，到此为止
+
+    def test_budget_for_public_entry_matches_ladder(self):
+        """工具轮 / 流式通道共用 ``budget_for``：与 ``chat()`` 同一套推理余量（== _budget(n, False)）。"""
+        c = _client(lambda req: httpx.Response(200, json=_reply("好")))
+        self.assertEqual(c.budget_for(80), 80 + REASON_HEADROOM_DEFAULT)
+        c.think_mode = 2
+        self.assertEqual(c.budget_for(80), 80 + REASON_HEADROOM_DEFAULT + 800)
 
     def test_truncated_but_nonempty_reply_is_used_as_is(self):
         """现状契约（防回归）：有内容就算被截断也照用，不许重试——重试只针对「空 content」。"""
