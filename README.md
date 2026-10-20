@@ -65,6 +65,35 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 
 ---
 
+## 目录
+
+- [分支说明](#分支说明)
+- [一、仓库结构](#一仓库结构)
+- [二、快速开始](#二快速开始)
+- [三、`config.json` 字段](#三configjson-字段)
+- [四、接大模型（LLM，OpenAI 兼容）](#四接大模型llmopenai-兼容)
+- [五、接语音（TTS，可选）](#五接语音tts可选)
+- [六、远程后端（唯一的运行方式）](#六远程后端唯一的运行方式)
+- [七、导出与分发（可选）](#七导出与分发可选)
+- [八、许可](#八许可)
+- [九、更新](#九更新)
+- [十、致谢](#十致谢)
+
+---
+
+## 分支说明
+
+本仓库以 **发展主版本** 为主线，另保留一条 **历史分支** 完整承载旧版：
+
+| 分支 | 定位 | 内容概要 | 链接 |
+| --- | --- | --- | --- |
+| **`main`** | 发展主版本（当前主线，v3.x） | 前后端分离：`game\` 只负责渲染、输入与语音播放，`backend\` 统一编排对局与模型调用，`katago_service\` 独立部署提供 KataGo；支持 LangChain 提示链、发言侧工具与长期记忆。 | [查看 main](https://github.com/AzureEstrath/Azure-Go) |
+| **`legacy`** | 历史分支（发展副版本，v1.0–v2.0.1） | 旧版完整存档：本机运行 KataGo 与本地模型、三维情感模型（valence / curiosity / arousal）、前后端分离 v2.0.1，以及 `peek\` 窥屏脚本等。 | [查看 legacy](https://github.com/AzureEstrath/Azure-Go/tree/legacy) |
+
+> `legacy` 为旧版的历史存档，后续功能开发集中在 `main`。
+
+---
+
 ## 一、仓库结构
 
 ```
@@ -102,14 +131,17 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 │   ├─ run_hidden.vbs       隐藏窗口启动（手动启动自建服务时用）
 │   ├─ start_tts_server*.bat 手动启动脚本
 │   ├─ voices.json          克隆音色的参考音频与文本
+│   ├─ third_party\OpenVoice\ 快速克隆音色转换（源码；权重 .pth 另行获取）
 │   └─ sherpa_voices.json   轻量音色清单（小雅 / 少女 / 女声）
-└─ docs\                    后端化决策与实现计划
+├─ docs\                    后端化决策与实现计划
+└─ peek\                    窥屏 VLM 脚本（azure_peek.py / start_vlm_server.py）；v3.x 未接线，保留供后续功能
 ```
 
 **模型与资产**（体积大，不随源码仓库分发，见 GitHub **Releases**）：
 `katago.exe` + `*.dll`、`model-b18c384nbt.bin.gz`（KataGo 权重）——这两个归 **KataGo 云服务的部署侧**持有
 （见第六节「KataGo 服务部署」），本仓库只含连它的客户端；
-`Azure.vrm`（形象）、CosyVoice 权重（`pretrained_models` / `sherpa_models`）。
+`Azure.vrm`（形象）、CosyVoice 权重（`pretrained_models` / `sherpa_models`）、
+OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端 LLM / VLM 的 gguf。
 
 ---
 
@@ -1356,3 +1388,13 @@ KataGo 引擎与权重遵循其上游许可。
 
 本人技术有限，但想象力绝对够，后续版本更新取决于ai以及我的计算机&人工智能学习深度(:-])
 自建部署采用 CosyVoice 3，Qwen3.6 35B（`Qwen3.6-35B-A3B-UD-Q4_K_XL`）。
+
+---
+
+## 十、致谢
+
+- **[@CarrotMissileVehicle](https://github.com/CarrotMissileVehicle)** —— 本版本的**前后端分离重构**由其贡献：
+  通过 [PR #1](https://github.com/AzureEstrath/Azure-Go/pull/1) 让 `game\` 只负责渲染与输入、`backend\` 统一编排、
+  `katago_service\` 独立部署，并引入 LangChain 提示链、发言侧工具与长期记忆。特此感谢。
+- 感谢 **KataGo**、**CosyVoice**、**Godot**、**LangChain** 等开源项目，本项目建立在它们之上。
+- 感谢每一位提交 issue / PR、以及下载试玩并反馈的使用者。
