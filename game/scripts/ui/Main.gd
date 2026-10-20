@@ -113,7 +113,7 @@ var _status_before_tool_bad := false           # 原文案的错误色标记（e
 var _status_bad := false                       # 状态栏当前是不是错误色（_set_status 记录，上面那行取用）
 var _tool_active := false                      # 工具进度是否在跑（start/end 成对，避免重复记原文案）
 var _chk_pass: CheckBox
-var _joseki_opt: OptionButton                     # 定式导学＝「开关 + 频率」一格（关闭 / 低 25% / 中 50% / 高 75%）
+var _joseki_opt: OptionButton                     # 定式导学＝「开关 + 频率」一格（关闭 / 低 25% / 中 50% / 高 75% / 总是 100%）
 var _drift_opt: OptionButton                      # 情绪波动＝「开关 + 基础概率」一格（关闭 / 低 3% / 中 5% / 高 6%；在 ⚙ 设置抽屉里）
 var _btn_settings: Button                         # ⚙ 设置抽屉的开关
 var _settings_box: PanelContainer                 # ⚙ 设置抽屉本体（情绪波动 / 同步说话 / 整段合成 / 长句合并 / 聊天摘要用 LLM / 画像，默认收起）
@@ -391,7 +391,7 @@ func _build_right_panel(root: Control) -> void:
 	_style_check(_chk_pass, "允许 Azure 虚着")
 	info.add_child(_chk_pass)
 
-	# 定式导学：开关 + 频率合一（关闭 / 低 25% / 中 50% / 高 75%）。改动即时写回 config.json 并对当前对局生效。
+	# 定式导学：开关 + 频率合一（关闭 / 低 25% / 中 50% / 高 75% / 总是 100%）。改动即时写回 config.json 并对当前对局生效。
 	# OptionButton 比原来的勾选框宽，单起一行——否则会把「手数 / 胜率 / 目差 / 允许虚着」那一行挤出面板。
 	var joseki_row := HBoxContainer.new()
 	vb.add_child(joseki_row)
@@ -400,9 +400,11 @@ func _build_right_panel(root: Control) -> void:
 	_joseki_opt.add_item("定式导学：低 25%", 1)
 	_joseki_opt.add_item("定式导学：中 50%", 2)
 	_joseki_opt.add_item("定式导学：高 75%", 3)
+	_joseki_opt.add_item("定式导学：总是 100%", 4)
 	_joseki_opt.tooltip_text = "识别对局中走出的定式：讲解要点、在棋盘上高亮手顺轨迹。\n" \
 		+ "· 关闭 = 不识别、不打扰\n" \
-		+ "· 低 25% / 中 50% / 高 75% = 有资格提示时按该概率提示（讲解与卡片只看「有没有资格」，不重复掷骰）"
+		+ "· 低 25% / 中 50% / 高 75% = 有资格提示时按该概率提示（讲解与卡片只看「有没有资格」，不重复掷骰）\n" \
+		+ "· 总是 100% = 有资格就一定讲（复测定式功能时用这一档）"
 	_joseki_opt.selected = joseki_level_index(cfg.joseki_teach, cfg.joseki_rate)   # 只显示，不回写 config.json
 	_joseki_opt.item_selected.connect(_on_joseki_level_selected)
 	joseki_row.add_child(_joseki_opt)
@@ -1940,8 +1942,9 @@ func _on_allow_pass_toggled(pressed: bool) -> void:
 	pairing.mark_text_only()                 # 这条提示只有文字（后端同步方法，T20②）
 	agent.set_allow_pass(pressed)
 
-## 定式导学的四档频率（与下拉框 index-1 一一对应）：低 25% / 中 50% / 高 75%
-const JOSEKI_RATES := [0.25, 0.5, 0.75]
+## 定式导学的四档频率（与下拉框 index-1 一一对应）：低 25% / 中 50% / 高 75% / 总是 100%。
+## 最高档给「总是」是给**复测**用的：有资格就一定讲，不必改 config.json 也不会被掷骰吞掉。
+const JOSEKI_RATES := [0.25, 0.5, 0.75, 1.0]
 
 ## 由 (开关, 频率) 反推下拉框档位：关闭 ⇒ 0；否则取最接近 `joseki_rate` 的一档，
 ## **并列时取「中 50%」**（两侧同时等距时优先中间档）。纯函数、不碰场景树（门卫可直接断言）。
@@ -2106,7 +2109,7 @@ func _on_joseki_level_selected(i: int) -> void:
 		# 原子入口（v3.7.0 修复波）：开关与频率**一次推一次** `/api/config`。分两次赋 setter 会各推
 		# 一条 POST、到达顺序无保证，极端情况下后端留下「新开关 + 旧频率」。
 		agent.set_joseki(teach, rate)
-	var names := ["关闭", "低 25%", "中 50%", "高 75%"]
+	var names := ["关闭", "低 25%", "中 50%", "高 75%", "总是 100%"]
 	_set_status("定式导学：%s" % names[lvl])
 
 ## 情绪波动「开关 + 基础概率」下拉（⚙ 设置抽屉）：写回 config.json，再走既有 `_flush_settings` 通道推给
