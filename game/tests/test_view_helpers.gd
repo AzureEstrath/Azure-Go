@@ -28,6 +28,7 @@ func _run() -> void:
 	_test_move_no_from_seq()
 	_test_corners()
 	_test_reset_view()
+	_test_camera_flight()
 
 	if _fail == 0:
 		print("[view] PASS：", _total, " 项断言全部通过")
@@ -114,4 +115,36 @@ func _test_reset_view() -> void:
 	b.set_view(200.0, 10.0, 30.0)
 	b.reset_view()
 	_check("④ reset_view：转乱 / 缩放过的取景逐项回到捕获值", b.view_state() == home)
+	b.free()
+
+## ⑤ 主界面 ⇄ 对局的运镜（v3.11.3）：远看取景 / 回初始取景 / 缓动曲线 / 飞行状态
+func _test_camera_flight() -> void:
+	var b := Board3D.new()
+	b.set_view(0.0, 27.0, 66.0)
+	_check("⑤ 远看取景原样落下（yaw 0 / pitch 27 / dist 66）",
+			is_equal_approx(float(b.view_state()["yaw_deg"]), 0.0)
+			and is_equal_approx(float(b.view_state()["pitch_deg"]), 27.0)
+			and is_equal_approx(float(b.view_state()["dist"]), 66.0))
+	b.fly_home(0.0)                                   # 没有相机：立刻到位、不抛
+	_check("⑤ fly_home(0) 立刻回到初始取景（正对棋盘）",
+			is_equal_approx(float(b.view_state()["pitch_deg"]), 38.0)
+			and is_equal_approx(float(b.view_state()["dist"]), 42.0))
+	b.fly_to(0.0, 27.0, 66.0, 1.0)
+	_check("⑤ 给出时长时处于「飞行中」", b.is_flying())
+	b.fly_to(0.0, 27.0, 66.0, 0.0)
+	_check("⑤ 时长 0：立刻到位、不再是飞行中", not b.is_flying()
+			and is_equal_approx(float(b.view_state()["dist"]), 66.0))
+	_check("⑤ 缓动曲线：f(0)=0 / f(0.5)=0.5 / f(1)=1", is_zero_approx(Board3D.fly_ease(0.0))
+			and is_equal_approx(Board3D.fly_ease(0.5), 0.5)
+			and is_equal_approx(Board3D.fly_ease(1.0), 1.0))
+	var monotonic := true
+	var prev := -1.0
+	for i in 21:
+		var e: float = Board3D.fly_ease(float(i) / 20.0)
+		if e < prev - 0.0001:
+			monotonic = false
+		prev = e
+	_check("⑤ 缓动曲线单调不回弹", monotonic)
+	_check("⑤ 越界进度夹到 0..1（脏值不把相机甩出去）",
+			is_zero_approx(Board3D.fly_ease(-3.0)) and is_equal_approx(Board3D.fly_ease(9.0), 1.0))
 	b.free()

@@ -63,9 +63,16 @@ var _drift_batch := false
 ## 聊天摘要用 LLM（单字段）原子入口的批量写入中（v3.8.0）：与 `_drift_batch` 同理——单字段本可只靠
 ## setter 推一次，这里保持与 `set_drift` / `set_joseki` 同一形状，将来加字段不会退回「两次 setter 各推一次」。
 var _digest_batch := false
-var limit_len := false:
+## 说话详略（v3.11.1）：0 精简 / 1 适中 / 2 详细。旧字段 `limit_len` 已并入它，
+## 推送时仍带上 `limit_len = (reply_style == 0)`，让旧版后端也读得懂「精简」。
+var reply_style := 0:
 	set(v):
-		limit_len = v
+		reply_style = v
+		_push_settings()
+## 思考强度（v3.11.1）：0 快速 / 1 中等 / 2 强思考。运行期推送，后端即时改档（不用重启）。
+var think_mode := 0:
+	set(v):
+		think_mode = v
 		_push_settings()
 var joseki_teach := true:
 	set(v):
@@ -415,7 +422,8 @@ func _flush_settings() -> void:
 	if not _settings_dirty:
 		return
 	_settings_dirty = false
-	_post("/api/config", {"limit_len": limit_len, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate,
+	_post("/api/config", {"reply_style": reply_style, "limit_len": reply_style == 0,
+		"think_mode": think_mode, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate,
 		"emotion_drift": emotion_drift, "drift_base": drift_base, "chat_digest_llm": chat_digest_llm,
 		"profile_enabled": profile_enabled, "time_aware_enabled": time_aware_enabled})
 

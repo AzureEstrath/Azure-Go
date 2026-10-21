@@ -173,6 +173,17 @@ func has_pending() -> bool:
 			return true
 	return false
 
+## 还有**没揭示的落子**吗（v3.11.1：棋盘锁的新判据）。
+## `reveal=true` 的记录就是「她这一手的落子宣告」——它的文字一显示，`Main` 就在同一刻 `_reveal_move()`。
+## 所以只要还有这种记录没显示，棋盘上就少着一颗她的子：这时即使后端这一轮已经结束，也**不许**先让玩家落子，
+## 否则会先看到自己的子、她的子过一会儿才冒出来。
+## 与 `has_pending()` 的区别：只认 `reveal` 那几条（点评 / 聊天 / 走神搭话不挡棋盘）。
+func pending_reveal() -> bool:
+	for rec in _pairs:
+		if bool(rec["reveal"]) and not bool(rec["displayed"]) and not bool(rec["tomb"]):
+			return true
+	return false
+
 # ================= 结果与清理 =================
 
 ## 这条语音有结论了（已开播 / 判定无声 / 被取消 / 被丢弃）：标记出结果、清分组位，并通知调用方刷新锁。

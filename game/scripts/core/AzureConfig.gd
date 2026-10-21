@@ -2,8 +2,9 @@ class_name AzureConfig
 extends RefCounted
 ## 配置加载/保存：优先读「可执行文件同目录 / config.json」，其次项目内 res://config.json
 
-## 朗读方式只有 system / openai 两种（与左侧栏下拉一一对应）：旧配置里的 "cosyvoice" 等未知值一律回落云端 openai
-const TTS_MODES := ["system", "openai"]
+## 朗读方式（与左侧栏下拉一一对应）：system（Windows 系统语音）/ openai（OpenAI 兼容 /v1/audio/speech）/
+## aliyun（阿里云 Voice Studio 实时语音合成，WebSocket）。旧配置里的 "cosyvoice" 等未知值一律回落云端 openai
+const TTS_MODES := ["system", "openai", "aliyun"]
 ## 旧配置里已废弃的本地引擎音色 id → 回落模板默认音色；清单是**唯一副本**，UI（`Main._is_removed_voice()`）直接引用它。
 ## 自建 CosyVoice 服务仍在用的活音色（azure / azure-fast / melo）**不在此列**，必须原样保留（该服务默认音色就是 azure）。
 ## 这里用黑名单而非白名单：tts_voice 允许手填任意服务商音色，白名单会把用户自填值冲掉。
@@ -48,6 +49,10 @@ var llm_base_url := "https://api.deepseek.com/v1"   # 云端 LLM（OpenAI 兼容
 var llm_model := "deepseek-chat"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
 var llm_think_mode := 0           # 思考档位：0=快速（不思考） 1=中等（限定推理预算） 2=强思考（自由推理）
+## 说话详略（v3.11.1）：0=精简（点评 1 句 / 聊天 2 句，默认） 1=适中（不加额外约束） 2=详细（2~3 句 / 80 字内）。
+## 与旧字段 `tts_limit_len`（布尔）同一件事的扩档：读配置时 `reply_style` 优先，只有旧键时按旧语义迁移
+## （true → 0 / false → 1）；写回时两个键一起写，保证旧版本读到的仍是「开 / 关」两档。
+var reply_style := 0
 var vrm_path := "D:/KataGo/assets/Azure.vrm"
 # —— 提示词自定义（留空则用内置 Azure 人设）——
 var prompt_system := ""           # 覆盖系统提示词（人设全文）；留空用内置
@@ -63,6 +68,13 @@ var tts_voice := TTS_VOICE_DEFAULT
 var tts_speed := 1.0
 var tts_pitch := 1.0              # 播放层音调（0.8~1.3，会略带动语速）
 var tts_volume := 1.0
+# —— 阿里云 Voice Studio（tts_mode=aliyun；合成在后端，这里只是配置载体）——
+var tts_aliyun_ws_url := ""       # 留空＝官方固定地址（wss://convai-platform.aliyuncs.com/api-ws/v1/inference）
+var tts_aliyun_api_key := ""      # Voice Studio 签发的 Key；百炼原生 Key 会被 401
+var tts_aliyun_voice := ""        # 平台音色 ID（UUID 形式），与 openai 的 tts_voice 各留各的
+var tts_aliyun_format := "pcm"    # 走裸 PCM 由后端补 WAV 头（引擎对 mp3 支持因音色而异）
+var tts_aliyun_sample_rate := 24000   # CosyVoice3 系引擎的 mp3 只认 24000（22050 会被 400 拒）
+var tts_aliyun_tn := true         # 文本归一化：数字/日期读成口语
 # —— 语音加速开关（右侧栏可改）——
 var tts_limit_len := true         # 限制 Azure 回复长度（点评 1 句/聊天 2 句）→ 语音等待随字数下降
 var tts_sync_speak := true        # 同步说话：Azure 文字等语音就绪后再一起显示（关掉则文字立即显示）
@@ -123,7 +135,15 @@ static func load_config(path := "") -> AzureConfig:
 			c.tts_speed = float(d.get("tts_speed", c.tts_speed))
 			c.tts_pitch = float(d.get("tts_pitch", c.tts_pitch))
 			c.tts_volume = float(d.get("tts_volume", c.tts_volume))
+			c.tts_aliyun_ws_url = str(d.get("tts_aliyun_ws_url", c.tts_aliyun_ws_url))
+			c.tts_aliyun_api_key = str(d.get("tts_aliyun_api_key", c.tts_aliyun_api_key))
+			c.tts_aliyun_voice = str(d.get("tts_aliyun_voice", c.tts_aliyun_voice))
+			c.tts_aliyun_format = str(d.get("tts_aliyun_format", c.tts_aliyun_format))
+			c.tts_aliyun_sample_rate = int(d.get("tts_aliyun_sample_rate", c.tts_aliyun_sample_rate))
+			c.tts_aliyun_tn = bool(d.get("tts_aliyun_tn", c.tts_aliyun_tn))
 			c.tts_limit_len = bool(d.get("tts_limit_len", c.tts_limit_len))
+			c.reply_style = _normalize_reply_style(d.get("reply_style", null), c.tts_limit_len)
+			c.tts_limit_len = c.reply_style == 0      # 两个字段对齐（save() 也按 reply_style 推导旧键）
 			c.tts_sync_speak = bool(d.get("tts_sync_speak", c.tts_sync_speak))
 			c.tts_batch_speak = bool(d.get("tts_batch_speak", c.tts_batch_speak))
 			c.tts_long_chunk = bool(d.get("tts_long_chunk", c.tts_long_chunk))
@@ -168,6 +188,19 @@ static func _clamp_rate(f: float) -> float:
 ## 一律退回默认（`fallback`）。本批新加的开关用它；既有开关的读法一个字不动。
 static func _normalize_flag(v, fallback: bool) -> bool:
 	return v if typeof(v) == TYPE_BOOL else fallback
+
+## 说话详略归一化（v3.11.1）：数值（含数字字符串）夹到 0~2；`null` / 脏值退回「由旧字段迁移」——
+## `limit_len_fallback=true` ⇒ 0（精简），否则 1（适中）。旧配置只有 `tts_limit_len`，走的就是这条迁移。
+static func _normalize_reply_style(v, limit_len_fallback := false) -> int:
+	var legacy := 0 if limit_len_fallback else 1
+	match typeof(v):
+		TYPE_INT, TYPE_FLOAT:
+			return clampi(int(v), 0, 2)
+		TYPE_STRING:
+			var s := (v as String).strip_edges()
+			return clampi(s.to_int(), 0, 2) if s.is_valid_int() else legacy
+		_:
+			return legacy
 
 ## 偏航基础概率归一化：与 `joseki_rate` **同一套守卫**（数值 / 字符串共用判据、NaN ⇒ 默认 0.03、
 ## 脏值不把启动搞崩），但**夹取上限不同**：夹到 `[0, limit]`（`limit` 缺省＝`DRIFT_MAX_DEFAULT`，
@@ -260,7 +293,14 @@ func save() -> bool:
 		"tts_speed": tts_speed,
 		"tts_pitch": tts_pitch,
 		"tts_volume": tts_volume,
-		"tts_limit_len": tts_limit_len,
+		"tts_aliyun_ws_url": tts_aliyun_ws_url,
+		"tts_aliyun_api_key": tts_aliyun_api_key,
+		"tts_aliyun_voice": tts_aliyun_voice,
+		"tts_aliyun_format": tts_aliyun_format,
+		"tts_aliyun_sample_rate": tts_aliyun_sample_rate,
+		"tts_aliyun_tn": tts_aliyun_tn,
+		"tts_limit_len": reply_style == 0,   # 旧键跟随新档位写回（旧版本读到的仍是「短回复 开/关」）
+		"reply_style": reply_style,          # 说话详略三档（v3.11.1）：0 精简 / 1 适中 / 2 详细
 		"tts_sync_speak": tts_sync_speak,
 		"tts_batch_speak": tts_batch_speak,
 		"tts_long_chunk": tts_long_chunk,

@@ -1012,5 +1012,52 @@ class ProfileGreetWsTest(unittest.TestCase):
                     self.assertIn("虚着", e["text"], "没有历史对局 ⇒ 一条提醒都不发")
 
 
+class ChatStyleRuntimeTest(unittest.TestCase):
+    """说话详略 / 思考强度都能在运行期改（v3.11.0）：一次 ``/api/config`` 立即生效、不用重启后端。"""
+
+    def _app(self):
+        cfg = AzureConfig()
+        cfg.llm_extra_body = {"top_k": 40}
+        cfg.llm_think_extra_body = {"reasoning_effort": "high"}
+        cfg.llm_think_mode = 0
+        return create_app(cfg=cfg, autostart=False)
+
+    def test_reply_style_and_think_mode_live(self):
+        app = self._app()
+        with TestClient(app) as client:
+            agent = app.state.agent
+            llm = agent.llm
+            self.assertEqual(agent.reply_style, 0)          # 默认「精简」＝旧「短回复」开
+            self.assertEqual(llm.extra_body, {"top_k": 40})
+
+            r = client.post("/api/config", json={"reply_style": 2, "think_mode": 2})
+            self.assertTrue(r.json()["ok"])
+            self.assertEqual(agent.reply_style, 2)
+            self.assertEqual(llm.think_mode, 2)
+            self.assertEqual(llm.extra_body, {"top_k": 40, "reasoning_effort": "high"})
+
+            client.post("/api/config", json={"reply_style": 0, "think_mode": 0})
+            self.assertEqual(agent.reply_style, 0)
+            self.assertEqual(llm.think_mode, 0)
+            self.assertEqual(llm.extra_body, {"top_k": 40})   # 思考字段必须撤掉
+
+    def test_dirty_values_do_not_500_or_change_state(self):
+        app = self._app()
+        with TestClient(app) as client:
+            client.post("/api/config", json={"reply_style": 2, "think_mode": 1})
+            r = client.post("/api/config", json={"reply_style": "abc", "think_mode": None})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(app.state.agent.reply_style, 2)
+            self.assertEqual(app.state.agent.llm.think_mode, 1)
+
+    def test_legacy_limit_len_still_maps_to_brief(self):
+        app = self._app()
+        with TestClient(app) as client:
+            client.post("/api/config", json={"limit_len": True})
+            self.assertEqual(app.state.agent.reply_style, 0)
+            client.post("/api/config", json={"limit_len": False})
+            self.assertEqual(app.state.agent.reply_style, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

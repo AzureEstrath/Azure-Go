@@ -62,6 +62,15 @@ func _run() -> void:
 	_check("v2.x tts_mode=cosyvoice 归一化为 openai", c1.tts_mode == "openai")
 	_check("自建服务活音色 azure 原样保留", c1.tts_voice == "azure")
 
+	# —— 1b) aliyun 是合法朗读方式：必须原样保留，不能被归一化冲成 openai（否则后端路由不到）——
+	_write_raw({"tts_mode": "aliyun", "tts_aliyun_voice": "9f2a1c4e-7b30-4d51-8a6c-2e5f1b8d0a37",
+		"tts_aliyun_api_key": "sk-test", "tts_aliyun_tn": false})
+	var c1b := AzureConfig.load_config(TMP)
+	_check("tts_mode=aliyun 原样保留", c1b.tts_mode == "aliyun")
+	_check("阿里云音色 ID 读入", c1b.tts_aliyun_voice == "9f2a1c4e-7b30-4d51-8a6c-2e5f1b8d0a37")
+	_check("阿里云 Key 读入", c1b.tts_aliyun_api_key == "sk-test")
+	_check("阿里云 TN 开关读入", c1b.tts_aliyun_tn == false)
+
 	# —— 2) 已废弃音色 id → 模板默认音色 ——
 	for dead in ["中文男", "azure-soft"]:
 		_write_raw({"tts_voice": dead})
@@ -150,6 +159,33 @@ func _run() -> void:
 	var out3 := _read_raw()
 	_check("save() 写回 joseki_teach=false", not bool(out3.get("joseki_teach", true)))
 	_check("save() 未改动的 joseki_rate 原值不变", is_equal_approx(float(out3.get("joseki_rate", -1.0)), 0.5))
+
+	# —— 4b) 说话详略三档（reply_style，v3.11.0）：新键优先、旧键迁就、脏值不炸 ——
+	_write_raw({})
+	_check("reply_style 两键都缺 ⇒ 默认 0（精简，与旧 tts_limit_len=true 一致）",
+			AzureConfig.load_config(TMP).reply_style == 0)
+	for pair in [[0, 0], [1, 1], [2, 2], [9, 2], [-1, 0], ["1", 1], ["abc", 0], [null, 0]]:
+		_write_raw({"reply_style": pair[0]})
+		_check("reply_style=%s ⇒ %d" % [str(pair[0]), int(pair[1])],
+			AzureConfig.load_config(TMP).reply_style == int(pair[1]))
+	_write_raw({"tts_limit_len": true})
+	_check("旧键 tts_limit_len=true ⇒ 迁移为 0（精简）",
+			AzureConfig.load_config(TMP).reply_style == 0)
+	_write_raw({"tts_limit_len": false})
+	_check("旧键 tts_limit_len=false ⇒ 迁移为 1（适中）",
+			AzureConfig.load_config(TMP).reply_style == 1)
+	_write_raw({"reply_style": 2, "tts_limit_len": true})
+	var rs1 := AzureConfig.load_config(TMP)
+	_check("reply_style 优先于旧键 tts_limit_len", rs1.reply_style == 2)
+	_check("两者对齐：读入后旧键跟随档位（详细 ⇒ false）", not rs1.tts_limit_len)
+	rs1.save()
+	var out_rs := _read_raw()
+	_check("save() 写回 reply_style=2", int(out_rs.get("reply_style", -1)) == 2)
+	_check("save() 同步旧键 tts_limit_len=false", not bool(out_rs.get("tts_limit_len", true)))
+	_write_raw({"reply_style": 0})
+	AzureConfig.load_config(TMP).save()
+	_check("save() 精简档 ⇒ 旧键 tts_limit_len=true",
+			bool(_read_raw().get("tts_limit_len", false)))
 
 	# —— 5) 情绪波动＝开关 + 基础概率（emotion_drift / drift_base，v3.8.0）——
 	# 口径与 `joseki` 那一格一致：键缺失 ⇒ 默认（false / 0.03）；脏值 ⇒ 0.03；
@@ -453,6 +489,17 @@ func _run() -> void:
 	_check("单独赋 chat_digest_llm 仍推一次（setter 语义与既有开关一致）", ne2.pushes == 1)
 	ne2.free()
 	ne.free()
+
+	# —— 6b) 说话详略 / 思考强度：单字段各自推一次 `/api/config`（v3.11.0）——
+	var ne3 := CountingNetClient.new()
+	ne3.reply_style = 2
+	_check("设 reply_style 推一次 /api/config", ne3.pushes == 1 and ne3.reply_style == 2)
+	ne3.think_mode = 1
+	_check("设 think_mode 再推一次 /api/config", ne3.pushes == 2 and ne3.think_mode == 1)
+	ne3.reply_style = 0
+	ne3.think_mode = 0
+	_check("每改一次各推一次（共 4 次；两者都走同一条 setter → _push_settings 通道）", ne3.pushes == 4)
+	ne3.free()
 
 	if _fail == 0:
 		print("[config] PASS：", _total, " 项断言全部通过")

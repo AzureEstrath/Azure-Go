@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import prompt_chains, prompts
-from app.agent import LEN_NOTE, LEN_TEACH_NOTE
+from app.agent import LEN_NOTE, LEN_TEACH_NOTE, LEN_VERBOSE_NOTE
 from helpers import mk_agent
 
 
@@ -154,6 +154,30 @@ class AgentSystemMessageTest(unittest.TestCase):
         agent, _eng, _llm, _bus = mk_agent()
         agent.limit_len = True
         self.assertTrue(agent._sys_msg()["content"].endswith(LEN_NOTE))
+
+    def test_reply_style_three_levels(self):
+        """说话详略三档（v3.11.0）：0 → LEN_NOTE、1 → 不加约束、2 → LEN_VERBOSE_NOTE。"""
+        agent, _eng, _llm, _bus = mk_agent()
+        agent.reply_style = 0
+        self.assertTrue(agent._sys_msg()["content"].endswith(LEN_NOTE))
+        agent.reply_style = 1
+        self.assertNotIn(LEN_NOTE, agent._sys_msg()["content"])
+        self.assertNotIn(LEN_VERBOSE_NOTE, agent._sys_msg()["content"])
+        agent.reply_style = 2
+        self.assertTrue(agent._sys_msg()["content"].endswith(LEN_VERBOSE_NOTE))
+        # 定式讲解仍是 LEN_TEACH_NOTE（详细档也不例外：讲解本来就允许 2~3 句）
+        self.assertEqual(agent._len_note(teach=True), LEN_TEACH_NOTE)
+
+    def test_limit_len_is_alias_of_brief(self):
+        """旧字段兼容：limit_len 读写的就是 reply_style 的精简 / 适中两档。"""
+        agent, _eng, _llm, _bus = mk_agent()
+        agent.reply_style = 2
+        self.assertFalse(agent.limit_len)
+        agent.limit_len = True
+        self.assertEqual(agent.reply_style, 0)
+        self.assertTrue(agent.limit_len)
+        agent.limit_len = False
+        self.assertEqual(agent.reply_style, 1)
 
     def test_think_hint_only_when_thinking(self):
         agent, _eng, llm, _bus = mk_agent()

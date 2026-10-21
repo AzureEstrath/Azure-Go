@@ -65,6 +65,20 @@ static func panel(pad := 12) -> StyleBoxTexture:
 	sb.content_margin_bottom = pad
 	return sb
 
+## 半透明纸签：**只给主界面封面用**——棋盘要在纸面后面透出来（侧栏仍用 `panel()`，不透明）。
+## `alpha` 压得越低，棋盘越清楚；封面文字是墨色，纸上仍够 4.5:1。
+static func veil_card(alpha := 0.82, pad := 30) -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(PAPER_WARM.r, PAPER_WARM.g, PAPER_WARM.b, alpha)
+	sb.border_color = Color(INK, 0.30)
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(0)
+	sb.content_margin_left = pad + 4
+	sb.content_margin_right = pad + 4
+	sb.content_margin_top = pad
+	sb.content_margin_bottom = pad
+	return sb
+
 ## 标题条：**黛青底**（深色但不是黑）+ 朱砂横线。右侧压一枚单字印。
 static func header() -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
