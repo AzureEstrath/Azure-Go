@@ -1002,24 +1002,54 @@ def joseki_short_prompt(name, key, gtp):
 # **卡片**（T5/T6/T8 的次数规则），不决定说与不说；模板自己不判。
 
 
-def joseki_enter_prompt(name, key, corner):
-    """进入：这一角开始走【name】——讲解**顶替**这一手的普通点评（同一时刻只出一条气泡）。
+def _joseki_role_note(owner: str) -> str:
+    """定式要点（``key``）都是站在**角上先落子一方**的立场写的；这里把角色映射讲清楚。
+
+    ``owner`` 是角上先落子那一方的颜色（``"B"`` = 对局对面 / ``"W"`` = Azure）。
+    「进入」那一手可能是她自己的，也可能是玩家的（U55）；不换角色就会讲出
+    「他占角、我守外围」这种主客颠倒的话（实机反馈：本局是 Azure 自己点三三，
+    对面才是守角的一方）。未知颜色 ⇒ 不注入任何文字（逐字符不变）。
+    """
+    if owner == "B":
+        return ("这一角的要点是站在**角上先落子的一方（对局对面）**的角度写的："
+            "对面是守角的一方，你是点三三/挂角的一方。讲给对面听时要把角色对调——"
+            "要点里的「你 / 我 / 自己」都指对面（一律说成「你」），「他 / 对方 / 别人」指你自己（说成「我」）；"
+            "「挡、守、拆、飞应、守角」这类防守动作归对面，「点三三、挂角、爬边、侵入」这类动作归你自己。"
+            "全程不要用第三人称「他」，也不要说「黑方/白棋」。")
+    if owner == "W":
+        return ("这一角的要点是站在**角上先落子的一方（你自己）**的角度写的："
+            "你是守角的一方，对面是点三三/挂角的一方。讲给对面听时——"
+            "要点里的「你 / 我 / 自己」都指你自己（一律说成「我」），「他 / 对方 / 别人」指对面（说成「你」）；"
+            "「挡、守、拆、飞应、守角」这类防守动作归你自己，「点三三、挂角、爬边、侵入」这类动作归对面。"
+            "全程不要用第三人称「他」，也不要说「黑方/白棋」。")
+    return ""
+
+
+def joseki_enter_prompt(name, key, corner, owner=""):
+    """进入：这一角走进了【name】——讲解**顶替**这一手的普通点评（同一时刻只出一条气泡）。
 
     U55：主语必须中性——「进入」那一手可能是玩家下的，也可能是**她自己**下的（`side == "azure"`），
     写死「Estarth 这一手」在她把这一角带进这一课时就是事实错误。素材只给「哪个角 + 这一课 + 要点」。
+
+    ``owner``（v3.11 修复）：角上先落子一方的颜色（``"B"`` / ``"W"``，缺省＝不注入角色说明）。
+    要点是按角主立场写的；本局角主与说话人相反时必须显式对调，否则会讲出「他占角」这种主客颠倒。
     """
-    return ("%s角开始走【%s】这一课了。这一角的要点是：%s\n"
-        + "用你自己的口吻（我/你）一句话把这一课点开：先说这一角现在开始走的是「%s」，"
-        + "再把上面的要点用更口语、更软的说法讲给他听——别像教科书背课文。"
+    base = ("%s角这一带走进了【%s】的起手。这一型的要点是：%s\n"
+        + "用你自己的口吻（我/你）一句话点一下：先说这一角现在走的是「%s」，"
+        + "再把上面的要点用更口语、更软的说法讲给对面听——别像教科书背课文，"
+        + "也别用「开始学、上课、教学、这一课」这种课堂口吻，像顺手提一句棋理。"
         + "不要提胜率数值，不要点具体坐标，别像解说员那样说「黑方/白棋」，也别复读你最近用过的口头禅。") % (
         corner, name, key, name)
+    note = _joseki_role_note(str(owner))
+    return base if note == "" else base + "\n" + note
 
 
-def joseki_branch_prompt(name, key, candidates):
+def joseki_branch_prompt(name, key, candidates, owner=""):
     """分岔 / 真走错：这一手走到了岔口——并进这一手的发言位（**不追加**第二条气泡）。
 
     素材＝这一课的名字与要点 + 每个候选**自己**的下一手坐标（``candidates[i]["next"]`` 是 0 基
     元组，这里转成 GTP 交给模型）；候选为空时只给要点，不留「（可选）」这类残缺句式。
+    主语保持中性（这一手可能是她自己的）；``owner`` 同 ``joseki_enter_prompt``。
     """
     ways = []
     for c in candidates or []:
@@ -1038,32 +1068,36 @@ def joseki_branch_prompt(name, key, candidates):
         gtp = coords.xy_to_gtp(x, y)
         nm = str(c.get("name") or "")
         ways.append(gtp if nm == "" else "「%s」的下一手在 %s" % (nm, gtp))
-    material = "Estarth 这一手从【%s】走到了岔口。这一课的要点是：%s" % (name, key)
+    material = "这一手从【%s】走到了岔口。这一课的要点是：%s" % (name, key)
     if ways:
         # 要点本身常以句号收尾：先去掉再补一个，免得拼出「。。」
         material = material.rstrip("。") + "。这里另有走法：" + "；".join(ways)
         # 有候选才要求她说「别的走法」——没给她的东西不能叫她说（U35：候选为空退回只说要点）
-        with_ways = "再把别的走法用软一点的说法带给他（别生硬地念坐标，也别批评他这一手）。"
+        with_ways = "再把别的走法用软一点的说法讲给对面听（别生硬地念坐标，也别批评对面这一手）。"
     else:
         with_ways = ""
-    return (material + "\n"
+    base = (material + "\n"
         + "用你自己的口吻（我/你）一句话把这一手说清楚：点一下这一角本来走的是「%s」，"
         + with_ways
         + "不要提胜率数值，别像解说员那样说「黑方/白棋」，也别复读你最近用过的口头禅。") % name
+    note = _joseki_role_note(str(owner))
+    return base if note == "" else base + "\n" + note
 
 
-def joseki_close_prompt(name, key, corner, side):
+def joseki_close_prompt(name, key, corner, side, owner=""):
     """收尾：这一课走完了——并进**走完那一方**的发言位。
 
     ``side`` 取 ``"player"``（玩家走完，并进他那一手的点评）/ ``"azure"``（她自己走完，并进她
-    落子后的那句感想）。素材＝角 + 名字 + 要点。
+    落子后的那句感想）。素材＝角 + 名字 + 要点；``owner`` 同 ``joseki_enter_prompt``。
     """
     who = "Estarth 这一手" if str(side) != "azure" else "你（Azure）刚下的这一手"
-    return ("%s把%s角这一片走完了，成的是【%s】。这一课的要点是：%s\n"
+    base = ("%s把%s角这一片走完了，成的是【%s】。这一课的要点是：%s\n"
         + "用你自己的口吻（我/你）一句话收个尾：先点一下这一角走出来的是「%s」，"
         + "再用更口语、更软的说法把要点带一句——是收尾，不是开讲。"
         + "不要提胜率数值，不要点具体坐标，别像解说员那样说「黑方/白棋」，也别复读你最近用过的口头禅。") % (
         who, corner, name, key, name)
+    note = _joseki_role_note(str(owner))
+    return base if note == "" else base + "\n" + note
 
 
 def joseki_hint_clause(name, expect_gtp):

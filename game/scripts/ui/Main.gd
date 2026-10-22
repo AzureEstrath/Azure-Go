@@ -40,6 +40,7 @@ var _right_open := true
 var _left_toggle: Button
 var _right_toggle: Button
 var _tts_status: Label
+var _tts_route: Label                       # 实际朗读路线（本地优先 → 云端 → 系统）：只读提示，合成在后端
 var _tts_url_edit: LineEdit
 var _tts_model_edit: LineEdit
 var _tts_voice_edit: LineEdit
@@ -53,6 +54,8 @@ var _game_started := false                 # 已经过了首次「开始对局�
 var _setup_done := false                   # 本次运行已在主界面里点过「设置」：开局时不再弹第二遍
 var _setup_showing := false                # 设置面板正在显示（防重入）
 var _transition := false                   # 主界面 ⇄ 对局的运镜正在跑（期间不吃 Esc / 不叠加动画）
+var _cover_only := false                   # --title：只画封面（截图调试）——不叠问候 / 设置面板
+var _shot_requested := false               # 命令行带 --shot= / --demo：截图模式
 ## —— 思考中的短句 ——
 var _thinking_lines: PackedStringArray = PackedStringArray()
 var _thinking_idx := -1                    # 当前句下标（-1 = 还没挑过）
@@ -97,7 +100,7 @@ var _typing_full := ""                     # 这条消息的完整文本
 var _typing_shown := 0.0                   # 已显示字数（浮点累计）
 var _typing_cps := 0.0                     # 当前打字速度（字/秒）
 var _typing_queue: Array[Dictionary] = []  # 排队等待打字的 {label,text}（单活跃顺序播放，防抢跑）
-var _tone_re := RegEx.new()                # [[tone:xxx]] 语气标记（首次使用时编译）
+static var _tone_re := RegEx.new()         # [[tone:xxx]] 语气标记（首次使用时编译）
 var _mood := ""                            # 当前情绪基调：同一情绪延续时只刷新计时、不再出声（治「语气太多」）
 var _mood_ms := 0                          # 最近一次情绪刷新的时刻
 const MOOD_KEEP_MS := 30000                # 同一情绪 30 秒内视为延续；情绪变化或久未出现才出声
@@ -174,6 +177,9 @@ func _ready() -> void:
 	_load_thinking_lines()                     # 思考中的 20 句：读不到就用旧的「Azure 思考中…」
 	_build_title_screen()                      # 主界面：纸幕封面（棋盘与化身在纸幕后）
 	await _maybe_show_title()                  # 首次启动：等「开始对局」
+	if _cover_only and _shot_requested:
+		_handle_cli()                          # 只拍封面：不起服务 / 不叠问候，避免聊天面板透在纸幕后
+		return
 	await _maybe_show_setup()                  # 启动设置面板：思考模式 + 各 API 配置（默认=当前配置）；确认后按新配置起服务
 	_build_services()
 	_greet()
@@ -824,18 +830,25 @@ func _build_left_panel(root: Control) -> void:
 			tts.stop())
 	btn_row.add_child(b_stop)
 
+	_tts_route = Label.new()
+	_tts_route.add_theme_font_size_override("font_size", 11)
+	_tts_route.add_theme_color_override("font_color", GufengTheme.DAI)
+	_tts_route.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	vb.add_child(_tts_route)
+
 	_tts_status = Label.new()
 	_tts_status.text = "未开启朗读"
 	_tts_status.add_theme_font_size_override("font_size", 11)
 	_tts_status.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	_tts_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(_tts_status)
+	_refresh_tts_route()
 
 	var tip := Label.new()
-	tip.text = "语音由后端合成（云端 OpenAI 兼容服务 / 阿里云 Voice Studio 实时流式），本端只负责播放；\n" \
-		+ "· 零配置兜底：上面第 1 项「Windows 系统语音」直接用本机 SAPI，不联网\n" \
-		+ "· 第 3 项要填「阿里云 API Key + 平台音色 ID（UUID）」，两项任缺一律回落系统语音\n" \
-		+ "· 云端合成不可用时，后端会直接改用系统语音念（配置里仍是你的选择）"
+	tip.text = "语音由后端合成：openai 模式按「本地 → 云端 → Windows 系统语音」逐级降级；阿里云模式走 Voice Studio 实时流式。本端只负责播放。\n" \
+		+ "· 本地地址写在 config.json 的 tts_local_base_url（dev_local.ps1 会自动写入 127.0.0.1:9880/v1）\n" \
+		+ "· 上面第 2 项是云端备选；第 3 项阿里云要填「API Key + 平台音色 ID」\n" \
+		+ "· 本地/云端/阿里云都不可用时，后端直接用系统语音念"
 	tip.add_theme_font_size_override("font_size", 11)
 	tip.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	tip.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -934,13 +947,19 @@ func _apply_panel_layout(animated := true, dur := 0.18, apply_board := true) -> 
 	if apply_board and board != null:
 		board.set_panels(_left_open, _right_open)
 
+## 刷新「实际朗读」只读提示：本地优先 → 云端 → 系统（后端读同一份 config.json）
+func _refresh_tts_route() -> void:
+	if _tts_route != null:
+		_tts_route.text = "实际朗读：" + cfg.tts_route_label()
+
 func _on_tts_enabled(v: bool) -> void:
 	cfg.tts_enabled = v
 	if tts != null:
 		tts.enabled = v
 		if not v:
 			tts.stop()
-	_tts_status.text = ("已开启朗读 · 语音服务 %s" % cfg.tts_base_url) if v else "未开启朗读"
+	_tts_status.text = ("已开启朗读 · " + cfg.tts_route_label()) if v else "未开启朗读"
+	_refresh_tts_route()
 	cfg.save()
 
 func _on_tts_mode(i: int) -> void:
@@ -953,6 +972,7 @@ func _on_tts_mode(i: int) -> void:
 		tts.stop()
 	cfg.save()
 	_tts_status.text = "朗读方式：%s（合成在后端，重启后端后生效）" % m
+	_refresh_tts_route()
 
 func _apply_tts_fields() -> void:
 	var url := _tts_url_edit.text.strip_edges()
@@ -978,6 +998,7 @@ func _apply_tts_fields() -> void:
 		tts.voice = voice
 	cfg.save()
 	_tts_status.text = "语音设置已保存（合成服务地址/模型/阿里云参数由后端读取，重启后端后生效）"
+	_refresh_tts_route()
 
 ## 音色下拉：云端服务商各有音色名，这里只填静态候选；具体 id 也可在右侧输入框手填（不再向语音服务探测）
 func _fill_voice_items() -> void:
@@ -1195,7 +1216,7 @@ func _add_stream_bubble() -> void:
 	_scroll_to_bottom()
 
 ## 剥离回复开头的 [[tone:xxx]] 语气标记 → [tone, 干净文本]；未知标记照删但不播音（防标记泄漏给玩家）
-func _strip_tone(text: String) -> Array:
+static func _strip_tone(text: String) -> Array:
 	if _tone_re.get_pattern() == "":
 		_tone_re.compile("\\[\\[?\\s*tone\\s*[:：]\\s*([a-zA-Z]+)\\s*\\]\\]?")
 	var tone := ""
@@ -1692,8 +1713,10 @@ func _maybe_show_title() -> void:
 	for a in OS.get_cmdline_user_args():
 		if a == "--title":
 			force = true
+			_cover_only = true
 		elif a.begins_with("--shot=") or a == "--demo" or a == "--setup":
 			shot = true
+	_shot_requested = shot
 	if shot and not force:
 		return
 	_open_title_screen(false)                    # 首帧直接摆到「远看棋盘 + 封面」，无动画
@@ -1729,6 +1752,8 @@ func _close_title_screen() -> void:
 	_title_open = false
 	if board != null:
 		board.input_blocked = false
+	if avatar != null:
+		avatar.visible = true                    # 封面收起：化身回到棋盘对面
 	if title_screen != null:
 		title_screen.close()
 	_refresh_lock()
@@ -1742,6 +1767,8 @@ func _enter_menu_view_immediate() -> void:
 	_apply_panel_layout(false, 0.0, false)
 	_right_toggle.visible = false
 	_left_toggle.visible = false
+	if avatar != null:
+		avatar.visible = false                   # 封面只透棋盘，不让化身在纸签后面留一团影子
 	if _joseki_card != null:
 		_joseki_card.visible = false
 	if board != null:
@@ -1773,6 +1800,8 @@ func _show_game_chrome(dur: float) -> void:
 func _play_enter_game() -> void:
 	_transition = true
 	_refresh_lock()
+	if avatar != null:
+		avatar.visible = true                    # 先回到纸幕后：封面淡出时她已经在对局位
 	if title_screen != null:
 		await title_screen.fade_out(TITLE_FADE_OUT)
 		title_screen.close()
@@ -1791,6 +1820,8 @@ func _play_exit_to_menu() -> void:
 	if board != null:
 		board.fly_to(CAM_MENU_YAW, CAM_MENU_PITCH, CAM_MENU_DIST, TITLE_FLY_OUT)
 	await get_tree().create_timer(TITLE_FLY_OUT).timeout
+	if avatar != null:
+		avatar.visible = false                   # 纸签浮上来前先收起化身：别在标题后面留影子
 	if title_screen != null:
 		title_screen.open()
 		await title_screen.fade_in(TITLE_FADE_IN)
@@ -1929,6 +1960,10 @@ func _maybe_show_setup() -> void:
 			shot = true
 		elif a == "--setup":
 			force = true
+		elif a == "--title":
+			_cover_only = true
+	if _cover_only and _shot_requested and not force:
+		return                                   # 只拍封面时，不要叠启动设置面板
 	if shot and not force:
 		return
 	if _setup_done and not force:
@@ -2007,20 +2042,32 @@ func _build_setup_panel(primary_text := "开始对局",
 	var le_llm_key := _setup_field(llm_body, "API Key（只有云端需要）", cfg.llm_api_key,
 		"留空=不发送 Authorization；只会存在本机的 config.json 里")
 
-	var tts_body := _setup_section(vb, "阿里云语音合成（Voice Studio）", cfg.tts_mode == "aliyun")
-	var le_tts_key := _setup_field(tts_body, "API Key（Voice Studio 签发）", cfg.tts_aliyun_api_key,
+	var tts_body := _setup_section(vb, "语音 TTS（本地 / 云端）")
+	var le_tts_url := _setup_field(tts_body, "云端服务地址（本地没有时才用）", cfg.tts_base_url,
+		"OpenAI 兼容地址，如 https://api.example.com/v1；本地优先地址由 config.json 的 tts_local_base_url 配置")
+	var le_tts_voice := _setup_field(tts_body, "云端音色", cfg.tts_voice,
+		"云端服务的音色 id（各服务商不同，如 alloy / 中文女）；进游戏后左侧栏也可下拉改")
+	var tts_route := Label.new()
+	tts_route.text = "实际朗读：" + cfg.tts_route_label()
+	tts_route.add_theme_font_size_override("font_size", 11)
+	tts_route.add_theme_color_override("font_color", GufengTheme.DAI)
+	tts_route.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	tts_body.add_child(tts_route)
+
+	var aliyun_body := _setup_section(vb, "阿里云语音合成（Voice Studio，可选）", cfg.tts_mode == "aliyun")
+	var le_tts_key := _setup_field(aliyun_body, "API Key（Voice Studio 签发）", cfg.tts_aliyun_api_key,
 		"Voice Studio 控制台签发的 sk-…；百炼原生 Key 无法通过鉴权（返回 401）。留空=这条回落系统语音")
 	le_tts_key.secret = true
-	var le_tts_voice := _setup_field(tts_body, "音色 ID（平台音色 UUID）", cfg.tts_aliyun_voice,
+	var le_tts_voice_id := _setup_field(aliyun_body, "音色 ID（平台音色 UUID）", cfg.tts_aliyun_voice,
 		"在 Voice Studio「音色管理」里复制，形如 9f2a1c4e-7b30-4d51-8a6c-2e5f1b8d0a37；不接受裸音色名")
 	var tts_hint := Label.new()
 	var mode_names := {"system": "系统语音", "openai": "OpenAI 兼容", "aliyun": "阿里云 Voice Studio"}
-	tts_hint.text = "当前朗读方式：%s（进游戏后在左侧栏「朗读方式」切换；这一节只配阿里云的两项）" \
+	tts_hint.text = "当前朗读方式：%s（进游戏后在左侧栏「朗读方式」切换）" \
 		% str(mode_names.get(cfg.tts_mode, cfg.tts_mode))
 	tts_hint.add_theme_font_size_override("font_size", 11)
 	tts_hint.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	tts_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	tts_body.add_child(tts_hint)
+	aliyun_body.add_child(tts_hint)
 
 	var sep := ColorRect.new()
 	sep.color = Color(GufengTheme.INK, 0.22)
@@ -2046,7 +2093,8 @@ func _build_setup_panel(primary_text := "开始对局",
 	start.pressed.connect(func():
 		_setup_showing = false
 		_setup_done = true                    # 本次运行已经配过：开局不再弹第二遍
-		_apply_setup(think_opt, le_llm_url, le_llm_model, le_llm_key, le_tts_key, le_tts_voice)
+		_apply_setup(think_opt, le_llm_url, le_llm_model, le_llm_key,
+			le_tts_url, le_tts_voice, le_tts_key, le_tts_voice_id)
 		back.queue_free()
 		setup_confirmed.emit())
 	start.grab_focus()
@@ -2082,16 +2130,20 @@ func _setup_field(parent: Control, label_text: String, value: String, tip := "")
 	return le
 
 ## 应用启动设置：写回 config.json（下次启动仍是这些值），随后 _build_services 按新配置起服务。
-## TTS 这一节只配阿里云（`tts_aliyun_api_key` / `tts_aliyun_voice`）——**不改 `tts_mode`**：
-## 朗读方式是玩家在左侧栏选的，启动面板不该每次开局都把它悄悄改回去。
+## TTS 分两节：云端/本地（`tts_base_url` / `tts_voice`）与阿里云（`tts_aliyun_api_key` / `tts_aliyun_voice`）——
+## **不改 `tts_mode`**：朗读方式是玩家在左侧栏选的，启动面板不该每次开局都把它悄悄改回去。
 func _apply_setup(think_opt: OptionButton, llm_url: LineEdit, llm_model: LineEdit, llm_key: LineEdit,
-		tts_key: LineEdit, tts_voice_id: LineEdit) -> void:
+		tts_url: LineEdit, tts_voice: LineEdit, tts_key: LineEdit, tts_voice_id: LineEdit) -> void:
 	cfg.llm_think_mode = clampi(think_opt.selected, 0, 2)
 	if llm_url.text.strip_edges() != "":         # 地址/模型/音色不允许被清成空：空则保留原值
 		cfg.llm_base_url = llm_url.text.strip_edges()
 	if llm_model.text.strip_edges() != "":
 		cfg.llm_model = llm_model.text.strip_edges()
 	cfg.llm_api_key = llm_key.text.strip_edges() # Key 可以清空
+	if tts_url.text.strip_edges() != "":         # 云端地址 / 音色：空则保留原值
+		cfg.tts_base_url = tts_url.text.strip_edges()
+	if tts_voice.text.strip_edges() != "":
+		cfg.tts_voice = tts_voice.text.strip_edges()
 	cfg.tts_aliyun_api_key = tts_key.text.strip_edges()      # Key 可以清空（→ 回落系统语音）
 	if tts_voice_id.text.strip_edges() != "":                # 音色 ID 不允许被清成空：空则保留原值
 		cfg.tts_aliyun_voice = tts_voice_id.text.strip_edges()
@@ -2106,9 +2158,11 @@ func _apply_setup(think_opt: OptionButton, llm_url: LineEdit, llm_model: LineEdi
 			_tts_aliyun_key_edit.text = cfg.tts_aliyun_api_key
 		if _tts_aliyun_voice_edit != null:
 			_tts_aliyun_voice_edit.text = cfg.tts_aliyun_voice
-	print("[Setup] 启动设置已保存：思考模式=%d · LLM=%s (%s) · 朗读方式=%s · 阿里云音色=%s%s"
+		_refresh_tts_route()
+	print("[Setup] 启动设置已保存：思考模式=%d · LLM=%s (%s) · 朗读方式=%s · 云端=%s/%s · 阿里云音色=%s%s"
 			% [cfg.llm_think_mode, cfg.llm_base_url, cfg.llm_model, cfg.tts_mode,
-			   cfg.tts_aliyun_voice, "" if cfg.tts_aliyun_api_key != "" else "（未填 Key）"])
+			   cfg.tts_base_url, cfg.tts_voice, cfg.tts_aliyun_voice,
+			   "" if cfg.tts_aliyun_api_key != "" else "（未填 Key）"])
 
 # ================= 服务与接线 =================
 
@@ -2702,7 +2756,8 @@ func _allow_tts_fillers() -> void:
 ## 棋盘在「她这一轮结束 + 落子揭示」后就放开了，但她的旧话可能还在念——玩家一动，旧话让位，
 ## 新回合的回应不必排在它后面。两条路径都要收账，否则会留下 `got && !played` 的悬空记录
 ## （那种记录会让 `audio_in_flight()` 恒真，是本项目最怕的「棋盘锁死」形态）：
-##   · 正在播 / 排队中的：`TTSClient.stop()` 会给每一条补发 `speech_skipped`（文字照常显示）；
+##   · 正在播 / 排队中的：`TTSClient.interrupt_for_move()` 先把文字收账（立即显示），当前句 0.25s
+##     淡出，然后接一句预制短句（嗯？ / 这么着急？…），新合成语音等短句说完再开播；
 ##   · 还在取音频（HTTP 在途 / 排队）的：`TTSClient` 根本不知道它们，这里自己 finish + display，
 ##     在途那条回来时 `resolve_fetch` 见到 `played` 会直接判 `done`，不会补播。
 func _interrupt_speech_for_move() -> void:
@@ -2710,7 +2765,7 @@ func _interrupt_speech_for_move() -> void:
 		return
 	if not tts.is_speaking() and _speech_fetch.is_empty() and _speech_fetch_current.is_empty():
 		return
-	tts.stop()
+	var cut := tts.interrupt_for_move(0.25)
 	var jobs: Array[Dictionary] = _speech_fetch.duplicate()
 	_speech_fetch.clear()
 	if not _speech_fetch_current.is_empty():
@@ -2722,6 +2777,11 @@ func _interrupt_speech_for_move() -> void:
 			continue
 		pairing.finish(rec)
 		pairing.display(rec)           # 先显示再收账：打断的只是声音，台词不能丢
+	if not cut and not jobs.is_empty():
+		# 旧句还没开播（只在取音频）：也要给一句「被打断」的预制反应，再等新合成语音
+		var dur := tts.play_interrupt_line()
+		if dur > 0.0:
+			tts.hold_for(dur + 0.12)
 	_speech_hold = _speech_busy()
 	_refresh_lock()
 
@@ -2924,7 +2984,7 @@ static func review_note_lines(notes, losses) -> Array[String]:
 			if typeof(n) != TYPE_DICTIONARY:
 				continue                                # 脏值跳过
 			var d: Dictionary = n
-			var text := str(d.get("text", "")).strip_edges()
+			var text := str(_strip_tone(str(d.get("text", "")))[1]).strip_edges()
 			if text == "":
 				continue                                # 空文本不算内容（后端不过滤，前端也不硬造）
 			var who := "你" if str(d.get("side", "")) == "E" else "Azure"

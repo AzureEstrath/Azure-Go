@@ -16,10 +16,13 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 > （`katago_service\`）提供，**人设与提示词也能在 `config.json` 里直接改**。
 > 客户端（`game\`）只做渲染、输入与语音播放，连不上后端时只在状态栏提示。
 >
-> 当前版本 **v3.11.3**：**主界面改成「远看棋盘」的开场运镜**——
+> 当前版本 **v3.11.4**：**主界面「远看棋盘」开场运镜 + 语音自然打断**——
 > 启动时相机停在院子另一头，整张棋盘在画面下半部、上方压着一枚半透明纸签（开始对局 / 设置 / 退出）；
 > 点开始后封面淡出、相机缓动飞近并正对棋盘，右侧工具栏再从画面外滑入；对局中按 `Esc` 回主界面时**整段反向播放**。
 > 等待时气泡里是她思考的短句，**每秒换一句**（20 句预存在 `game/data/thinking_lines.json`）。
+> **v3.11.4** 起，你一落子，她上一轮没说完的话会先 **0.25 秒淡出**，再随机接一句预制短句
+> （嗯？ / 这么着急？ / 这么快就有思路啦？ / 唔…… / 好快！ / 可以呀！ / 哦？），
+> 等新合成语音接上——像人被打断时收住话头，而不是硬切。
 > **v3.11.2** 起有了主界面与思考短句；**v3.11.1** 起她「说多少 / 想多久」当场可调、说话过程中也能继续落子——
 > 右侧栏「说话：精简 / 适中 / 详细」与 ⚙ 设置里的「思考强度：快速 / 中等 / 强思考」都**即时生效**
 > （思考强度不再需要重启后端），改动写回 `config.json`；棋盘在**她这一轮结束、那颗子已揭示**后就解锁，
@@ -176,10 +179,10 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
 4. 玩家**执黑先行**：左键落子，右键拖拽旋转视角，滚轮缩放。
 
 `config.json` 放在**可执行文件同目录**即可覆盖包内默认值（源码运行时读 `game\config.json`）。
-语音默认走**阿里云 Voice Studio 实时语音合成**（`tts_mode=aliyun`，WebSocket 流式）：要填好
-`tts_aliyun_api_key` 与 `tts_aliyun_voice`（平台音色 ID，UUID）才能真正出声；仍想用 OpenAI 兼容服务
-就把 `tts_mode` 改成 `openai`、按第三节配 `tts_api_key` + `tts_voice`。**合成在后端**，云端不可用
-（连不上 / 超时 / 服务端报错）时后端会自动**整条降级**为 **Windows 系统语音**，文字照常显示。
+语音默认走 OpenAI 兼容链路（`tts_mode=openai`）：`tts_local_base_url` 非空时先走本地，失败才用
+`tts_base_url`，两路都不通才自动整条降级为 **Windows 系统语音**；也可切到 `aliyun` 走
+**阿里云 Voice Studio 实时语音合成**（要填 `tts_aliyun_api_key` 与 `tts_aliyun_voice`，平台音色 ID 为 UUID）。
+**合成在后端**，文字始终照常显示；左侧栏「实际朗读」一行显示当前生效路线。
 聊天/讲解需要按第四节接上一个大模型 API。
 
 ### 2.1 首次运行清单（一次性准备）
@@ -445,25 +448,44 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
 
 ### 2.7 开发者：跑测试与调试
 
+**一键起本地全套**（Godot 编辑器工具栏，或命令行）：
+
+- 编辑器工具栏 **「本地一键」**：依次启动本地 LLM(8080) / 语音(9880) / KataGo 服务(8100) / 后端(8000)，
+  就绪后运行游戏；**「全量测试」**：新开控制台跑后端 + KataGo 服务 + 前端 headless。
+- 命令行等价：`powershell -NoProfile -ExecutionPolicy Bypass -File dev_local.ps1`
+  - `-NoGame` 只起服务（确认各模型接上、不开游戏）
+  - `-QualityTts` 用 CosyVoice 质量音色（`azure`，约 20 秒/句）
+  - `-Tests` 跑全量测试；`-Stop` 停止本脚本启动的进程
+- 默认走**快引擎**（MeloTTS，约 0.4 秒/句，音色 `xiaoya`）。质量引擎（CosyVoice，`azure`）每句
+  15~25 秒，而后端**同步等待合成**（`_emit_line` → `tts.speak`），一回合可能 1~2 分钟——只建议最终验收时用。
+- 本机模型路径写在 `dev_local.ps1` 顶部（`KataGoExe` / `KataGoModel` / `KataGoCfg` / `GodotExe`），
+  换机器只改这几行；它是**开发工具**，不进入游戏运行时（导出的游戏仍然只连后端）。
+- 本地若用 Qwen3 这类推理模型：在 `game/config.json` 把
+  `llm_extra_body` 设为 `{"chat_template_kwargs": {"enable_thinking": false}}`。否则每次发言会先把
+  输出预算耗在思考段（`content` 为空），后端按设计去掉上限重试一次，单回合可能拖到数分钟。
+
 **测试**（后端与 KataGo 服务都用标准库 `unittest`，不用 pytest）：
 
 ```bash
-cd backend && python -m unittest discover -s tests          # 后端全量（721）
+cd backend && python -m unittest discover -s tests          # 后端全量（793）
 cd katago_service && python -m unittest discover -s tests   # KataGo 云服务全量（36；假引擎，不依赖真实 KataGo 与公网）
-godot --path game --headless --script res://tests/test_tts.gd              # 语音播放器（20）
-godot --path game --headless --script res://tests/test_speech_pairing.gd   # 语音配对状态机（77；纯逻辑）
-godot --path game --headless --script res://tests/test_joseki_card.gd      # 定式参考图卡片（51；纯逻辑）
-godot --path game --headless --script res://tests/test_config.gd           # 客户端配置读写（151）
-godot --path game --headless --script res://tests/test_review_mode.gd      # 复盘冻结 / 翻页夹取（31；纯逻辑）
-godot --path game --headless --script res://tests/test_view_helpers.gd     # 视角 / 悬停文案（22；纯逻辑）
+godot --path game --headless --script res://tests/test_tts.gd              # 语音播放器（22）
+godot --path game --headless --script res://tests/test_speech_pairing.gd   # 语音配对状态机（82；纯逻辑）
+godot --path game --headless --script res://tests/test_joseki_card.gd      # 定式参考图卡片（79；纯逻辑）
+godot --path game --headless --script res://tests/test_config.gd           # 客户端配置读写（174）
+godot --path game --headless --script res://tests/test_review_mode.gd      # 复盘冻结 / 翻页夹取 / 存档渲染（38；纯逻辑）
+godot --path game --headless --script res://tests/test_view_helpers.gd     # 视角 / 运镜 / 悬停文案 / 摸头判定（32；纯逻辑）
 godot --path game --headless --script res://tests/test_score_phrase.gd     # 目差量级人话（17；纯逻辑）
-godot --path game --headless --script res://tests/test_joseki_level.gd     # 定式档位纯函数（13；纯逻辑）
+godot --path game --headless --script res://tests/test_joseki_level.gd     # 定式档位纯函数（15；纯逻辑）
 godot --path game --headless --script res://tests/test_net_chat.gd         # 聊天回包与排队（14；纯逻辑）
 godot --path game --headless --script res://tests/test_chat_queue.gd       # 聊天队列 FIFO / 上限（17；纯逻辑）
+godot --path game --headless --script res://tests/test_thinking_lines.gd   # 思考短句解析 / 不连复（19；纯逻辑）
+godot --path game --headless --script res://tests/test_title_screen.gd     # 主界面纸幕 / 三键 / 淡入淡出（18；纯逻辑）
 ```
 
 > 后端跑前先 `pip install -r backend\requirements.txt`。`test_tts.gd` 会真的拉起一次系统语音进程（音量已压到最低）；
-> 其余前端门卫都纯逻辑、无外部依赖（语音配对 / 定式卡片 / 客户端配置 / 复盘 / 视角 / 目差 / 定式档位 / 聊天队列）。
+> 其余前端门卫都纯逻辑、无外部依赖（语音配对 / 定式卡片 / 客户端配置 / 复盘 / 视角运镜 / 目差 / 定式档位 /
+> 聊天队列 / 思考短句 / 主界面）。
 > 括号里是断言项数（本版实测，只增不减）。
 > v3.8.0 新增的后端门卫模块：`tests\test_pv_lines.py`（预测线 A/B/C 提取，零引擎调用）、
 > `tests\test_event_log.py`（局内事件表：只增不减 / 去重 / 不随悔棋回退）、`tests\test_decay.py`（遗忘权重 4 档）。
@@ -556,16 +578,19 @@ Godot_v4.6.3-stable_win64.exe --path game -- --title --shot=menu.png   # 只画�
 | `prompt_phase_notes` | 后端（启动时） | **覆盖各阶段提示**，键：`observe` / `after_player` / `own_turn` / `just_moved` / `analyze` / `chat` / `summary` |
 | `vrm_path` | 客户端 | 虚拟形象 `.vrm` 路径；**建议填绝对路径**（相对路径要能被 Godot 解析到，否则形象加载失败） |
 | `tts_enabled` | 客户端 + 后端（启动时） | 是否启用语音；后端据此决定要不要合成（关闭时零请求、不发 `speech` 事件，文字照常） |
-| `tts_mode` | 后端（启动时）+ 客户端 | `aliyun`（**阿里云 Voice Studio 实时语音合成，WebSocket 流式，默认**）/ `openai`（云端 OpenAI 兼容 `/v1/audio/speech`）/ `system`（Windows 系统语音）；后端按它决定合成路由，客户端只作本地镜像（两边都把未知值回落 `openai`） |
-| `tts_base_url` | 后端（启动时） | **云端语音服务地址**（OpenAI 兼容，含 `/v1`，如 `https://api.openai.com/v1`）；`openai` 模式留空＝视为未启用（只出文字） |
+| `tts_mode` | 后端（启动时）+ 客户端 | `openai`（默认；OpenAI 兼容 `/v1/audio/speech`，先本地 `tts_local_base_url` → 云端 `tts_base_url` → 系统语音）/ `aliyun`（阿里云 Voice Studio 实时语音合成，WebSocket 流式）/ `system`（Windows 系统语音）；后端按它决定合成路由，客户端只作本地镜像（两边都把未知值回落 `openai`） |
+| `tts_base_url` | 后端（启动时） | **云端语音服务地址**（OpenAI 兼容，含 `/v1`，如 `https://api.openai.com/v1`）；留空＝不试云端（本地也没有时只出文字） |
 | `tts_model` | 后端（启动时） | 云端语音模型名 |
 | `tts_voice` | 后端（启动时）+ 客户端 | 音色 id（随服务商而定，也可手填）；后端用它合成，客户端系统语音兜底时也拿它选音色 |
 | `tts_api_key` | 后端（启动时） | **云端 TTS 的 API Key**；非空则发送 `Authorization: Bearer <key>` |
 | `tts_speed` | 后端（启动时）+ 客户端 | 语速：后端合成时传给服务商，客户端系统语音兜底也用它 |
 | `tts_pitch` / `tts_volume` | 客户端 | 音调（播放层变调，会略带动语速）/ 音量 |
-| `tts_timeout_sec` | 后端（启动时） | **单次合成超时**（秒，默认 `30`）；`≤0` **钳到 1 秒**、脏值退回默认；超时一律**整条降级**为系统语音，回合不卡死 |
+| `tts_timeout_sec` | 后端（启动时） | **云端**单次合成超时（秒，默认 `30`）；`≤0` **钳到 1 秒**、脏值退回默认；超时一律改用下一路（本地超时另见 `tts_local_timeout_sec`） |
 | `tts_limit_len` | 客户端 + 后端（实时） | **旧键**（v3.11.1 起由 `reply_style` 取代）：`true` ⇔ `reply_style=0`（精简）。仍随 `save()` 一起写回，旧版本客户端 / 后端读到的仍是「短回复 开 / 关」 |
 | `reply_style` | 客户端 + 后端（实时） | **说话详略三档**（v3.11.1）：`0` 精简（点评 1 句 / 聊天最多 2 句，默认）/ `1` 适中（不加额外约束）/ `2` 详细（2~3 句、约 80 字内）；经 `/api/config` 转发后端，**立即生效**。脏值退回默认，越界夹到 `0~2`；文件里只有旧键 `tts_limit_len` 时按旧语义迁移 |
+| `tts_local_base_url` | 后端（启动时） | **本地语音服务地址**（OpenAI 兼容，含 `/v1`，如 `http://127.0.0.1:9880/v1`）。**非空时优先于云端**：本地整条合成失败 → 自动改用 `tts_base_url`；云端也不通 → Windows 系统语音 |
+| `tts_local_model` / `tts_local_voice` / `tts_local_api_key` | 后端（启动时） | 本地端点专用；**留空沿用云端同名字段**（旧配置零迁移） |
+| `tts_local_timeout_sec` | 后端（启动时） | 本地单次合成超时（默认 `120`；本地模型冷启动较慢）；`0` / 脏值沿用 `tts_timeout_sec` |
 | `tts_sync_speak` | 客户端 | **同步说话**：开启后她的**朗读台词**（含聊天与闲置搭话）文字等这条语音**开始播放**后再显示；**取音频失败 / 合成超时 / 超过 45 秒配对窗口**时会兜底立即显示文字（不卡字、不丢字）。聊天与闲置搭话看起来接近即时，是因为它们的回合在发话前就已解锁、前端会立刻放字——不是因为音频已就绪；**立即生效** |
 | `tts_batch_speak` | 客户端 | **整段排队播报**：连发的多条台词合并成一段连续朗读（**立即生效**）；语义变化见下方说明 |
 | `tts_long_chunk` | 后端（启动时） | **长句合并**：后端单块字数上限 `100` → `160`（关 = 100，首句更快）；改完要**重启后端** |
@@ -950,7 +975,21 @@ KataGo 引擎与权重遵循其上游许可。
 
 ## 九、更新
 
-### v3.11.3（当前）
+### v3.11.4（当前）
+- **语音自然打断**：玩家落子时不再 `stop()` 硬切——当前句先 0.25 秒音量淡出（文字立即照常显示），
+  然后随机播一句预制短句（`filler_interrupt_1..7.wav`：嗯？ / 这么着急？ / 这么快就有思路啦？ /
+  唔…… / 好快！ / 可以呀！ / 哦？），新合成语音等短句 + 0.12 秒气口后再开播。
+  预制句走独立的 `_filler_player`，不会和正式语音叠在一起；短句缺失 / 语音关闭时自动退回「淡出后直接接新语音」。
+- **定式讲解角色修正**：定式库的 `key` 是按「角上先落子一方」写的；识别结果新增角主映射（`line[0].c`），
+  进入 / 分岔 / 收尾提示词显式声明「你 / 我 / 自己 / 他 / 对方 / 别人」的对应关系——
+  再也不会出现「他占角、我守外围」这种主客颠倒；同时去掉「开始学 / 上课 / 这一课」的课堂口吻。
+- **摸头判定修正**：放大视角后头部出画时，旧判定永远点不到；现在按屏幕空间「头 → 髋 → 脚」折线命中，
+  点她可见的上身或腿也算摸头。
+- **界面字号**：默认字号 14→15、按钮 15/13→16/14、印章字 17→18。
+- **本地 TTS 可见性**：左侧栏与启动面板新增「实际朗读」行；`openai` 模式显示本地优先地址，
+  `aliyun` 模式显示 Voice Studio 状态，不再被空的云端地址误导。
+
+### v3.11.3
 - **主界面运镜（v3.11.2 封面的再设计）**：主界面不再是「满屏不透明纸幕」，而是**远看棋盘**：
   - 远看取景 `Main.CAM_MENU_YAW / PITCH / DIST = 10° / 36° / 64`——棋盘完整落在画面下半部；
     纸签**偏上**（`TitleScreen` 的 CenterContainer 取 0.02..0.55 高度带），纸面 alpha 0.66、满屏 `Veil` 只留 0.40，

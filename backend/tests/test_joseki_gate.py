@@ -538,6 +538,20 @@ class RealStoreGateTest(unittest.TestCase):
         self.assertFalse(asyncio.run(agent.joseki_gate_show(jk, None)), "连频率层都到不了")
 
 
+class MoodMappingConsistencyTest(unittest.TestCase):
+    """``_MOOD_RAW`` 的键必须全部是 ``emotion.REGIONS`` 里的区域名。
+
+    区域改名后，键会静默失效（``mood_adj`` 恒 0）——不崩溃、不报错，只是「定式频率不再随情绪
+    波动」，最难发现。用一条一致性断言钉住。
+    """
+
+    def test_every_mood_key_is_a_region_name(self):
+        from app import emotion
+        names = {r["name"] for r in emotion.REGIONS}
+        missing = sorted(k for k in joseki_gate._MOOD_RAW if k not in names)
+        self.assertEqual(missing, [], "这些 _MOOD_RAW 键不在情绪区域表里：%s" % missing)
+
+
 class ConfigPassthroughTest(unittest.TestCase):
     """``/api/config`` 透传 ``joseki_rate``（与 ``joseki_teach`` 同一条通道）。"""
 

@@ -478,6 +478,24 @@ func head_world_pos() -> Vector3:
 	_update_gaze_pivot()
 	return _gaze_pivot
 
+## 摸头判定用的身体中线（头 → 髋 → 脚，世界坐标）：放大视角后头可能出画，
+## 此时点在可见的上身/腿上也应当算摸头（不再出现「头在屏幕外就永远摸不到」）。
+func pat_zone_world() -> Array:
+	if not ok:
+		return []
+	_update_gaze_pivot()
+	var out: Array = []
+	if _gaze_pivot.is_finite():
+		out.append(_gaze_pivot)
+	for bn in ["J_Bip_C_Hips", "J_Bip_L_Foot"]:
+		var idx := _skel.find_bone(bn)
+		if idx < 0:
+			continue
+		var p: Vector3 = _skel.global_transform * _cur_global_xform(idx).origin
+		if p.is_finite():
+			out.append(p)
+	return out
+
 func _process(delta: float) -> void:
 	if not ok:
 		return

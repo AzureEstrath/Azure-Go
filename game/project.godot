@@ -20,6 +20,10 @@ config/features=PackedStringArray("4.6", "Forward Plus")
 window/size/viewport_width=1280
 window/size/viewport_height=800
 
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/azure_dev/plugin.cfg")
+
 [rendering]
 
 anti_aliasing/quality/msaa_3d=2

@@ -78,14 +78,20 @@ class AzureConfig:
         # —— 云端语音合成（后端合成 + 缓存；Task 2 起）：默认关闭、默认系统语音兜底 ——
         self.tts_enabled = False            # 关闭时零开销：不发请求、不发 speech 事件，文字照常
         self.tts_mode = "system"            # "openai"＝云端合成；"system"＝让前端用系统语音念
-        self.tts_base_url = ""              # OpenAI 兼容地址；openai 模式未配置时视为未启用
+        self.tts_base_url = ""              # 云端 OpenAI 兼容地址；留空＝不试云端
         self.tts_model = "tts-1"
         self.tts_api_key = ""               # 留空＝不带 Authorization（本机回环调试）
         self.tts_voice = ""
         self.tts_speed = 1.0
         self.tts_volume = 1.0
-        self.tts_timeout_sec = 30           # 单次合成超时；超时整条降级为系统语音
+        self.tts_timeout_sec = 30           # 云端单次合成超时；超时整条降级
         self.tts_long_chunk = False         # 打开后单块字数上限放宽（templates 里该键已在）
+        # —— 本地语音（优先）：tts_mode=openai 时非空则先试它，失败再试云端 tts_base_url，最后系统语音 ——
+        self.tts_local_base_url = ""        # 本地 OpenAI 兼容地址（如 http://127.0.0.1:9880/v1）
+        self.tts_local_model = ""           # 留空沿用 tts_model
+        self.tts_local_api_key = ""         # 留空沿用 tts_api_key
+        self.tts_local_voice = ""           # 留空沿用 tts_voice
+        self.tts_local_timeout_sec = 120    # 本地模型冷启动较慢；0 / 脏值 → 沿用 tts_timeout_sec
         # —— 阿里云 Voice Studio 实时语音合成（tts_mode="aliyun"；WebSocket 流式）——
         # 与上面的 openai 三件套互不影响：切换模式只改 tts_mode，两套配置各留各的。
         self.tts_aliyun_ws_url = ""         # 留空＝官方固定地址（见 tts_aliyun.WS_URL）
@@ -222,6 +228,15 @@ class AzureConfig:
         except (TypeError, ValueError):
             self.tts_timeout_sec = 30.0
         self.tts_long_chunk = bool(d.get("tts_long_chunk", self.tts_long_chunk))
+        self.tts_local_base_url = str(d.get("tts_local_base_url", self.tts_local_base_url))
+        self.tts_local_model = str(d.get("tts_local_model", self.tts_local_model))
+        self.tts_local_api_key = str(d.get("tts_local_api_key", self.tts_local_api_key))
+        self.tts_local_voice = str(d.get("tts_local_voice", self.tts_local_voice))
+        try:
+            self.tts_local_timeout_sec = max(0.0, float(d.get("tts_local_timeout_sec",
+                                                              self.tts_local_timeout_sec)))
+        except (TypeError, ValueError):
+            self.tts_local_timeout_sec = 120.0
         self.tts_aliyun_ws_url = str(d.get("tts_aliyun_ws_url", self.tts_aliyun_ws_url))
         self.tts_aliyun_api_key = str(d.get("tts_aliyun_api_key", self.tts_aliyun_api_key))
         self.tts_aliyun_voice = str(d.get("tts_aliyun_voice", self.tts_aliyun_voice))

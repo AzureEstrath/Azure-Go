@@ -280,7 +280,8 @@ func _update_camera() -> void:
 	var target := right * lateral + Vector3(0.0, VIEW_LIFT, 0.0)
 	eye += target
 	cam.position = eye
-	cam.look_at(target, Vector3.UP)
+	# `look_at` 要的是**全局**坐标：棋盘可能被缩放/平移（真实尺度场景），局部 target 不能直接用
+	cam.look_at(cam.get_parent().to_global(target), Vector3.UP)
 
 func _world(bx: int, by: int, h := 0.0) -> Vector3:
 	return Vector3((bx - HALF) * CELL, h, (by - HALF) * CELL)
@@ -560,15 +561,40 @@ func is_rotating() -> bool:
 	return _rotating
 
 ## 鼠标是否位于 Azure 头部附近（摸头触发区；半径随窗口高度放大，容易命中）
+## 放大视角后头可能出画：判定用「头 → 髋 → 脚」的身体中线，点在可见的头部/上身上都算摸头。
 func _in_head_zone(pos: Vector2) -> bool:
-	if pat_head == null or cam == null or not pat_head.has_method("head_world_pos"):
+	if pat_head == null or cam == null:
 		return false
-	var wp: Vector3 = pat_head.call("head_world_pos")
-	if not wp.is_finite() or cam.is_position_behind(wp):
+	var pts: Array = []
+	if pat_head.has_method("pat_zone_world"):
+		pts = pat_head.call("pat_zone_world")
+	elif pat_head.has_method("head_world_pos"):
+		pts = [pat_head.call("head_world_pos")]
+	var proj: Array[Vector2] = []
+	for p in pts:
+		if typeof(p) != TYPE_VECTOR3:
+			continue
+		var wp: Vector3 = p
+		if wp.is_finite() and not cam.is_position_behind(wp):
+			proj.append(cam.unproject_position(wp))
+	if proj.is_empty():
 		return false
-	var sp := cam.unproject_position(wp)
 	var r := maxf(110.0, get_viewport().get_visible_rect().size.y * 0.15)
-	return pos.distance_to(sp) <= r
+	if proj.size() == 1:
+		return pos.distance_to(proj[0]) <= r
+	var best := INF
+	for i in range(proj.size() - 1):
+		best = minf(best, _point_segment_distance(pos, proj[i], proj[i + 1]))
+	return best <= r
+
+## 点到线段的最短距离（屏幕坐标；纯函数，门卫可直接断言）
+static func _point_segment_distance(p: Vector2, a: Vector2, b: Vector2) -> float:
+	var ab := b - a
+	var l2 := ab.length_squared()
+	if l2 <= 0.0001:
+		return p.distance_to(a)
+	var t := clampf((p - a).dot(ab) / l2, 0.0, 1.0)
+	return p.distance_to(a + ab * t)
 
 ## 化身的注视点优先级：摸头中（跟随鼠标微动）→ 旋转视角（含结束后 1 秒）→ Azure 刚落的子 → 闲置看玩家 → 鼠标落点
 func gaze_target() -> Vector3:
@@ -602,7 +628,10 @@ func player_eye() -> Vector3:
 func _player_eye() -> Vector3:
 	if cam == null:
 		return Vector3(0, 0, 14)
-	return cam.global_position - Vector3(0, 2.5, 0)
+	# 2.5 是**棋盘单位**：棋盘若被整体缩放（真实尺度场景），要按缩放换算；
+	# 否则相机在 2 m 高时减去 2.5 会落到地下，Azure 只能低头、抬不起视线对视。
+	var s := global_transform.basis.get_scale().y
+	return cam.global_position - Vector3(0, 2.5 * s, 0)
 
 ## 鼠标射线与棋盘平面的交点（限制在棋盘附近）；不可用时返回 Vector3.INF
 func _mouse_board_point(mp: Vector2) -> Vector3:
@@ -634,11 +663,13 @@ func pick(mouse_pos: Vector2) -> Vector2i:
 	if t <= 0.0:
 		return Vector2i(-1, -1)
 	var hit := from + dir * t
-	var bx := int(round(hit.x / CELL + HALF))
-	var by := int(round(hit.z / CELL + HALF))
+	# 棋盘可能被缩放到真实尺度 / 平移过：拾取一律换到棋盘**本地**坐标再换算交叉点
+	var local := to_local(hit)
+	var bx := int(round(local.x / CELL + HALF))
+	var by := int(round(local.z / CELL + HALF))
 	if not Coords.valid(bx, by):
 		return Vector2i(-1, -1)
-	if hit.distance_to(_world(bx, by)) > CELL * 0.45:
+	if local.distance_to(_world(bx, by)) > CELL * 0.45:
 		return Vector2i(-1, -1)
 	return Vector2i(bx, by)
 

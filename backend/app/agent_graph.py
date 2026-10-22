@@ -245,6 +245,20 @@ async def _ctx_extras(agent, data):
     return profile, time_facts
 
 
+def _joseki_owner(jk) -> str:
+    """定式结果里「角上先落子一方」的颜色（``"B"`` / ``"W"``）；脏值 / 缺线 ⇒ ``""``。
+
+    定式库的 ``key`` 全是以角主（先落子一方）的立场写的。识别结果里的 ``line[0]`` 正是
+    「先手星位 / 小目 / 三三」那一颗，所以用它的颜色当角色映射的依据：
+    ``"B"`` ⇒ 要点里的「我/自己」指对局对面，``"W"`` ⇒ 指 Azure 自己。
+    """
+    line = jk.get("line") if isinstance(jk, dict) else None
+    if isinstance(line, (list, tuple)) and line and isinstance(line[0], dict):
+        c = str(line[0].get("c") or "")
+        return c if c in ("B", "W") else ""
+    return ""
+
+
 async def _prepare_after_player(agent, data):
     """玩家落子：两次引擎分析 → 落子入谱 → 定式 → 情绪 → 点评提示词。"""
     x = int(data["x"])
@@ -412,16 +426,17 @@ async def _prepare_after_player(agent, data):
     mistake = data.get("jk_mistake") or {}
     if jk_teach and kind == "entered":
         eval_prompt = prompts.joseki_enter_prompt(
-            str(jk.get("name") or ""), str(jk.get("key") or ""), str(jk.get("corner") or ""))
+            str(jk.get("name") or ""), str(jk.get("key") or ""), str(jk.get("corner") or ""),
+            _joseki_owner(jk))
     elif jk_teach and (kind == "branch" or (kind == "deviated" and mistake.get("is_mistake") is True)):
         # 「走错」＝真亏又出线：这里正是「有别的走法」的场合，与分岔同一套
         eval_prompt = prompts.joseki_branch_prompt(
             str(jk.get("name") or ""), str(jk.get("key") or ""),
-            list(jk.get("candidates") or []))
+            list(jk.get("candidates") or []), _joseki_owner(jk))
     elif jk_teach and kind == "formed":
         eval_prompt = prompts.joseki_close_prompt(
             str(jk.get("name") or ""), str(jk.get("key") or ""), str(jk.get("corner") or ""),
-            "player")
+            "player", _joseki_owner(jk))
     if eval_prompt == "":
         if player_rank == 0:
             eval_prompt = "Estarth下了 %s，这是我算的最优手！胜率%s。轻描淡写夸一下，1-2句。" % (gtp, agent._pct(winrate_before))
@@ -535,16 +550,17 @@ async def _prepare_just_moved(agent, data):
         #   同一套分流——进入 / 分岔 / 收尾必说，只按 `kind`；**门控命中才讲**（T5：未命中＝没识别到定式，
         #   走普通感想）。讲解**顶替**本来那句普通感想，不新增气泡、不多调一次模型。
         ai_eval_prompt = prompts.joseki_enter_prompt(
-            str(jk2.get("name") or ""), str(jk2.get("key") or ""), str(jk2.get("corner") or ""))
+            str(jk2.get("name") or ""), str(jk2.get("key") or ""), str(jk2.get("corner") or ""),
+            _joseki_owner(jk2))
     elif str(jk2.get("kind", "")) == "branch" and data.get("jk_show_card"):
         ai_eval_prompt = prompts.joseki_branch_prompt(
             str(jk2.get("name") or ""), str(jk2.get("key") or ""),
-            list(jk2.get("candidates") or []))
+            list(jk2.get("candidates") or []), _joseki_owner(jk2))
     elif str(jk2.get("kind", "")) == "formed" and data.get("jk_show_card"):
         # T7（U36）：她走完定式时，「收尾」并进**她的**发言位（这条落子后的感想）。
         ai_eval_prompt = prompts.joseki_close_prompt(
             str(jk2.get("name") or ""), str(jk2.get("key") or ""),
-            str(jk2.get("corner") or ""), "azure")
+            str(jk2.get("corner") or ""), "azure", _joseki_owner(jk2))
     elif ai_gtp == "pass":
         ai_eval_prompt = "你（Azure）这手选择虚着。本回合你已经说过：①对Estarth那手的点评「%s」；②你的落子用意「%s」。换一句新话，用你自己的口吻（我/你）说说你现在对局面的感觉、心里在琢磨什么；不要重复上面两层意思、不要用相同句式，也不要用「感觉这盘棋会很有趣」「接下来看看你如何应对」这类套话。注意：上面引号里是你自己刚说过的话——整句和半句都不许原样搬回来，开头词和句式都必须换新的。" % (player_eval, think_msg)
     else:
