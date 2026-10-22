@@ -27,6 +27,35 @@ class EventShapeTest(unittest.TestCase):
         self.assertEqual(events.info(0.6, 1.5), {"type": "info", "winrate": 0.6, "score": 1.5})
         self.assertEqual(events.busy(True), {"type": "busy", "busy": True})
 
+    def test_ownership_shape(self):
+        """领地热力图事件：361 个浮点原样过、脏值退 0、手数跟手。"""
+        e = events.ownership([0.5, -1, "bad", None], 12)
+        self.assertEqual(e["type"], "ownership")
+        self.assertEqual(e["values"], [0.5, -1.0, 0.0, 0.0])
+        self.assertEqual(e["move_count"], 12)
+
+    def test_estimate_shape(self):
+        """点目事件：cells 去重 / 越界跳过，数字夹取，脏值不抛。"""
+        e = events.estimate({"cells": [[3, 4, "black"], [3, 4, "black"], [19, 0, "white"],
+                                       [2, 2, "x"]], "komi": 7.5, "move_count": 12,
+                             "lead": -1.5, "black": 1, "white": 0})
+        self.assertEqual(e["type"], "estimate")
+        self.assertEqual(e["cells"], [[3, 4, "black"]])
+        self.assertEqual((e["komi"], e["move_count"], e["lead"], e["black"], e["white"]),
+                         (7.5, 12, -1.5, 1, 0))
+        dirty = events.estimate("oops")
+        self.assertEqual(dirty["cells"], [])
+        self.assertEqual(dirty["komi"], 7.5)
+        self.assertIsNone(dirty["lead"])
+
+    def test_difficulty_shape(self):
+        """自适应难度事件：档位 / 基线夹到 1..5，reason 原样。"""
+        e = events.difficulty(2, 3, "你压得很稳")
+        self.assertEqual(e, {"type": "difficulty", "level": 2, "base": 3, "reason": "你压得很稳"})
+        self.assertEqual(events.difficulty(9, 0)["level"], 5)
+        self.assertEqual(events.difficulty(9, 0)["base"], 1)
+        self.assertEqual(events.difficulty("bad", None)["level"], 3)
+
     def test_mood_and_joseki(self):
         m = events.mood({"region": 12, "name": "平静"})
         self.assertEqual(m["type"], "mood")

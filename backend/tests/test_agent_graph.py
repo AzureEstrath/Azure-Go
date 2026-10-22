@@ -1611,6 +1611,51 @@ class _FakeProfileStore:
         return []
 
 
+# —— 以下为 v3.12.0（局面点目）追加：只在「局面分析」发一次、且先于台词 ——
+
+
+class EstimateWiringTest(unittest.TestCase):
+    """``estimate`` 是**棋盘注记**：复用那一次分析、先于台词发出，不产生语音、不改棋局。"""
+
+    def test_analyze_position_emits_estimate_once_before_the_line(self):
+        agent, _eng, _llm, bus = _mk()
+        _seed_moves(agent, [["B", "D16"]])          # 空盘时 analyze 会直接提示「先落几手」，不出点目
+        asyncio.run(agent.analyze_position())
+
+        est = bus.of_type("estimate")
+        self.assertEqual(len(est), 1, "一次局面分析只发一条点目事件")
+        self.assertEqual(est[0]["move_count"], 1)
+        self.assertEqual(est[0]["komi"], 7.5)
+        self.assertIsInstance(est[0]["cells"], list)
+
+        kinds = [e["type"] for e in bus.events]
+        first_est = kinds.index("estimate")
+        first_msg = next((i for i, k in enumerate(kinds) if k == "message"), len(kinds))
+        self.assertLess(first_est, first_msg, "点目在台词之前：玩家先看到棋盘注记")
+        self.assertEqual(bus.of_type("speech"), [], "点目本身绝不出声")
+
+    def test_no_ownership_means_no_estimate_event(self):
+        class _NoOwn(StubEngine):
+            async def analyze(self, moves, max_visits=None):
+                out = await super().analyze(moves, max_visits)
+                out.pop("ownership", None)
+                return out
+
+        agent, _eng, _llm, bus = _mk()
+        agent.katago = _NoOwn()
+        _seed_moves(agent, [["B", "D16"]])
+        asyncio.run(agent.analyze_position())
+
+        self.assertEqual(bus.of_type("estimate"), [], "没有归属数据 ⇒ 不发点目事件（不是空图）")
+        self.assertTrue(bus.messages(), "分析台词照旧")
+
+    def test_estimate_is_not_sent_on_player_move(self):
+        agent, _eng, _llm, bus = _mk()
+        asyncio.run(agent.player_move(3, 3))
+        self.assertEqual(bus.of_type("estimate"), [],
+                         "普通落子/点评不发点目：它是玩家主动点「局面分析」才有的注记")
+
+
 class CtxExtrasGateTest(unittest.TestCase):
     """``_ctx_extras`` 的门控与降级（v3.9.0）：两个开关是「注不注入」的唯一闸门。"""
 

@@ -15,7 +15,7 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import coords, events, joseki_gate, profile, prompt_chains, prompts, pv_lines, time_ctx
+from . import adaptive, coords, events, joseki_gate, profile, prompt_chains, prompts, pv_lines, time_ctx
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, is_joseki_mistake, _emit_line,
@@ -362,7 +362,9 @@ class AzureAgent:
                  pv_max_visits=PV_MAX_VISITS_DEFAULT, emotion_drift=False,
                  drift_base=DRIFT_BASE_DEFAULT, drift_max=DRIFT_MAX_DEFAULT,
                  pv_max_drop=PV_MAX_DROP_DEFAULT, drift_rng=None, chat_digest_llm=False,
-                 profile_enabled=False, time_aware_enabled=False, reply_style=None):
+                 profile_enabled=False, time_aware_enabled=False, reply_style=None,
+                 adaptive_enabled=False, adaptive_base=adaptive.BASE_DEFAULT,
+                 adaptive_spread=adaptive.SPREAD_DEFAULT, adaptive_rng=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -487,6 +489,14 @@ class AzureAgent:
         self.profile_enabled = bool(profile_enabled)
         self.time_aware_enabled = bool(time_aware_enabled)
         self.profile_store = None
+        # —— 棋谱库（v3.11.5）：默认不接线（None）⇒ 局末不写库；由 main.py lifespan 注入 GameStore。
+        #    ``player_name`` 只用于棋谱的 PB（黑方名），``_library_sig`` 防同一次结束重复归档。
+        self.game_store = None
+        self.player_name = "Estarth"
+        self._library_sig = None
+        # —— 自适应难度（v3.11.5）：默认关；基线上下最多 ±spread 档，由 main.py lifespan 按配置接通。
+        self.adaptive = adaptive.AdaptiveDifficulty(
+            enabled=adaptive_enabled, base=adaptive_base, spread=adaptive_spread, rng=adaptive_rng)
         # 主动约战 / 提醒（v3.9.0，设计 §5-E）：**本次进程只触发一次**的标记。跨重连不重复
         # （WS 重连会再调 ``greet_with_context``，第二次直接返回）；``reset_game`` **有意不重置**
         # ——「打过招呼」是这一次会话的事实，与「这一局」无关。
@@ -1731,6 +1741,112 @@ class AzureAgent:
         except Exception as e:                  # noqa: BLE001 —— 写不进去只丢这一次，绝不抛
             print("[Agent] 对局记录 / 画像写入异常（已忽略）：%s" % e)
 
+    async def _persist_library(self, state):
+        """把这一局写进棋谱库（v3.11.5）：**与画像开关无关**，每次「🏁 结束」归档一次。
+
+        素材直接取 ``self.st``（moves / 逐手点评 / 亏损手账）与 summary 终态的 ``wr`` / ``score`` /
+        ``reply``；LLM 兜底台词（``failed``）不写进 summary，但棋谱本身照存。
+        ``_library_sig``＝(手数, 末手) 挡住同一次对局重复点「结束」造成的重复归档；``reset_game`` 清空。
+        任何故障只打日志，绝不影响对局。
+        """
+        store = getattr(self, "game_store", None)
+        if store is None or not self.st.moves:
+            return
+        data = dict(state.get("data") or {}) if isinstance(state, dict) else {}
+        moves = []
+        for m in self.st.moves:
+            if isinstance(m, (list, tuple)) and len(m) >= 2:
+                moves.append([str(m[0]), str(m[1])])
+        if not moves:
+            return
+        sig = (len(moves), str(moves[-1][1]))
+        if sig == self._library_sig:
+            return
+        summary = "" if data.get("failed") else str(data.get("reply") or "")
+        rec = {
+            "moves": moves,
+            "move_count": len(moves),
+            "final_black_wr": data.get("wr"),
+            "final_score": data.get("score"),
+            "result": "",
+            "summary": summary,
+            "meta": {
+                "black": str(getattr(self, "player_name", "") or "Estarth"),
+                "white": "Azure",
+                "source": "game",
+                "notes": [dict(n) for n in self.st.move_notes if isinstance(n, dict)],
+                "losses": [dict(l) for l in self.st.losses if isinstance(l, dict)],
+            },
+        }
+        try:
+            game_id = await asyncio.to_thread(store.add_game, rec)
+        except Exception as e:                  # noqa: BLE001 —— 棋谱库故障绝不影响对局
+            print("[Agent] 棋谱归档异常（已忽略）：%s" % e)
+            return
+        if game_id:
+            self._library_sig = sig
+
+    # ================= 自适应难度（v3.11.5） =================
+
+    def _difficulty_profile_shift(self) -> int:
+        """画像给基线的 ±1 档修正；画像关着 / 库不可用 ⇒ 0（绝不影响开局）。"""
+        if not self.profile_enabled or self.profile_store is None:
+            return 0
+        try:
+            return adaptive.profile_adj(self.profile_facts())
+        except Exception as e:                  # noqa: BLE001 —— 画像读取失败＝无修正
+            print("[Adaptive] 画像修正读取失败（按 0 处理）：%s" % e)
+            return 0
+
+    def _reset_adaptive(self) -> None:
+        self.adaptive.reset(self._difficulty_profile_shift())
+        self._emit_difficulty()
+
+    def configure_adaptive(self, enabled, base, spread=None) -> None:
+        """界面 / 配置接通时调用：基线变化才重置到基线，并通知前端状态栏。"""
+        if spread is not None:
+            try:
+                self.adaptive.spread = max(0, min(2, int(spread)))
+            except (TypeError, ValueError):
+                pass
+        self.adaptive.configure(enabled=enabled, base=base,
+                               profile_shift=self._difficulty_profile_shift())
+        self._emit_difficulty("")
+
+    def _emit_difficulty(self, reason="") -> None:
+        try:
+            self._emit(events.difficulty(self.adaptive.level, self.adaptive.base,
+                                         reason or self.adaptive.last_reason))
+        except Exception as e:                  # noqa: BLE001 —— 一个状态事件不许影响对局
+            print("[Adaptive] 难度事件发布失败（已忽略）：%s" % e)
+
+    def _difficulty_pick(self, move_infos, pick):
+        """把已有候选按当前档位弱化（档位 5 / 关闭时原样返回）；零额外引擎调用。"""
+        if not self.adaptive.enabled:
+            return pick
+
+        def legal(gtp: str) -> bool:
+            if gtp == "pass":
+                return bool(self.st.allow_pass)
+            x, y = coords.gtp_to_xy(gtp)
+            return x >= 0 and y >= 0 and bool(self.st.board.is_legal(x, y, "white")["ok"])
+
+        try:
+            return self.adaptive.choose(list(move_infos or []), legal, self.st.allow_pass, pick)
+        except Exception as e:                  # noqa: BLE001 —— 选点异常回到原落点
+            print("[Adaptive] 落点弱化异常（回到原落点）：%s" % e)
+            return pick
+
+    def note_adaptive_move(self, move_no, black_wr, rank, drop) -> None:
+        """玩家这一手的表现进自适应窗口（零额外调用）；真的调档才推一条 difficulty 事件。"""
+        if not self.adaptive.enabled:
+            return
+        try:
+            if self.adaptive.note_move(move_no, black_wr, rank, drop):
+                self._emit_difficulty("")
+        except Exception as e:                  # noqa: BLE001 —— 难度调节失败不影响对局
+            print("[Adaptive] 表现记录失败（已忽略）：%s" % e)
+
     # ================= 主动约战 / 提醒（v3.9.0，设计 §5-E） =================
 
     async def greet_with_context(self, *, now=None) -> str:
@@ -2184,6 +2300,9 @@ class AzureAgent:
         if text is None or text.strip() == "":
             return
         self.st.chat_history.append({"role": "user", "content": text})
+        # 自适应难度：玩家明确说「太难 / 认真点」时立刻调一档（受 4 手冷却与基线 ±1 约束）
+        if self.adaptive.enabled and self.adaptive.note_chat(text, len(self.st.moves)):
+            self._emit_difficulty("")
         # 按聊天内容即时结算情绪（本地关键词分类）
         self._mood_event(self._chat_event(self.chat_emotion(text)), "，他说：「%s」" % text[:40].strip())
         owner = self._set_busy(True)
@@ -2244,6 +2363,9 @@ class AzureAgent:
         # 局末（Q7）：**写入点只有这里**——本局记录 + 融合后的画像（开关关着 / 无素材 ⇒ 不写）
         if self.epoch_ok(token):
             await self._persist_game(state)
+        # 棋谱库（v3.11.5）：与画像开关解耦，每局「结束」归档一次（重复点结束由 _library_sig 挡住）
+        if self.epoch_ok(token):
+            await self._persist_library(state)
         # 局末：`chat_digest_llm=true` 时在这里补做一次 LLM 分段总结（默认关，零额外调用）。
         # 代数一并带进去：那一趟 LLM ``await`` 里若玩家起了新回合，摘要不再写表（修复波 / Minor #2）。
         if self.epoch_ok(token):
@@ -2304,6 +2426,8 @@ class AzureAgent:
         self.begin_epoch()
         keep_pass = self.st.allow_pass
         self.st.reset()
+        self._library_sig = None                 # 新一局：同长度同末手也不再算「已归档」
+        self._reset_adaptive()                    # 新一局：难度回到基线（按画像修正）
         self.st.allow_pass = keep_pass
         self._joseki_taught = {}                 # 新一局：门控的冷却表清空（手数从头数）
         # v3.8.0：事件表是**局内内存**——新一局不带上一局的账（与「不随悔棋回退」是两回事，

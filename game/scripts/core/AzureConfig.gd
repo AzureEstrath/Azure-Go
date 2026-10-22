@@ -75,6 +75,14 @@ var tts_local_voice := ""
 var tts_speed := 1.0
 var tts_pitch := 1.0              # 播放层音调（0.8~1.3，会略带动语速）
 var tts_volume := 1.0
+## 对局音效（v3.11.5）：落子 / 提子 / 虚着 / 终局；纯前端，默认开、0.8 音量
+var sfx_enabled := true
+var sfx_volume := 0.8
+## 领地热力图（v3.11.5）：默认关，避免常驻遮挡棋形；打开后按后端 ownership 事件刷新
+var ownership_enabled := false
+## 自适应难度（v3.11.5）：默认关；基线 1 入门 … 5 严苛（局内最多在基线 ±1 档内调整）
+var adaptive_difficulty := false
+var adaptive_difficulty_base := 3
 # —— 阿里云 Voice Studio（tts_mode=aliyun；合成在后端，这里只是配置载体）——
 var tts_aliyun_ws_url := ""       # 留空＝官方固定地址（wss://convai-platform.aliyuncs.com/api-ws/v1/inference）
 var tts_aliyun_api_key := ""      # Voice Studio 签发的 Key；百炼原生 Key 会被 401
@@ -142,6 +150,18 @@ static func load_config(path := "") -> AzureConfig:
 			c.tts_speed = float(d.get("tts_speed", c.tts_speed))
 			c.tts_pitch = float(d.get("tts_pitch", c.tts_pitch))
 			c.tts_volume = float(d.get("tts_volume", c.tts_volume))
+			c.sfx_enabled = bool(d.get("sfx_enabled", c.sfx_enabled))
+			var sv = d.get("sfx_volume", c.sfx_volume)
+			if typeof(sv) == TYPE_INT or typeof(sv) == TYPE_FLOAT:
+				c.sfx_volume = clampf(float(sv), 0.0, 1.0)
+			elif typeof(sv) == TYPE_STRING and (sv as String).strip_edges().is_valid_float():
+				c.sfx_volume = clampf((sv as String).to_float(), 0.0, 1.0)
+			else:
+				c.sfx_volume = 0.8
+			c.ownership_enabled = bool(d.get("ownership_enabled", c.ownership_enabled))
+			c.adaptive_difficulty = _normalize_flag(d.get("adaptive_difficulty"), c.adaptive_difficulty)
+			c.adaptive_difficulty_base = _normalize_adaptive_base(d.get("adaptive_difficulty_base"),
+				c.adaptive_difficulty_base)
 			c.tts_aliyun_ws_url = str(d.get("tts_aliyun_ws_url", c.tts_aliyun_ws_url))
 			c.tts_aliyun_api_key = str(d.get("tts_aliyun_api_key", c.tts_aliyun_api_key))
 			c.tts_aliyun_voice = str(d.get("tts_aliyun_voice", c.tts_aliyun_voice))
@@ -213,6 +233,21 @@ static func _clamp_rate(f: float) -> float:
 ## 一律退回默认（`fallback`）。本批新加的开关用它；既有开关的读法一个字不动。
 static func _normalize_flag(v, fallback: bool) -> bool:
 	return v if typeof(v) == TYPE_BOOL else fallback
+
+## 自适应难度基线归一化（v3.11.5）：夹到 1..5；数字字符串也认，脏值退回默认 3。
+static func _normalize_adaptive_base(v, fallback := 3) -> int:
+	match typeof(v):
+		TYPE_INT, TYPE_FLOAT:
+			return clampi(int(v), 1, 5)
+		TYPE_STRING:
+			var s := (v as String).strip_edges()
+			if s.is_valid_int():
+				return clampi(s.to_int(), 1, 5)
+			if s.is_valid_float():
+				return clampi(int(s.to_float()), 1, 5)
+			return fallback
+		_:
+			return fallback
 
 ## 说话详略归一化（v3.11.1）：数值（含数字字符串）夹到 0~2；`null` / 脏值退回「由旧字段迁移」——
 ## `limit_len_fallback=true` ⇒ 0（精简），否则 1（适中）。旧配置只有 `tts_limit_len`，走的就是这条迁移。
@@ -318,6 +353,11 @@ func save() -> bool:
 		"tts_speed": tts_speed,
 		"tts_pitch": tts_pitch,
 		"tts_volume": tts_volume,
+		"sfx_enabled": sfx_enabled,
+		"sfx_volume": sfx_volume,
+		"ownership_enabled": ownership_enabled,
+		"adaptive_difficulty": adaptive_difficulty,
+		"adaptive_difficulty_base": adaptive_difficulty_base,
 		"tts_aliyun_ws_url": tts_aliyun_ws_url,
 		"tts_aliyun_api_key": tts_aliyun_api_key,
 		"tts_aliyun_voice": tts_aliyun_voice,

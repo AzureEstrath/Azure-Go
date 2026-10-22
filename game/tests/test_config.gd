@@ -71,6 +71,28 @@ func _run() -> void:
 	_check("阿里云 Key 读入", c1b.tts_aliyun_api_key == "sk-test")
 	_check("阿里云 TN 开关读入", c1b.tts_aliyun_tn == false)
 
+	# —— 1c) 对局音效（v3.11.5）：开关 / 音量；脏值不炸、越界夹到 [0,1] ——
+	_write_raw({"sfx_enabled": false, "sfx_volume": 0.35})
+	var c1c := AzureConfig.load_config(TMP)
+	_check("音效开关读入", c1c.sfx_enabled == false)
+	_check("音效音量读入", is_equal_approx(c1c.sfx_volume, 0.35))
+	_write_raw({"sfx_volume": "abc"})
+	_check("音效音量脏值 ⇒ 默认 0.8", is_equal_approx(AzureConfig.load_config(TMP).sfx_volume, 0.8))
+	_write_raw({"sfx_volume": 2.0})
+	_check("音效音量越界 ⇒ 夹到 1.0", is_equal_approx(AzureConfig.load_config(TMP).sfx_volume, 1.0))
+	_write_raw({"ownership_enabled": true})
+	_check("领地热力图开关读入", AzureConfig.load_config(TMP).ownership_enabled == true)
+	_write_raw({"adaptive_difficulty": true, "adaptive_difficulty_base": 5})
+	var c1d := AzureConfig.load_config(TMP)
+	_check("自适应难度开关读入", c1d.adaptive_difficulty == true)
+	_check("自适应难度基线读入", c1d.adaptive_difficulty_base == 5)
+	_write_raw({"adaptive_difficulty_base": 9})
+	_check("自适应难度基线越界 ⇒ 夹到 5", AzureConfig.load_config(TMP).adaptive_difficulty_base == 5)
+	_write_raw({"adaptive_difficulty_base": "abc"})
+	_check("自适应难度基线脏值 ⇒ 默认 3", AzureConfig.load_config(TMP).adaptive_difficulty_base == 3)
+	_write_raw({"adaptive_difficulty": "false"})
+	_check("自适应难度脏值（字符串）⇒ 保持默认关", AzureConfig.load_config(TMP).adaptive_difficulty == false)
+
 	# —— 2) 已废弃音色 id → 模板默认音色 ——
 	for dead in ["中文男", "azure-soft"]:
 		_write_raw({"tts_voice": dead})
@@ -92,6 +114,8 @@ func _run() -> void:
 	_write_raw(raw)
 	var c3 := AzureConfig.load_config(TMP)
 	c3.tts_api_key = "sk-changed"
+	c3.adaptive_difficulty = true
+	c3.adaptive_difficulty_base = 4
 	_check("save() 返回成功", c3.save())
 	var out := _read_raw()
 	for k in DEAD_KEYS:
@@ -101,6 +125,11 @@ func _run() -> void:
 	_check("save() 清除旧键 katago_config", not out.has("katago_config"))
 	_check("save() 保留未知键", out.get("future_unknown_key", "") == "保留我")
 	_check("save() 写回改动的 tts_api_key", out.get("tts_api_key", "") == "sk-changed")
+	_check("save() 写回音效开关", out.get("sfx_enabled", false) == true)
+	_check("save() 写回音效音量", is_equal_approx(float(out.get("sfx_volume", 0.0)), 0.8))
+	_check("save() 写回领地热力图开关", out.get("ownership_enabled", true) == false)
+	_check("save() 写回自适应难度开关", out.get("adaptive_difficulty", false) == true)
+	_check("save() 写回自适应难度基线", int(out.get("adaptive_difficulty_base", 0)) == 4)
 
 	# —— 4) 定式导学＝开关 + 频率（joseki_teach / joseki_rate）——
 	# 口径与后端 `config._apply` 一致：键缺失 ⇒ 默认（teach=true / rate=0.5）；

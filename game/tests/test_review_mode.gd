@@ -105,6 +105,11 @@ func _run() -> void:
 	_check("⑤ 主界面关着时回到原状态（默认参数不受影响）",
 			not bool(main_script.review_lock_state(false, false, false)["locked"])
 			and bool(main_script.review_lock_state(false, false, false)["chat_editable"]))
+	# v3.11.5 全盘复盘：棋盘只读、按钮灰、聊天禁用、别的改动入口一起冻（与普通复盘同一判据）
+	var fr := main_script.review_lock_state(false, false, false, false, false, false, true)
+	_check("⑤ 全盘复盘期间：棋盘只读 + 按钮灰 + 聊天禁用 + 别的入口冻",
+			bool(fr["readonly"]) and bool(fr["locked"]) and bool(fr["buttons_disabled"])
+			and not bool(fr["chat_editable"]) and bool(fr["extra_disabled"]))
 	# v3.9.5：点下就锁——`busy` 事件回来之前的那一瞬也在锁内（否则能连发两手，
 	# 后端挡下后棋盘上留下一颗撤不掉的幽灵子）。
 	_check("⑤ 点下就锁：move_pending 也算锁住、且不设只读",
@@ -161,6 +166,34 @@ func _run() -> void:
 	_check("⑧ 她在跑回合（总结还在途中）时不许进复盘", not main_script.review_can_enter(true, false))
 	_check("⑧ 她的语音还没播完时不许进复盘", not main_script.review_can_enter(false, true))
 	_check("⑧ 又闲又静（她这一轮收尾、语音也完了）才允许进复盘", main_script.review_can_enter(false, false))
+
+	# —— ⑨ 全盘复盘的分段计划：与后端 full_review.plan_segments 同一条公式 ——
+	var segs24 := main_script.full_review_segments(24)
+	_check("⑨ 24 手切成 2 段 12+12", segs24 == [[0, 12], [12, 24]])
+	_check("⑨ 空棋谱 / 脏手数 ⇒ 空计划", main_script.full_review_segments(0).is_empty()
+			and main_script.full_review_segments(-3).is_empty())
+	var segs200 := main_script.full_review_segments(200)
+	_check("⑨ 长棋谱：覆盖完整、无缝无重叠、每段不超过 48 手",
+			int(segs200[0][0]) == 0 and int(segs200[-1][1]) == 200
+			and segs200.size() <= 8)
+	var ok200 := true
+	for i in segs200.size():
+		var seg_start := int(segs200[i][0])
+		var seg_end := int(segs200[i][1])
+		ok200 = ok200 and seg_end > seg_start and (seg_end - seg_start) <= main_script.FULL_REVIEW_MAX_SPAN
+		if i > 0:
+			ok200 = ok200 and seg_start == int(segs200[i - 1][1])
+	_check("⑨ 200 手：连续覆盖且段长合法", ok200)
+
+	# —— ⑩ {行为} 标签：剥离 / 白名单映射（与后端 actions.ALLOWED 一一对应） ——
+	var parsed := main_script._strip_actions("我{笑}觉得{摸头}这手好")
+	_check("⑩ 标签从正文剥离、动作按出现顺序取出",
+			str(parsed[1]) == "我觉得这手好" and (parsed[0] as Array) == ["笑", "摸头"])
+	_check("⑩ 中文 / 英文别名映射到同一动作",
+			main_script.action_key("笑") == "smile" and main_script.action_key("smile") == "smile"
+			and main_script.action_key("脸红") == "blush" and main_script.action_key("托腮") == "think")
+	_check("⑩ 未知动作返回空串（前端安全忽略）", main_script.action_key("摸头") == "")
+	_check("⑩ 没有标签时正文原样", str(main_script._strip_actions("普通的一句")[1]) == "普通的一句")
 
 	if _fail == 0:
 		print("[review] PASS：", _total, " 项断言全部通过")
