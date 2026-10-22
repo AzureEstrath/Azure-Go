@@ -49,6 +49,12 @@ class AzureConfig:
         # 画像库路径：留空＝<backend>/data/profile.db（由 profile_store.DEFAULT_DB_PATH 决定，
         # 已 gitignore、属运行产物）。与 memory_db_path 同一形状：只存路径、不在这里碰盘。
         self.profile_db_path = ""
+        # 棋谱库路径（v3.11.5）：留空＝<backend>/data/games.db；与 profile / memory 一样只存路径。
+        self.game_db_path = ""
+        # —— 自适应难度（v3.11.5）：默认关；基线 1 入门 … 5 严苛，局内最多在基线 ±spread 档内调整 ——
+        self.adaptive_difficulty = False
+        self.adaptive_difficulty_base = 3
+        self.adaptive_difficulty_spread = 1
         self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
@@ -172,6 +178,17 @@ class AzureConfig:
         v = d.get("time_aware_enabled")
         self.time_aware_enabled = v if isinstance(v, bool) else self.time_aware_enabled
         self.profile_db_path = str(d.get("profile_db_path", self.profile_db_path))
+        self.game_db_path = str(d.get("game_db_path", self.game_db_path))
+        v = d.get("adaptive_difficulty")        # 只认 JSON true / false（与 profile_enabled 同口径）
+        self.adaptive_difficulty = v if isinstance(v, bool) else self.adaptive_difficulty
+        try:
+            self.adaptive_difficulty_base = max(1, min(5, int(d.get("adaptive_difficulty_base", 3))))
+        except (TypeError, ValueError):
+            self.adaptive_difficulty_base = 3
+        try:
+            self.adaptive_difficulty_spread = max(0, min(2, int(d.get("adaptive_difficulty_spread", 1))))
+        except (TypeError, ValueError):
+            self.adaptive_difficulty_spread = 1
         self.llm_base_url = str(d.get("llm_base_url", self.llm_base_url))
         self.llm_model = str(d.get("llm_model", self.llm_model))
         self.llm_api_key = str(d.get("llm_api_key", self.llm_api_key))

@@ -30,6 +30,8 @@ func _run() -> void:
 	_test_reset_view()
 	_test_camera_flight()
 	_test_pat_zone_distance()
+	_test_ownership_color()
+	_test_estimate_helpers()
 
 	if _fail == 0:
 		print("[view] PASS：", _total, " 项断言全部通过")
@@ -158,3 +160,40 @@ func _test_pat_zone_distance() -> void:
 			is_equal_approx(Board3D._point_segment_distance(Vector2(50, 60), Vector2(0, 50), Vector2(100, 50)), 10.0))
 	_check("④′ 头在屏幕上方、髋在下方：点身体中段仍命中（距离 0）",
 			is_zero_approx(Board3D._point_segment_distance(Vector2(50, 40), Vector2(50, -200), Vector2(50, 300))))
+
+## ⑥ 领地热力图颜色（v3.11.5）：+ 黑 / - 白 / 0 透明；脏值不抛、越界夹到 [-1,1]
+func _test_ownership_color() -> void:
+	var black := Board3D.ownership_color(0.8)
+	var white := Board3D.ownership_color(-0.8)
+	var clear := Board3D.ownership_color(0.0)
+	_check("⑥ 黑色领地：深色 + 透明度随 |v|", black.r < 0.2 and black.a > 0.3 and black.a < 0.5)
+	_check("⑥ 白色领地：亮色 + 透明度随 |v|", white.r > 0.9 and white.a > 0.3 and white.a < 0.5)
+	_check("⑥ 归属接近 0：完全透明", is_zero_approx(clear.a))
+	_check("⑥ 越界 / NaN 不抛且夹到合法范围",
+			Board3D.ownership_color(9.0).a <= 0.50 + 0.001
+			and Board3D.ownership_color(-9.0).a <= 0.50 + 0.001
+			and is_zero_approx(Board3D.ownership_color(NAN).a))
+
+## ⑦ 局面点目（v3.12.0 采纳）：面板两行文案 + 棋盘小方块的格位容错。
+## `Main.gd` 没有 `class_name` ⇒ `preload` 调静态函数（同 test_joseki_level 的做法）。
+func _test_estimate_helpers() -> void:
+	var m := preload("res://scripts/ui/Main.gd")
+	_check("⑦ 点目计数：黑 41 目 · 白 4 目",
+			m.estimate_count_line({"black": 41, "white": 4}) == "黑 41 目 · 白 4 目")
+	_check("⑦ 计数认 JSON 的 float 数字", m.estimate_count_line({"black": 40.6, "white": 3.9}) == "黑 40 目 · 白 3 目")
+	_check("⑦ 计数缺字段 / 脏值 / 负数一律退 0", m.estimate_count_line({}) == "黑 0 目 · 白 0 目"
+			and m.estimate_count_line({"black": "x", "white": -5}) == "黑 0 目 · 白 0 目")
+	_check("⑦ 黑领先：正数 + 贴目", m.estimate_lead_line({"lead": 29.5, "komi": 7.5}) == "黑领先 29.5 目（贴 7.5 目）")
+	_check("⑦ 白领先：负数取绝对值", m.estimate_lead_line({"lead": -3.0, "komi": 6.5}) == "白领先 3.0 目（贴 6.5 目）")
+	_check("⑦ 持平 / 缺数据 / null 各有话说",
+			m.estimate_lead_line({"lead": 0.0}) == "盘面持平（贴 7.5 目）"
+			and m.estimate_lead_line({}) == "目差暂缺（贴 7.5 目）"
+			and m.estimate_lead_line({"lead": null}) == "目差暂缺（贴 7.5 目）")
+	_check("⑦ 点目格：合法 / 越界 / 颜色 / 非数组",
+			Board3D.estimate_cell_ok([3, 15, "black"])
+			and Board3D.estimate_cell_ok([0.0, 18.0, "white"])
+			and not Board3D.estimate_cell_ok([-1, 0, "black"])
+			and not Board3D.estimate_cell_ok([0, 19, "white"])
+			and not Board3D.estimate_cell_ok([3, 3, "red"])
+			and not Board3D.estimate_cell_ok([3, 3])
+			and not Board3D.estimate_cell_ok("oops"))

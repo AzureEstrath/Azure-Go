@@ -8,6 +8,7 @@
     state         ↔  state_changed(payload)     棋盘与手数权威快照
     info          ↔  info_changed(winrate, score)
     estimate      ↔  estimate_event(payload)    点目 / 形势注记（棋盘小方块 + 面板数字）
+    ownership     ↔  ownership_changed(values, move_count)  逐点归属（+ = 黑；361 个浮点）
     busy          ↔  busy_changed(busy)
     mood          ↔  mood_changed(payload)      三维情绪区域（表情/语气词/音高）
     joseki        ↔  joseki_event(payload)      定式高亮轨迹（kind/corner/points）+ 卡片载荷
@@ -32,7 +33,7 @@ message.kind 取值与前端 message 信号一致：
 ``tool`` 只描述「她自己查了一次资料」的进度（``phase`` = start/end），**不是台词**：
 前端只用它更新状态栏文案，工具返回的原始文本永远只回到模型手里。
 
-``estimate``（v3.12.0）是**棋盘注记**（点目 / 形势判断）：只在玩家主动点「局面分析」时随那次
+``estimate``（v3.12.0 采纳）是**棋盘注记**（点目 / 形势判断）：只在玩家主动点「局面分析」时随那次
 分析一起发出，前端在棋盘上画归属小方块、并弹一块形势面板；玩家下一手 / 局面变了就收起。
 它与 ``info`` 刻意分开（``info`` 是右栏的胜率 / 目差，任何分析都会刷），**不改 ``message`` 的
 形状、不产生 ``speech``、不进任何 LLM 上下文**。
@@ -58,6 +59,8 @@ AI_NOTICE = "ai_notice"      # **推送方声明「这条没有语音」**的普
 AI_COMMENT = "ai_comment"    # 重要点评（导演层据此加犹豫节拍）
 AI_MOVE = "ai_move"          # 落子宣告（带坐标；语音开始时揭示）
 AI_IDLE = "ai_idle"          # 闲置搭话（玩家一回来可整句作废）
+AI_REVIEW = "ai_review"      # 全盘复盘的一段点评（v3.11.5；退出复盘后迟到的这类台词前端直接丢弃）
+DIFFICULTY = "difficulty"     # 自适应难度档位变化（v3.11.5；只喂状态栏，不产生台词/语音）
 USER = "user"
 SYSTEM = "system"
 
@@ -142,6 +145,33 @@ def estimate(payload):
         "white": max(0, _int(p.get("white"))),
         "cells": cells,
     }
+
+
+def ownership(values, move_count):
+    """逐点归属（+ = 黑，- = 白），供前端领地热力图；长度 361，按 y*19+x（y=0 顶行）。
+
+    只做数值化，不夹取：客户端按 ``[-1,1]`` 渲染；脏值退 0（坏数据不把前端画崩）。
+    """
+    vals = []
+    for v in values or []:
+        try:
+            vals.append(float(v))
+        except (TypeError, ValueError):
+            vals.append(0.0)
+    return {"type": "ownership", "values": vals, "move_count": int(move_count)}
+
+
+def difficulty(level, base, reason=""):
+    """自适应难度档位（1 入门 … 5 严苛）与基线；``reason`` 只给状态栏一句人话。"""
+    try:
+        lv = max(1, min(5, int(level)))
+    except (TypeError, ValueError):
+        lv = 3
+    try:
+        bs = max(1, min(5, int(base)))
+    except (TypeError, ValueError):
+        bs = 3
+    return {"type": "difficulty", "level": lv, "base": bs, "reason": str(reason or "")}
 
 
 def busy(is_busy):

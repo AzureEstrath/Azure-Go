@@ -4,10 +4,8 @@ extends Node
 ##
 ## 对 Main.gd 暴露的信号与方法面（Main 的 agent.* 调用点只认这套契约）：
 ##   - 命令：REST POST（/api/move /api/hint /api/analyze /api/chat ... 见 docs）
-##   - 事件：WebSocket /ws 推送（message / state / info / estimate / busy / mood / joseki / tool / token / speech / memory；连上先收 hello 同步）
+##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool / token / speech / memory；连上先收 hello 同步）
 ##     token 是可选（默认关闭）的流式增量：只影响气泡的显示过程，最终内容仍以 message 为准
-##     estimate 是「局面分析」的点目注记（棋盘归属小方块 + 形势面板数字）：只给玩家看，
-##     不改 message / speech，也不参与任何编排
 ##     speech 是每条台词的**语音指令**（`mode=openai` 时按 id 去 GET /api/tts/audio/{id} 取音频；
 ##     `mode=system` 时按 text 交给系统语音）——合成全在后端，前端只取音频 + 播放
 ##     memory 是长期记忆写入/召回的元数据：只记一行日志，不进台词、不产生任何信号
@@ -21,9 +19,9 @@ extends Node
 signal message(kind: String, text: String)
 signal state_changed(payload: Dictionary)
 signal info_changed(winrate: float, score: float)
-## 「局面分析」的点目注记（v3.12.0）：`cells = [[x, y, "black"|"white"], …]` + 双方点数 / 目差 / 贴目。
-## 原样转给 Main（画棋盘小方块 + 形势面板）；玩家下一手由 Main 自己收起，后端不会再发「收起」事件。
-signal estimate_event(payload: Dictionary)
+signal ownership_changed(values: Array, move_count: int)   # 逐点归属（+黑/-白，361 个）
+signal estimate_event(payload: Dictionary)                # 局面分析的点目注记（v3.12.0 采纳）
+signal difficulty_changed(level: int, base: int, reason: String)   # 自适应难度档位变化（v3.11.5）
 signal busy_changed(busy: bool)
 signal mood_changed(payload: Dictionary)
 signal joseki_event(payload: Dictionary)
@@ -117,6 +115,18 @@ var time_aware_enabled := false:
 		time_aware_enabled = v
 		if not _profile_batch:
 			_push_settings()
+## 自适应难度（v3.11.5）：开关 + 基线（1..5）一次推一次；与 profile 同一套原子入口做法。
+var _adaptive_batch := false
+var adaptive_difficulty := false:
+	set(v):
+		adaptive_difficulty = v
+		if not _adaptive_batch:
+			_push_settings()
+var adaptive_difficulty_base := 3:
+	set(v):
+		adaptive_difficulty_base = v
+		if not _adaptive_batch:
+			_push_settings()
 
 var _ws: WebSocketPeer = null
 var _opened_once := false
@@ -205,8 +215,15 @@ func _handle_packet(raw: String) -> void:
 		"info":
 			info_changed.emit(float(d.get("winrate", 0.5)), float(d.get("score", 0.0)))
 		"estimate":
-			# 点目注记：原样交给 Main（它只画棋盘 / 面板，不产生台词、不改 busy）
+			# 点目注记：原样交给 Main（只画棋盘 / 面板，不产生台词、不改 busy）
 			estimate_event.emit(_without_type(d))
+		"ownership":
+			var vals = d.get("values", [])
+			ownership_changed.emit(vals if typeof(vals) == TYPE_ARRAY else [],
+				int(d.get("move_count", 0)))
+		"difficulty":
+			difficulty_changed.emit(int(d.get("level", 3)), int(d.get("base", 3)),
+				str(d.get("reason", "")))
 		"busy":
 			_apply_busy(bool(d.get("busy", false)))
 		"mood":
@@ -354,9 +371,8 @@ func summarize(note: String) -> void:
 func undo(turn_index: int) -> void:
 	_post("/api/undo", {"turn": turn_index})
 
-## 开新局。`silent=true`（v3.12.1）＝只清棋局、不添「重新来吧」那句——从主界面进对局时用。
-func reset_game(silent := false) -> void:
-	_post("/api/reset", {"silent": silent})
+func reset_game() -> void:
+	_post("/api/reset")
 
 func set_allow_pass(v: bool) -> void:
 	_post("/api/config", {"allow_pass": v})
@@ -422,6 +438,14 @@ func set_profile(profile_on: bool, time_on: bool) -> void:
 	_profile_batch = false
 	_push_settings()
 
+## 自适应难度「开关 + 基线」原子入口（v3.11.5）：两个字段一次落定、只推一次 `/api/config`。
+func set_adaptive(on: bool, base: int) -> void:
+	_adaptive_batch = true
+	adaptive_difficulty = on
+	adaptive_difficulty_base = clampi(base, 1, 5)
+	_adaptive_batch = false
+	_push_settings()
+
 ## 画像面板（**只读**，v3.9.0 / Q6）：`GET /api/profile` → 回调 `(ok, code, body)`。
 ## 只读、无副作用（不写库、不改任何开关）；连不上后端时回调 `ok=false`（与 `fetch_bytes` 同一套收账）。
 func fetch_profile(callback: Callable) -> void:
@@ -434,7 +458,9 @@ func _flush_settings() -> void:
 	_post("/api/config", {"reply_style": reply_style, "limit_len": reply_style == 0,
 		"think_mode": think_mode, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate,
 		"emotion_drift": emotion_drift, "drift_base": drift_base, "chat_digest_llm": chat_digest_llm,
-		"profile_enabled": profile_enabled, "time_aware_enabled": time_aware_enabled})
+		"profile_enabled": profile_enabled, "time_aware_enabled": time_aware_enabled,
+		"adaptive_difficulty": adaptive_difficulty,
+		"adaptive_difficulty_base": adaptive_difficulty_base})
 
 func _post(path: String, body: Dictionary = {}) -> void:
 	var req := HTTPRequest.new()

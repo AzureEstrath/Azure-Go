@@ -172,18 +172,25 @@ class LLMClient:
         u = str(self.base_url or "").strip().lower()
         return u.startswith("http://") or u.startswith("https://")
 
-    def _budget(self, max_tokens, no_think) -> int:
+    def _budget(self, max_tokens, no_think, think_mode=None) -> int:
         """思考档位的输出上限：推理段与正文共用，按档位追加一段预算。
 
         ``no_think`` 是调用方明确的「这次不要推理」⇒ 一个 token 都不多给；其余情况**永远**带上
         ``REASON_HEADROOM_DEFAULT``（推理型模型不看档位也会推理，档位只是「再多想一点」）。档位
         1/2 的追加量**叠在余量之上**——否则提高档位反而会把上限压到比档位 0 更低。
+
+        ``think_mode``（v3.11.5）：**按调用**覆盖档位（全盘复盘固定用强思考），``None`` 沿用实例档位。
         """
         if no_think:
             return max_tokens
-        if self.think_mode == 2:
+        try:
+            mode = self.think_mode if think_mode is None else int(think_mode)
+        except (TypeError, ValueError):
+            mode = int(self.think_mode or 0)
+        mode = max(0, min(2, mode))
+        if mode == 2:
             return max_tokens + REASON_HEADROOM_DEFAULT + REASON_BUDGET_STRONG
-        if self.think_mode == 1:
+        if mode == 1:
             return max_tokens + REASON_HEADROOM_DEFAULT + REASON_BUDGET_MED
         return max_tokens + REASON_HEADROOM_DEFAULT
 
@@ -257,10 +264,10 @@ class LLMClient:
             return "无法连接 LLM（%s），请确认服务地址与网络" % self.base_url
         return "LLM 调用失败（%s）" % type(e).__name__
 
-    async def chat(self, messages, max_tokens=300, no_think=False) -> str:
+    async def chat(self, messages, max_tokens=300, no_think=False, think_mode=None) -> str:
         if not self._url_ok():
             return "调用出错：未配置 LLM 地址（llm_base_url），请在 config.json 里填写"
-        budget = self._budget(max_tokens, no_think)
+        budget = self._budget(max_tokens, no_think, think_mode)
         try:
             ai = await self._call(messages, budget)
         except openai.APIStatusError as e:

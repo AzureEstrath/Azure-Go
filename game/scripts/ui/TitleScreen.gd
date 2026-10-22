@@ -12,6 +12,7 @@ extends Control
 ## 这个类只负责画与发信号，**不碰配置、不碰服务、不碰棋盘**：
 ##   · `primary_pressed`  —— 开始对局 / 开始新对局（由 `Main` 决定是不是首次开局）
 ##   · `settings_pressed` —— 打开 `Main` 的启动设置面板（复用同一块面板，不另写一份设置）
+##   · `library_pressed`  —— 打开棋谱库（v3.11.5；列表 / SGF 由 `Main` 接线）
 ##   · `quit_pressed`     —— 退出游戏
 ##
 ## `set_restart_mode(true)` 把主按钮改成「开始新对局」、提示行明说**上一局不保留**——
@@ -19,6 +20,7 @@ extends Control
 
 signal primary_pressed
 signal settings_pressed
+signal library_pressed
 signal quit_pressed
 
 var _primary: Button = null
@@ -112,6 +114,15 @@ func _build() -> void:
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 10)
 	vb.add_child(row)
+	var library_btn := Button.new()
+	library_btn.text = "棋谱库"
+	library_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	library_btn.custom_minimum_size = Vector2(0, 36)
+	library_btn.tooltip_text = "查看已保存的对局，导入 / 导出 SGF 棋谱"
+	GufengTheme.apply_button(library_btn)
+	library_btn.pressed.connect(func(): library_pressed.emit())
+	row.add_child(library_btn)
+
 	var settings_btn := Button.new()
 	settings_btn.text = "设置"
 	settings_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL

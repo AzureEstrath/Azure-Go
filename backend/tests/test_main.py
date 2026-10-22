@@ -101,6 +101,27 @@ class RestTest(unittest.TestCase):
             self.assertFalse(s.emotion_drift, "开关能关回去（关掉＝现状）")
 
 
+class AdaptiveSwitchTest(unittest.TestCase):
+    """``/api/config`` 接通自适应难度（v3.11.5）：开关 + 基线一次落定，脏值不生效。"""
+
+    def test_config_forwards_adaptive_switch_and_base(self):
+        cfg = AzureConfig()
+        app = create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(), autostart=False)
+        with TestClient(app) as client:
+            s = app.state.agent
+            self.assertFalse(s.adaptive.enabled)
+            self.assertEqual(s.adaptive.base_cfg, 3)
+            r = client.post("/api/config", json={"adaptive_difficulty": True,
+                                                 "adaptive_difficulty_base": 4})
+            self.assertTrue(r.json()["ok"])
+            self.assertTrue(s.adaptive.enabled)
+            self.assertEqual((s.adaptive.base_cfg, s.adaptive.level), (4, 4))
+            client.post("/api/config", json={"adaptive_difficulty_base": "oops"})
+            self.assertEqual(s.adaptive.base_cfg, 4, "脏值不生效")
+            client.post("/api/config", json={"adaptive_difficulty_base": 9})
+            self.assertEqual(s.adaptive.base_cfg, 5, "越界夹到 1..5")
+
+
 class ProfileTimeSwitchTest(unittest.TestCase):
     """``/api/config`` 透传两个开关（v3.9.0）：默认关、只认 JSON 的 true / false、脏值不生效。"""
 
@@ -355,6 +376,7 @@ class MemoryApiEnabledTest(unittest.TestCase):
         cfg = AzureConfig()
         cfg.memory_enabled = True
         cfg.memory_db_path = os.path.join(d, "m.db")
+        cfg.profile_db_path = os.path.join(d, "p.db")   # 别读真实画像：否则连上 WS 会先推约战提醒
         return create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(), autostart=False)
 
     def test_write_query_stats_forget_roundtrip(self):
@@ -556,17 +578,21 @@ class FakeTTS:
 class TtsApiTest(unittest.TestCase):
     def test_speech_event_pairs_with_message(self):
         """每条对外台词都必须有一条对应的 speech 事件（同 turn_id，seq 递增）。"""
-        app = create_app(engine=StubEngine(), llm=StubLLM(), tts=FakeTTS(), autostart=False)
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws") as ws:
-                ws.receive_json()                                  # hello
-                client.post("/api/move", json={"x": 3, "y": 3})
-                seen = []
-                for _ in range(20):
-                    ev = ws.receive_json()
-                    seen.append(ev)
-                    if ev.get("type") == "busy" and ev.get("busy") is False:
-                        break
+        with tempfile.TemporaryDirectory() as d:
+            cfg = AzureConfig()
+            cfg.profile_db_path = os.path.join(d, "p.db")   # 空画像：不触发主动约战提醒
+            app = create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(),
+                             tts=FakeTTS(), autostart=False)
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws") as ws:
+                    ws.receive_json()                                  # hello
+                    client.post("/api/move", json={"x": 3, "y": 3})
+                    seen = []
+                    for _ in range(20):
+                        ev = ws.receive_json()
+                        seen.append(ev)
+                        if ev.get("type") == "busy" and ev.get("busy") is False:
+                            break
         msgs = [e for e in seen if e.get("type") == "message"]
         speech = [e for e in seen if e.get("type") == "speech"]
         self.assertGreaterEqual(len(speech), len(msgs))

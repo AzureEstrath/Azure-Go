@@ -5,7 +5,7 @@
     POST /api/hint                          方向性提示
     POST /api/analyze                       局面分析
     POST /api/chat        {text}            自由聊天
-    POST /api/summarize   {note}            对局总结
+    POST /api/summarize   {note}            对局总结（局末自动归档到棋谱库，与画像开关无关）
     POST /api/undo        {turn}            俗手回档
     POST /api/reset                         重开一局
     POST /api/config      {allow_pass}      允许虚着开关（另见 limit_len / reply_style / think_mode /
@@ -21,6 +21,12 @@
     POST /api/review      {on}              进入 / 退出复盘模式（只读回看；期间落子/聊天/闲置/提示/分析被拒）
     POST /api/review/goto {n}               复盘：把第 n 手（含）之后的**只读**快照推一份 state 事件
     GET  /api/review/notes                  复盘：本局逐手存档（move_notes）+ 亏损手账（losses）
+    POST /api/review/full/segment {game_id, from, to}  全盘复盘：分析一段棋谱并让 Azure 点评（分段拉取）
+    GET  /api/games                         棋谱库列表（首次访问会塞入内置示例局）
+    GET  /api/games/{id}                    一盘棋谱全文（moves / meta / notes / losses）
+    GET  /api/games/{id}/sgf                导出 SGF（application/x-go-sgf）
+    POST /api/games/import {sgf}            导入 SGF（逐手规则校验，非法可读拒绝）
+    DELETE /api/games/{id}                  删除一盘棋谱
     POST /api/tts/speak   {text}            试听/手动合成 → 音频（WAV/MP3，按内容嗅探 MIME；合成不出来 → 409）
     GET  /api/tts/audio/{audio_id}          取一条已合成的音频 → 音频（未命中 → 404）
     POST /api/memory/query  {query, k?}     检索长期记忆（管理面；默认关闭时返回空列表）
@@ -47,14 +53,17 @@ from contextlib import asynccontextmanager
 
 import asyncio
 import sys
+import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
 from . import config as config_mod
-from . import coords, events, prompts
+from . import coords, events, prompts, sgf
+from . import full_review
 from .agent import AzureAgent
 from .engine import KataGoEngine
+from .game_store import GameStore
 from .joseki_progress import JosekiProgress
 from .llm import LLMClient
 from .memory_service import MemoryService
@@ -122,8 +131,9 @@ def _harden_stdout() -> None:
 PROFILE_SOURCE_GAMES = 20
 
 
-def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=True, memory=None):
-    """构造应用；测试可注入 stub 引擎/LLM/agent/memory/tts（autostart=False 跳过引擎启动）。
+def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=True, memory=None,
+               game_store=None):
+    """构造应用；测试可注入 stub 引擎/LLM/agent/memory/tts/game_store（autostart=False 跳过引擎启动）。
 
     ``memory`` 显式传入时优先于 lifespan 构造的 ``MemoryService``（测试 seam）：
     ``agent`` 分支也不再覆盖它。``tts`` 同理——显式传入的假 TTS 优先；不传时 lifespan
@@ -152,6 +162,12 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         # 且 `profile_enabled=true` 时发生**；`GET /api/profile` 始终可读（关着 / 无画像 ⇒ 空结果）。
         profile_store = ProfileStore(cfg.profile_db_path)
         app.state.profile_store = profile_store
+        # 棋谱库（v3.11.5）：无开关、独立文件；构造期不碰磁盘（首列 / 首次导入 / 局末归档才建库）。
+        # `autostart=False` 是测试装配：**未显式注入就不落真实库**，免得全量门卫往 data/games.db 写对局；
+        # 显式注入（测试自己的临时库）照常使用。
+        gstore = game_store if game_store is not None else (
+            GameStore(cfg.game_db_path) if autostart else None)
+        app.state.game_store = gstore
         if agent is None:
             eng = engine if engine is not None else KataGoEngine(cfg.katago_url, cfg.katago_token, cfg.max_visits, cfg.katago_timeout_ms)
             cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key,
@@ -173,6 +189,12 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                          memory=mem, tts=tts_client,
                                          joseki_progress=joseki_progress)
             app.state.agent.profile_store = profile_store   # v3.9.0：画像库无条件接上（懒建库、零开销）
+            app.state.agent.game_store = gstore             # v3.11.5：棋谱库同样无条件接上（懒建库）
+            app.state.agent.player_name = cfg.prompt_user_name
+            _adaptive = getattr(app.state.agent, "configure_adaptive", None)
+            if callable(_adaptive):                     # v3.11.5：默认关；关着＝落点与现状一致
+                _adaptive(cfg.adaptive_difficulty, cfg.adaptive_difficulty_base,
+                          cfg.adaptive_difficulty_spread)
             if autostart:
                 ok = await eng.start()
                 if not ok:
@@ -183,9 +205,15 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent.tts = tts_client     # 注入的 agent 同样接上（显式 tts= 优先）
             app.state.agent.joseki_progress = joseki_progress   # T5：注入的 agent 也接上同一个实例
             app.state.agent.profile_store = profile_store       # v3.9.0：画像库同样无条件接上
+            app.state.agent.game_store = gstore                 # v3.11.5：棋谱库同样无条件接上
+            app.state.agent.player_name = cfg.prompt_user_name
             # v3.9.0：画像 / 时间感知两个开关同样以 cfg 为准（关着＝现状）
             app.state.agent.profile_enabled = bool(cfg.profile_enabled)
             app.state.agent.time_aware_enabled = bool(cfg.time_aware_enabled)
+            _adaptive = getattr(app.state.agent, "configure_adaptive", None)
+            if callable(_adaptive):                     # v3.11.5：注入 agent 也按配置接通
+                _adaptive(cfg.adaptive_difficulty, cfg.adaptive_difficulty_base,
+                          cfg.adaptive_difficulty_spread)
         yield
         mem.close()                              # 退出时收尾（可重复调用）
         await tts_client.close()                 # 语音客户端**无条件**关闭（autostart 为假时也要关）
@@ -415,6 +443,25 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             v = body["time_aware_enabled"]      # 与 `emotion_drift` / `chat_digest_llm` 同一口径
             if isinstance(v, bool):
                 s.time_aware_enabled = v
+        if ("adaptive_difficulty" in body or "adaptive_difficulty_base" in body) \
+                and hasattr(s, "adaptive"):
+            on = s.adaptive.enabled
+            base = s.adaptive.base_cfg
+            if "adaptive_difficulty" in body:
+                v = body["adaptive_difficulty"]         # 只认 true / false；脏值保留原值
+                if isinstance(v, bool):
+                    on = v
+            if "adaptive_difficulty_base" in body:
+                try:
+                    base = max(1, min(5, int(float(body["adaptive_difficulty_base"]))))
+                except (TypeError, ValueError):
+                    pass
+            if on != s.adaptive.enabled or base != s.adaptive.base_cfg:
+                cfg.adaptive_difficulty = on            # 进程内 cfg 跟着走（落盘由客户端负责）
+                cfg.adaptive_difficulty_base = base
+                fn = getattr(s, "configure_adaptive", None)
+                if callable(fn):
+                    fn(on, base, cfg.adaptive_difficulty_spread)
         return ok()
 
     @app.post("/api/reveal")
@@ -491,6 +538,149 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         return {"ok": True,
                 "notes": [dict(n) for n in s.st.move_notes if isinstance(n, dict)],
                 "losses": [dict(l) for l in s.st.losses if isinstance(l, dict)]}
+
+    # ================= 全盘 AI 复盘（v3.11.5，分段拉取） =================
+    @app.post("/api/review/full/segment")
+    async def review_full_segment(body: dict):
+        """分析棋谱库里的一盘棋的 ``[from, to)`` 这一段，并让 Azure 用强思考点评。
+
+        前端**按段拉取**：上一段的文字/语音播完再请求下一段（TTS 不堆积）。本端点不碰当前对局、
+        不改 ``busy``；复盘期间（``review=true``）拒绝，避免两套「只读回看」叠在一起。
+        """
+        s = a()
+        if s.busy:
+            return {"ok": False, "busy": True, "state": s.st.payload()}
+        if bool(getattr(s, "review", False)):
+            return {"ok": False, "error": "先退出当前复盘，再开全盘复盘"}
+        store = game_store_of()
+        rec = await asyncio.to_thread(store.get_game, _int(body.get("game_id"), 0)) if store is not None else None
+        if not rec:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "棋谱不存在"})
+        moves = rec.get("moves") if isinstance(rec.get("moves"), list) else []
+        n = len(moves)
+        if n <= 0:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "这盘棋谱没有落子"})
+        start = max(0, min(_int(body.get("from"), 0), n))
+        end = max(start, min(_int(body.get("to"), start), n))
+        if end <= start:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "这一段的起止手数无效"})
+        if end - start > full_review.MAX_SPAN:
+            end = start + full_review.MAX_SPAN              # 防单次请求把引擎拖太久
+        # 这一段的引擎 / LLM / TTS 跑在 busy 里：前端照常「思考中」，且文字会等语音开播再显示。
+        # 全盘复盘固定强思考：聊天里的 think_mode 覆盖只加预算，这里再把 llm 档位临时拨到 2
+        # （让 `llm_think_extra_body` 这类扩展字段也一起进请求），结束后原样拨回。
+        llm = getattr(s, "llm", None)
+        prev_think = getattr(llm, "think_mode", 0)
+        if hasattr(llm, "set_think_mode"):
+            try:
+                llm.set_think_mode(2)
+            except Exception as e:              # noqa: BLE001 —— 档位切换失败不拖垮复盘
+                print("[FullReview] 强思考档位切换失败（继续）：%s" % e)
+        owner = s._set_busy(True)
+        try:
+            result = await full_review.comment_segment(
+                s, rec, start, end,
+                index=_int(body.get("index"), 0),
+                total=max(1, _int(body.get("total"), 1)),
+                previous=str(body.get("previous") or ""))
+        finally:
+            s._clear_busy(owner)
+            if hasattr(llm, "set_think_mode"):
+                try:
+                    llm.set_think_mode(prev_think)
+                except Exception:               # noqa: BLE001
+                    pass
+        return {"ok": True, **result}
+
+    # ================= 棋谱库 + SGF（v3.11.5） =================
+    # 只读写独立文件 ``games.db``，不碰当前对局、不碰复盘模式；列表 / 导入 / 导出 / 删除都
+    # 不被 busy 门禁挡（它们本来就不改动棋局）。所有故障都回可读错误，绝不把端点打成 500。
+
+    def game_store_of():
+        return getattr(app.state, "game_store", None)
+
+    def _with_date(rec: dict) -> dict:
+        rec = dict(rec)
+        try:
+            rec["date"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(rec.get("ts") or 0)))
+        except (TypeError, ValueError, OSError):
+            rec["date"] = ""
+        return rec
+
+    @app.get("/api/games")
+    async def games_list():
+        """棋谱库列表；**库里一盘都没有时**先塞入内置示例局（首访即时可玩）。"""
+        store = game_store_of()
+        if store is None:
+            return {"ok": True, "games": []}
+        try:
+            await asyncio.to_thread(store.ensure_demo)
+            rows = await asyncio.to_thread(store.list_games)
+        except Exception as e:                  # noqa: BLE001 —— 棋谱库故障只丢列表
+            print("[Games] 列表读取异常（已忽略）：%s" % e)
+            return {"ok": False, "error": "棋谱库读取失败", "games": []}
+        return {"ok": True, "games": [_with_date(r) for r in rows if isinstance(r, dict)]}
+
+    @app.get("/api/games/{game_id}")
+    async def games_get(game_id: int):
+        store = game_store_of()
+        rec = await asyncio.to_thread(store.get_game, game_id) if store is not None else None
+        if not rec:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "棋谱不存在"})
+        return {"ok": True, "game": _with_date(rec)}
+
+    @app.get("/api/games/{game_id}/sgf")
+    async def games_sgf(game_id: int):
+        store = game_store_of()
+        rec = await asyncio.to_thread(store.get_game, game_id) if store is not None else None
+        if not rec:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "棋谱不存在"})
+        text = sgf.to_sgf(rec)
+        return Response(content=text, media_type="application/x-go-sgf",
+                        headers={"Content-Disposition": 'attachment; filename="azure_game_%d.sgf"' % game_id})
+
+    @app.post("/api/games/import")
+    async def games_import(body: dict):
+        """导入 SGF：**逐手重放校验**后才入库；坏棋谱回可读 error（400）。"""
+        raw = body.get("sgf")
+        if not isinstance(raw, str) or raw.strip() == "":
+            return JSONResponse(status_code=400, content={"ok": False, "error": "空棋谱"})
+        parsed = await asyncio.to_thread(sgf.parse_sgf, raw)
+        if not parsed.get("ok"):
+            return JSONResponse(status_code=400,
+                                content={"ok": False, "error": str(parsed.get("error") or "棋谱解析失败")})
+        store = game_store_of()
+        if store is None:
+            return JSONResponse(status_code=503, content={"ok": False, "error": "棋谱库不可用"})
+        rec = {
+            "ts": time.time(),
+            "moves": parsed["moves"],
+            "move_count": len(parsed["moves"]),
+            "final_black_wr": None,
+            "final_score": None,
+            "result": parsed.get("result") or "",
+            "summary": parsed.get("summary") or "",
+            "meta": {
+                "black": parsed.get("black") or cfg.prompt_user_name,
+                "white": parsed.get("white") or "Azure",
+                "source": "import",
+                "sgf_date": parsed.get("date") or "",
+                "notes": parsed.get("notes") or [],
+                "losses": [],
+            },
+        }
+        game_id = await asyncio.to_thread(store.add_game, rec)
+        if not game_id:
+            return JSONResponse(status_code=503, content={"ok": False, "error": "棋谱写入失败（库不可用）"})
+        return {"ok": True, "id": int(game_id)}
+
+    @app.delete("/api/games/{game_id}")
+    async def games_delete(game_id: int):
+        store = game_store_of()
+        ok_del = await asyncio.to_thread(store.delete_game, game_id) if store is not None else False
+        if not ok_del:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "棋谱不存在"})
+        return {"ok": True}
 
     # ================= 云端语音（计划 05） =================
     # 对局中的台词由 WS 的 `speech` 事件驱动（前端据 id 来拉音频）；这里两个端点是**试听/手动用**的。

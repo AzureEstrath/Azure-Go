@@ -57,7 +57,7 @@ from typing import TypedDict
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from . import coords, decay, estimate, events, prompts
+from . import actions, coords, decay, estimate, events, prompts
 from .llm_chain import ThinkStream, content_of, content_text_of
 from .tools import TOOLS
 
@@ -324,6 +324,9 @@ async def _prepare_after_player(agent, data):
 
     # ④ 俗手判定：不在我算的前5，或胜率明显下滑
     drop = winrate_before - after_black_wr
+    fn = getattr(agent, "note_adaptive_move", None)
+    if callable(fn):
+        fn(n + 1, after_black_wr, player_rank, drop)   # 自适应难度：只读这一手已有信号
     if player_rank < 0 or drop > 0.10:
         reason = "不在我算的前5候选" if player_rank < 0 else "胜率下滑%d%%" % int(round(drop * 100.0))
         agent.st.record_bad_move(turn_index, gtp, reason)
@@ -331,6 +334,11 @@ async def _prepare_after_player(agent, data):
         # 触发条件与俗手一字不改——只掉名次不掉胜率的仍然进 bad_moves，但进不了 losses。
         agent.st.record_loss(gtp, drop, reason)
     agent._emit(events.state(agent.st.payload()))
+    # 领地热力图：复用这一次「玩家落子后」的 after 分析（零额外引擎调用）；放在 state 之后，
+    # 前端拿到时棋盘已经包含这一手。y*19+x（y=0 顶行）与客户端棋盘坐标一致。
+    own = after.get("ownership") or []
+    if own:
+        agent._emit(events.ownership(own, len(agent.st.moves)))
 
     # ④″ 定式识别（纯本地计算、零引擎调用）
     jk = agent._joseki_check()
@@ -544,6 +552,9 @@ async def _prepare_just_moved(agent, data):
             agent.st.pre_analysis = {"n": len(agent.st.moves), "a": post}
     if _alive(agent, data):                         # 看门狗守卫：旧一代不再推信息栏
         agent._emit(events.info(wr, sc))
+        own2 = post.get("ownership") or []
+        if own2:                                    # 复用她落子后的这次分析：零额外引擎调用
+            agent._emit(events.ownership(own2, len(agent.st.moves)))
 
     if str(jk2.get("kind", "")) == "entered" and data.get("jk_show_card"):
         # T7（U36）+ F2：她走出的**结构点**并进**她的**发言位（这条落子后的感想），与玩家那一侧
@@ -594,6 +605,9 @@ async def _prepare_observe(agent, data):
     agent.st.pre_analysis = {"n": n, "a": analysis}
     tops = [str(m.get("move", "")) for m in (analysis.get("moveInfos", []) or [])[:3]]
     agent._update_katago_brief(analysis, n)
+    own = analysis.get("ownership") or []
+    if own and _alive(agent, data):                 # 提示：顺手刷新领地图，不新增引擎调用
+        agent._emit(events.ownership(own, n))
     prompt = "当前局面：%s。我算到的好点：%s。Estarth还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）；换个说法开场，别重复你上一次提示的句式和口头禅。" % (
         prompts.board_summary(agent.st.move_seq), agent._py_list(tops))
     profile, time_facts = await _ctx_extras(agent, data)
@@ -617,18 +631,20 @@ async def _prepare_analyze(agent, data):
         return
     if not _alive(agent, data):                     # 看门狗守卫：超时后旧一代不再写缓存 / 出话
         return
-    # 点目注记（v3.12.0）：**复用这一次分析**，在 LLM 思考开始前就发出去 —— 玩家点「局面分析」
-    # 后先看到棋盘上的归属方块与形势面板，她的台词随后到。它只是棋盘注记：不发 speech、
-    # 不进提示词、不碰 busy；分析失败（上面已短路）时一条都不发。
-    est = estimate.build(analysis, n, agent.st.board.stones_list())
-    if est is not None:
-        agent._emit(events.estimate(est))
     conv = prompts.to_black_perspective(analysis, n)
     black_wr = float(conv[0])
     score_black = float(conv[1])
     azure_wr = 1.0 - black_wr
     tops = [str(m.get("move", "")) for m in (analysis.get("moveInfos", []) or [])[:5]]
     agent._update_katago_brief(analysis, n)
+    own = analysis.get("ownership") or []
+    if own and _alive(agent, data):                 # 手动局面分析：顺手刷新领地图，不新增引擎调用
+        agent._emit(events.ownership(own, n))
+    # 点目注记（v3.12.0 采纳）：复用这一次分析，在 LLM 思考开始前就发出去——玩家先看到
+    # 棋盘归属方块与形势面板，她的台词随后到；不发 speech、不进提示词、不碰 busy。
+    est = estimate.build(analysis, n, agent.st.board.stones_list())
+    if est is not None:
+        agent._emit(events.estimate(est))
     lead = "你略占上风" if azure_wr > 0.5 else ("局面胶着" if azure_wr > 0.45 else "Estarth领先")
     prompt = "当前局面：%s，共%d手。你（Azure，执白）算出的判断：白方胜率约%s（%s），目差%s（正数是你领先）。你在考虑的几个点：%s。请用你自己的视角（我/你，别说「黑方/白棋」）分析当前局势3-4句：局面走向、关键处或薄弱处，可以点醒Estarth；语气慵懒但专业，先结合【当前棋面】核对再说，别提到盘上没有的子。" % (
         prompts.board_summary(agent.st.move_seq), n, agent._pct(azure_wr), lead, "%+.1f" % (-score_black), agent._py_list(tops))
@@ -798,11 +814,16 @@ async def _decide_own_turn(agent, data):
     pick = agent._pick_ai_move(list(data.get("after_infos") or []))
     if data.get("drift_picked"):
         pick = list(data.get("drift_pick") or pick)
+        pick = list(data.get("difficulty_pick") or pick)
     else:
         pick = agent._drift_pick(list(data.get("after_infos") or []), pick)
         data["drift"] = agent._take_drift_pending()
         data["drift_pick"] = list(pick)
         data["drift_picked"] = True
+        fn = getattr(agent, "_difficulty_pick", None)
+        if callable(fn):
+            pick = fn(list(data.get("after_infos") or []), pick)
+            data["difficulty_pick"] = list(pick)
     ai_gtp, ai_x, ai_y = pick[0], pick[1], pick[2]
     data["move"] = {"x": ai_x, "y": ai_y, "gtp": ai_gtp, "pass": ai_gtp == "pass"}
 
@@ -1215,8 +1236,11 @@ async def _emit_speech(agent, text):
     tts = getattr(agent, "tts", None)
     if tts is None:
         return
+    spoken = actions.strip_actions(text)            # {行为} 只给前端演，绝不念进语音
+    if spoken == "":
+        return
     try:
-        res = await tts.speak(text)
+        res = await tts.speak(spoken)
     except Exception as e:                          # noqa: BLE001 —— 语音失败只丢语音，文字照常
         print("[TTS] 合成异常（本条不发语音事件）：%s" % e)
         return

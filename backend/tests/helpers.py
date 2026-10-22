@@ -94,10 +94,12 @@ class StubLLM:
         self.think_mode = 0
         self.text = text
         self.calls = []
+        self.think_modes = []
         self.base_url = "http://localhost:8080/v1"
 
-    async def chat(self, messages, max_tokens=300, no_think=False):
+    async def chat(self, messages, max_tokens=300, no_think=False, think_mode=None):
         self.calls.append((list(messages), max_tokens, no_think))
+        self.think_modes.append(think_mode)
         return self.text
 
 
@@ -107,7 +109,7 @@ class BoomLLM:
     think_mode = 0
     base_url = "https://api.example.com/v1"
 
-    async def chat(self, messages, max_tokens=300, no_think=False):
+    async def chat(self, messages, max_tokens=300, no_think=False, think_mode=None):
         raise RuntimeError("云端 500")
 
 
@@ -117,7 +119,7 @@ class ErrLLM:
     think_mode = 0
     base_url = "https://api.example.com/v1"
 
-    async def chat(self, messages, max_tokens=300, no_think=False):
+    async def chat(self, messages, max_tokens=300, no_think=False, think_mode=None):
         return "调用出错：HTTP 401（检查模型名是否为 qwen3.5）"
 
 

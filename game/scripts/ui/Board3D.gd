@@ -141,6 +141,7 @@ func view_state() -> Dictionary:
 var locked := false              # Azure 思考中时禁止落子
 var readonly := false            # 复盘回看（v3.7.0）：棋盘整体只读——**落子与摸头都不接受**（与 locked 独立）
 var input_blocked := false       # 主界面封面期间：视角键 / 滚轮 / 拖拽一起让路（运镜另有 `is_flying()`）
+var ownership_enabled := false   # 领地热力图开关（v3.11.5）：前端渲染，数据由后端 ownership 事件推来
 var idle_attention := false      # 玩家长时间无操作：化身转为看向玩家
 var cam: Camera3D = null
 
@@ -179,6 +180,10 @@ var _black_mat: StandardMaterial3D
 var _white_mat: StandardMaterial3D
 var _sphere: SphereMesh
 var _dot_tex: ImageTexture
+var _ownership_plane: MeshInstance3D = null
+var _ownership_tex: ImageTexture = null
+var _ownership_has_data := false
+var _ownership_values: Array = []
 
 func _ready() -> void:
 	_black_mat = StandardMaterial3D.new()
@@ -334,6 +339,78 @@ func _build_board() -> void:
 			add_child(mi)
 
 	_build_labels()
+	_build_ownership()
+
+## 领地热力图：19×19 的半透明贴图铺在棋盘面之上、网格之下（y=0.004）。
+## 每个像素对应一个交叉点；线性过滤让色块变柔和，不挡棋子 / 网格 / 点击。
+func _build_ownership() -> void:
+	_ownership_tex = ImageTexture.new()
+	var img := Image.create(19, 19, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0, 0, 0, 0))
+	_ownership_tex.set_image(img)
+	var pm := PlaneMesh.new()
+	pm.size = Vector2(19.0 * CELL, 19.0 * CELL)
+	_ownership_plane = MeshInstance3D.new()
+	_ownership_plane.mesh = pm
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.albedo_texture = _ownership_tex
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	_ownership_plane.material_override = mat
+	_ownership_plane.position = Vector3(0, 0.004, 0)
+	_ownership_plane.visible = false
+	add_child(_ownership_plane)
+
+## 单个交叉点的归属颜色（纯函数，门卫可直接断言）：
+## + 黑（墨色）/ - 白（纸白），透明度随 |v| 增大；|v| 很小就完全透明。
+static func ownership_color(v: float) -> Color:
+	var f := clampf(v, -1.0, 1.0)
+	if not is_finite(f):
+		f = 0.0
+	var a := absf(f) * 0.50
+	if a < 0.02:
+		return Color(0, 0, 0, 0)
+	return Color(0.06, 0.08, 0.10, a) if f > 0.0 else Color(0.99, 0.97, 0.92, a)
+
+## 后端 ownership 事件 → 贴图。长度必须 361；脏值退 0，绝不抛。
+func set_ownership(values: Array) -> void:
+	if values.size() != 19 * 19:
+		clear_ownership()
+		return
+	var img := Image.create(19, 19, false, Image.FORMAT_RGBA8)
+	for y in 19:
+		for x in 19:
+			var raw = values[y * 19 + x]
+			var v := 0.0
+			if typeof(raw) == TYPE_FLOAT or typeof(raw) == TYPE_INT:
+				v = float(raw)
+			img.set_pixel(x, y, ownership_color(v))
+	_ownership_tex.set_image(img)
+	_ownership_values = values.duplicate()
+	_ownership_has_data = true
+	_ownership_plane.visible = ownership_enabled
+
+func set_ownership_enabled(on: bool) -> void:
+	ownership_enabled = on
+	if _ownership_plane != null:
+		_ownership_plane.visible = on and _ownership_has_data
+
+func clear_ownership() -> void:
+	_ownership_has_data = false
+	_ownership_values = []
+	if _ownership_plane != null:
+		_ownership_plane.visible = false
+
+## 战报用：当前可见棋子（权威 + 乐观）与最近一次领地图；只读副本，调用方随便改。
+func visible_stones() -> Array:
+	var out: Array = _displayed.duplicate(true)
+	out.append_array(_optimistic)
+	return out
+
+func ownership_values() -> Array:
+	return _ownership_values.duplicate()
 
 func _quad(st: SurfaceTool, x0: float, z0: float, x1: float, z1: float, y: float) -> void:
 	var a := Vector3(x0, y, z0)
@@ -527,11 +604,12 @@ func _clear_joseki() -> void:
 	_joseki_marks = []
 	_joseki_t = 0.0
 
-## 点目标记（v3.12.0）：后端 `estimate` 事件里的归属小方块。空点贴在棋盘面上，
-## 已有棋子的点**抬到棋子上**（被点死的对手子）——演示图的口径。
+# ================= 点目标记（v3.12.0 采纳） =================
+
+## 后端 `estimate` 事件里的归属小方块：空点贴在棋盘面上，已有棋子的点抬到棋子上（被点死的对手子）。
 const EST_MARK := 0.30          # 小方块边长（格距 1.0）
-const EST_Y := 0.03             # 空点：压在网格线（0.012）/ 星位（0.015）之上
-const EST_DEAD_Y := STONE_H + 0.02  # 死子：压在棋子顶面（STONE_H = 0.28）之上
+const EST_Y := 0.03             # 空点：压在网格线 / 星位之上
+const EST_DEAD_Y := STONE_H + 0.02
 const EST_BLACK := Color(0.129, 0.122, 0.110)
 const EST_WHITE := Color(0.980, 0.953, 0.886)
 
@@ -556,8 +634,7 @@ static func estimate_cell_ok(c) -> bool:
 	var yi := int(y)
 	return xi >= 0 and xi < 19 and yi >= 0 and yi < 19
 
-## 画 / 换一批点目标记；传空数组等于清除。`cells` 形状见 `NetClient.estimate_event`。
-## 全部脏值跳过（不画、不抛）：点目是「锦上添花」，绝不该让棋盘崩掉。
+## 画 / 换一批点目标记；传空数组等于清除。全部脏值跳过（不画、不抛）。
 func set_estimate(cells) -> void:
 	clear_estimate()
 	if typeof(cells) != TYPE_ARRAY:
@@ -575,7 +652,7 @@ func set_estimate(cells) -> void:
 		var x := int((c as Array)[0])
 		var y := int((c as Array)[1])
 		var side := str((c as Array)[2])
-		var h := EST_DEAD_Y if is_occupied(x, y) else EST_Y    # 死子抬到棋子上
+		var h := EST_DEAD_Y if is_occupied(x, y) else EST_Y
 		var p := _world(x, y, h)
 		var st := black if side == "black" else white
 		_mark_quad(st, p, half)
@@ -592,7 +669,6 @@ func set_estimate(cells) -> void:
 	if nw > 0:
 		_estimate_root.add_child(_mark_mesh(white.commit(), EST_WHITE))
 
-## 一个平躺在棋盘面（XZ 平面）上的方块，边长 2*half。
 func _mark_quad(st: SurfaceTool, p: Vector3, half: float) -> void:
 	st.add_vertex(Vector3(p.x - half, p.y, p.z - half))
 	st.add_vertex(Vector3(p.x + half, p.y, p.z + half))
@@ -607,11 +683,11 @@ func _mark_mesh(mesh: ArrayMesh, col: Color) -> MeshInstance3D:
 	var m := StandardMaterial3D.new()
 	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	m.albedo_color = col
-	m.cull_mode = BaseMaterial3D.CULL_DISABLED      # 平躺方块：两面都画，省去绕序烦恼（与棋盘网格同一做法）
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED
 	mi.material_override = m
 	return mi
 
-## 收起点目标记（玩家下一手 / 重来 / 换局面 / 进主界面）。
+## 收起点目标记（玩家下一手 / 重来 / 换局面 / 进主界面 / 进复盘）。
 func clear_estimate() -> void:
 	if _estimate_root != null and is_instance_valid(_estimate_root):
 		_estimate_root.queue_free()

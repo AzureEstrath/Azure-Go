@@ -1,8 +1,8 @@
-"""局面点目（v3.12.0）：``ownership`` → 棋盘标记 + 面板数字的**纯函数**门卫。
+"""局面点目（v3.12.0 采纳）：``ownership`` → 棋盘标记 + 面板数字的**纯函数**门卫。
 
 这里的断言全部不碰引擎 / 事件总线：``estimate.build`` 只吃引擎响应原文与棋子列表，
-所以不需要任何 stub 装配。编排侧（analyze 阶段真的发 ``estimate`` 事件）的用例在
-``test_agent_graph.py`` 的 ``AnalyzeEstimateTest``。
+所以不需要任何 stub 装配。编排侧（analyze 阶段真的发 ``estimate`` 事件）由
+``test_events`` 的事件形状 + 前端门卫覆盖。
 """
 
 import os

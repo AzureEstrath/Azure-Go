@@ -27,6 +27,7 @@ var board: Board3D
 var ambience: Ambience
 var avatar: AzureAvatar
 var tts: TTSClient
+var sfx: SfxPlayer                            # 对局音效（落子 / 提子 / 虚着 / 终局；纯前端）
 
 var _left_panel: PanelContainer            # 左侧：语音设置
 var _right_panel: PanelContainer           # 右侧：对局 / 聊天
@@ -50,9 +51,7 @@ var _tts_aliyun_voice_edit: LineEdit
 ## —— 主界面（纸幕封面，v3.11.2）——
 var title_screen: TitleScreen = null       # 首次启动 / 对局中按 Esc 都是这一块
 var _title_open := false                   # 封面开着：棋盘锁、聊天禁用、不闲置搭话
-var _game_started := false                 # 已经过了首次「开始对局」（决定主按钮是「开始对局」还是「开始新对局」）
-## 从主界面进入时用：后端 `/api/reset` 在 busy 时会拒绝，忙就先记下，等 `_on_busy_changed(false)` 补发
-var _restart_when_idle := false
+var _game_started := false                 # 已经过了首次「开始对局」（决定主按钮是开始还是继续）
 var _setup_done := false                   # 本次运行已在主界面里点过「设置」：开局时不再弹第二遍
 var _setup_showing := false                # 设置面板正在显示（防重入）
 var _transition := false                   # 主界面 ⇄ 对局的运镜正在跑（期间不吃 Esc / 不叠加动画）
@@ -103,6 +102,7 @@ var _typing_shown := 0.0                   # 已显示字数（浮点累计）
 var _typing_cps := 0.0                     # 当前打字速度（字/秒）
 var _typing_queue: Array[Dictionary] = []  # 排队等待打字的 {label,text}（单活跃顺序播放，防抢跑）
 static var _tone_re := RegEx.new()         # [[tone:xxx]] 语气标记（首次使用时编译）
+static var _action_re := RegEx.new()       # {行为} 标签（首次使用时编译）
 var _mood := ""                            # 当前情绪基调：同一情绪延续时只刷新计时、不再出声（治「语气太多」）
 var _mood_ms := 0                          # 最近一次情绪刷新的时刻
 const MOOD_KEEP_MS := 30000                # 同一情绪 30 秒内视为延续；情绪变化或久未出现才出声
@@ -115,6 +115,13 @@ var _idle := false
 var _idle_muted := false                   # 玩家已回来（落子/说话）：在途与排队的走神搭话全部作废
 var _next_talk_ms := 0                     # 下一次闲置搭话的时刻
 var _last_move_count := 0                  # 用于识别 Azure 刚落的那颗子
+var _last_stone_count := 0                 # 上一份 state 的棋子数：判断提子 / 虚着
+var _sfx_ready := false                    # 第一次权威 state 不播音效（连接 / 重连的一次性对齐）
+var _last_move_seq: Array = []             # 最近一份 state 的 GTP 手顺（战报用）
+var _last_wr := 0.5                        # 最近一次形势（战报用；黑方视角）
+var _last_score := 0.0
+var _info_ready := false
+var _report_busy := false                  # 战报生成中：按钮防重入
 
 ## 音色候选（静态列表）：云端服务商各有音色名，这里只给常见几种；右侧输入框可手填任意音色 id
 const VOICE_PRESETS := ["alloy", "echo", "fable", "nova", "onyx", "shimmer",
@@ -134,8 +141,7 @@ var _lbl_moves: Label
 var _lbl_wr: Label
 var _lbl_score: Label
 var _lbl_score_hint: Label                     # 目差下面那行 11px 小字：量级人话（空串＝还没有形势信息）
-## —— 局面点目（v3.12.0，「局面分析」的形势面板）——
-## 浮在棋盘左上方的 2D 小面板（与定式卡片同一层做法，不进侧栏）；棋盘上的归属小方块在 Board3D。
+## —— 局面点目（v3.12.0 采纳）——
 var _estimate_box: PanelContainer
 var _estimate_count: Label                     # 「黑 41 目 · 白 4 目」
 var _estimate_lead: Label                      # 「黑领先 29.5 目（贴 7.5 目）」
@@ -148,6 +154,7 @@ var _tool_active := false                      # 工具进度是否在跑（star
 var _chk_pass: CheckBox
 var _joseki_opt: OptionButton                     # 定式导学＝「开关 + 频率」一格（关闭 / 低 25% / 中 50% / 高 75% / 总是 100%）
 var _drift_opt: OptionButton                      # 情绪波动＝「开关 + 基础概率」一格（关闭 / 低 3% / 中 5% / 高 6%；在 ⚙ 设置抽屉里）
+var _adaptive_base_opt: OptionButton              # 自适应难度基线（1 入门 … 5 严苛；开关与基线同在两格）
 var _reply_opt: OptionButton                      # 说话详略三档（精简 / 适中 / 详细；v3.11.1，原来那个「短回复」勾选框）
 var _think_opt: OptionButton                      # 思考强度三档（快速 / 中等 / 强思考；v3.11.1，运行期即时生效）
 var _btn_settings: Button                         # ⚙ 设置抽屉的开关
@@ -169,6 +176,30 @@ var _review_cur := 0                       # 当前回看到第几手（0.._revi
 var _review_box: HBoxContainer             # 复盘按钮组（对局结束前整组隐藏，不挤界面）
 var _btn_review: Button                    # 📖 复盘 / ✅ 退出复盘
 var _btn_home: Button                      # 🏠 返回主界面（v3.11.3：对局结束后与复盘并排）
+var _btn_report: Button                    # 战报（v3.11.5）：生成 PNG，局后与复盘并排
+var game_library: GameLibrary = null       # 棋谱库（v3.11.5）：主界面打开的全屏模态
+## —— 全盘 AI 复盘（v3.11.5）：棋谱库选一盘 → 主棋盘只读回放 + 分段点评 ——
+var _fr_active := false                    # 全盘复盘模式：棋盘只读、聊天禁用、闲话停
+var _fr_record: Dictionary = {}            # 正在复盘的那盘棋（来自棋谱库）
+var _fr_segments: Array = []               # [[from, to), ...]：与后端 plan_segments 同一条公式
+var _fr_index := 0                         # 下一段要请求的序号
+var _fr_step := 0                          # 棋盘当前回放到第几手（0..总手数）
+var _fr_paused := false                    # 暂停自动解说
+var _fr_requesting := false                # 当前有段请求在途（暂停 / 重试时判断用）
+var _fr_token := 0                         # 退出 / 重开后旧回调一律作废
+var _fr_last_text := ""                    # 上一段点评原文（喂给下一段防重复）
+var _fr_saved_own: Array = []               # 进复盘前的领地图：退出时还原（不用再等一次分析）
+var _fr_saved_stones: Array = []            # 进复盘前的盘面：退出时先本地还原，再拉权威 state 对齐
+var _fr_saved_seq: Array = []
+var _fr_box: HBoxContainer = null          # 全盘复盘按钮行（只在模式内显示）
+var _fr_prev: Button = null
+var _fr_next: Button = null
+var _fr_toggle: Button = null
+var _btn_fr_exit: Button = null
+const FULL_REVIEW_MAX_SEGMENTS := 8
+const FULL_REVIEW_MIN_SPAN := 12
+const FULL_REVIEW_MAX_SPAN := 48
+const FULL_REVIEW_TIMEOUT := 180.0          # 一段：N 次引擎 + 强思考 LLM + TTS，给足时间
 var _btn_prev: Button                      # ◀ 上一手（只在复盘模式内可见）
 var _btn_next: Button                      # 下一手 ▶（只在复盘模式内可见）
 var _btn_send: Button                      # 聊天发送（复盘期间与输入框一起禁用）
@@ -178,6 +209,7 @@ func _ready() -> void:
 	cfg = AzureConfig.load_config()
 	_apply_cli_overrides()
 	_build_pairing()                           # 语音配对状态机：只做决策，副作用回调回本文件
+	_build_sfx()                               # 对局音效：预加载 6 个音频、4 个播放器轮转
 	_font = _make_cjk_font()
 	_build_world()
 	_build_board()
@@ -189,8 +221,8 @@ func _ready() -> void:
 		_handle_cli()                          # 只拍封面：不起服务 / 不叠问候，避免聊天面板透在纸幕后
 		return
 	await _maybe_show_setup()                  # 启动设置面板：思考模式 + 各 API 配置（默认=当前配置）；确认后按新配置起服务
-	_build_services()
-	_start_launch_game()                       # 首次进对局也保证空局（后端可能还留着上次运行的对局）
+	if agent == null:
+		_build_services()                      # 从主界面直接进过棋谱库时已经起过：不重复装配
 	_greet()
 	_handle_cli()
 
@@ -217,6 +249,13 @@ func _build_pairing() -> void:
 	add_child(pairing)
 	pairing.display_requested.connect(_on_pairing_display)
 	pairing.resolved.connect(_on_pairing_resolved)
+
+## 对局音效：纯前端、事件驱动；不参与编排与锁
+func _build_sfx() -> void:
+	sfx = SfxPlayer.new()
+	sfx.enabled = cfg.sfx_enabled
+	sfx.volume = cfg.sfx_volume
+	add_child(sfx)
 
 # ================= 世界与棋盘 =================
 
@@ -259,6 +298,7 @@ func _build_board() -> void:
 	if avatar != null:
 		avatar.gaze_source = board          # 化身视线：旋转视角时看玩家，平时看鼠标落点
 		board.pat_head = avatar             # 摸头触发区：左键点在头部附近即可摸头
+	board.set_ownership_enabled(cfg.ownership_enabled)   # 领地热力图：默认关，打开后等 ownership 事件
 
 # ================= 界面 =================
 
@@ -291,13 +331,13 @@ func _build_joseki_card(root: Control) -> void:
 	root.add_child(_joseki_card)
 	get_viewport().size_changed.connect(_on_viewport_resized)
 
-## 形势面板（v3.12.0）：浮在棋盘左上方的小纸签，内容全部来自后端 `estimate` 事件。
+## 形势面板（v3.12.0 采纳）：浮在棋盘左上方的小纸签，内容全部来自后端 `estimate` 事件。
 ## 它是**临时注记**（玩家下一手 / 局面变了就收起），所以不进侧栏、不新增常驻控件。
 func _build_estimate_box(root: Control) -> void:
 	_estimate_box = PanelContainer.new()
 	_estimate_box.visible = false
 	_estimate_box.custom_minimum_size = Vector2(200, 0)
-	_estimate_box.mouse_filter = Control.MOUSE_FILTER_STOP   # 面板上点一下不许穿到棋盘去落子
+	_estimate_box.mouse_filter = Control.MOUSE_FILTER_STOP
 	_estimate_box.tooltip_text = "只统计归属明确的点（|归属| ≥ 50%）：空地算目，被点死的对手子也算；\n" \
 		+ "中间大片还没定下来的地方不计入——所以双方点数加起来通常小于棋盘总点数。"
 	_estimate_box.add_theme_stylebox_override("panel", GufengTheme.slip(GufengTheme.PAPER_WARM, 10))
@@ -349,8 +389,7 @@ func _place_joseki_card() -> void:
 
 ## 窗口尺寸变了：只有用户还没动过卡片（还在我们摆的位置上）才重新摆位，绝不抢用户的手
 func _on_viewport_resized() -> void:
-	if _estimate_box != null and _estimate_box.visible:
-		_place_estimate_box()
+	_place_estimate_box()                        # 形势面板钉在左上角：窗口变了只需按侧栏重新算 x
 	if _joseki_card == null or _joseki_card.position != _joseki_card_home:
 		return
 	_place_joseki_card()
@@ -608,6 +647,40 @@ func _build_right_panel(root: Control) -> void:
 	_acc_check(drawer, "长句合并", cfg.tts_long_chunk, "chunk",
 		"单次 TTS 合成字数上限：关=100（更快出第一句，默认）；开=160（长句一次合成、但首句更慢）。"
 		+ "改完重启后端才生效（分块在后端做）")
+	# 对局音效（v3.11.5）：纯前端；落子 / 提子 / 虚着 / 终局，音量与开关写回 config.json
+	_acc_check(drawer, "音效", cfg.sfx_enabled, "sfx",
+		"落子、提子、虚着、终局的轻音效；关闭后完全静音（不影响语音朗读）→ 立即生效")
+	var sfx_vol_lbl := _field_label("音效音量")
+	sfx_vol_lbl.tooltip_text = "只控制落子/提子/虚着/终局音效；语音朗读音量在左侧栏单独调"
+	drawer.add_child(sfx_vol_lbl)
+	var sfx_vol := HSlider.new()
+	sfx_vol.min_value = 0.0
+	sfx_vol.max_value = 1.0
+	sfx_vol.step = 0.05
+	sfx_vol.value = cfg.sfx_volume
+	sfx_vol.custom_minimum_size = Vector2(0, 18)
+	sfx_vol.value_changed.connect(func(v): _on_sfx_volume(v, false))
+	sfx_vol.drag_ended.connect(func(_c): _on_sfx_volume(sfx_vol.value, true))
+	drawer.add_child(sfx_vol)
+	# 领地热力图（v3.11.5）：默认关；后端每次落子后复用既有分析推 ownership，前端只渲染
+	_acc_check(drawer, "领地热力图", cfg.ownership_enabled, "ownership",
+		"按 KataGo 逐点归属显示双方势力（墨色=黑 / 纸白=白），只做视觉辅助、不改变对局；关闭后立即隐藏")
+	# 自适应难度（v3.11.5）：开关 + 基线同一行（不新增常驻控件位）；局内只在这条基线上下最多 ±1 档浮动
+	var adaptive_row := HBoxContainer.new()
+	adaptive_row.add_theme_constant_override("separation", 6)
+	drawer.add_child(adaptive_row)
+	_acc_check(adaptive_row, "自适应难度", cfg.adaptive_difficulty, "adaptive",
+		"默认关。开启后按你的棋风画像、聊天（「太难 / 认真点」）与最近几手表现，"
+		+ "在基线上下最多浮动 1 档；每 4 手最多调整一次，不会随意跳。关闭＝落点与原来完全一致")
+	_adaptive_base_opt = OptionButton.new()
+	for nm in ADAPTIVE_BASE_NAMES:
+		_adaptive_base_opt.add_item("基线：" + nm)
+	_adaptive_base_opt.selected = clampi(cfg.adaptive_difficulty_base, 1, 5) - 1
+	_adaptive_base_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_adaptive_base_opt.tooltip_text = "1 入门 / 2 轻松 / 3 均衡（默认）/ 4 挑战 / 5 严苛。\n" \
+		+ "自适应开启时，当前档位只在这条基线 ±1 档内移动；关掉后基线只用于下次开启。"
+	_adaptive_base_opt.item_selected.connect(_on_adaptive_base_selected)
+	adaptive_row.add_child(_adaptive_base_opt)
 	# 聊天摘要用 LLM（v3.8.0）：**默认关**——聊天摘要走规则式（纯函数分段 + 模板摘要）、零额外 LLM 调用；
 	# 开启后只在**局末 / 空闲**用 LLM 补做分段总结（落子回合内绝不加调用）。写回 config.json 并即时生效。
 	_acc_check(drawer, "聊天摘要用 LLM", cfg.chat_digest_llm, "digest",
@@ -677,7 +750,6 @@ func _build_right_panel(root: Control) -> void:
 		agent.hint()))
 	_buttons.append(_button(btn_row, "局面分析", func():
 		_allow_tts_fillers()
-		_hide_estimate()                        # 点一次＝重新算：先收起上一张，等新的 estimate 事件
 		agent.analyze_position()))
 	_buttons.append(_button(btn_row, "重来", _ask_reset))
 	var end_btn := _button(btn_row, "结束", _ask_end)
@@ -699,6 +771,23 @@ func _build_right_panel(root: Control) -> void:
 	# v3.11.3：局后给一个**明确的出口**——不用先想起 Esc，直接回封面（开始新局 / 设置 / 退出）
 	_btn_home = _button(_review_box, "返回主界面", _on_back_to_title)
 	_btn_home.tooltip_text = "收起这局，回主界面（可开新局 / 改设置 / 退出；对局中按 Esc 也是这里）"
+	_btn_report = _button(_review_box, "战报", _on_report_request)
+	_btn_report.tooltip_text = "生成一张 PNG 战报：棋盘、手顺、胜率/目差、关键点评与亏损手（保存到用户目录并复制路径）"
+
+	# 全盘 AI 复盘（v3.11.5）：只有从棋谱库选一盘进来时才显示这一行，不挤普通界面。
+	# 棋盘是**本地回放**（GameReplay），后端只按段做分析与点评，不碰当前对局。
+	_fr_box = HBoxContainer.new()
+	_fr_box.add_theme_constant_override("separation", 6)
+	_fr_box.visible = false
+	vb.add_child(_fr_box)
+	_fr_prev = _button(_fr_box, "上一手", func(): _fr_step_by(-1))
+	_fr_prev.tooltip_text = "只在这个模式下翻看棋谱；自动解说会继续按段落推进"
+	_fr_next = _button(_fr_box, "下一手", func(): _fr_step_by(1))
+	_fr_toggle = _button(_fr_box, "暂停", _on_fr_toggle)
+	_fr_toggle.tooltip_text = "暂停 / 继续自动解说（当前这段说完后停下）"
+	_btn_fr_exit = _button(_fr_box, "退出复盘", _exit_full_review)
+	GufengTheme.apply_seal_button(_btn_fr_exit, false)
+	_btn_fr_exit.tooltip_text = "结束全盘复盘，棋盘回到当前对局"
 
 	# 俗手回档
 	var bad_title := Label.new()
@@ -1005,9 +1094,9 @@ func _apply_panel_layout(animated := true, dur := 0.18, apply_board := true) -> 
 		_left_panel.offset_right = lr
 	_right_toggle.text = "▶" if _right_open else "◀"
 	_left_toggle.text = "◀" if _left_open else "▶"
+	_place_estimate_box()                        # 左栏一开合，形势面板立刻跟着让位（不压在侧栏上）
 	if apply_board and board != null:
 		board.set_panels(_left_open, _right_open)
-	_place_estimate_box()                      # 形势面板跟着左栏让位（收起时挪回左上角）
 
 ## 刷新「实际朗读」只读提示：本地优先 → 云端 → 系统（后端读同一份 config.json）
 func _refresh_tts_route() -> void:
@@ -1119,6 +1208,19 @@ func _on_acc_toggled(on: bool, which: String) -> void:
 		"chunk":
 			cfg.tts_long_chunk = on
 			# 分块已归后端：这个开关只写配置，后端按其 config.json 决定单块字数（重启后端后生效）
+		"sfx":
+			cfg.sfx_enabled = on
+			if sfx != null:
+				sfx.enabled = on
+		"ownership":
+			cfg.ownership_enabled = on
+			if board != null:
+				board.set_ownership_enabled(on)
+		"adaptive":
+			cfg.adaptive_difficulty = on
+			if agent != null:
+				# 原子入口：开关 + 基线一次推一次；后端会回到基线并推一条 difficulty 事件
+				agent.set_adaptive(on, cfg.adaptive_difficulty_base)
 		"digest":
 			cfg.chat_digest_llm = on
 			if agent != null:
@@ -1134,9 +1236,9 @@ func _on_acc_toggled(on: bool, which: String) -> void:
 			if agent != null:
 				agent.set_profile(cfg.profile_enabled, cfg.time_aware_enabled)
 	cfg.save()
-	if which in ["digest", "profile", "time_aware"]:
+	if which in ["digest", "profile", "time_aware", "sfx", "ownership", "adaptive"]:
 		# 它们不是语音项：只进底部状态栏——`_tts_status` 是左栏「语音朗读」的状态行，别写串
-		var nm2 := "聊天摘要用 LLM" if which == "digest" else ("玩家棋风画像" if which == "profile" else "时间感知")
+		var nm2 := "聊天摘要用 LLM" if which == "digest" else ("玩家棋风画像" if which == "profile" else ("时间感知" if which == "time_aware" else ("音效" if which == "sfx" else ("领地热力图" if which == "ownership" else "自适应难度"))))
 		_set_status("%s 已%s（立即生效）" % [nm2, "开启" if on else "关闭"])
 		return
 	var nm := "同步说话" if which == "sync" else ("整段合成" if which == "batch" else "长句合并")
@@ -1150,6 +1252,15 @@ func _on_tts_speed(v: float, persist: bool) -> void:
 		tts.speed = v
 	if persist:
 		cfg.save()
+
+## 音效音量（右侧 ⚙ 抽屉）：拖动即时生效，松手才写盘 + 状态栏提示
+func _on_sfx_volume(v: float, persist: bool) -> void:
+	cfg.sfx_volume = clampf(v, 0.0, 1.0)
+	if sfx != null:
+		sfx.volume = cfg.sfx_volume
+	if persist:
+		cfg.save()
+		_set_status("音效音量：%d%%" % int(round(cfg.sfx_volume * 100.0)))
 
 func _on_tts_pitch(v: float, persist: bool) -> void:
 	cfg.tts_pitch = v
@@ -1178,6 +1289,10 @@ func _add_msg(kind: String, text: String) -> void:
 	var speak_kind := "idle" if kind == "ai_idle" else ""
 	var text_only := pairing.take_text_only_mark(kind) if is_ai else false
 	var wants_speech := message_needs_speech(kind, text_only)
+	if kind == "ai_review" and not _fr_active:
+		if wants_speech:
+			_register_tomb("")                   # 已经退出全盘复盘：迟到的点评连同它的语音一起丢掉
+		return
 	if kind == "ai_idle" and _idle_muted:
 		_register_tomb(speak_kind)           # 本地作废：留个占位吃掉它自己那条 speech
 		return                               # 玩家已经回来继续下棋：这句走神搭话作废（不出声也不显示）
@@ -1188,8 +1303,13 @@ func _add_msg(kind: String, text: String) -> void:
 		text = str(parsed[1])
 		if text.strip_edges() == "":
 			return
-		var norm := text.strip_edges()
-		if kind != "ai_move" and _recent_ai_texts.has(norm):
+		# 防复读按「去掉 {行为} 后的正文」判断：只换动作、正文一样的两条也算复读
+		var action_parsed := _strip_actions(text)
+		var norm := str(action_parsed[1]).strip_edges()
+		var acts: Array = action_parsed[0]
+		if norm == "" and acts.is_empty():
+			return
+		if norm != "" and kind != "ai_move" and _recent_ai_texts.has(norm):
 			print("[chat] 防复读（最近 %d 条内一字不差）已抑制：%s" % [_recent_ai_texts.size(), norm])
 			# 兜底判据：后端已去重，这里只兜 WS 重连后乱序到达的重复句（含隔了几条的原样复读）。
 			# 占位（tomb）是用来「吃掉它自己那条 speech」的——**无语音的台词不许留占位**，
@@ -1197,9 +1317,10 @@ func _add_msg(kind: String, text: String) -> void:
 			if wants_speech:
 				_register_tomb(speak_kind)
 			return
-		_recent_ai_texts.append(norm)
-		while _recent_ai_texts.size() > AI_DEDUP_WINDOW:
-			_recent_ai_texts.pop_front()
+		if norm != "":
+			_recent_ai_texts.append(norm)
+			while _recent_ai_texts.size() > AI_DEDUP_WINDOW:
+				_recent_ai_texts.pop_front()
 	# 所有消息统一入队、单协程顺序投递：ai_comment 前由导演层加犹豫节拍，延迟期间顺序不乱
 	# 要由后端朗读的 AI 台词在这里就登记配对记录（登记顺序 = 与 speech 事件的配对顺序）；
 	# 无语音的台词（推送方声明的 `AI_NOTICE` / 本地 `text_only` 标记）**不登记**——它没有语音，
@@ -1289,6 +1410,36 @@ static func _strip_tone(text: String) -> Array:
 	if not ["sigh", "cheer", "proud"].has(tone):
 		tone = ""
 	return [tone, clean]
+
+## 剥离回复里的 {行为} 标签 → [动作数组, 干净文本]。未知标签照样删（防花括号漏进气泡）。
+static func _strip_actions(text: String) -> Array:
+	if _action_re.get_pattern() == "":
+		_action_re.compile("\\{\\s*([^{}]{1,16})\\s*\\}")
+	var acts: Array = []
+	for m in _action_re.search_all(text):
+		acts.append(m.get_string(1).strip_edges())
+	return [acts, _action_re.sub(text, "", true).strip_edges()]
+
+## 标签名 → 化身动作键；与后端 `actions.ALLOWED` 一一对应。未知动作返回空串（忽略）。
+static func action_key(name: String) -> String:
+	match name.strip_edges().to_lower():
+		"笑", "微笑", "轻笑", "smile":
+			return "smile"
+		"大笑", "笑出声", "laugh":
+			return "laugh"
+		"得意", "骄傲", "proud":
+			return "proud"
+		"惊讶", "吃惊", "意外", "surprise":
+			return "surprise"
+		"担心", "担忧", "worried":
+			return "worried"
+		"难过", "失落", "sad":
+			return "sad"
+		"脸红", "害羞", "blush":
+			return "blush"
+		"思考", "托腮", "think":
+			return "think"
+	return ""
 
 ## 单协程顺序投递：重要点评前先犹豫一下（她空闲时才犹豫），其余消息即时投递
 func _pump_msg_queue() -> void:
@@ -1400,6 +1551,15 @@ func _release_batch(force_show: bool) -> void:
 	_flush_pending_ai()                 # 已经在响了 / 需要保序：先显示文字
 
 func _add_msg_now(kind: String, text: String) -> void:
+	# {行为} 标签只在**文字真正出现**的这一刻演（有语音时这里正是语音开播 / 配对的显示点）
+	if kind.begins_with("ai"):
+		var parsed := _strip_actions(text)
+		text = str(parsed[1]).strip_edges()
+		var acts: Array = parsed[0]
+		if not acts.is_empty():
+			_play_actions(acts)
+		if text == "":
+			return
 	# 流式收口（后端 stream_tokens 开启时才有）：文字已由 `token` 增量显示在同一气泡里，
 	# 最终内容以这条 message 为准——整条替换，不再另建气泡、也不再走打字机
 	if kind == "ai" and _stream_label != null and is_instance_valid(_stream_label):
@@ -1591,7 +1751,7 @@ func _clear_thinking_if_idle() -> void:
 ## 这里只把它**逐项应用**到控件上——退出复盘时同样走这里，所以「逐项恢复」不需要另一套逻辑（V20/V21）。
 func _refresh_lock() -> void:
 	var s := review_lock_state(_reviewing, agent != null and agent.busy, _speech_hold, _move_pending,
-			pairing.pending_reveal(), _title_open)
+			pairing.pending_reveal(), _title_open, _fr_active)
 	if board != null:
 		board.locked = bool(s["locked"])
 		board.set_readonly(bool(s["readonly"]))   # 复盘只读（落子与摸头同源）
@@ -1626,17 +1786,18 @@ func _refresh_lock() -> void:
 ## 一边听一边下棋是自然的，一边听一边再叠一个「局面分析」就不必了。
 ## `menu_open`（v3.11.2）＝主界面纸幕开着：棋盘、按钮、聊天与「别的改动入口」一起冻住。
 static func review_lock_state(reviewing: bool, busy: bool, speech_hold: bool,
-		move_pending := false, reveal_pending := false, menu_open := false) -> Dictionary:
-	var locked := busy or move_pending or reveal_pending or menu_open
+		move_pending := false, reveal_pending := false, menu_open := false,
+		full_review := false) -> Dictionary:
+	var locked := busy or move_pending or reveal_pending or menu_open or full_review
 	return {
-		"readonly": reviewing,                  # 棋盘只读：**只在复盘**（不接受落子与摸头）
+		"readonly": reviewing or full_review,          # 棋盘只读：复盘 / 全盘复盘
 		"locked": locked,                       # 她思考中 / 点下就锁 / 她的落子还没揭示 / 主界面开着
-		"buttons_disabled": locked or speech_hold or reviewing,   # 四个功能按钮：锁着、她还在说、或复盘中
-		"chat_editable": not reviewing and not menu_open,         # 聊天：复盘 / 主界面期间禁用（她忙时照旧可排队）
+		"buttons_disabled": locked or speech_hold or reviewing or full_review,   # 四个功能按钮
+		"chat_editable": not reviewing and not menu_open and not full_review,    # 聊天禁用
 		# 别的会改动**真实棋局**的入口（I1）：`⏪ 俗手回档` 按钮（`_bad_box`，每次 state 事件都会重建）
 		# 与两个开关（允许虚着 → POST /api/config、定式导学）。后端刻意不门禁 /api/undo 与 /api/config，
 		# 所以只能靠前端冻住——但**只有复盘**冻它们：她忙碌时回档 / 改配置是既有且被支持的玩法，不许回退。
-		"extra_disabled": reviewing or menu_open,
+		"extra_disabled": reviewing or menu_open or full_review,
 	}
 
 ## 能不能进复盘（I2）：正在跑回合（如「结束」的总结还在途中）或她还有语音没播完时**先别进**。
@@ -1644,6 +1805,25 @@ static func review_lock_state(reviewing: bool, busy: bool, speech_hold: bool,
 ## 破掉「回看全程不出声」。纯函数、门卫可直接断言。
 static func review_can_enter(busy: bool, speech_hold: bool) -> bool:
 	return not (busy or speech_hold)
+
+## 全盘复盘的分段计划：与后端 `full_review.plan_segments` **同一条公式**（门卫两边都钉）。
+## 尽量 8 段以内、每段至少 12 手、最长 48 手；返回 `[[from, to), ...]`（0 基、覆盖 0..total）。
+static func full_review_segments(total: int) -> Array:
+	var n := maxi(total, 0)
+	if n == 0:
+		return []
+	var count := int(ceil(float(n) / float(FULL_REVIEW_MIN_SPAN)))
+	count = clampi(count, 1, FULL_REVIEW_MAX_SEGMENTS)
+	count = maxi(count, int(ceil(float(n) / float(FULL_REVIEW_MAX_SPAN))))
+	var base := int(floor(float(n) / float(count)))
+	var extra := n - base * count
+	var out: Array = []
+	var start := 0
+	for i in count:
+		var span := base + (1 if i < extra else 0)
+		out.append([start, start + span])
+		start += span
+	return out
 
 ## 复盘翻页的目标手数：`cur + delta` 夹到 `0..total`（上界＝总手数，下界＝0 手）。
 ## 纯函数、不碰场景树（V11）；`delta` 先夹到 ±total，`cur` 越界也照夹——脏值一律不抛、不越界。
@@ -1683,6 +1863,9 @@ func _render_bad_moves(list: Array) -> void:
 			_allow_tts_fillers()
 			if agent != null and not agent.busy:
 				pairing.mark_text_only()     # 回档提示只有文字（后端同步方法，T20②）
+			_sfx_ready = false               # 悔棋：下一份 state 只对齐，不把回退当提子
+			if board != null:
+				board.clear_ownership()       # 旧领地图对应的是被悔掉的那一手，先清掉
 			agent.undo(idx))
 		_bad_box.add_child(btn)
 	# 复盘期间重建出来的按钮**必须是灰的**（I1）：每次 `state` 事件（含复盘翻页的只读快照）都会走到这里
@@ -1761,6 +1944,7 @@ func _build_title_screen() -> void:
 	title_screen.theme = _ui_root.theme          # 与棋盘同一套宣纸 / 楷体主题
 	title_screen.primary_pressed.connect(_on_title_primary)
 	title_screen.settings_pressed.connect(_on_title_settings)
+	title_screen.library_pressed.connect(_on_title_library)
 	title_screen.quit_pressed.connect(func(): get_tree().quit())
 	_ui_root.add_child(title_screen)
 
@@ -1792,10 +1976,10 @@ func _open_title_screen(animated := false) -> void:
 	if title_screen == null or _title_open or _transition:
 		return
 	_title_open = true
-	_hide_estimate()                              # 回封面：点目是临时注记，不跟着进主界面
+	_hide_estimate()                              # 封面期间不留对局内的临时注记
 	if board != null:
 		board.input_blocked = true                # 封面期间 Home / C / 拖拽 / 滚轮都不许动视角
-	title_screen.set_restart_mode(_game_started)  # 首次「开始对局」/ 对局中回来「开始新对局」
+	title_screen.set_resume_mode(_game_started)   # 首次「开始对局」/ 对局中「继续对局」
 	_idle = false
 	_set_idle_state(false)
 	_refresh_lock()
@@ -1850,7 +2034,7 @@ func _hide_game_chrome(dur: float) -> void:
 	if board != null:
 		board.set_panels(false, false)            # 平滑回中间：棋盘跟着工具栏一起让位
 
-## 工具栏飞入：开始 / 开始新对局那一段（右侧面板从画面外滑进来，棋盘同时让位）
+## 工具栏飞入：开始 / 继续对局那一段（右侧面板从画面外滑进来，棋盘同时让位）
 func _show_game_chrome(dur: float) -> void:
 	_left_open = false
 	_right_open = true
@@ -1890,9 +2074,7 @@ func _play_exit_to_menu() -> void:
 		await title_screen.fade_in(TITLE_FADE_IN)
 	_transition = false
 
-## 开始 / 开始新对局：首次开局先过设置面板（盖在封面上），再走入场运镜。
-## **每次从主界面进对局都是新的一局**（v3.12.1：不再有「继续上一局」）——
-## 入门前先把上一局的棋盘 / 侧栏清干净，再让后端 reset，运镜期间看到的就已经是空棋盘。
+## 开始 / 继续：首次开局先过设置面板（盖在封面上），再走入场运镜。
 func _on_title_primary() -> void:
 	if _transition or _setup_showing:
 		return                                   # 运镜中 / 设置面板已开：不重入
@@ -1902,76 +2084,394 @@ func _on_title_primary() -> void:
 		_build_setup_panel()
 		await setup_confirmed
 		_setup_done = true
-	if entry_needs_restart(_game_started):
-		_begin_new_game_on_entry()
 	await _play_enter_game()
 	_close_title_screen()
 	if first:
 		_game_started = true
 		title_started.emit()                      # 释放 _ready 的等待，继续起服务 / 问候
 
-## 从主界面进对局要不要重开一局：首次启动不用（后端本来就是空局、服务还没起），
-## 其余每一次都要——「每次从主界面进入游戏刷新棋局，不遗留上一局」。纯函数，门卫可直接断言。
-static func entry_needs_restart(game_started) -> bool:
-	match typeof(game_started):
-		TYPE_BOOL:
-			return game_started
-		TYPE_INT, TYPE_FLOAT:
-			return game_started != 0
-		_:
-			return false
-
-## 从主界面进入＝新的一局：先在本地清屏（运镜期间就看不到旧棋子），再让后端 reset。
-## 后端 `/api/reset` 忙时会拒绝（保护在途回合），所以忙就先挂着，等 `_on_busy_changed(false)` 补发；
-## 不这样做的话，「她还在想的时候按 Esc 回主界面再进来」会静默保留上一局。
-func _begin_new_game_on_entry() -> void:
-	_reset_game_view()
-	_restart_when_idle = true
-	_try_restart_backend()
-
-## 首次进对局也保证是空局：后端是独立进程，可能跨游戏运行（上一次对局还在里面）——
-## 不 reset 的话 `hello` 会把上一局的 stones 推回来。走与「从主界面进来」同一条路（静默 + 忙时等 idle）。
-func _start_launch_game() -> void:
-	if agent == null:
-		return
-	_begin_new_game_on_entry()
-
-func _try_restart_backend() -> void:
-	if not _restart_when_idle or agent == null:
-		return
-	if agent.busy:
-		return                                   # 等这一轮收尾（`_on_busy_changed(false)` 会再进来）
-	_restart_when_idle = false
-	agent.reset_game(true)                       # 静默新局：进门不该每次都多一句「重新来吧」
-
-## 新的一局的侧栏文案（纯函数：从主界面进入 / 「重来」共用，门卫可直接断言）。
-## `state` 事件只带棋盘与俗手，**胜率 / 目差不会自己归零**——必须在这里显式清，否则上一局会留着。
-static func fresh_game_labels() -> Dictionary:
-	return {"moves": "手数: 0", "winrate": "黑胜率: --", "score": score_line(null), "hint": ""}
-
-## 把界面恢复到空局：棋盘 / 手数 / 胜率 / 目差 / 俗手 / 复盘入口 / 点目注记一起清。
-func _reset_game_view() -> void:
-	_hide_estimate()
-	_move_pending = false
-	_last_move_count = 0
-	var lab := fresh_game_labels()
-	_lbl_moves.text = str(lab["moves"])
-	_lbl_wr.text = str(lab["winrate"])
-	_lbl_score.text = str(lab["score"])
-	if _lbl_score_hint != null:
-		_lbl_score_hint.text = str(lab["hint"])
-	_render_bad_moves([])
-	_game_ended = false
-	_refresh_review_entry()
-	if board != null:
-		board.set_stones([])
-		board.set_move_seq([])
-
 ## 主界面的「设置」：复用启动设置面板（只换主按钮措辞），改完回主界面、不掉出对局。
 func _on_title_settings() -> void:
 	if _setup_showing or _transition:
 		return
 	_build_setup_panel("保存设置", "改完点「保存设置」回到主界面；改过的值会写回 config.json。", "返回")
+
+# ================= 棋谱库（v3.11.5） =================
+## 只在主界面打开：全屏模态纸签。网络 / 文件选择都在这里，`GameLibrary` 只做列表与本地回放；
+## 打开期间封面仍在（棋盘锁着），不会误落子。所有读 / 导入 / 导出 / 删除都不碰当前对局。
+
+func _on_title_library() -> void:
+	if _transition or _setup_showing:
+		return
+	if game_library != null:
+		return
+	if agent == null:
+		# 首次启动时服务还没装配：先走一遍「出发前的准备」，再用同一份配置起客户端。
+		# 面板没有取消键（与首次开局一致），所以这里 await 不会被晾住。
+		if not _setup_done:
+			_transition = true
+			_build_setup_panel("保存并进入棋谱库",
+				"以下默认就是上次的配置，直接点「保存并进入棋谱库」即可；改过的值会写回 config.json。", "")
+			await setup_confirmed
+			_transition = false
+		if agent == null:
+			_build_services()
+	if agent == null:
+		_set_status("后端未连接：棋谱库需要后端", true)
+		return
+	game_library = GameLibrary.new()
+	game_library.closed.connect(func(): game_library = null)
+	game_library.refresh_requested.connect(_games_refresh)
+	game_library.import_requested.connect(_games_import)
+	game_library.game_selected.connect(_games_open)
+	game_library.export_requested.connect(_games_export)
+	game_library.delete_requested.connect(_games_delete)
+	game_library.game_review_requested.connect(_on_game_review)
+	_ui_root.add_child(game_library)
+	game_library.set_status("正在读取棋谱库…")
+	_games_refresh()
+
+## 棋谱库的错误文案：HTTP 0 通常是后端没起（比裸「HTTP 0」可读）
+func _games_error_text(code: int, body: PackedByteArray) -> String:
+	if code == 0:
+		return "连不上后端（先启动 backend\\run_server.bat）"
+	return _api_error_text(code, body)
+
+## 列表：`select_id > 0` 时刷新后直接选中它（导入 / 删除后用）；否则保持当前选择或选第一盘。
+func _games_refresh(select_id := 0) -> void:
+	if game_library == null or agent == null:
+		return
+	agent.fetch_bytes("/api/games", HTTPClient.METHOD_GET, {},
+		func(ok: bool, code: int, body: PackedByteArray):
+			if game_library == null:
+				return
+			if not ok:
+				game_library.set_status("棋谱库读取失败：" + _games_error_text(code, body), true)
+				return
+			var d := _json_dict(body)
+			var list = d.get("games", [])
+			if typeof(list) != TYPE_ARRAY:
+				list = []
+			game_library.set_games(list)
+			game_library.set_status("共 %d 盘棋谱" % (list as Array).size())
+			var target := int(select_id)
+			if target <= 0:
+				target = game_library.selected_id()
+			if target <= 0 and not (list as Array).is_empty():
+				target = int(((list as Array)[0] as Dictionary).get("id", 0))
+			if target > 0:
+				_games_open(target))
+
+func _games_open(game_id: int) -> void:
+	if game_library == null or agent == null or game_id <= 0:
+		return
+	agent.fetch_bytes("/api/games/%d" % game_id, HTTPClient.METHOD_GET, {},
+		func(ok: bool, code: int, body: PackedByteArray):
+			if game_library == null:
+				return
+			if not ok:
+				game_library.set_status("读到第 %d 盘失败：%s" % [game_id, _games_error_text(code, body)], true)
+				return
+			var d := _json_dict(body)
+			var rec = d.get("game", {})
+			if typeof(rec) != TYPE_DICTIONARY or (rec as Dictionary).is_empty():
+				game_library.set_status("这盘棋谱是空的", true)
+				return
+			game_library.set_selected(rec)
+			game_library.set_status("已载入第 %d 盘" % game_id))
+
+func _games_import() -> void:
+	if game_library == null or agent == null:
+		return
+	var fd := FileDialog.new()
+	fd.title = "导入 SGF 棋谱"
+	fd.access = FileDialog.ACCESS_FILESYSTEM
+	fd.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	fd.filters = PackedStringArray(["*.sgf ; SGF 棋谱"])
+	fd.use_native_dialog = true
+	fd.file_selected.connect(func(path: String):
+		fd.queue_free()
+		if game_library == null:
+			return
+		var f := FileAccess.open(path, FileAccess.READ)
+		if f == null:
+			game_library.set_status("文件打不开：" + path, true)
+			return
+		var text := f.get_as_text()
+		f.close()
+		if text.strip_edges() == "":
+			game_library.set_status("文件是空的", true)
+			return
+		game_library.set_status("正在导入…")
+		agent.fetch_bytes("/api/games/import", HTTPClient.METHOD_POST, {"sgf": text},
+			func(ok: bool, code: int, body: PackedByteArray):
+				if game_library == null:
+					return
+				if not ok:
+					game_library.set_status("导入失败：" + _games_error_text(code, body), true)
+					return
+				var d := _json_dict(body)
+				var gid := int(d.get("id", 0))
+				game_library.set_status("已导入第 %d 盘" % gid)
+				_games_refresh(gid)))
+	fd.canceled.connect(func(): fd.queue_free())
+	add_child(fd)
+	fd.popup_centered_ratio(0.65)
+
+func _games_export(game_id: int) -> void:
+	if game_library == null or agent == null or game_id <= 0:
+		return
+	game_library.set_status("正在导出 SGF…")
+	agent.fetch_bytes("/api/games/%d/sgf" % game_id, HTTPClient.METHOD_GET, {},
+		func(ok: bool, code: int, body: PackedByteArray):
+			if game_library == null:
+				return
+			if not ok:
+				game_library.set_status("导出失败：" + _games_error_text(code, body), true)
+				return
+			_save_sgf_dialog(game_id, body.get_string_from_utf8()))
+
+func _save_sgf_dialog(game_id: int, text: String) -> void:
+	var fd := FileDialog.new()
+	fd.title = "导出 SGF 棋谱"
+	fd.access = FileDialog.ACCESS_FILESYSTEM
+	fd.file_mode = FileDialog.FILE_MODE_SAVE_FILE
+	fd.filters = PackedStringArray(["*.sgf ; SGF 棋谱"])
+	fd.current_file = "azure_game_%d.sgf" % game_id
+	fd.use_native_dialog = true
+	fd.file_selected.connect(func(path: String):
+		fd.queue_free()
+		if game_library == null:
+			return
+		if not path.to_lower().ends_with(".sgf"):
+			path += ".sgf"
+		var f := FileAccess.open(path, FileAccess.WRITE)
+		if f == null:
+			game_library.set_status("写不进这个位置：" + path, true)
+			return
+		f.store_string(text)
+		f.close()
+		game_library.set_status("已导出：" + path))
+	fd.canceled.connect(func(): fd.queue_free())
+	add_child(fd)
+	fd.popup_centered_ratio(0.65)
+
+func _games_delete(game_id: int) -> void:
+	if game_library == null or agent == null or game_id <= 0:
+		return
+	agent.fetch_bytes("/api/games/%d" % game_id, HTTPClient.METHOD_DELETE, {},
+		func(ok: bool, code: int, body: PackedByteArray):
+			if game_library == null:
+				return
+			if not ok:
+				game_library.set_status("删除失败：" + _games_error_text(code, body), true)
+				return
+			game_library.set_status("已删除第 %d 盘" % game_id)
+			_games_refresh())
+
+# ================= 全盘 AI 复盘（v3.11.5） =================
+## 棋谱库选一盘 → 入场 → 棋盘本地回放；后端按段分析并让 Azure 用强思考点评。
+## 棋子始终由 `GameReplay` 在本地铺（不经过 WS state），因此**不会碰当前对局**；
+## 退出时拉一次 `/api/state` 把棋盘恢复成原来的局面。
+
+func _on_game_review(record: Dictionary) -> void:
+	if _fr_active or _transition or agent == null:
+		return
+	var moves = record.get("moves", [])
+	if typeof(moves) != TYPE_ARRAY or (moves as Array).is_empty():
+		_set_status("这盘棋谱没有落子，没法复盘", true)
+		return
+	_fr_token += 1
+	var token := _fr_token
+	_fr_record = record.duplicate(true)
+	_fr_segments = full_review_segments((moves as Array).size())
+	_fr_index = 0
+	_fr_step = 0
+	_fr_paused = false
+	_fr_requesting = false
+	_fr_last_text = ""
+	# 先置模式再放 title_started：`_ready` 可能同步恢复并 `_greet()`，别让开场白插进复盘
+	_fr_active = true
+	_hide_estimate()
+	# 从主界面进来：先把封面收掉、飞进对局视野（首次还要释放 _ready 的等待）
+	if _title_open:
+		var first := not _game_started
+		await _play_enter_game()
+		_close_title_screen()
+		if first:
+			_game_started = true
+			title_started.emit()
+	if token != _fr_token:
+		return
+	if board != null:
+		_fr_saved_own = board.ownership_values()
+		_fr_saved_stones = board.visible_stones()
+		_fr_saved_seq = _last_move_seq.duplicate()
+		board.clear_ownership()
+		board.set_move_seq(_fr_move_seq())
+	_apply_full_review_board()
+	_refresh_review_entry()
+	_refresh_lock()
+	_set_status("全盘复盘：共 %d 段，准备第 1 段…" % _fr_segments.size())
+	_fr_next_segment(token)
+
+func _fr_move_seq() -> Array:
+	var out: Array = []
+	var moves = _fr_record.get("moves", [])
+	if typeof(moves) != TYPE_ARRAY:
+		return out
+	for m in moves:
+		if typeof(m) == TYPE_ARRAY and (m as Array).size() >= 2:
+			out.append(str((m as Array)[1]))
+	return out
+
+func _fr_total_moves() -> int:
+	var moves = _fr_record.get("moves", [])
+	return (moves as Array).size() if typeof(moves) == TYPE_ARRAY else 0
+
+func _apply_full_review_board() -> void:
+	if board == null:
+		return
+	board.set_stones(GameReplay.stones_at(_fr_record.get("moves", []), _fr_step))
+
+func _fr_step_by(delta: int) -> void:
+	if not _fr_active:
+		return
+	_fr_step = clampi(_fr_step + delta, 0, _fr_total_moves())
+	_apply_full_review_board()
+	_set_status("全盘复盘 · 手动回看第 %d / %d 手" % [_fr_step, _fr_total_moves()])
+
+func _on_fr_toggle() -> void:
+	if not _fr_active:
+		return
+	_fr_paused = not _fr_paused
+	_fr_toggle.text = "继续" if _fr_paused else "暂停"
+	if _fr_paused:
+		_set_status("全盘复盘已暂停（第 %d / %d 手）；点「继续」接着解说" % [_fr_step, _fr_total_moves()])
+		return
+	_set_status("全盘复盘继续…")
+	if not _fr_requesting:
+		_fr_next_segment(_fr_token)
+
+## 请求下一段。**上一段的文字/语音没播完不会走到这里**（`_fr_wait_then_next` 在等）。
+func _fr_next_segment(token: int) -> void:
+	if not _fr_active or token != _fr_token:
+		return
+	if _fr_paused or _fr_requesting:
+		return
+	if _fr_index >= _fr_segments.size():
+		_fr_finish()
+		return
+	var seg: Array = _fr_segments[_fr_index]
+	var from_no := int(seg[0])
+	var to_no := int(seg[1])
+	_fr_step = to_no
+	_apply_full_review_board()
+	var total := _fr_segments.size()
+	_set_status("全盘复盘 · 第 %d/%d 段（第 %d-%d 手）· 她正在算…"
+			% [_fr_index + 1, total, from_no + 1, to_no])
+	_fr_requesting = true
+	var body := {
+		"game_id": int(_fr_record.get("id", 0)),
+		"from": from_no,
+		"to": to_no,
+		"index": _fr_index,
+		"total": total,
+		"previous": _fr_last_text,
+	}
+	var done := func(ok: bool, code: int, data: PackedByteArray):
+		_fr_requesting = false
+		if not _fr_active or token != _fr_token:
+			return
+		if not ok:
+			_fr_paused = true
+			_fr_toggle.text = "继续"
+			_set_status("这一段复盘失败：%s（点「继续」重试）" % _games_error_text(code, data), true)
+			return
+		var d := _json_dict(data)
+		_fr_last_text = str(d.get("text", ""))
+		_fr_index += 1
+		_set_status("全盘复盘 · 第 %d/%d 段已说完（第 %d-%d 手）"
+				% [_fr_index, total, from_no + 1, int(d.get("to", to_no))])
+		_fr_wait_then_next(token)
+	agent.fetch_bytes("/api/review/full/segment", HTTPClient.METHOD_POST, body,
+		done, FULL_REVIEW_TIMEOUT)
+
+## 等这一段的语音 / 打字都结束，再请求下一段（**这就是「分几段防 TTS 忙不过来」**）。
+func _fr_wait_then_next(token: int) -> void:
+	if not _fr_active or token != _fr_token:
+		return
+	var guard := 0
+	while guard < 300:                                   # 最多等 60 秒，绝不把复盘卡死
+		if not _fr_active or token != _fr_token:
+			return
+		var speaking := tts != null and tts.enabled and (tts.is_speaking() or _speech_busy())
+		var typing := not _typing_full.is_empty()
+		var queued := _msg_queue_busy or not _msg_queue.is_empty()
+		if not speaking and not typing and not queued:
+			break
+		await get_tree().create_timer(0.2).timeout
+		guard += 1
+	if not _fr_active or token != _fr_token or _fr_paused:
+		return
+	if tts == null or not tts.enabled:
+		# 没有语音：按字数留出阅读时间，别让下一段追着上一段
+		var wait_sec := clampf(float(_fr_last_text.length()) / 9.0, 1.5, 7.0)
+		await get_tree().create_timer(wait_sec).timeout
+	else:
+		await get_tree().create_timer(0.35).timeout
+	if not _fr_active or token != _fr_token or _fr_paused:
+		return
+	_fr_next_segment(token)
+
+func _fr_finish() -> void:
+	if not _fr_active:
+		return
+	_fr_toggle.text = "完成"
+	_fr_toggle.disabled = true
+	_set_status("全盘复盘看完了（共 %d 手）。点「退出复盘」回到当前棋盘。" % _fr_total_moves())
+
+## 退出：清掉本地回放，拉一次权威 state 回到当前对局（后端全程没被改过）。
+func _exit_full_review() -> void:
+	if not _fr_active:
+		return
+	_fr_active = false
+	_fr_token += 1
+	_fr_paused = false
+	_fr_requesting = false
+	_fr_record = {}
+	_fr_segments = []
+	_fr_index = 0
+	_fr_step = 0
+	_fr_last_text = ""
+	if _fr_toggle != null:
+		_fr_toggle.text = "暂停"
+		_fr_toggle.disabled = false
+	_refresh_review_entry()
+	_refresh_lock()
+	if board != null:
+		board.clear_ownership()
+		board.set_stones(_fr_saved_stones)           # 先本地还原，别在等 state 时露出复盘棋谱
+		board.set_move_seq(_fr_saved_seq)
+		if _fr_saved_own.size() == 361 and cfg.ownership_enabled:
+			board.set_ownership(_fr_saved_own)
+			board.set_ownership_enabled(true)
+	_fr_saved_own = []
+	_fr_saved_stones = []
+	_fr_saved_seq = []
+	if agent == null:
+		_set_status("已退出全盘复盘")
+		return
+	agent.fetch_bytes("/api/state", HTTPClient.METHOD_GET, {},
+		func(ok: bool, code: int, body: PackedByteArray):
+			if not ok:
+				_set_status("退出全盘复盘后同步失败：%s" % _games_error_text(code, body), true)
+				return
+			var st := _json_dict(body)
+			if not st.is_empty():
+				_on_state_changed(st)
+			_refresh_lock()
+			_set_status("已退出全盘复盘，回到当前对局"))
 
 ## Esc：对局中回主界面；主界面里再按一次回对局。弹窗开着 / 复盘 / 运镜中都不抢。
 ## 走 `_input`（与复盘翻页键同一个最早入口）：不然焦点在按钮上时 Esc 会被别处吃掉。
@@ -1985,6 +2485,10 @@ func _menu_keys(event: InputEvent) -> void:
 		return                                   # 运镜期间不叠加第二次切换
 	if _modal_open():
 		return                                   # 设置面板 / 备注框开着：Esc 不抢它们的键盘
+	if _fr_active:
+		get_viewport().set_input_as_handled()
+		_exit_full_review()                      # 全盘复盘：Esc = 退出复盘（回到当前对局）
+		return
 	if _title_open:
 		if _game_started:
 			get_viewport().set_input_as_handled()
@@ -2295,6 +2799,8 @@ const NetClientScript := preload("res://scripts/net/NetClient.gd")
 ## 装配服务：编排与 KataGo/LLM 都在后端服务进程；游戏只做渲染与语音，
 ## 通过 NetClient 以 REST（命令）+ WebSocket（事件）与后端通信。
 func _build_services() -> void:
+	if agent != null:
+		return                                    # 已装配（例如首次从主界面进棋谱库时提前起过）
 	_build_client_tts()                           # 语音朗读归客户端
 	agent = NetClientScript.new()
 	agent.base_url = cfg.backend_url
@@ -2310,6 +2816,8 @@ func _build_services() -> void:
 	agent.set_drift(cfg.emotion_drift, cfg.drift_base)
 	agent.set_digest(cfg.chat_digest_llm)
 	agent.set_profile(cfg.profile_enabled, cfg.time_aware_enabled)   # v3.9.0：画像 / 时间感知两个开关
+	agent.adaptive_difficulty = cfg.adaptive_difficulty              # v3.11.5：自适应难度（默认关）
+	agent.adaptive_difficulty_base = cfg.adaptive_difficulty_base
 	_wire_agent()
 	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
 
@@ -2334,7 +2842,9 @@ func _wire_agent() -> void:
 	agent.message.connect(_add_msg)
 	agent.state_changed.connect(_on_state_changed)
 	agent.info_changed.connect(_on_info_changed)
-	agent.estimate_event.connect(_on_estimate)
+	agent.ownership_changed.connect(_on_ownership_changed)
+	agent.estimate_event.connect(_on_estimate)      # 局面点目（只在点「局面分析」时来）
+	agent.difficulty_changed.connect(_on_difficulty_changed)
 	agent.busy_changed.connect(_on_busy_changed)
 	agent.move_rejected.connect(_on_move_rejected)   # 这一手被后端拒绝：撤掉乐观子（v3.9.5）
 	agent.mood_changed.connect(_on_mood_changed)
@@ -2368,6 +2878,42 @@ func _mood_sound(kind: String) -> void:
 	_mood = kind
 	_mood_ms = now
 	tts.play_filler(kind, true)
+
+## {行为} 标签 → 化身动作：只在文字/语音出现的时刻调用（见 `_add_msg_now`）。
+## 一个段里最多两个：表情按顺序播放，后一个覆盖前一个；脸红单独走定时器。
+func _play_actions(acts: Array) -> void:
+	if avatar == null:
+		return
+	var played := 0
+	for a in acts:
+		var key := action_key(str(a))
+		if key == "":
+			continue
+		played += 1
+		match key:
+			"smile":
+				avatar.play_expression("pleased")
+			"laugh":
+				avatar.play_expression("laugh")
+			"proud":
+				avatar.play_expression("delight")
+			"surprise":
+				avatar.play_expression("puzzled")
+			"worried":
+				avatar.play_expression("worried")
+			"sad":
+				avatar.play_expression("sad")
+			"think":
+				avatar.play_expression("puzzled")
+			"blush":
+				_blush_seq += 1
+				var token := _blush_seq
+				avatar.set_blush(true)
+				get_tree().create_timer(2.6).timeout.connect(func():
+					if token == _blush_seq and avatar != null:
+						avatar.set_blush(false))
+		if played >= 2:
+			break
 
 ## 三维情绪区域变化：持续表情 / 一次性强调表情 / 语气词 / TTS 音高微调
 func _on_mood_changed(p: Dictionary) -> void:
@@ -2472,6 +3018,8 @@ func _on_tts_status(text: String) -> void:
 		_flush_pending_ai()              # 语音出错：文字不能丢，立即显示
 
 func _greet() -> void:
+	if _fr_active:
+		return                               # 直接从主界面进全盘复盘：开场白不插进来
 	var greet := "嗯~ %s，来下棋吧...我会陪你的 (｡･ω･｡)" % cfg.prompt_user_name
 	if tts != null and tts.play_welcome(cfg.prompt_user_name):
 		_add_msg_now("ai", greet)             # 预制欢迎语音已经开口：文字直接显示，零等待
@@ -2482,8 +3030,10 @@ func _greet() -> void:
 
 func _on_intersection_clicked(x: int, y: int) -> void:
 	_allow_tts_fillers()
-	_hide_estimate()                            # 你一落子：上一张点目图立刻收起（v3.12.0）
+	_hide_estimate()                            # 一手落下，刚才那张点目就过期了：先收起
 	_interrupt_speech_for_move()                # v3.11.1：你一落子，她上一轮没说完的话就让位
+	if sfx != null:
+		sfx.play("stone")                       # 玩家落子：乐观棋子出现的那一刻就响
 	# 点下就锁（本地闩）：`busy` 事件回来之前还有一瞬，期间再点会发出第二手——后端会挡下，
 	# 但棋盘上已经乐观画上了那颗子，回包又被忽略 ⇒ 撤不掉的幽灵子（v3.9.5）。闩由
 	# busy / state / 拒绝回包解开，另有 MOVE_PENDING_SEC 兜底，绝不把棋盘锁死。
@@ -2519,23 +3069,54 @@ func _on_move_rejected(st: Dictionary) -> void:
 	_refresh_lock()
 
 func _on_state_changed(p: Dictionary) -> void:
+	if _fr_active:
+		return                                  # 全盘复盘：棋盘由本地回放掌控，别被 WS state 盖掉
 	_release_move_pending()                # 权威快照到了：乐观落子已经被它取代
-	board.set_stones(p["stones"])
+	var stones = p.get("stones", [])
+	if typeof(stones) != TYPE_ARRAY:
+		stones = []
+	var prev_count := _last_stone_count
+	board.set_stones(stones)
 	board.set_move_seq(p.get("move_seq", []))       # 悬停已有棋子时推手数用（后端 state 自带 GTP 手顺）
+	var seq = p.get("move_seq", [])
+	if typeof(seq) == TYPE_ARRAY:
+		_last_move_seq = seq.duplicate()            # 战报用：最近手顺
 	var mc := int(p["move_count"])
-	# 点目注记只对「她分析时那个局面」有效：手数一变（重来 / 悔棋 / 复盘翻页）就收起
-	if _estimate_move_count >= 0 and mc != _estimate_move_count:
-		_hide_estimate()
+	if mc < _last_move_count and not _reviewing:
+		_info_ready = false                         # 重来 / 悔棋不推 info：别把上一局的形势写进战报
+	_last_stone_count = stones.size()
+	if not _sfx_ready:
+		_sfx_ready = true                           # 首次（或重连后）只对齐，不把她已有的棋子一次性播出声音
+	elif not _reviewing and mc > _last_move_count:
+		_play_move_sfx(p, prev_count)
 	if mc > _last_move_count:                       # Azure 每落一子：先注视自己的落点，再交还鼠标跟随
-		var stone := _last_stone(p["stones"])
+		var stone := _last_stone(stones)
 		if not stone.is_empty() and str(stone["c"]) == "white":
 			board.look_at_board_point(board.stone_world(int(stone["x"]), int(stone["y"])), 2.0)
 	_last_move_count = mc
+	if _estimate_move_count >= 0 and mc != _estimate_move_count:
+		_hide_estimate()                               # 局面已经变了（落子 / 悔棋 / 重来）：旧点目收起
 	if _reviewing:
 		_review_cur = mc                                # 复盘翻页的进度以后端推来的只读快照为准
 	_lbl_moves.text = "手数: %d" % mc
 	_chk_pass.set_pressed_no_signal(bool(p["allow_pass"]))
 	_render_bad_moves(p["bad_moves"])
+
+## 一手的音效：虚着 → 提子 → 她的落子。
+## 玩家的落子在 `_on_intersection_clicked` 已经响过，这里不重复；她的子要等 state 揭示才响。
+func _play_move_sfx(p: Dictionary, prev_count: int) -> void:
+	if sfx == null:
+		return
+	var seq = p.get("move_seq", [])
+	if typeof(seq) == TYPE_ARRAY and seq.size() > 0 and str(seq[seq.size() - 1]) == "pass":
+		sfx.play("pass")
+		return
+	if _last_stone_count < prev_count + 1:
+		sfx.play("capture")
+		return
+	var stone := _last_stone(p.get("stones", []))
+	if not stone.is_empty() and str(stone["c"]) == "white":
+		sfx.play("stone")
 
 ## payload 里带 last=true 的那颗子（最近一手；pass 时为旧值，不会触发注视）
 static func _last_stone(stones: Array) -> Dictionary:
@@ -2545,27 +3126,40 @@ static func _last_stone(stones: Array) -> Dictionary:
 	return {}
 
 func _on_info_changed(wr: float, sc: float) -> void:
+	_last_wr = wr
+	_last_score = sc
+	_info_ready = true
 	_lbl_wr.text = "黑胜率: %.1f%%" % (wr * 100.0)
 	_lbl_score.text = score_line(sc)                       # 原始数字照旧保留
 	if _lbl_score_hint != null:
 		_lbl_score_hint.text = score_hint(sc, wr)          # 下面那行量级人话
 
-## 「局面分析」的点目注记（v3.12.0）：后端在 prepare 阶段、她还在想的时候就发过来，
-## 所以棋盘方块与形势面板和她的思考**同步出现**。前端不加工归属，只把后端的数字排版。
-func _on_estimate(payload: Dictionary) -> void:
-	if board == null:
+## 领地热力图：后端每次落子后的既有分析会推 361 个归属值（+黑/-白）。
+## 复盘快照没有 ownership：进入复盘时已清掉旧图，避免把终局领地盖在回放上。
+func _on_ownership_changed(values: Array, _move_count: int) -> void:
+	if board == null or _reviewing or _fr_active:
 		return
-	board.set_estimate(payload.get("cells", []))
-	_estimate_move_count = int(payload.get("move_count", -1))
-	if _estimate_count != null:
-		_estimate_count.text = estimate_count_line(payload.get("black", 0), payload.get("white", 0))
-	if _estimate_lead != null:
-		_estimate_lead.text = estimate_lead_line(payload.get("lead"), payload.get("komi"))
-	_place_estimate_box()
-	if _estimate_box != null:
-		_estimate_box.visible = true
+	board.set_ownership(values)
+	board.set_ownership_enabled(cfg.ownership_enabled)
 
-## 收起形势注记（玩家下一手 / 重来 / 局面变了 / 回主界面 / 进复盘 / 点「关闭形势」）。
+## 形势点目（v3.12.0 采纳）：只在「局面分析」的回包里来一次。棋盘画小方块 + 左上角纸签；
+## 手数与当前局面不一致（迟到的包）就不显示。它是临时注记：下一手 / 换局面 / 进复盘都会收起。
+func _on_estimate(payload: Dictionary) -> void:
+	if _estimate_box == null or _reviewing or _fr_active or _title_open:
+		return
+	var mc := int(payload.get("move_count", -1))
+	if mc >= 0 and mc != _last_move_count:
+		return                                    # 迟到的旧判断：对应的是上一手，别贴到现在的盘面
+	_estimate_move_count = mc
+	_estimate_count.text = estimate_count_line(payload)
+	_estimate_lead.text = estimate_lead_line(payload)
+	if board != null:
+		var cells = payload.get("cells", [])
+		board.set_estimate(cells if typeof(cells) == TYPE_ARRAY else [])
+	_place_estimate_box()
+	_estimate_box.visible = true
+
+## 收起形势面板（连同棋盘上的点目小方块）：幂等，任何出口都可直接调用。
 func _hide_estimate() -> void:
 	_estimate_move_count = -1
 	if _estimate_box != null:
@@ -2573,29 +3167,55 @@ func _hide_estimate() -> void:
 	if board != null:
 		board.clear_estimate()
 
-## 形势面板「双方点数」：数字是后端标出来的点（空地 + 被点死的对手子）。脏值 ⇒ 「形势: --」。
-static func estimate_count_line(black, white) -> String:
-	var b := _metric(black)
-	var w := _metric(white)
-	if is_nan(b) or is_inf(b) or is_nan(w) or is_inf(w):
-		return "形势: --"
-	return "黑 %d 目 · 白 %d 目" % [int(b), int(w)]
+## 「黑 41 目 · 白 4 目」：脏值 / 缺字段一律按 0（宁可少算，不把面板打崩）。
+static func estimate_count_line(payload: Dictionary) -> String:
+	return "黑 %d 目 · 白 %d 目" % [_count_of(payload, "black"), _count_of(payload, "white")]
 
-## 形势面板「谁领先」：`lead` 是黑方视角目差（含贴目，正数＝黑好），`komi` 是贴目。
-static func estimate_lead_line(lead, komi) -> String:
-	var s := _metric(lead)
-	var txt := "--"
-	if not is_nan(s) and not is_inf(s):
-		if absf(s) < 0.5:
-			txt = "双方接近"
-		elif s > 0.0:
-			txt = "黑领先 %.1f 目" % s
-		else:
-			txt = "白领先 %.1f 目" % -s
-	var k := _metric(komi)
-	if is_nan(k) or is_inf(k):
-		return txt
-	return "%s（贴 %.1f 目）" % [txt, k]
+## 「黑领先 29.5 目（贴 7.5 目）」：lead 是黑方视角（正数＝黑领先，含贴目）；
+## 缺数据给「目差暂缺」，持平给「盘面持平」——不硬说谁领先。
+static func estimate_lead_line(payload: Dictionary) -> String:
+	var komi := 7.5
+	var raw_komi = payload.get("komi", null)
+	if typeof(raw_komi) == TYPE_FLOAT or typeof(raw_komi) == TYPE_INT:
+		komi = float(raw_komi)
+	var raw = payload.get("lead", null)
+	if typeof(raw) != TYPE_FLOAT and typeof(raw) != TYPE_INT:
+		return "目差暂缺（贴 %.1f 目）" % komi
+	var lead := float(raw)
+	if is_nan(lead) or is_inf(lead):
+		return "目差暂缺（贴 %.1f 目）" % komi
+	if is_zero_approx(lead):
+		return "盘面持平（贴 %.1f 目）" % komi
+	return "%s领先 %.1f 目（贴 %.1f 目）" % ["黑" if lead > 0.0 else "白", absf(lead), komi]
+
+static func _count_of(payload: Dictionary, key: String) -> int:
+	var v = payload.get(key, 0)
+	if typeof(v) != TYPE_FLOAT and typeof(v) != TYPE_INT:
+		return 0
+	var n := int(v)
+	return n if n > 0 else 0
+
+## 自适应难度档位变化（v3.11.5）：只喂状态栏，不产生台词 / 语音 / 动画。
+func _on_difficulty_changed(level: int, base: int, reason: String) -> void:
+	if not cfg.adaptive_difficulty:
+		return
+	var lv := clampi(level, 1, 5)
+	var bs := clampi(base, 1, 5)
+	var why := str(reason).strip_edges()
+	var tail := (" · " + why) if why != "" and not why.begins_with("基线") else ""
+	_set_status("自适应难度：%s（基线 %s）%s"
+		% [ADAPTIVE_BASE_NAMES[lv - 1], ADAPTIVE_BASE_NAMES[bs - 1], tail])
+
+## 自适应难度基线（1..5）：写回 config.json 并原子推给后端；当前对局立即按新基线重置档位。
+func _on_adaptive_base_selected(i: int) -> void:
+	var base := clampi(i + 1, 1, 5)
+	if base == cfg.adaptive_difficulty_base:
+		return
+	cfg.adaptive_difficulty_base = base
+	cfg.save()
+	if agent != null:
+		agent.set_adaptive(cfg.adaptive_difficulty, base)
+	_set_status("自适应难度基线：%s（立即生效）" % ADAPTIVE_BASE_NAMES[base - 1])
 
 ## 目差的量级人话（四档；与 `winrate_band` 同一套档位编号）
 const SCORE_PHRASES := ["差不多", "半个角", "一个角的实空", "已经很难追了"]
@@ -2670,13 +3290,15 @@ func _on_busy_changed(busy: bool) -> void:
 		_speech_hold = _speech_busy()      # Azure 还有话没播完（含音频还在取）：继续锁住棋盘，等她说完
 		if not _speech_hold:
 			_reveal_move()                 # 兜底：语音不可用/未播时，也要把落子显示出来
-		_try_restart_backend()             # 主界面进来时她还在想：等这一轮收尾再补发新局 reset
 	_refresh_lock()
 	_clear_thinking_if_idle()
 
 func _on_allow_pass_toggled(pressed: bool) -> void:
 	pairing.mark_text_only()                 # 这条提示只有文字（后端同步方法，T20②）
 	agent.set_allow_pass(pressed)
+
+## 自适应难度的五档基线（索引 0 = 入门 … 4 = 严苛；配置里存 1..5）
+const ADAPTIVE_BASE_NAMES := ["入门", "轻松", "均衡", "挑战", "严苛"]
 
 ## 定式导学的四档频率（与下拉框 index-1 一一对应）：低 25% / 中 50% / 高 75% / 总是 100%。
 ## 最高档给「总是」是给**复测**用的：有资格就一定讲，不必改 config.json 也不会被掷骰吞掉。
@@ -2987,13 +3609,20 @@ func _ask_reset() -> void:
 	_ask_note("重新开始？当前棋局与俗手记录都会清空。", func(_note):
 		_allow_tts_fillers()
 		pairing.mark_text_only()             # 重来提示只有文字（后端同步方法，T20②）
-		_reset_game_view()                   # 棋盘 / 手数 / 胜率 / 目差 / 俗手 / 复盘入口一起清
+		_game_ended = false                  # 新的一局：复盘入口收起（V19，本地标志）
+		_refresh_review_entry()
+		_sfx_ready = false                   # 重来：下一份空盘 state 只对齐，不把收子声当提子
+		_hide_estimate()
+		if board != null:
+			board.clear_ownership()
 		agent.reset_game())
 
 func _ask_end() -> void:
 	_ask_note("对局总结：想对Azure说什么吗？（可留空直接确定）", func(note):
 		_allow_tts_fillers()
 		_game_ended = true                   # 「结束」流程走完：复盘入口出现（V19；不读 st.finished）
+		if sfx != null:
+			sfx.play("game_end")
 		_refresh_review_entry()
 		agent.summarize(note))
 
@@ -3024,19 +3653,92 @@ func _on_back_to_title() -> void:
 		_exit_review()
 	_open_title_screen(true)
 
+# ================= 棋谱战报（v3.11.5） =================
+## 生成 PNG：棋盘、手顺、形势、关键点评与亏损手。独立 2D 画布（GameReport），
+## 不截主界面、不受 3D 相机 / 侧栏开合影响；复盘时按当前回看手数截断。
+func _on_report_request() -> void:
+	if _report_busy or board == null:
+		return
+	_report_busy = true
+	_btn_report.disabled = true
+	_btn_report.text = "生成中…"
+	_set_status("正在生成战报…")
+	if agent == null:
+		_build_and_save_report({})
+		return
+	agent.fetch_bytes("/api/review/notes", HTTPClient.METHOD_GET, {},
+		func(ok: bool, _code: int, body: PackedByteArray):
+			var d := _json_dict(body) if ok else {}
+			_build_and_save_report(d))
+
+func _build_and_save_report(d: Dictionary) -> void:
+	var move_no := _review_cur if _reviewing else _last_move_count
+	var total := _review_total if _reviewing else _last_move_count
+	var data := {
+		"move_no": move_no,
+		"total_moves": total,
+		"reviewing": _reviewing,
+		"stones": board.visible_stones() if board != null else [],
+		"ownership": board.ownership_values() if board != null else [],
+		"ownership_enabled": cfg.ownership_enabled,
+		"winrate": _last_wr,
+		"score": _last_score,
+		"has_info": _info_ready and (not _reviewing or _review_cur >= _review_total),
+		"move_seq": _last_move_seq,
+		"notes": d.get("notes", []),
+		"losses": d.get("losses", []),
+		"date": Time.get_datetime_string_from_system().replace("T", " "),
+		"user": cfg.prompt_user_name,
+	}
+	var vp := SubViewport.new()
+	vp.size = Vector2i(int(GameReport.REPORT_SIZE.x), int(GameReport.REPORT_SIZE.y))
+	vp.transparent_bg = false
+	vp.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	var canvas := GameReport.new()
+	canvas.set_data(data)
+	vp.add_child(canvas)
+	add_child(vp)
+	await get_tree().process_frame
+	await get_tree().process_frame
+	await RenderingServer.frame_post_draw
+	var img := vp.get_texture().get_image() if vp.get_texture() != null else null
+	vp.queue_free()
+	if img == null:
+		_finish_report(false, "")
+		return
+	var dir_abs := ProjectSettings.globalize_path("user://reports")
+	DirAccess.make_dir_recursive_absolute(dir_abs)
+	var stamp := Time.get_datetime_string_from_system().replace(":", "-").replace("T", "_")
+	var rel := "user://reports/azure_report_%s.png" % stamp
+	var err := img.save_png(rel)
+	_finish_report(err == OK, ProjectSettings.globalize_path(rel))
+
+func _finish_report(ok: bool, path: String) -> void:
+	_report_busy = false
+	if _btn_report != null:
+		_btn_report.disabled = false
+		_btn_report.text = "战报"
+	if ok:
+		DisplayServer.clipboard_set(path)
+		_set_status("战报已保存（路径已复制）：" + path)
+	else:
+		_set_status("战报生成失败：无法写入用户目录", true)
+
 ## 进入复盘：POST /api/review {"on": true} → 冻结 UI + 空闲收尾 + 用**新鲜**的 state 对齐总手数 + 拉存档。
 ## **不推盘面**：棋盘上本来就是终局那手，玩家按 ◀ 往回看即可。
 func _enter_review() -> void:
 	if agent == null:
 		_set_status("后端未连接：无法进入复盘")
 		return
-	_hide_estimate()                              # 复盘是只读回看：先把点目注记收掉
 	agent.fetch_bytes("/api/review", HTTPClient.METHOD_POST, {"on": true},
 		func(ok: bool, code: int, body: PackedByteArray):
 			if not ok:
 				_set_status("进入复盘失败：%s" % _api_error_text(code, body))
 				return
 			_reviewing = true
+			_hide_estimate()                                # 复盘期间不留对局内的临时注记
+			if board != null:
+				board.clear_ownership()                     # 复盘快照没有 ownership：别把终局领地盖在回放上
 			_cancel_idle_speech()                       # 复盘期间绝不出声：作废还没开口 / 还在合成的走神搭话（V20）
 			_review_total = _last_move_count            # 先给个下界；下面用新鲜 state 覆盖（Minor #6）
 			_review_cur = _review_total
@@ -3073,6 +3775,7 @@ func _exit_review() -> void:
 				_set_status("退出复盘失败：%s" % _api_error_text(code, body))
 				return
 			_reviewing = false
+			_sfx_ready = false                           # 退出复盘：拉回终局的 state 只对齐，不播提子/落子声
 			_btn_prev.visible = false
 			_btn_next.visible = false
 			_btn_review.text = "复盘"
@@ -3108,20 +3811,32 @@ func _review_step(delta: int) -> void:
 				return
 			_set_status("复盘：第 %d / %d 手" % [_review_cur, _review_total]))
 
-## 复盘入口的显隐：只在**对局结束后**出现（V19 的本地标志，不改后端 `finished` 语义）。
+## 复盘入口的显隐：普通复盘只在**对局结束后**出现；全盘复盘模式则只显示它自己那一行。
 func _refresh_review_entry() -> void:
 	if _review_box != null:
-		_review_box.visible = _game_ended
+		_review_box.visible = _game_ended and not _fr_active
+	if _fr_box != null:
+		_fr_box.visible = _fr_active
 
 ## 复盘翻页键（← / →）：**只在复盘模式内生效**，绝不抢聊天框的键盘输入（V20）。
 ## 走 `_input`（最早一步）而不是 `_unhandled_input`：复盘期间聊天框已被禁用（`editable=false`），
 ## 而焦点在按钮上时方向键会在 GUI 阶段被吃掉去做焦点导航——放到最早才抢不到。
 ## 复盘模式外立刻返回，键盘行为与以前一字不差。
 func _review_keys(event: InputEvent) -> void:
-	if not _reviewing or not (event is InputEventKey):
+	if not (event is InputEventKey):
 		return
 	var k := event as InputEventKey
 	if not k.pressed or k.echo:
+		return
+	if _fr_active and not _reviewing:
+		if k.keycode == KEY_LEFT:
+			_fr_step_by(-1)
+			get_viewport().set_input_as_handled()
+		elif k.keycode == KEY_RIGHT:
+			_fr_step_by(1)
+			get_viewport().set_input_as_handled()
+		return
+	if not _reviewing:
 		return
 	if k.keycode == KEY_LEFT:
 		_review_step(-1)
@@ -3213,7 +3928,7 @@ func _process(delta: float) -> void:
 		_set_idle_state(true)
 		_next_talk_ms = now + int(IDLE_TALK_FIRST * 1000.0)
 	# 复盘期间绝不出声（V20/M3）：走神搭话本来该由后端门禁挡住，前端也不许发——不依赖 Task C。
-	if _idle and now >= _next_talk_ms and not _reviewing and not _title_open \
+	if _idle and now >= _next_talk_ms and not _reviewing and not _title_open and not _fr_active \
 			and agent != null and not agent.busy:
 		_next_talk_ms = now + randi_range(int(IDLE_TALK_MIN * 1000.0), int(IDLE_TALK_MAX * 1000.0))
 		_idle_muted = false                             # 新的一轮搭话：先解除「玩家已回来」的作废标记
