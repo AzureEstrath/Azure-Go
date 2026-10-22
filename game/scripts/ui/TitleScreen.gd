@@ -61,7 +61,7 @@ func _build() -> void:
 	add_child(center)
 
 	var box := PanelContainer.new()
-	box.add_theme_stylebox_override("panel", GufengTheme.veil_card(0.66, 26))
+	box.add_theme_stylebox_override("panel", GufengTheme.veil_card(0.80, 26))
 	box.custom_minimum_size = Vector2(560, 0)
 	center.add_child(box)
 

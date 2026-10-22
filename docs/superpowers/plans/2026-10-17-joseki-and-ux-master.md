@@ -434,7 +434,7 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'app.joseki_gate'`
 - **走错优先**：`mistake=True` → 直接 True，不进概率。
 - **冷却**：维护「族 → 最近讲过的手数」（`last_taught_move`），窗口内按未命中处理。
 - **画像 / 情绪**：`skill_adj(ranks, seen_count)` 用局内最近若干手的 `player_rank` + 该族计数；`mood_adj(mood)` 用现有 `mood` 区域（好奇 / 兴奋 ↑，疲惫 / 低落 ↓）。取不到 → `0.0`。
-- `bump` 只在**本局首次进入该族**时执行一次（`joseki_counted` 去重），且必须 `await asyncio.to_thread(...)`；`joseki_counted` / `joseki_dropped` 加入 `make_snapshot()` 与 `_rollback`，悔棋回档时对被回滚的族 `unbump`。
+- `bump` 只在**本局首次讲解该族**时执行一次（`joseki_counted` 去重；**计数＝讲解次数**——频率层未命中不消耗「前 3 次」教学预算，与 `tests/test_joseki_gate.py` 锁定的口径一致），且必须 `await asyncio.to_thread(...)`；`joseki_counted` / `joseki_dropped` 加入 `make_snapshot()` 与 `_rollback`，悔棋回档时对被回滚的族 `unbump`。
 - 决策留**一行日志**（rate / adj / roll / 命中），便于调参与事后归因。
 
 - [ ] **Step 4: 跑测试确认通过**

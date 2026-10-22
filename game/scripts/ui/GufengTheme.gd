@@ -150,7 +150,7 @@ static func seal(pad := 10) -> StyleBoxFlat:
 
 ## 按钮：一条墨线 + 纸底；悬停变朱砂字，按下反白。（无图标、无圆角、无阴影）
 static func apply_button(b: Button, big := false) -> void:
-	var fs := 15 if big else 13
+	var fs := 16 if big else 14
 	b.add_theme_font_size_override("font_size", fs)
 	b.add_theme_stylebox_override("normal", _btn_box(PAPER_WARM, 0.45, false))
 	b.add_theme_stylebox_override("hover", _btn_box(PAPER_TONE, 0.85, false))
@@ -182,7 +182,7 @@ static func _btn_box(bg: Color, border_a: float, inverted: bool) -> StyleBoxFlat
 
 ## 朱砂主按钮（结束 / 确认）：整块红印，反白字
 static func apply_seal_button(b: Button, big := true) -> void:
-	b.add_theme_font_size_override("font_size", 15 if big else 13)
+	b.add_theme_font_size_override("font_size", 16 if big else 14)
 	b.add_theme_stylebox_override("normal", seal(12))
 	b.add_theme_stylebox_override("hover", _seal_variant(Color(0.72, 0.27, 0.21)))
 	b.add_theme_stylebox_override("pressed", _seal_variant(Color(0.50, 0.15, 0.11)))
@@ -224,7 +224,7 @@ static func seal_char(ch: String) -> Control:
 	l.text = ch
 	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	l.add_theme_font_size_override("font_size", 17)
+	l.add_theme_font_size_override("font_size", 18)
 	l.add_theme_color_override("font_color", PAPER_WARM)
 	p.add_child(l)
 	return p
@@ -261,7 +261,7 @@ static func apply_option(o: OptionButton) -> void:
 static func build_theme(f: Font) -> Theme:
 	var th := Theme.new()
 	th.default_font = f
-	th.default_font_size = 14
+	th.default_font_size = 15
 	th.set_color("font_color", "Label", INK)
 	th.set_color("font_color", "Button", INK)
 	th.set_color("font_color", "CheckBox", INK)

@@ -29,6 +29,7 @@ func _run() -> void:
 	_test_corners()
 	_test_reset_view()
 	_test_camera_flight()
+	_test_pat_zone_distance()
 
 	if _fail == 0:
 		print("[view] PASS：", _total, " 项断言全部通过")
@@ -148,3 +149,12 @@ func _test_camera_flight() -> void:
 	_check("⑤ 越界进度夹到 0..1（脏值不把相机甩出去）",
 			is_zero_approx(Board3D.fly_ease(-3.0)) and is_equal_approx(Board3D.fly_ease(9.0), 1.0))
 	b.free()
+
+## ④′ 摸头判定：头出画时用「头 → 髋 → 脚」折线，点在可见的身体上仍算命中
+func _test_pat_zone_distance() -> void:
+	_check("④′ 线段上的点距离为 0",
+			is_zero_approx(Board3D._point_segment_distance(Vector2(50, 50), Vector2(0, 50), Vector2(100, 50))))
+	_check("④′ 线段外按垂直距离算（10px）",
+			is_equal_approx(Board3D._point_segment_distance(Vector2(50, 60), Vector2(0, 50), Vector2(100, 50)), 10.0))
+	_check("④′ 头在屏幕上方、髋在下方：点身体中段仍命中（距离 0）",
+			is_zero_approx(Board3D._point_segment_distance(Vector2(50, 40), Vector2(50, -200), Vector2(50, 300))))

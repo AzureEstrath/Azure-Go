@@ -65,6 +65,13 @@ var tts_base_url := "https://api.openai.com/v1"
 var tts_model := "tts-1"
 var tts_api_key := ""             # 云端 TTS（OpenAI 兼容 /v1/audio/speech）的 API Key；留空则不发送
 var tts_voice := TTS_VOICE_DEFAULT
+## —— 本地语音（优先；只读镜像）——
+## 实际合成在后端：`tts_local_base_url` 非空 ⇒ 先试本地，失败再试云端，最后系统语音。
+## 前端只读它做界面提示（左侧栏「实际朗读」），不改、不清空；手改 config.json 或
+## `dev_local.ps1` 写入的值随 `_raw` 原样保留。
+var tts_local_base_url := ""
+var tts_local_model := ""
+var tts_local_voice := ""
 var tts_speed := 1.0
 var tts_pitch := 1.0              # 播放层音调（0.8~1.3，会略带动语速）
 var tts_volume := 1.0
@@ -147,10 +154,28 @@ static func load_config(path := "") -> AzureConfig:
 			c.tts_sync_speak = bool(d.get("tts_sync_speak", c.tts_sync_speak))
 			c.tts_batch_speak = bool(d.get("tts_batch_speak", c.tts_batch_speak))
 			c.tts_long_chunk = bool(d.get("tts_long_chunk", c.tts_long_chunk))
+			c.tts_local_base_url = str(d.get("tts_local_base_url", c.tts_local_base_url)).strip_edges()
+			c.tts_local_model = str(d.get("tts_local_model", c.tts_local_model)).strip_edges()
+			c.tts_local_voice = str(d.get("tts_local_voice", c.tts_local_voice)).strip_edges()
 	return c
 
-## 旧配置归一化：v2.x 的 "cosyvoice"（本地 CosyVoice 表单接口）已不是合法朗读方式，一律回落云端 openai，
-## 避免「存储值 ≠ 下拉显示值」（下拉只有 system / openai，未知值会让它默认落在 system 上）
+## 实际朗读路线（只用于界面提示；合成在后端，按 本地 → 云端 → 系统 逐级降级）
+func tts_route_label() -> String:
+	if tts_mode == "system":
+		return "系统语音（Windows）"
+	if tts_mode == "aliyun":
+		if tts_aliyun_api_key != "" and tts_aliyun_voice != "":
+			return "阿里云 Voice Studio（实时流式）"
+		return "阿里云 Voice Studio（未配置 Key/音色，将回落系统语音）"
+	if tts_local_base_url != "":
+		var v := (" · 音色 " + tts_local_voice) if tts_local_voice != "" else ""
+		return "本地语音（优先）%s%s" % [tts_local_base_url, v]
+	if tts_base_url.strip_edges() != "":
+		return "云端语音 %s" % tts_base_url
+	return "系统语音（Windows；本地/云端地址都未配置）"
+
+## 旧配置归一化：v2.x 的 "cosyvoice"（本地 CosyVoice 表单接口）已不是合法朗读方式，一律回落 openai，
+## 避免「存储值 ≠ 下拉显示值」（下拉是 system / openai / aliyun，未知值会让它默认落在 system 上）
 static func _normalize_tts_mode(v: String) -> String:
 	var m := v.strip_edges().to_lower()
 	return m if m in TTS_MODES else "openai"

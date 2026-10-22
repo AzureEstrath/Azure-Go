@@ -136,6 +136,12 @@ func _run() -> void:
 	_check("⑥ 两份账都空 ⇒ 零行（不硬造内容）", main_script.review_note_lines([], []).is_empty())
 	_check("⑥ 非数组脏值（null / 字符串）不抛、返回空", main_script.review_note_lines(null, null).is_empty()
 			and main_script.review_note_lines("oops", {}).is_empty())
+	# 语气标记必须在复盘存档里也剥掉：实时气泡走 _strip_tone，存档若直出就会把 [[tone:cheer]] 显示给玩家
+	var toned := main_script.review_note_lines(
+		[{"move_no": 7, "kind": "aim", "side": "A", "text": "[[tone:cheer]] 我打算下 Q4"}], [])
+	_check("⑥ 复盘存档剥离 [[tone:...]] 语气标记",
+			toned.size() == 1 and not str(toned[0]).contains("tone")
+			and str(toned[0]).contains("我打算下 Q4"))
 
 	# —— ⑦ 复盘期间**别的**改动入口一并冻结（修复轮 1 · I1）——
 	# 俗手回档按钮（`_bad_box`，每次 state 事件都会重建）与两个开关（允许虚着 → /api/config、定式导学）

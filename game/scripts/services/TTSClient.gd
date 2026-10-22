@@ -51,6 +51,9 @@ var _filler_last_ms := 0               # 上次插语气词的时刻（冷却用
 var _filler_last_kind := ""            # 上次语气词的类型（情绪声可优先接在「思考声」后、并可打断它）
 var _filler_last_idx := {}             # kind → 上次播的序号（避免同一句连着播）
 var think_filler_budget := 0           # 本回合剩余可自动插的 think 语气词次数（Main 在玩家互动时重置）
+var _interrupting := false             # 正在做「淡出 + 预制短句」的打断；期间不许 _pump 新语音
+var _interrupt_gen := 0                # 打断代际：stop() 会作废尚未执行完的淡出回调
+var _hold_until_ms := 0                # 新语音最早开播时刻（等预制短句说完；0 = 不等）
 
 func _ready() -> void:
 	_player = AudioStreamPlayer.new()
@@ -72,6 +75,11 @@ const FILLER_FILES := {
 	"cheer": ["filler_cheer_1.wav", "filler_cheer_2.wav"],       # 惊叹/赞叹：哇！、好哎~
 	"proud": ["filler_proud_1.wav", "filler_proud_2.wav"],       # 小得意/撒娇：哼哼~、诶嘿
 	"hmph": ["filler_hmph_1.wav", "filler_hmph_2.wav"],          # 生气/得意的哼：情绪区域爆发时用
+	# 玩家落子打断时的预制短句（v3.11.4）：0.25s 淡出后接一句，再等新合成语音
+	"interrupt": ["filler_interrupt_1.wav", "filler_interrupt_2.wav",
+		"filler_interrupt_3.wav", "filler_interrupt_4.wav",
+		"filler_interrupt_5.wav", "filler_interrupt_6.wav",
+		"filler_interrupt_7.wav"],
 }
 
 ## 载入预制语气词：res://assets/voice/ 下按清单加载
@@ -122,6 +130,80 @@ func play_filler(kind: String, force := false) -> void:
 	_filler_last_idx[kind] = idx
 	_filler_player.stream = arr[idx]
 	_filler_player.play()
+
+## 播一句「被打断」的预制短句（嗯？ / 这么着急？ / 好快！…），返回时长（秒）。
+## 不走 `play_filler` 的冷却与 allow_fillers：玩家一落子就应当立刻有反应。
+func play_interrupt_line() -> float:
+	if not enabled or _filler_player == null or not fillers.has("interrupt"):
+		return 0.0
+	var arr: Array = fillers["interrupt"]
+	if arr.is_empty():
+		return 0.0
+	_filler_player.stop()
+	var idx := randi() % arr.size()
+	if arr.size() > 1 and int(_filler_last_idx.get("interrupt", -1)) == idx:
+		idx = (idx + 1) % arr.size()
+	_filler_last_idx["interrupt"] = idx
+	_filler_last_ms = Time.get_ticks_msec()
+	_filler_last_kind = "interrupt"
+	var st: AudioStream = arr[idx]
+	_filler_player.stream = st
+	_filler_player.play()
+	return st.get_length()
+
+## 新语音最早开播时刻：等预制短句播完（再留一点气口），避免短句和新合成语音叠在一起。
+func hold_for(sec: float) -> void:
+	if sec <= 0.0:
+		return
+	_hold_until_ms = maxi(_hold_until_ms, Time.get_ticks_msec() + int(sec * 1000.0))
+
+## 玩家落子打断（v3.11.4）：先清掉排队旧句（文字由 Main 立即收账显示），当前句 0.25s 音量淡出，
+## 然后播一句预制短句，并让新合成语音等短句说完再开播——像人被打断时收住话头、换口气再接。
+## 返回是否真的做了打断（没有在播 / 没启用时为 false，调用方照旧走自己的收账逻辑）。
+func interrupt_for_move(fade_sec := 0.25) -> bool:
+	if not enabled:
+		return false
+	var had_queue := false
+	for it in _queue:
+		if bool(it.get("start", false)):
+			speech_skipped.emit.call_deferred(int(it["group"]))
+			had_queue = true
+	_queue.clear()
+	if not _speaking and not had_queue and _sapi_pid <= 0:
+		return false
+	# 正在播的那条：立刻把「不会再响」告诉配对层（文字先显示），音频再淡出 0.25 秒。
+	var cur_group := _play_group
+	_play_group = 0
+	if cur_group > 0:
+		speech_skipped.emit.call_deferred(cur_group)
+	_interrupt_gen += 1
+	var gen := _interrupt_gen
+	_interrupting = true
+	var finish := func():
+		if gen != _interrupt_gen:
+			return                                  # stop() / 下一次打断已作废这次回调
+		_interrupting = false
+		if _player != null:
+			_player.stop()
+			_player.volume_db = linear_to_db(clampf(volume, 0.01, 2.0))
+		if _sapi_pid > 0:
+			OS.kill(_sapi_pid)
+			_sapi_pid = -1
+		_play_kind = ""
+		_set_speaking(false)
+		var dur := play_interrupt_line()
+		if dur > 0.0:
+			hold_for(dur + 0.12)                    # 短句 + 一点气口，新语音再进来
+	if _player != null and _player.playing:
+		var tw := create_tween()
+		tw.tween_property(_player, "volume_db", -45.0, maxf(0.01, fade_sec))
+		tw.tween_callback(finish)
+	elif _sapi_pid > 0:
+		# 系统语音没有音量可淡：等 fade 时长再杀进程（听感上仍是「收声」而不是硬切）
+		get_tree().create_timer(maxf(0.01, fade_sec)).timeout.connect(finish)
+	else:
+		finish.call()
+	return true
 
 ## 玩家发起一次互动（落子 / 提问 / 功能按钮）：重置本回合的 think 语气词额度
 func begin_filler_turn() -> void:
@@ -207,6 +289,9 @@ func is_speaking() -> bool:
 
 ## 停掉所有朗读（文字不会跟着消失：排着队的首块 + 正在播的那条都补发 speech_skipped）
 func stop() -> void:
+	_interrupt_gen += 1                          # 作废还没执行完的淡出回调（别在 stop 后又补一句短句）
+	_interrupting = false
+	_hold_until_ms = 0
 	for it in _queue:
 		if bool(it.get("start", false)):
 			speech_skipped.emit.call_deferred(int(it["group"]))
@@ -244,6 +329,9 @@ func cancel_kind(kind: String) -> bool:
 		_set_speaking(false)
 		hit = true
 	if hit:
+		_interrupt_gen += 1                       # 取消期间别让淡出回调再补一句预制短句
+		_interrupting = false
+		_hold_until_ms = 0
 		_pump()                                       # 若队列里还有别的（玩家互动的新回复），立刻接着来
 	return hit
 
@@ -283,6 +371,10 @@ func _exit_tree() -> void:
 	_sapi_pid = -1
 
 func _process(delta: float) -> void:
+	if _hold_until_ms > 0 and Time.get_ticks_msec() >= _hold_until_ms:
+		_hold_until_ms = 0
+		if not _queue.is_empty():
+			_pump()                              # 预制短句说完：新合成语音接着开播
 	if _cooldown > 0.0:
 		_cooldown -= delta
 		if _cooldown <= 0.0 and not _queue.is_empty():
@@ -293,6 +385,8 @@ func _process(delta: float) -> void:
 
 ## 出队一条并开播（播放中 / 队列空 / 冷却中都不动）
 func _pump() -> void:
+	if _interrupting or Time.get_ticks_msec() < _hold_until_ms:
+		return                                   # 打断的淡出 / 预制短句还没走完
 	if _speaking or _queue.is_empty() or _cooldown > 0.0:
 		return
 	var item: Dictionary = _queue.pop_front()

@@ -80,6 +80,43 @@ def _mode(cfg) -> str:
     return m if m in TTS_MODES else DEFAULT_TTS_MODE
 
 
+def _endpoints(cfg) -> list:
+    """合成端点的**尝试顺序**：本地（``tts_local_base_url``）→ 云端（``tts_base_url``）。
+
+    这是「有本地 TTS 优先本地，没有/失败才用云端，云端也不通才系统语音」的唯一实现处。
+    本地端点的 model / voice / api_key 留空时**沿用云端字段**，所以老配置（没有 local 字段）
+    的行为与之前逐项一致；两个地址都空 ⇒ 返回空列表（``enabled`` 判为未启用）。
+    """
+    out = []
+    seen = set()
+    local = _text_of(cfg, "tts_local_base_url").strip()
+    if local:
+        t = _float_cfg(cfg, "tts_local_timeout_sec", 0.0)
+        if t <= 0.0:
+            t = _float_cfg(cfg, "tts_timeout_sec", DEFAULT_TIMEOUT_SEC)
+        out.append({
+            "name": "local",
+            "base_url": local,
+            "model": _text_of(cfg, "tts_local_model").strip() or _text_of(cfg, "tts_model"),
+            "voice": _text_of(cfg, "tts_local_voice").strip() or _text_of(cfg, "tts_voice"),
+            "api_key": _text_of(cfg, "tts_local_api_key").strip() or _text_of(cfg, "tts_api_key"),
+            "timeout": t if t > 0 else DEFAULT_TIMEOUT_SEC,
+        })
+        seen.add(local.rstrip("/"))
+    cloud = _text_of(cfg, "tts_base_url").strip()
+    if cloud and cloud.rstrip("/") not in seen:      # 同一个地址不重复试
+        t = _float_cfg(cfg, "tts_timeout_sec", DEFAULT_TIMEOUT_SEC)
+        out.append({
+            "name": "cloud",
+            "base_url": cloud,
+            "model": _text_of(cfg, "tts_model"),
+            "voice": _text_of(cfg, "tts_voice"),
+            "api_key": _text_of(cfg, "tts_api_key"),
+            "timeout": t if t > 0 else DEFAULT_TIMEOUT_SEC,
+        })
+    return out
+
+
 class TTSClient:
     """云端 TTS 客户端：``speak()`` → 音频 id（``openai``）或系统语音指令（``system``）。
 
@@ -109,7 +146,7 @@ class TTSClient:
         mode = _mode(self.cfg)
         if mode == "system":
             return True
-        return _text_of(self.cfg, "tts_base_url").strip() != ""
+        return len(_endpoints(self.cfg)) > 0
 
     def audio(self, audio_id: str) -> bytes | None:
         """按 id 取音频；未知 id 返回 ``None``。命中会刷新 LRU 位置。"""
@@ -182,48 +219,72 @@ class TTSClient:
         return [c for c in chunk_for_synthesis(text, max_chars=max_chars) if c.strip()]
 
     async def _synthesize(self, chunks: list[str]) -> bytes | None:
-        """逐块合成；任一块失败返回 ``None``（整条降级，绝不返回半截音频）。
+        """按「本地 → 云端」顺序逐路合成；任一整路成功即返回音频，全部失败返回 ``None``。
 
-        每次网络往返都经 ``to_thread``（T10）：同步 ``httpx`` 不得跑在事件循环线程上。
+        **整条语义**：某一路只要有一块失败，就**整条改用下一路**（不把两路的音频拼在一起）；
+        全部路都失败才由调用方降级 ``system``。每次网络往返都经 ``to_thread``（T10）。
         """
-        parts: list[bytes] = []
-        for chunk in chunks:
-            blob = await asyncio.to_thread(self._post_chunk, chunk)
-            if blob is None:
-                return None
-            parts.append(blob)
-        if not parts:
-            return None
-        if len(parts) == 1:
-            return parts[0]                     # 单块：WAV / MP3 原样接受
-        return _join_audio(parts)               # 多块：同格式才拼，否则 None
+        endpoints = _endpoints(self.cfg)
+        for i, ep in enumerate(endpoints):
+            parts: list[bytes] = []
+            failed = False
+            for chunk in chunks:
+                blob = await asyncio.to_thread(self._post_chunk, chunk, ep)
+                if blob is None:
+                    failed = True
+                    break
+                parts.append(blob)
+            if failed:
+                if i + 1 < len(endpoints):
+                    print("[TTS] %s 合成失败，改用下一路（%s）" % (ep["name"], endpoints[i + 1]["name"]))
+                continue
+            if not parts:
+                continue
+            if len(parts) == 1:
+                return parts[0]                 # 单块：WAV / MP3 原样接受
+            joined = _join_audio(parts)         # 多块：同格式才拼，否则 None
+            if joined is not None:
+                return joined
+            if i + 1 < len(endpoints):
+                print("[TTS] %s 多个分块格式不一致，改用下一路（%s）" % (
+                    ep["name"], endpoints[i + 1]["name"]))
+        return None
 
-    def _post_chunk(self, text: str) -> bytes | None:
-        """同步 POST 一块文本，返回音频字节；非 200 / 空响应 / 异常都返回 ``None``。"""
+    def _post_chunk(self, text: str, ep: dict | None = None) -> bytes | None:
+        """同步 POST 一块文本到某一路端点，返回音频字节；非 200 / 空响应 / 异常都返回 ``None``。
+
+        ``ep`` 留空时按云端端点构造（兼容既有单测 / 旧调用点）。
+        """
+        if ep is None:
+            eps = _endpoints(self.cfg)
+            ep = eps[-1] if eps else None
+        if not ep:
+            return None
         try:
             body = {
-                "model": _text_of(self.cfg, "tts_model"),
-                "voice": _text_of(self.cfg, "tts_voice"),
+                "model": ep.get("model") or "",
+                "voice": ep.get("voice") or "",
                 "input": text,
                 "speed": _float_cfg(self.cfg, "tts_speed", 1.0),
                 "response_format": "wav",
             }
             headers = {"Content-Type": "application/json"}
-            key = _text_of(self.cfg, "tts_api_key").strip()
+            key = str(ep.get("api_key") or "").strip()
             if key:
                 headers["Authorization"] = "Bearer " + key     # 留空＝不鉴权（本机回环调试）
-            resp = self._http().post(self._speech_url(), json=body, headers=headers,
-                                     timeout=self._timeout())
+            resp = self._http().post(_speech_url(ep), json=body, headers=headers,
+                                     timeout=float(ep.get("timeout") or DEFAULT_TIMEOUT_SEC))
             if resp.status_code != 200:
-                print("[TTS] 合成返回 HTTP %d（降级为系统语音）" % resp.status_code)
+                print("[TTS] %s 合成返回 HTTP %d（尝试下一路 / 降级系统语音）"
+                      % (ep.get("name"), resp.status_code))
                 return None
             data = bytes(resp.content or b"")
             if not data:
-                print("[TTS] 合成返回空响应（降级为系统语音）")
+                print("[TTS] %s 合成返回空响应（尝试下一路 / 降级系统语音）" % ep.get("name"))
                 return None
             return data
         except Exception as e:                  # noqa: BLE001 —— 超时 / 连接被拒 / 解析失败
-            print("[TTS] 合成请求失败（降级为系统语音）：%s" % e)
+            print("[TTS] %s 合成请求失败（尝试下一路 / 降级系统语音）：%s" % (ep.get("name"), e))
             return None
 
     def _http(self) -> httpx.Client:
@@ -234,13 +295,11 @@ class TTSClient:
         if self._client is None:
             with self._lock:
                 if self._client is None:
-                    self._client = httpx.Client(timeout=self._timeout())
+                    self._client = httpx.Client(timeout=DEFAULT_TIMEOUT_SEC)
         return self._client
 
-    def _speech_url(self) -> str:
-        return _text_of(self.cfg, "tts_base_url").strip().rstrip("/") + SPEECH_PATH
-
     def _timeout(self) -> float:
+        """云端单次合成的默认超时（脏值 / 非正数 → ``DEFAULT_TIMEOUT_SEC``）。"""
         t = _float_cfg(self.cfg, "tts_timeout_sec", DEFAULT_TIMEOUT_SEC)
         return t if t > 0 else DEFAULT_TIMEOUT_SEC
 
@@ -272,6 +331,11 @@ class TTSClient:
         _, blob = self._cache.popitem(last=False)
         self._cache_bytes -= len(blob)
         return True
+
+
+def _speech_url(ep: dict) -> str:
+    """某一路端点的合成 URL：``base_url`` 去尾斜杠 + ``/audio/speech``。"""
+    return str(ep.get("base_url") or "").strip().rstrip("/") + SPEECH_PATH
 
 
 def _result(mode: str, text: str, tone: str, audio_id: str = "") -> dict:

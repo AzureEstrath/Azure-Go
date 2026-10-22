@@ -396,6 +396,32 @@ class TestJosekiActiveTemplates(_Base):
         self.assertNotIn("Estarth", azure)
         self.assertNotEqual(player, azure)
 
+    def test_role_note_inverts_when_the_player_owns_the_corner(self):
+        """角主是黑（对局对面）时，要点里的「我/自己」要讲成「你」、「他/对方」要讲成「我」。"""
+        out = prompts.joseki_enter_prompt(self.NAME, self.KEY, self.CORNER, "B")
+        self._assert_common(out)
+        self.assertIn("角色对调", out)
+        self.assertIn("「你 / 我 / 自己」都指对面", out)
+        self.assertIn("「他 / 对方 / 别人」指你自己", out)
+        self.assertNotIn("Estarth", out)
+
+    def test_role_note_keeps_azure_as_the_corner_owner(self):
+        """角主是白（Azure 自己）时，要点里的「我/自己」仍是「我」、「他/对方」是「你」。"""
+        out = prompts.joseki_enter_prompt(self.NAME, self.KEY, self.CORNER, "W")
+        self._assert_common(out)
+        self.assertIn("角上先落子的一方（你自己）", out)
+        self.assertIn("「你 / 我 / 自己」都指你自己", out)
+        self.assertIn("「他 / 对方 / 别人」指对面", out)
+
+    def test_role_note_is_optional_and_byte_identical_without_owner(self):
+        """旧的三参调用逐字符不变（编排 / 单测的既有断言不受影响）。"""
+        enter = prompts.joseki_enter_prompt(self.NAME, self.KEY, self.CORNER)
+        self.assertEqual(enter, prompts.joseki_enter_prompt(self.NAME, self.KEY, self.CORNER, ""))
+        self.assertNotIn("角色对调", enter)
+        branch = prompts.joseki_branch_prompt(self.NAME, self.KEY, [])
+        self.assertEqual(branch, prompts.joseki_branch_prompt(self.NAME, self.KEY, [], ""))
+        self.assertNotIn("角色对调", branch)
+
 
 # ===================== 阶段三 · Task P5：提示词事件区块（v3.8.0）=====================
 #
