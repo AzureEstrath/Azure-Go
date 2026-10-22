@@ -44,6 +44,30 @@ LEN_TEACH_NOTE = ("\n\n【本次额外要求 · 优先遵守】\n"
                   "- 这是定式讲解：把名称与要点讲清楚，2~3 句即可，别长篇大论\n"
                   "- 不复述局面、不客套，直接开讲就好")
 
+# 「说话详略」三档（v3.11.1，客户端 ⚙ 抽屉可调、即时生效）：
+#   0 = 精简（沿用 ``LEN_NOTE``：点评 1 句 / 聊天 2 句）
+#   1 = 适中（不加额外约束，模型按人设自己收着说 —— 与旧「短回复」关闭时逐字一致）
+#   2 = 详细（允许展开 2~3 句，但仍封顶，不许长篇大论）
+# 档位只改**提示词末尾的这条约束**，不改人设、不改阶段提示；``LEN_TEACH_NOTE`` 仍是定式讲解的特例。
+LEN_VERBOSE_NOTE = ("\n\n【本次额外要求 · 优先遵守】\n"
+                    "- 这次可以展开一些：2~3 句，尽量 80 字以内\n"
+                    "- 仍不复述局面、不客套，讲重点就好")
+REPLY_STYLE_BRIEF = 0
+REPLY_STYLE_NORMAL = 1
+REPLY_STYLE_VERBOSE = 2
+
+
+def _clamp_reply_style(v, fallback=REPLY_STYLE_NORMAL) -> int:
+    """说话详略档位：脏值（None / 字符串 / NaN）退回 ``fallback``，数值夹到 ``0..2``。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return int(fallback)
+    if f != f:                                   # NaN
+        return int(fallback)
+    return max(REPLY_STYLE_BRIEF, min(REPLY_STYLE_VERBOSE, int(f)))
+
+
 # —— 主动约战 / 提醒（v3.9.0，设计 §5-E）——
 # 「好久没来」的门槛：距上次对局不足一天就不打扰（刚下过）。台词是**模板句**，零 LLM 调用；
 # 触发点只有一处（``main.py`` 的 WS 处理器在 ``hello`` 之后调 ``greet_with_context``），
@@ -338,7 +362,7 @@ class AzureAgent:
                  pv_max_visits=PV_MAX_VISITS_DEFAULT, emotion_drift=False,
                  drift_base=DRIFT_BASE_DEFAULT, drift_max=DRIFT_MAX_DEFAULT,
                  pv_max_drop=PV_MAX_DROP_DEFAULT, drift_rng=None, chat_digest_llm=False,
-                 profile_enabled=False, time_aware_enabled=False):
+                 profile_enabled=False, time_aware_enabled=False, reply_style=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -346,7 +370,13 @@ class AzureAgent:
         self.mood = EmotionModel()
 
         self.joseki_teach = joseki_teach
-        self.limit_len = limit_len
+        # 说话详略（v3.11.1）：``reply_style`` 是唯一真身（0 精简 / 1 适中 / 2 详细）；
+        # 旧字段 ``limit_len`` 保留成**属性**（见下面），读写都映射到 0（开）/ 1（关）两档。
+        # 两者同时给出时 ``reply_style`` 优先；只给旧字段时按旧语义迁移（True → 精简）。
+        if reply_style is None:
+            self.reply_style = REPLY_STYLE_BRIEF if limit_len else REPLY_STYLE_NORMAL
+        else:
+            self.reply_style = _clamp_reply_style(reply_style)
         self.busy = False
 
         # —— 回合代数（v3.7.0）：每一次公开编排调用开启新一代，本回合的所有写入都带这一代的 token ——
@@ -755,19 +785,33 @@ class AzureAgent:
 
     def _sys_msg(self):
         """系统消息：聊天 / 闲置搭话这类「context_block + 历史窗口」的路径用；带 with_context 的路径走 `_phase_messages`。"""
-        return {"role": "system", "content": self._sys_content(LEN_NOTE if self.limit_len else "")}
+        return {"role": "system", "content": self._sys_content(self._len_note())}
+
+    @property
+    def limit_len(self) -> bool:
+        """旧字段兼容（v3.11.1）：``True`` ⇔ 精简档（``reply_style == 0``）。
+
+        历史上它是「短回复」布尔开关；现在档位是 ``reply_style`` 三档，但它仍是大量调用点与
+        测试的读写入口，所以做成属性：**读**回答「是不是精简档」，**写** true → 精简 / false → 适中。
+        """
+        return self.reply_style == REPLY_STYLE_BRIEF
+
+    @limit_len.setter
+    def limit_len(self, v):
+        self.reply_style = REPLY_STYLE_BRIEF if bool(v) else REPLY_STYLE_NORMAL
 
     def _phase_messages(self, phase, context, len_note=None) -> list:
         """某阶段的完整消息（系统 + 上下文）：经 ``prompt_chains`` 的链构造。
 
-        ``len_note=None`` 表示「按本局设置推导」：``limit_len`` 开着就附上 ``LEN_NOTE``（短回复约束）——
-        与旧 ``_sys_msg()`` 的做法一致，调用点不必各自记得；定式讲解这类特例显式传入 ``LEN_TEACH_NOTE``。
+        ``len_note=None`` 表示「按本局设置推导」：按 ``reply_style`` 取对应长度约束（精简 → ``LEN_NOTE``、
+        适中 → 空、详细 → ``LEN_VERBOSE_NOTE``）——调用点不必各自记得；定式讲解这类特例显式传入
+        ``LEN_TEACH_NOTE``。
 
         必须与旧 ``[_sys_msg(), _user_msg(context)]`` 逐字符一致——模型要看到的字与本次重构前
         完全相同，一个标点都不能变（tests/test_prompt_chains.py 逐字符锁定）。
         """
         if len_note is None:
-            len_note = LEN_NOTE if self.limit_len else ""
+            len_note = self._len_note()
         return prompt_chains.build_messages(
             phase, context=context, len_note=len_note,
             mood_name=self.mood.region_name(), think_hint=self._think_hint(),
@@ -778,14 +822,18 @@ class AzureAgent:
         return {"role": "user", "content": content}
 
     def _len_note(self, teach=False) -> str:
-        """长度约束后缀：短回复开着时附 ``LEN_NOTE``；定式讲解换 ``LEN_TEACH_NOTE``。
+        """长度约束后缀：按 ``reply_style`` 三档取（精简 → ``LEN_NOTE``、适中 → 空、详细 → ``LEN_VERBOSE_NOTE``）；
+        定式讲解（``teach=True``）在精简 / 详细档换 ``LEN_TEACH_NOTE``。
 
         调用点在 ``agent_graph`` 里——「定式成型那一手」是唯一显式传 ``len_note`` 的地方
         （tests/test_prompt_chains.py 的条数断言守着调用点有没有漏）。
         """
-        if not self.limit_len:
-            return ""
-        return LEN_TEACH_NOTE if teach else LEN_NOTE
+        style = _clamp_reply_style(self.reply_style)
+        if style == REPLY_STYLE_BRIEF:
+            return LEN_TEACH_NOTE if teach else LEN_NOTE
+        if style == REPLY_STYLE_VERBOSE:
+            return LEN_TEACH_NOTE if teach else LEN_VERBOSE_NOTE
+        return ""
 
     def _moves_with(self, color, gtp):
         out = list(self.st.moves)

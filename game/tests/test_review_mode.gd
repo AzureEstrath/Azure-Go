@@ -89,6 +89,22 @@ func _run() -> void:
 			not bool(main_script.review_lock_state(false, true, false)["readonly"])
 			and bool(main_script.review_lock_state(false, true, false)["buttons_disabled"])
 			and bool(main_script.review_lock_state(false, true, false)["chat_editable"]))
+	# v3.11.0「边听边下」：她还在念上一段，棋盘**不再**跟着锁；只挡四个功能按钮。
+	var speech_only := main_script.review_lock_state(false, false, true)
+	_check("⑤ 她还有话没播完：棋盘不锁、四个按钮仍置灰",
+			not bool(speech_only["locked"]) and bool(speech_only["buttons_disabled"]))
+	# v3.11.0：她的落子还没揭示时必须继续锁——否则玩家先落子、她的子过一会儿才冒出来。
+	_check("⑤ 落子还没揭示（reveal_pending）时棋盘仍锁着，揭示后才放开",
+			bool(main_script.review_lock_state(false, false, false, false, true)["locked"])
+			and not bool(main_script.review_lock_state(false, false, false, false, false)["locked"]))
+	# v3.11.2：主界面（纸幕封面）开着时，棋盘 / 四个按钮 / 聊天 / 别的改动入口一起冻住。
+	var menu := main_script.review_lock_state(false, false, false, false, false, true)
+	_check("⑤ 主界面开着：棋盘锁、按钮灰、聊天禁用、别的入口也冻",
+			bool(menu["locked"]) and bool(menu["buttons_disabled"])
+			and not bool(menu["chat_editable"]) and bool(menu["extra_disabled"]))
+	_check("⑤ 主界面关着时回到原状态（默认参数不受影响）",
+			not bool(main_script.review_lock_state(false, false, false)["locked"])
+			and bool(main_script.review_lock_state(false, false, false)["chat_editable"]))
 	# v3.9.5：点下就锁——`busy` 事件回来之前的那一瞬也在锁内（否则能连发两手，
 	# 后端挡下后棋盘上留下一颗撤不掉的幽灵子）。
 	_check("⑤ 点下就锁：move_pending 也算锁住、且不设只读",

@@ -55,7 +55,73 @@ func reset_view() -> void:
 	_yaw = _home_yaw
 	_pitch = _home_pitch
 	_dist = _home_dist
+	_cancel_fly()
 	_update_camera()
+
+# ================= 主界面 ⇄ 对局的运镜（v3.11.3） =================
+## 运镜只改取景三元组（yaw / pitch / dist），**不碰棋子、不碰面板**；进度由 `_process` 推进，
+## 中途玩家拖拽 / 滚轮不会打断（`_unhandled_input` 在飞行中整体让路）。
+
+var _fly_t := -1.0                # <0：没有在飞；>=0：已飞时长（秒）
+var _fly_dur := 1.0
+var _fly_from := Vector3.ZERO     # x=yaw(rad) y=pitch(rad) z=dist
+var _fly_to := Vector3.ZERO
+var _fly_done := Callable()
+
+## 平滑进出（smoothstep）：两端速度为 0，中段最快——「缓动飞入」的手感。
+## 纯函数，门卫可直接断言（`test_view_helpers.gd`）。
+static func fly_ease(t: float) -> float:
+	var k := clampf(t, 0.0, 1.0)
+	return k * k * (3.0 - 2.0 * k)
+
+## 缓动到目标取景。`duration <= 0` 视作立刻到位（主界面首帧就是这么摆的）。
+func fly_to(yaw_deg: float, pitch_deg: float, dist: float, duration := 1.0,
+		done := Callable()) -> void:
+	_fly_from = Vector3(_yaw, _pitch, _dist)
+	_fly_to = Vector3(deg_to_rad(yaw_deg), clampf(deg_to_rad(pitch_deg), PITCH_MIN, PITCH_MAX),
+		clampf(dist, DIST_MIN, DIST_MAX))
+	if duration <= 0.0:
+		_cancel_fly()
+		_yaw = _fly_to.x
+		_pitch = _fly_to.y
+		_dist = _fly_to.z
+		_update_camera()
+		if done.is_valid():
+			done.call()
+		return
+	_fly_dur = duration
+	_fly_t = 0.0
+	_fly_done = done
+
+## 缓动回初始取景（正对棋盘）：主界面 → 对局的那一段
+func fly_home(duration := 1.0, done := Callable()) -> void:
+	fly_to(rad_to_deg(_home_yaw), rad_to_deg(_home_pitch), _home_dist, duration, done)
+
+func is_flying() -> bool:
+	return _fly_t >= 0.0
+
+func _cancel_fly() -> void:
+	_fly_t = -1.0
+	_fly_done = Callable()
+
+func _step_fly(delta: float) -> void:
+	if _fly_t < 0.0:
+		return
+	_fly_t += delta
+	var k := fly_ease(_fly_t / _fly_dur)
+	_yaw = lerp_angle(_fly_from.x, _fly_to.x, k)
+	_pitch = lerpf(_fly_from.y, _fly_to.y, k)
+	_dist = lerpf(_fly_from.z, _fly_to.z, k)
+	_update_camera()
+	if _fly_t >= _fly_dur:
+		_yaw = _fly_to.x
+		_pitch = _fly_to.y
+		_dist = _fly_to.z
+		_update_camera()
+		var cb := _fly_done
+		_cancel_fly()
+		if cb.is_valid():
+			cb.call()
 
 ## 四角的相机方位角（度）：角 0 在 45°（从东南看西北角），每 +1 顺时针走一个角。
 ## 越界按 4 取模、负数也绕回来（脏值不越界）；纯函数、不碰场景树（门卫可直接断言）。
@@ -74,6 +140,7 @@ func view_state() -> Dictionary:
 
 var locked := false              # Azure 思考中时禁止落子
 var readonly := false            # 复盘回看（v3.7.0）：棋盘整体只读——**落子与摸头都不接受**（与 locked 独立）
+var input_blocked := false       # 主界面封面期间：视角键 / 滚轮 / 拖拽一起让路（运镜另有 `is_flying()`）
 var idle_attention := false      # 玩家长时间无操作：化身转为看向玩家
 var cam: Camera3D = null
 
@@ -97,6 +164,11 @@ var _look_point := Vector3.ZERO  # Azure 落子后的注视点
 var _look_until := 0.0           # 落子注视的剩余时间
 var _panel_left := false         # 左侧面板是否展开
 var _panel_right := true         # 右侧面板是否展开
+## 面板让位的**实际**比例（0..1）：`set_panels` 只改目标，`_process` 里平滑逼近——
+## 主界面进对局时棋盘随工具栏一起让位，不会「啪」地横跳（v3.11.3）。
+const PANEL_BIAS_SPEED := 7.0
+var _bias_l := 0.0
+var _bias_r := 1.0
 var _occupied := {}
 var _displayed: Array = []       # 当前显示的棋子（权威 + 乐观）
 var _optimistic: Array = []
@@ -162,10 +234,31 @@ func _build_camera() -> void:
 	_update_camera()
 	cam.make_current()
 
-## 侧栏状态：展开的一侧会把棋盘从画面中心推开（单侧沿用既有取景，两侧都开时整体等比推远）
+## 侧栏状态：展开的一侧会把棋盘从画面中心推开（单侧沿用既有取景，两侧都开时整体等比推远）。
+## 平滑过渡（`_step_panel_bias`）：棋盘跟着面板一起挪，不瞬移。
 func set_panels(left_open: bool, right_open: bool) -> void:
 	_panel_left = left_open
 	_panel_right = right_open
+	_update_camera()
+
+## 立刻对齐让位（主界面首帧用：不要开场先飘一下）
+func snap_panels(left_open: bool, right_open: bool) -> void:
+	_panel_left = left_open
+	_panel_right = right_open
+	_bias_l = 1.0 if left_open else 0.0
+	_bias_r = 1.0 if right_open else 0.0
+	_update_camera()
+
+func _step_panel_bias(delta: float) -> void:
+	var tl := 1.0 if _panel_left else 0.0
+	var tr := 1.0 if _panel_right else 0.0
+	if absf(_bias_l - tl) < 0.001 and absf(_bias_r - tr) < 0.001:
+		_bias_l = tl
+		_bias_r = tr
+		return
+	var k := clampf(PANEL_BIAS_SPEED * delta, 0.0, 1.0)
+	_bias_l = lerpf(_bias_l, tl, k)
+	_bias_r = lerpf(_bias_r, tr, k)
 	_update_camera()
 
 func _update_camera() -> void:
@@ -173,8 +266,8 @@ func _update_camera() -> void:
 		return                                   # 还没建相机（`Board3D.new()` 的门卫 / 视角便捷键的纯逻辑）
 	var vp := get_viewport().get_visible_rect().size
 	var vh := vp.y
-	var free_l := PANEL_W if _panel_left else 0.0
-	var free_r := PANEL_W if _panel_right else 0.0
+	var free_l := PANEL_W * _bias_l
+	var free_r := PANEL_W * _bias_r
 	var fit := 1.0
 	if free_l + free_r > PANEL_W:
 		fit = (vp.x - PANEL_W) / maxf(240.0, vp.x - free_l - free_r)
@@ -436,6 +529,8 @@ func _clear_joseki() -> void:
 # ================= 化身视线目标 =================
 
 func _process(delta: float) -> void:
+	_step_panel_bias(delta)                      # 面板让位平滑（棋盘不横跳）
+	_step_fly(delta)                             # 主界面 ⇄ 对局的运镜（v3.11.3）
 	if _rotate_hold > 0.0:
 		_rotate_hold -= delta
 	if _look_until > 0.0:
@@ -560,6 +655,8 @@ func set_readonly(v: bool) -> void:
 		_pat_active = false
 
 func _unhandled_input(event: InputEvent) -> void:
+	if input_blocked or is_flying():
+		return                                   # 封面 / 运镜期间输入整体让路（落子 / 摸头 / 旋转 / 缩放 / Home·C）
 	if event is InputEventMouseButton:
 		var mb := event as InputEventMouseButton
 		if mb.button_index == MOUSE_BUTTON_LEFT:

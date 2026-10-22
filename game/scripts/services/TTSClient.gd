@@ -253,6 +253,8 @@ func cancel_kind(kind: String) -> bool:
 func is_slow_engine() -> bool:
 	if mode == "system":
 		return false
+	if mode == "aliyun":
+		return false                       # 云端实时流式合成（WebSocket），不是本地慢引擎
 	var v := voice.strip_edges().to_lower()
 	if v.ends_with("-fast"):
 		return false                       # 快速克隆版（melo + 音色转换）很快

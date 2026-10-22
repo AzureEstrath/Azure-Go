@@ -82,13 +82,20 @@ class _ChainCfg:
 class LLMClient:
     # 默认值是云端示例（与 game/config.json 模板、backend/app/config.py 一致）；实际运行时由 main.py 传入 cfg 的值
     def __init__(self, base_url="https://api.deepseek.com/v1", model="deepseek-chat", api_key="", timeout_sec=120.0,
-                 think_mode=0, http_client=None, http_async_client=None, extra_body=None):
+                 think_mode=0, http_client=None, http_async_client=None, extra_body=None,
+                 base_extra_body=None, think_extra_body=None):
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
         self.timeout_sec = timeout_sec
         self.think_mode = think_mode
-        self.extra_body = dict(extra_body or {})    # 可写：被服务端拒绝后清空（见 _strip_on_reject）
+        # 扩展字段的两份**原料**（v3.11.1）：思考档位可以在运行时改（`/api/config` 的 think_mode），
+        # 改完要能重新算出「基础字段 +（档位 > 0 时的思考字段）」。不传原料时退回旧的单份 extra_body，
+        # `set_think_mode` 就只改现场、不重算（行为与没有这个功能时一致）。
+        self._base_extra_body = dict(base_extra_body) if base_extra_body is not None else dict(extra_body or {})
+        self._think_extra_body = dict(think_extra_body or {})
+        self.extra_body = (self._merged_extra_body() if base_extra_body is not None
+                           else dict(extra_body or {}))    # 可写：被服务端拒绝后清空（见 _strip_on_reject）
         self._extra_body_unsupported = False
         self._http = http_client                    # 同步路径（invoke）：langchain-openai 1.x 只认它
         self._http_async = http_async_client        # 异步路径（ainvoke）：只认它，测试注入假客户端用
@@ -100,6 +107,36 @@ class LLMClient:
         self._sync_chain()
 
     # ================= 链 =================
+
+    def _merged_extra_body(self) -> dict:
+        """按当前 ``think_mode`` 重新合并扩展字段：基础字段打底，档位 > 0 时并入思考字段。
+
+        与 ``llm_chain.merge_extra_body`` 同一条口径（那边是启动期一次性合并），区别只在
+        **可重复计算**——运行期改档位要立刻生效，又不能用旧合并结果再叠一次（会残留上一档的键）。
+        """
+        body = dict(self._base_extra_body or {})
+        if int(self.think_mode or 0) > 0:
+            body.update(self._think_extra_body or {})
+        return body
+
+    def set_think_mode(self, mode) -> int:
+        """运行期切换思考档位（v3.11.1）：夹到 ``0..2``，改完下一次调用即生效。
+
+        两件事：① ``think_mode`` 本身（``_budget`` 每次读它 ⇒ 推理预算立刻变）；② 扩展字段重新合并
+        （思考档专属的 ``reasoning_effort`` 这类键要跟着进 / 出）。服务端已经拒过扩展字段
+        （``_extra_body_unsupported``）时**不再加料**——那是设计好的降级，不是故障。
+        返回真正生效的档位（脏值按整数截断，不抛）。
+        """
+        try:
+            mode = max(0, min(2, int(float(mode))))
+        except (TypeError, ValueError):
+            return int(self.think_mode or 0)
+        if mode == int(self.think_mode or 0):
+            return mode
+        self.think_mode = mode
+        if not self._extra_body_unsupported:
+            self.extra_body = self._merged_extra_body()   # `_sync_chain` 下次调用发现变化会重建链
+        return mode
 
     def _sync_chain(self):
         """按当前 ``extra_body`` 装配/重建链：外部改写 ``extra_body`` 后下次调用即生效。"""

@@ -435,6 +435,25 @@ func _run() -> void:
 	p11d.display(r11d)
 	_check("⑪d 语音开播后照常显示（等到了，含揭示）", _shown == ["落子宣告"] and _reveals[0])
 
+	# —— ⑨ 未揭示的落子（v3.11.0：棋盘锁的新判据 `pending_reveal()`）——
+	var p12 := _new_pairing()
+	_reset()
+	var r12 := p12.register("这一手……", true, "ai_move")
+	_check("⑨ 刚登记、还没显示的落子 ⇒ 算「没揭示」", p12.pending_reveal())
+	p12.arm(r12, true)
+	p12.finish(r12)
+	_check("⑨ 语音出了结果、但文字/落子还没显示 ⇒ 仍算「没揭示」", p12.pending_reveal())
+	p12.display(r12)
+	_check("⑨ 显示过（同一刻 POST /api/reveal）之后不再挡棋盘", not p12.pending_reveal())
+	var r12b := p12.register("这句只是点评", false, "ai")
+	p12.arm(r12b, false)
+	_check("⑨ 普通点评不算：只有 reveal 那几条才挡棋盘", not p12.pending_reveal())
+	p12.finish(r12b)
+	p12.display(r12b)
+	var tomb12 := p12.register("", true, "idle", true)
+	_check("⑨ 本地作废的占位（tomb）不算「没揭示」", not p12.pending_reveal())
+	p12.finish(tomb12)
+
 	if _fail == 0:
 		print("[pair] PASS：", _total, " 项断言全部通过")
 	else:

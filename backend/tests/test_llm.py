@@ -399,5 +399,44 @@ class ChainTest(unittest.TestCase):
         self.assertEqual(seen[0]["reasoning_effort"], "high")
 
 
+class ThinkModeRuntimeTest(unittest.TestCase):
+    """思考强度运行时可调（v3.11.0）：改档位 ⇒ 扩展字段跟着进 / 出，下一次调用即生效。
+
+    覆盖两条不变量：① 基础字段永远在；② 思考字段只在档位 > 0 时并入（改回 0 必须**撤掉**，
+    不能用旧合并结果再叠一次）。
+    """
+
+    def test_merge_and_withdraw(self):
+        c = LLMClient(model="m", api_key="k", think_mode=0,
+                      base_extra_body={"top_k": 40},
+                      think_extra_body={"reasoning_effort": "high"})
+        self.assertEqual(c.extra_body, {"top_k": 40})
+        c.set_think_mode(2)
+        self.assertEqual(c.extra_body, {"top_k": 40, "reasoning_effort": "high"})
+        c.set_think_mode(0)
+        self.assertEqual(c.extra_body, {"top_k": 40})
+
+    def test_clamps_and_ignores_dirty(self):
+        c = LLMClient(model="m", api_key="k", think_mode=1, base_extra_body={"a": 1})
+        self.assertEqual(c.set_think_mode(9), 2)
+        self.assertEqual(c.think_mode, 2)
+        self.assertEqual(c.set_think_mode("oops"), 2)     # 脏值：保持原档，不抛
+        self.assertEqual(c.set_think_mode(-1), 0)
+
+    def test_extra_body_shape_after_withdraw(self):
+        """撤档后请求体里不能再有思考字段（只测合并结果，不发请求）。"""
+        c = LLMClient(model="m", api_key="k", think_mode=2,
+                      base_extra_body={"top_k": 40},
+                      think_extra_body={"reasoning_effort": "high"})
+        c.set_think_mode(0)
+        self.assertNotIn("reasoning_effort", c.extra_body)
+
+    def test_legacy_single_extra_body_untouched(self):
+        """不传两份原料时保持旧行为：set_think_mode 只改档位，不动 extra_body。"""
+        c = LLMClient(model="m", api_key="k", think_mode=0, extra_body={"top_k": 40})
+        c.set_think_mode(2)
+        self.assertEqual(c.extra_body, {"top_k": 40})
+
+
 if __name__ == "__main__":
     unittest.main()

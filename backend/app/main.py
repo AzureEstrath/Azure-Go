@@ -8,10 +8,12 @@
     POST /api/summarize   {note}            对局总结
     POST /api/undo        {turn}            俗手回档
     POST /api/reset                         重开一局
-    POST /api/config      {allow_pass}      允许虚着开关（另见 limit_len / joseki_teach / joseki_rate /
+    POST /api/config      {allow_pass}      允许虚着开关（另见 limit_len / reply_style / think_mode /
+                                            joseki_teach / joseki_rate /
                                             emotion_drift / drift_base / drift_max / pv_max_drop /
                                             chat_digest_llm / tools_enabled /
-                                            profile_enabled / time_aware_enabled）
+                                            profile_enabled / time_aware_enabled）——后两项是
+                                            v3.11.1 的「说话详略三档」与「思考强度三档」，均即时生效
     POST /api/reveal                        落子宣告语音开始（需要 round-trip 的客户端）
     POST /api/interaction {what}            玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话
@@ -19,8 +21,8 @@
     POST /api/review      {on}              进入 / 退出复盘模式（只读回看；期间落子/聊天/闲置/提示/分析被拒）
     POST /api/review/goto {n}               复盘：把第 n 手（含）之后的**只读**快照推一份 state 事件
     GET  /api/review/notes                  复盘：本局逐手存档（move_notes）+ 亏损手账（losses）
-    POST /api/tts/speak   {text}            试听/手动合成 → audio/wav（合成不出来 → 409）
-    GET  /api/tts/audio/{audio_id}          取一条已合成的音频 → audio/wav（未命中 → 404）
+    POST /api/tts/speak   {text}            试听/手动合成 → 音频（WAV/MP3，按内容嗅探 MIME；合成不出来 → 409）
+    GET  /api/tts/audio/{audio_id}          取一条已合成的音频 → 音频（未命中 → 404）
     POST /api/memory/query  {query, k?}     检索长期记忆（管理面；默认关闭时返回空列表）
     POST /api/memory/write  {tag?, text}    手动写一条长期记忆（关闭 / 空文本时被拒）
     GET  /api/memory/stats                  长期记忆体量（行数 / 归档数 / 向量数 / 库路径）
@@ -55,10 +57,34 @@ from .agent import AzureAgent
 from .engine import KataGoEngine
 from .joseki_progress import JosekiProgress
 from .llm import LLMClient
-from .llm_chain import merge_extra_body
 from .memory_service import MemoryService
 from .profile_store import ProfileStore
 from .tts import TTSClient
+from .tts_aliyun import AliyunTTSClient, is_aliyun_mode
+
+
+def _build_tts(cfg):
+    """按 ``tts_mode`` 选客户端：``aliyun`` 走 WebSocket 实时合成，其余沿用原实现。
+
+    两者共享同一套 ``speak() -> {"id","mode"}`` + ``audio(id)`` 契约，所以装配处
+    （agent / 两个 TTS 端点 / 前端）完全不需要知道用的是哪家。
+    """
+    return AliyunTTSClient(cfg) if is_aliyun_mode(cfg) else TTSClient(cfg)
+
+
+def _audio_media_type(blob: bytes) -> str:
+    """按字节嗅探音频 MIME：云端服务常忽略 ``response_format``，不能一律标成 WAV。
+
+    前端 ``TTSClient.play_audio`` 自己按字节解析（WAV/MP3 都认），这里只是让
+    ``Content-Type`` 与真实内容一致（阿里云默认回 MP3）。
+    """
+    if len(blob) >= 12 and blob[:4] == b"RIFF" and blob[8:12] == b"WAVE":
+        return "audio/wav"
+    if blob[:3] == b"ID3" or (len(blob) >= 2 and blob[0] == 0xFF and (blob[1] & 0xE0) == 0xE0):
+        return "audio/mpeg"
+    if blob[:4] == b"OggS":
+        return "audio/ogg"
+    return "audio/wav"
 
 
 def _int(v, d=-1):
@@ -101,7 +127,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
 
     ``memory`` 显式传入时优先于 lifespan 构造的 ``MemoryService``（测试 seam）：
     ``agent`` 分支也不再覆盖它。``tts`` 同理——显式传入的假 TTS 优先；不传时 lifespan
-    构造 ``TTSClient(cfg)``，**两个分支**（自建 agent / 注入 agent）都把它挂到 agent 上（T16）。
+    按 ``tts_mode`` 构造客户端（``aliyun`` → ``AliyunTTSClient``，其余 → ``TTSClient``），
+    **两个分支**（自建 agent / 注入 agent）都把它挂到 agent 上（T16）。
     定式族计数（T5）没有 seam、也没有开关：lifespan 无条件构造 ``JosekiProgress()``（构造期不碰
     磁盘），**两个分支**都挂同一个实例（有开关就等于能悄悄关掉教学记忆，设计 §8.4 明确不设）。
     """
@@ -114,7 +141,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         mem = memory if memory is not None else MemoryService(cfg)
         app.state.memory = mem
         # 云端语音：显式注入优先（测试用假 TTS）；默认关闭时 speak() 零请求
-        tts_client = tts if tts is not None else TTSClient(cfg)
+        tts_client = tts if tts is not None else _build_tts(cfg)
         app.state.tts = tts_client
         # 定式族计数（T5）：**无条件装配**、不设开关（设计 §8.4）；构造期不碰磁盘——
         # 库目录 / 库文件只在真正 bump 时才按需创建（tick 只读时连目录都不建）。
@@ -129,7 +156,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             eng = engine if engine is not None else KataGoEngine(cfg.katago_url, cfg.katago_token, cfg.max_visits, cfg.katago_timeout_ms)
             cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key,
                                                          think_mode=cfg.llm_think_mode,
-                                                         extra_body=merge_extra_body(cfg))
+                                                         base_extra_body=cfg.llm_extra_body,
+                                                         think_extra_body=cfg.llm_think_extra_body)
             app.state.agent = AzureAgent(eng, cli, events.EventBus(), joseki_teach=cfg.joseki_teach,
                                          joseki_rate=cfg.joseki_rate,
                                          tools_enabled=cfg.tools_enabled, max_tool_calls=cfg.max_tool_calls,
@@ -141,6 +169,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                          chat_digest_llm=cfg.chat_digest_llm,
                                          profile_enabled=cfg.profile_enabled,
                                          time_aware_enabled=cfg.time_aware_enabled,
+                                         reply_style=cfg.reply_style,
                                          memory=mem, tts=tts_client,
                                          joseki_progress=joseki_progress)
             app.state.agent.profile_store = profile_store   # v3.9.0：画像库无条件接上（懒建库、零开销）
@@ -321,8 +350,27 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         s = a()
         if "allow_pass" in body:
             s.set_allow_pass(bool(body["allow_pass"]))
-        if "limit_len" in body:                 # 客户端「短回复」开关：转发到后端编排
-            s.limit_len = bool(body["limit_len"])
+        if "limit_len" in body:                 # 旧字段（客户端「短回复」布尔开关）：转发到后端编排
+            s.limit_len = bool(body["limit_len"])   # 属性：true → 精简档 / false → 适中档
+        if "reply_style" in body:               # 说话详略三档（v3.11.1）：0 精简 / 1 适中 / 2 详细
+            try:                                # 脏值不生效（保留原档），不把端点打成 500
+                s.reply_style = max(0, min(2, int(float(body["reply_style"]))))
+            except (TypeError, ValueError):
+                pass
+        if "think_mode" in body:                # 思考强度（v3.11.1）：运行时改档，立即生效、不用重启后端
+            llm = getattr(s, "llm", None)
+            if llm is not None:
+                try:
+                    mode = max(0, min(2, int(float(body["think_mode"]))))
+                except (TypeError, ValueError):
+                    mode = None
+                if mode is not None:
+                    fn = getattr(llm, "set_think_mode", None)
+                    if callable(fn):
+                        fn(mode)
+                    else:                       # 注入的假 LLM / 老实现：只落属性，行为与原来一致
+                        llm.think_mode = mode
+                    cfg.llm_think_mode = mode   # 进程内 cfg 跟着走（帧内自洽；落盘由客户端负责）
         if "joseki_teach" in body:              # 客户端「定式导学」开关：转发到后端编排
             s.joseki_teach = bool(body["joseki_teach"])
         if "joseki_rate" in body:               # 「定式导学」的频率（0~1，与开关同一格）：门控的基础概率
@@ -478,7 +526,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             blob = None
         if not blob:
             return JSONResponse({"ok": False, "error": "音频已过期，请重试"}, status_code=409)
-        return Response(content=bytes(blob), media_type="audio/wav")
+        return Response(content=bytes(blob), media_type=_audio_media_type(bytes(blob)))
 
     @app.get("/api/tts/audio/{audio_id}")
     async def tts_audio(audio_id: str):
@@ -491,7 +539,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             blob = None
         if not blob:
             return JSONResponse({"ok": False, "error": "音频不存在或已过期"}, status_code=404)
-        return Response(content=bytes(blob), media_type="audio/wav")
+        return Response(content=bytes(blob), media_type=_audio_media_type(bytes(blob)))
 
     # ================= 长期记忆管理面 =================
     # 默认关闭（memory_enabled=false）时全部退化为可读的空结果：查询面可用、写入被拒。

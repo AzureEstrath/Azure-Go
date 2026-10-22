@@ -53,6 +53,11 @@ class AzureConfig:
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
         self.llm_think_mode = 0
+        # 说话详略（v3.11.1）：0=精简（1 句 / 20 字，默认——与旧「短回复」开关的默认 true 一致）
+        # 1=适中（不加额外约束）2=详细（2~3 句 / 80 字内）。
+        # 与旧字段 `tts_limit_len`（布尔）同一件事的扩档：文件里两个键都在时以 `reply_style` 为准，
+        # 只有旧键时按旧语义迁移（true → 0 精简 / false → 1 适中）。
+        self.reply_style = 0
         # —— 请求体扩展字段（透传给 OpenAI 兼容服务，如 top_k / reasoning_effort）——
         self.llm_extra_body = {}            # 始终并入
         self.llm_think_extra_body = {}      # 仅思考档位开启（think_mode > 0）时并入
@@ -81,6 +86,15 @@ class AzureConfig:
         self.tts_volume = 1.0
         self.tts_timeout_sec = 30           # 单次合成超时；超时整条降级为系统语音
         self.tts_long_chunk = False         # 打开后单块字数上限放宽（templates 里该键已在）
+        # —— 阿里云 Voice Studio 实时语音合成（tts_mode="aliyun"；WebSocket 流式）——
+        # 与上面的 openai 三件套互不影响：切换模式只改 tts_mode，两套配置各留各的。
+        self.tts_aliyun_ws_url = ""         # 留空＝官方固定地址（见 tts_aliyun.WS_URL）
+        self.tts_aliyun_api_key = ""        # Voice Studio 签发的 Key（sk-…）；百炼原生 Key 会被 401
+        self.tts_aliyun_voice = ""          # 平台音色 ID（UUID）；留空则退回 tts_voice
+        self.tts_aliyun_format = "pcm"      # mp3 / pcm / wav / opus（pcm 自己补 WAV 头，最稳）
+        self.tts_aliyun_sample_rate = 24000   # CosyVoice3 系引擎的 mp3 只认 24000（22050 会被 400 拒）
+        self.tts_aliyun_volume = 50         # 0~100，合成侧音量（播放音量是客户端的 tts_volume）
+        self.tts_aliyun_tn = True           # 文本归一化：把「12345」读成口语，默认开
         # —— 提示词自定义（留空则用内置 Azure 人设）——
         self.prompt_system = ""
         self.prompt_user_name = "Estarth"
@@ -159,6 +173,16 @@ class AzureConfig:
             self.llm_think_mode = max(0, min(2, int(d.get("llm_think_mode", self.llm_think_mode))))
         else:
             self.llm_think_mode = 2 if bool(d.get("llm_think_strong", False)) else 0   # 旧键（bool）迁移
+        # 说话详略：`reply_style` 优先（脏值退回默认 0 = 精简）；只有旧键 `tts_limit_len` 时按旧语义迁移。
+        if "reply_style" in d:
+            try:
+                self.reply_style = max(0, min(2, int(float(d.get("reply_style")))))
+            except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把后端启动搞崩
+                self.reply_style = 0
+        elif "tts_limit_len" in d:
+            self.reply_style = 0 if bool(d.get("tts_limit_len")) else 1
+        else:
+            self.reply_style = 0                # 两个键都没有：与客户端旧默认（短回复开）一致
         eb = d.get("llm_extra_body")
         if isinstance(eb, dict):
             self.llm_extra_body = dict(eb)
@@ -198,6 +222,20 @@ class AzureConfig:
         except (TypeError, ValueError):
             self.tts_timeout_sec = 30.0
         self.tts_long_chunk = bool(d.get("tts_long_chunk", self.tts_long_chunk))
+        self.tts_aliyun_ws_url = str(d.get("tts_aliyun_ws_url", self.tts_aliyun_ws_url))
+        self.tts_aliyun_api_key = str(d.get("tts_aliyun_api_key", self.tts_aliyun_api_key))
+        self.tts_aliyun_voice = str(d.get("tts_aliyun_voice", self.tts_aliyun_voice))
+        self.tts_aliyun_format = str(d.get("tts_aliyun_format", self.tts_aliyun_format))
+        try:
+            self.tts_aliyun_sample_rate = int(d.get("tts_aliyun_sample_rate",
+                                                    self.tts_aliyun_sample_rate))
+        except (TypeError, ValueError):
+            self.tts_aliyun_sample_rate = 24000
+        try:
+            self.tts_aliyun_volume = int(d.get("tts_aliyun_volume", self.tts_aliyun_volume))
+        except (TypeError, ValueError):
+            self.tts_aliyun_volume = 50
+        self.tts_aliyun_tn = bool(d.get("tts_aliyun_tn", self.tts_aliyun_tn))
         self.prompt_system = str(d.get("prompt_system", self.prompt_system))
         self.prompt_user_name = str(d.get("prompt_user_name", self.prompt_user_name))
         pn = d.get("prompt_phase_notes")

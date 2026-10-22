@@ -143,6 +143,10 @@ func _run() -> void:
 	_check("is_slow_engine 仍是纯函数（melo 不算慢）", not t.is_slow_engine())
 	t.voice = "中文女"
 	_check("is_slow_engine 认得慢引擎音色", t.is_slow_engine())
+	t.mode = "aliyun"                      # 云端实时流式：不是慢引擎，队列上限按 3 算
+	_check("is_slow_engine 不把 aliyun 当慢引擎", not t.is_slow_engine())
+	t.mode = "system"
+	_check("is_slow_engine 不把 system 当慢引擎", not t.is_slow_engine())
 
 	if _fail == 0:
 		print("[tts] PASS：", _total, " 项断言全部通过")

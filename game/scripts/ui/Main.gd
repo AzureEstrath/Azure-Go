@@ -10,6 +10,15 @@ const MOVE_PENDING_SEC := 12.0               # 「点下就锁」的兜底解锁
 
 ## 启动设置面板确认（_ready 里 await 它，之后才按新配置起各服务）
 signal setup_confirmed
+## 主界面「开始对局」（首次启动时 _ready 里 await 它，之后才进设置面板 / 起服务）
+signal title_started
+
+## —— 思考中的短句（v3.11.2）——
+## 20 句预存在 JSON 里，气泡里**每秒换一句**、随机且不连复（见 `_update_thinking`）。
+## 文件缺失 / 写坏时退回旧的「Azure 思考中…」省略号动效，绝不因一句话把游戏搞崩。
+const THINKING_LINES_PATH := "res://data/thinking_lines.json"
+const THINKING_SWITCH_MS := 1000               # 换句间隔（用户口径：每秒一句）
+const THINKING_FALLBACK := "Azure 思考中"
 
 var cfg: AzureConfig
 ## 对局编排入口：NetClient（编排与 KataGo/LLM 都在后端服务进程）。不写死类型，与信号接线解耦。
@@ -35,6 +44,18 @@ var _tts_url_edit: LineEdit
 var _tts_model_edit: LineEdit
 var _tts_voice_edit: LineEdit
 var _tts_voice_opt: OptionButton
+var _tts_aliyun_key_edit: LineEdit
+var _tts_aliyun_voice_edit: LineEdit
+## —— 主界面（纸幕封面，v3.11.2）——
+var title_screen: TitleScreen = null       # 首次启动 / 对局中按 Esc 都是这一块
+var _title_open := false                   # 封面开着：棋盘锁、聊天禁用、不闲置搭话
+var _game_started := false                 # 已经过了首次「开始对局」（决定主按钮是开始还是继续）
+var _setup_done := false                   # 本次运行已在主界面里点过「设置」：开局时不再弹第二遍
+var _setup_showing := false                # 设置面板正在显示（防重入）
+var _transition := false                   # 主界面 ⇄ 对局的运镜正在跑（期间不吃 Esc / 不叠加动画）
+## —— 思考中的短句 ——
+var _thinking_lines: PackedStringArray = PackedStringArray()
+var _thinking_idx := -1                    # 当前句下标（-1 = 还没挑过）
 const AI_DEDUP_WINDOW := 8                 # 防复读窗口（兜底判据）：后端已按同样窗口去重，这里只兜 WS 重连后的乱序
 var _recent_ai_texts: Array[String] = []   # 最近说过的 AI 原话（含落子宣告）：只兜 WS 重连后乱序到达的重复句
 
@@ -44,12 +65,13 @@ var _recent_ai_texts: Array[String] = []   # 最近说过的 AI 原话（含落�
 ##   · 外部事实（后端 busy / 音频是否在播 / 是否还有取音频请求在途）由 `_pair_facts()` 打包喂给它
 var pairing: SpeechPairing = null
 var _speech_fetch: Array[Dictionary] = []  # 待取音频的 FIFO（**串行**取：保证播放顺序 = speech 到达顺序）
+var _speech_fetch_current: Dictionary = {} # 正在取的那一条（v3.11.1：玩家落子打断时要一并收账）
 var _speech_fetch_busy := false
 var _stream_turn := ""                     # 当前流式气泡对应的 turn_id（后端 token 流式通道：可选、默认关闭）
 var _stream_label: Label = null            # 当前流式气泡：增量直接追加，最终由 message 全文收口
 var _thinking_row: Control = null          # 「Azure 思考中……」占位气泡
 var _thinking_label: Label = null
-var _speech_hold := false                  # Azure 还有语音没播完：继续锁住棋盘
+var _speech_hold := false                  # Azure 还有语音没播完：只挡四个功能按钮（v3.11.1 起不再锁棋盘）
 var _batch_pending := false                # 整段模式：还攒着没放出来的 Azure 文本（只当标记用，文本不再合并）
 var _pending_batch_kind := ""              # 这批文本的类型（""=对局发言；"idle"=走神搭话，可整批作废）
 var _batch_token := 0                      # 去抖令牌：又来新消息就自增，让旧计时器失效
@@ -115,6 +137,8 @@ var _tool_active := false                      # 工具进度是否在跑（star
 var _chk_pass: CheckBox
 var _joseki_opt: OptionButton                     # 定式导学＝「开关 + 频率」一格（关闭 / 低 25% / 中 50% / 高 75% / 总是 100%）
 var _drift_opt: OptionButton                      # 情绪波动＝「开关 + 基础概率」一格（关闭 / 低 3% / 中 5% / 高 6%；在 ⚙ 设置抽屉里）
+var _reply_opt: OptionButton                      # 说话详略三档（精简 / 适中 / 详细；v3.11.1，原来那个「短回复」勾选框）
+var _think_opt: OptionButton                      # 思考强度三档（快速 / 中等 / 强思考；v3.11.1，运行期即时生效）
 var _btn_settings: Button                         # ⚙ 设置抽屉的开关
 var _settings_box: PanelContainer                 # ⚙ 设置抽屉本体（情绪波动 / 同步说话 / 整段合成 / 长句合并 / 聊天摘要用 LLM / 画像，默认收起）
 var _lbl_profile: Label                           # 画像面板的只读文本（v3.9.0：与开关同一格，不占右栏常驻位）
@@ -133,6 +157,7 @@ var _review_total := 0                     # 进入复盘时的总手数（翻�
 var _review_cur := 0                       # 当前回看到第几手（0.._review_total）
 var _review_box: HBoxContainer             # 复盘按钮组（对局结束前整组隐藏，不挤界面）
 var _btn_review: Button                    # 📖 复盘 / ✅ 退出复盘
+var _btn_home: Button                      # 🏠 返回主界面（v3.11.3：对局结束后与复盘并排）
 var _btn_prev: Button                      # ◀ 上一手（只在复盘模式内可见）
 var _btn_next: Button                      # 下一手 ▶（只在复盘模式内可见）
 var _btn_send: Button                      # 聊天发送（复盘期间与输入框一起禁用）
@@ -146,6 +171,9 @@ func _ready() -> void:
 	_build_world()
 	_build_board()
 	_build_ui()
+	_load_thinking_lines()                     # 思考中的 20 句：读不到就用旧的「Azure 思考中…」
+	_build_title_screen()                      # 主界面：纸幕封面（棋盘与化身在纸幕后）
+	await _maybe_show_title()                  # 首次启动：等「开始对局」
 	await _maybe_show_setup()                  # 启动设置面板：思考模式 + 各 API 配置（默认=当前配置）；确认后按新配置起服务
 	_build_services()
 	_greet()
@@ -447,13 +475,22 @@ func _build_right_panel(root: Control) -> void:
 	_joseki_opt.item_selected.connect(_on_joseki_level_selected)
 	joseki_row.add_child(_joseki_opt)
 
-	# 语音开关：短回复（对局常用，留外面）；同步说话 / 整段合成 / 长句合并进 ⚙ 设置抽屉（默认收起）。
-	# 生效范围**不一样**：前两个立即生效；长句合并只写配置，分块在后端做 ⇒ 重启后端后生效（tooltip 必须说清）。
+	# 说话详略（v3.11.1）：原来的「短回复」布尔开关扩成三档——精简 / 适中 / 详细。
+	# 只改**提示词末尾的长度约束**（后端 `reply_style`），即时生效并写回 config.json。
 	var acc := HBoxContainer.new()
 	acc.add_theme_constant_override("separation", 12)
 	vb.add_child(acc)
-	_acc_check(acc, "短回复", cfg.tts_limit_len, "len",
-		"限制 Azure 每次只说 1~2 句：语音等待时间随字数下降（立即生效）")
+	_reply_opt = OptionButton.new()
+	_reply_opt.add_item("说话：精简", 0)
+	_reply_opt.add_item("说话：适中", 1)
+	_reply_opt.add_item("说话：详细", 2)
+	_reply_opt.tooltip_text = "她每次说多少（即时生效，并写回 config.json）：\n" \
+		+ "· 精简 = 点评 1 句、聊天最多 2 句 → 语音等待最短（默认）\n" \
+		+ "· 适中 = 不加额外约束（按人设自己收着说）\n" \
+		+ "· 详细 = 允许展开 2~3 句（约 80 字内），仍不复述局面"
+	_reply_opt.selected = clampi(cfg.reply_style, 0, 2)   # 只显示，不回写 config.json
+	_reply_opt.item_selected.connect(_on_reply_style_selected)
+	acc.add_child(_reply_opt)
 	_btn_settings = Button.new()
 	_btn_settings.text = "设置 ▸"
 	_btn_settings.toggle_mode = true
@@ -469,6 +506,19 @@ func _build_right_panel(root: Control) -> void:
 	var drawer := VBoxContainer.new()
 	drawer.add_theme_constant_override("separation", 6)
 	_settings_box.add_child(drawer)
+	# 思考强度（v3.11.1）：从启动面板搬到这里，并且**运行期即时生效**——后端 `/api/config` 直接改档位
+	# （推理预算 + 扩展字段一起跟着变），不用再重启后端。启动面板里的同一项仍写 config.json，两边同源。
+	_think_opt = OptionButton.new()
+	_think_opt.add_item("思考强度：快速", 0)
+	_think_opt.add_item("思考强度：中等", 1)
+	_think_opt.add_item("思考强度：强思考", 2)
+	_think_opt.tooltip_text = "她回复前想多久（即时生效，并写回 config.json）：\n" \
+		+ "· 快速 = 不思考，首字最快（默认，推荐边下边聊）\n" \
+		+ "· 中等 = 先想几句再答，慢 3~6 秒\n" \
+		+ "· 强思考 = 充分推理再回答，更慢、质量更好"
+	_think_opt.selected = clampi(cfg.llm_think_mode, 0, 2)   # 只显示，不回写 config.json
+	_think_opt.item_selected.connect(_on_think_mode_selected)
+	drawer.add_child(_think_opt)
 	# 情绪波动（v3.8.0）：**开关与参数同占一格**（spec 第五节 K：不新增右栏控件位）——一个下拉框
 	# 同时表达「关 / 低 3% / 中 5% / 高 6%」。改动即时写回 config.json 并推给后端（同 joseki 那条通道）。
 	_drift_opt = OptionButton.new()
@@ -579,6 +629,9 @@ func _build_right_panel(root: Control) -> void:
 	_btn_next.visible = false
 	_btn_review = _button(_review_box, "复盘", _on_review_toggle)
 	_btn_review.tooltip_text = "只读回看这一局：棋盘不接受落子与摸头，她也不开口（← / → 翻页）"
+	# v3.11.3：局后给一个**明确的出口**——不用先想起 Esc，直接回封面（开始新局 / 设置 / 退出）
+	_btn_home = _button(_review_box, "返回主界面", _on_back_to_title)
+	_btn_home.tooltip_text = "收起这局，回主界面（可开新局 / 改设置 / 退出；对局中按 Esc 也是这里）"
 
 	# 俗手回档
 	var bad_title := Label.new()
@@ -654,7 +707,8 @@ func _build_left_panel(root: Control) -> void:
 	opt.fit_to_longest_item = false                  # 不让长选项文字撑宽面板（保证左右侧栏等宽）
 	opt.add_item("系统语音", 0)
 	opt.add_item("CosyVoice OpenAI 接口", 1)
-	opt.selected = maxi(0, ["system", "openai"].find(cfg.tts_mode))
+	opt.add_item("阿里云 Voice Studio（实时流式）", 2)
+	opt.selected = maxi(0, ["system", "openai", "aliyun"].find(cfg.tts_mode))
 	opt.item_selected.connect(_on_tts_mode)
 	vb.add_child(opt)
 
@@ -700,6 +754,26 @@ func _build_left_panel(root: Control) -> void:
 	_tts_voice_edit.text = cfg.tts_voice
 	_tts_voice_edit.tooltip_text = "手动输入音色 id（服务商不同，音色名也不同）"
 	vrow.add_child(_tts_voice_edit)
+
+	# —— 阿里云 Voice Studio（上面第 3 项才需要）：Key 与平台音色 ID 各留各的，切模式不互相覆盖 ——
+	vb.add_child(_field_label("阿里云 API Key（上面第 3 项才需要）"))
+	_tts_aliyun_key_edit = LineEdit.new()
+	_tts_aliyun_key_edit.text = cfg.tts_aliyun_api_key
+	_tts_aliyun_key_edit.secret = true
+	_tts_aliyun_key_edit.placeholder_text = "sk-…（Voice Studio 签发）"
+	_tts_aliyun_key_edit.tooltip_text = "Voice Studio 控制台签发的 API Key；百炼原生 Key 无法通过鉴权（返回 401）"
+	_tts_aliyun_key_edit.text_submitted.connect(func(_t): _apply_tts_fields())
+	_tts_aliyun_key_edit.focus_exited.connect(_apply_tts_fields)
+	vb.add_child(_tts_aliyun_key_edit)
+
+	vb.add_child(_field_label("阿里云音色 ID（UUID，如 9f2a1c4e-…）"))
+	_tts_aliyun_voice_edit = LineEdit.new()
+	_tts_aliyun_voice_edit.text = cfg.tts_aliyun_voice
+	_tts_aliyun_voice_edit.placeholder_text = "在 Voice Studio「音色管理」里复制"
+	_tts_aliyun_voice_edit.tooltip_text = "平台音色 ID（UUID 形式）；不接受 {model}:{voice} 或裸音色名"
+	_tts_aliyun_voice_edit.text_submitted.connect(func(_t): _apply_tts_fields())
+	_tts_aliyun_voice_edit.focus_exited.connect(_apply_tts_fields)
+	vb.add_child(_tts_aliyun_voice_edit)
 
 	vb.add_child(_field_label("语速"))
 	var sp := HSlider.new()
@@ -758,8 +832,9 @@ func _build_left_panel(root: Control) -> void:
 	vb.add_child(_tts_status)
 
 	var tip := Label.new()
-	tip.text = "语音由后端合成（云端 OpenAI 兼容服务），本端只负责播放；\n" \
+	tip.text = "语音由后端合成（云端 OpenAI 兼容服务 / 阿里云 Voice Studio 实时流式），本端只负责播放；\n" \
 		+ "· 零配置兜底：上面第 1 项「Windows 系统语音」直接用本机 SAPI，不联网\n" \
+		+ "· 第 3 项要填「阿里云 API Key + 平台音色 ID（UUID）」，两项任缺一律回落系统语音\n" \
 		+ "· 云端合成不可用时，后端会直接改用系统语音念（配置里仍是你的选择）"
 	tip.add_theme_font_size_override("font_size", 11)
 	tip.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
@@ -835,18 +910,20 @@ func _set_panel_open(which: String, open: bool) -> void:
 		_right_open = open
 	_apply_panel_layout(true)
 
-## 侧栏位置：展开时贴边显示，收起时整体滑出画面；棋盘取景按两侧占用自动让位
-func _apply_panel_layout(animated := true) -> void:
+## 侧栏位置：展开时贴边显示，收起时整体滑出画面；棋盘取景按两侧占用自动让位。
+## `apply_board=false` 只滑面板、不改棋盘取景（主界面运镜用：右侧让位一直保留，飞入时棋盘不跳）。
+func _apply_panel_layout(animated := true, dur := 0.18, apply_board := true) -> void:
 	var rl := -float(PANEL_W) if _right_open else 0.0
 	var rr := 0.0 if _right_open else float(PANEL_W)
 	var ll := 0.0 if _left_open else -float(PANEL_W)
 	var lr := float(PANEL_W) if _left_open else 0.0
 	if animated:
 		var tw := create_tween().set_parallel(true)
-		tw.tween_property(_right_panel, "offset_left", rl, 0.18)
-		tw.tween_property(_right_panel, "offset_right", rr, 0.18)
-		tw.tween_property(_left_panel, "offset_left", ll, 0.18)
-		tw.tween_property(_left_panel, "offset_right", lr, 0.18)
+		tw.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)   # 工具栏「飞入」的手感：起步快、贴边稳
+		tw.tween_property(_right_panel, "offset_left", rl, dur)
+		tw.tween_property(_right_panel, "offset_right", rr, dur)
+		tw.tween_property(_left_panel, "offset_left", ll, dur)
+		tw.tween_property(_left_panel, "offset_right", lr, dur)
 	else:
 		_right_panel.offset_left = rl
 		_right_panel.offset_right = rr
@@ -854,7 +931,7 @@ func _apply_panel_layout(animated := true) -> void:
 		_left_panel.offset_right = lr
 	_right_toggle.text = "▶" if _right_open else "◀"
 	_left_toggle.text = "◀" if _left_open else "▶"
-	if board != null:
+	if apply_board and board != null:
 		board.set_panels(_left_open, _right_open)
 
 func _on_tts_enabled(v: bool) -> void:
@@ -867,7 +944,7 @@ func _on_tts_enabled(v: bool) -> void:
 	cfg.save()
 
 func _on_tts_mode(i: int) -> void:
-	var m: String = ["system", "openai"][clampi(i, 0, 1)]
+	var m: String = ["system", "openai", "aliyun"][clampi(i, 0, 2)]
 	if m == cfg.tts_mode:
 		return                       # 程序化赋值也可能触发该信号：值没变就不写配置
 	cfg.tts_mode = m
@@ -881,16 +958,26 @@ func _apply_tts_fields() -> void:
 	var url := _tts_url_edit.text.strip_edges()
 	var model := _tts_model_edit.text.strip_edges()
 	var voice := _tts_voice_edit.text.strip_edges()
-	if url == cfg.tts_base_url and model == cfg.tts_model and voice == cfg.tts_voice:
+	var akey := cfg.tts_aliyun_api_key
+	var avoice := cfg.tts_aliyun_voice
+	if _tts_aliyun_key_edit != null:              # 面板未建好时（极端时序）保持原值
+		akey = _tts_aliyun_key_edit.text.strip_edges()
+	if _tts_aliyun_voice_edit != null:
+		avoice = _tts_aliyun_voice_edit.text.strip_edges()
+	if url == cfg.tts_base_url and model == cfg.tts_model and voice == cfg.tts_voice \
+			and akey == cfg.tts_aliyun_api_key and avoice == cfg.tts_aliyun_voice:
 		return                       # 仅在用户真正改动时落盘，避免启动时把旧值写回去
 	cfg.tts_base_url = url
 	cfg.tts_model = model
 	cfg.tts_voice = voice
+	cfg.tts_aliyun_api_key = akey
+	cfg.tts_aliyun_voice = avoice
 	if tts != null:
-		# 合成归后端：地址/模型不再由前端使用（后端读同一份 config.json），音色本端系统语音还要用
+		# 合成归后端：地址/模型/阿里云 Key 与音色 ID 都不由前端使用（后端读同一份 config.json），
+		# 音色本端系统语音还要用
 		tts.voice = voice
 	cfg.save()
-	_tts_status.text = "语音设置已保存（合成服务地址/模型由后端读取，重启后端后生效）"
+	_tts_status.text = "语音设置已保存（合成服务地址/模型/阿里云参数由后端读取，重启后端后生效）"
 
 ## 音色下拉：云端服务商各有音色名，这里只填静态候选；具体 id 也可在右侧输入框手填（不再向语音服务探测）
 func _fill_voice_items() -> void:
@@ -936,10 +1023,6 @@ func _refresh_voices() -> void:
 ## 右侧栏语音开关：立即存盘并即时生效（都不需要重启任何服务）
 func _on_acc_toggled(on: bool, which: String) -> void:
 	match which:
-		"len":
-			cfg.tts_limit_len = on
-			if agent != null:
-				agent.limit_len = on
 		"sync":
 			cfg.tts_sync_speak = on
 		"batch":
@@ -973,7 +1056,7 @@ func _on_acc_toggled(on: bool, which: String) -> void:
 		var nm2 := "聊天摘要用 LLM" if which == "digest" else ("玩家棋风画像" if which == "profile" else "时间感知")
 		_set_status("%s 已%s（立即生效）" % [nm2, "开启" if on else "关闭"])
 		return
-	var nm := "短回复" if which == "len" else ("同步说话" if which == "sync" else ("整段合成" if which == "batch" else "长句合并"))
+	var nm := "同步说话" if which == "sync" else ("整段合成" if which == "batch" else "长句合并")
 	var scope := "（重启后端后生效）" if which == "chunk" else "（立即生效）"
 	_tts_status.text = "%s：%s%s" % [nm, "开" if on else "关", scope]
 	_set_status("语音：%s已%s" % [nm, "开启" if on else "关闭"])
@@ -1373,7 +1456,8 @@ func _show_thinking() -> void:
 	who.add_theme_color_override("font_color", GufengTheme.CINNABAR)
 	inner.add_child(who)
 	var lbl := Label.new()
-	lbl.text = "Azure 思考中……"
+	_thinking_idx = -1                                 # 新的一次等待：从短句表里重新挑一句
+	lbl.text = _next_thinking_text()
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	lbl.custom_minimum_size = Vector2(292, 0)
 	lbl.add_theme_color_override("font_color", GufengTheme.INK)
@@ -1381,6 +1465,7 @@ func _show_thinking() -> void:
 	_chat_box.add_child(row)
 	_thinking_row = row
 	_thinking_label = lbl
+	_think_last_ms = Time.get_ticks_msec()              # 换句计时从这一句开始
 	_scroll_to_bottom()
 	if tts != null:
 		tts.play_filler("think")         # 思考时先「嗯……」一声，别让等待无声（冷却由 TTS 内部管）
@@ -1391,16 +1476,23 @@ func _clear_thinking() -> void:
 	_thinking_row = null
 	_thinking_label = null
 
-## 句间合成空隙也要有「思考中…」：下一句正在合成、还没开始播时显示占位，并让省略号动起来
+## 句间合成空隙也要有「思考中…」：下一句正在合成、还没开始播时显示占位。
+## v3.11.2：占位里的短句**每秒换一句**（随机且不连复，句子表见 `game/data/thinking_lines.json`）；
+## 句子表读不到时退回旧行为——每 450ms 让省略号动一下。
 func _update_thinking(now: int) -> void:
 	if _thinking_label == null and pairing.has_pending() and not _tts_playing:
 		_show_thinking()                                 # 文字还没轮到显示、也没在播：她在憋下一句
 	if _thinking_label == null:
 		return
-	if now - _think_last_ms >= 450:
+	if _thinking_lines.is_empty():
+		if now - _think_last_ms >= 450:
+			_think_last_ms = now
+			_think_dots = _think_dots % 3 + 1
+			_thinking_label.text = THINKING_FALLBACK + "…".repeat(_think_dots)
+		return
+	if now - _think_last_ms >= THINKING_SWITCH_MS:
 		_think_last_ms = now
-		_think_dots = _think_dots % 3 + 1
-		_thinking_label.text = "Azure 思考中" + "…".repeat(_think_dots)
+		_thinking_label.text = _next_thinking_text()
 
 ## 占位气泡只在「还等着、也没在说话」时清掉，避免把马上要被替换的占位提前删掉
 func _clear_thinking_if_idle() -> void:
@@ -1410,11 +1502,13 @@ func _clear_thinking_if_idle() -> void:
 		return
 	_clear_thinking()
 
-## 棋盘锁 + 复盘冻结：Azure 思考中，或她还有话没播完（整段关闭时尤其要等她说完），
-## 或**正在只读复盘**。冻结范围（棋盘只读 / 四个按钮 / 聊天）在静态 `review_lock_state` 里一处定死，
+## 棋盘锁 + 复盘冻结：Azure 思考中，或**正在只读复盘**；她「还有话没播完」不再锁棋盘（v3.11.1：
+## 后端这一轮一结束、她那一手一揭示，玩家就能边听边下），只锁四个功能按钮。
+## 冻结范围（棋盘只读 / 四个按钮 / 聊天）在静态 `review_lock_state` 里一处定死，
 ## 这里只把它**逐项应用**到控件上——退出复盘时同样走这里，所以「逐项恢复」不需要另一套逻辑（V20/V21）。
 func _refresh_lock() -> void:
-	var s := review_lock_state(_reviewing, agent != null and agent.busy, _speech_hold, _move_pending)
+	var s := review_lock_state(_reviewing, agent != null and agent.busy, _speech_hold, _move_pending,
+			pairing.pending_reveal(), _title_open)
 	if board != null:
 		board.locked = bool(s["locked"])
 		board.set_readonly(bool(s["readonly"]))   # 复盘只读（落子与摸头同源）
@@ -1438,20 +1532,28 @@ func _refresh_lock() -> void:
 	if _drift_opt != null:
 		_drift_opt.disabled = extra
 
-## 界面的「冻结状态」：进复盘 / 她思考中 / 她还有话没播完，各自的冻结范围。
+## 界面的「冻结状态」：进复盘 / 她思考中 / 她还有话没播完 / 还有没揭示的落子，各自的冻结范围。
 ## 纯函数、不碰场景树 ⇒ 门卫可直接断言「进入复盘 ⇒ 冻结；退出 ⇒ 逐项回到进入前」（V11/V21）。
+##
+## **棋盘解锁点（v3.11.1）**：`locked` 只看「她这一轮还在跑（busy）/ 点下就锁（move_pending）/
+## 还有没揭示的落子（reveal_pending）」——**不再看她还在不在说话**。
+## 后端 `busy=false` 就已经空闲、可以接下一手；原来把 `speech_hold` 也算进 `locked`，玩家必须
+## 把整段语音听完才能落子（「说话过程中不能下棋」）。现在语音继续播，棋盘已经放开。
+## `speech_hold` 仍然留着，但只用于**四个功能按钮**（提示 / 局面分析 / 重来 / 结束）与进复盘的闸门：
+## 一边听一边下棋是自然的，一边听一边再叠一个「局面分析」就不必了。
+## `menu_open`（v3.11.2）＝主界面纸幕开着：棋盘、按钮、聊天与「别的改动入口」一起冻住。
 static func review_lock_state(reviewing: bool, busy: bool, speech_hold: bool,
-		move_pending := false) -> Dictionary:
-	var locked := busy or speech_hold or move_pending
+		move_pending := false, reveal_pending := false, menu_open := false) -> Dictionary:
+	var locked := busy or move_pending or reveal_pending or menu_open
 	return {
 		"readonly": reviewing,                  # 棋盘只读：**只在复盘**（不接受落子与摸头）
-		"locked": locked,                       # 她思考中 / 她的语音还没播完
-		"buttons_disabled": locked or reviewing,   # 四个功能按钮：锁着或复盘中都置灰
-		"chat_editable": not reviewing,         # 聊天：复盘期间禁用（她忙时照旧可排队）
+		"locked": locked,                       # 她思考中 / 点下就锁 / 她的落子还没揭示 / 主界面开着
+		"buttons_disabled": locked or speech_hold or reviewing,   # 四个功能按钮：锁着、她还在说、或复盘中
+		"chat_editable": not reviewing and not menu_open,         # 聊天：复盘 / 主界面期间禁用（她忙时照旧可排队）
 		# 别的会改动**真实棋局**的入口（I1）：`⏪ 俗手回档` 按钮（`_bad_box`，每次 state 事件都会重建）
 		# 与两个开关（允许虚着 → POST /api/config、定式导学）。后端刻意不门禁 /api/undo 与 /api/config，
 		# 所以只能靠前端冻住——但**只有复盘**冻它们：她忙碌时回档 / 改配置是既有且被支持的玩法，不许回退。
-		"extra_disabled": reviewing,
+		"extra_disabled": reviewing or menu_open,
 	}
 
 ## 能不能进复盘（I2）：正在跑回合（如「结束」的总结还在途中）或她还有语音没播完时**先别进**。
@@ -1512,6 +1614,7 @@ func _set_status(text: String, bad := false) -> void:
 ## 简易模态输入框（用于「重来」确认与总结备注）
 func _ask_note(title_text: String, on_ok: Callable) -> void:
 	var back := ColorRect.new()
+	back.name = "ModalVeil"                       # 供 `_modal_open()` 识别（Esc 不抢键盘）
 	back.color = Color(0.09, 0.08, 0.06, 0.45)
 	back.set_anchors_preset(Control.PRESET_FULL_RECT)
 	back.mouse_filter = Control.MOUSE_FILTER_STOP
@@ -1556,10 +1659,265 @@ func _ask_note(title_text: String, on_ok: Callable) -> void:
 	le.text_submitted.connect(func(t): finish.call(t))
 	le.grab_focus()
 
+# ================= 主界面（纸幕封面 + 运镜，v3.11.3） =================
+## 远看取景：离棋盘远、略偏一个角度（入场时一边飞近、一边把棋盘转正）
+const CAM_MENU_YAW := 10.0
+const CAM_MENU_PITCH := 36.0
+const CAM_MENU_DIST := 64.0
+## 运镜节奏（秒）：淡出 → 相机飞入 → 工具栏飞入；回主界面时反过来
+const TITLE_FADE_OUT := 0.35
+const TITLE_FLY_IN := 1.05
+const TITLE_PANEL_IN := 0.35
+const TITLE_PANEL_OUT := 0.22
+const TITLE_FLY_OUT := 0.95
+const TITLE_FADE_IN := 0.45
+
+## 建主界面：它是 `_ui_root` 的最后一个孩子，所以压在左右栏 / 定式卡片之上。
+func _build_title_screen() -> void:
+	title_screen = TitleScreen.new()
+	title_screen.theme = _ui_root.theme          # 与棋盘同一套宣纸 / 楷体主题
+	title_screen.primary_pressed.connect(_on_title_primary)
+	title_screen.settings_pressed.connect(_on_title_settings)
+	title_screen.quit_pressed.connect(func(): get_tree().quit())
+	_ui_root.add_child(title_screen)
+
+## 首次启动时显示封面并等「开始对局」。调试模式：
+## `--shot=` / `--demo` / `--setup` 默认跳过（截图与自动开局都别被封面挡住）；
+## `--title` 强制只把封面画出来（供截图核对），不等待。
+func _maybe_show_title() -> void:
+	if DisplayServer.get_name() == "headless":
+		return                                   # 无窗口：没人能点，等了就死锁
+	var shot := false
+	var force := false
+	for a in OS.get_cmdline_user_args():
+		if a == "--title":
+			force = true
+		elif a.begins_with("--shot=") or a == "--demo" or a == "--setup":
+			shot = true
+	if shot and not force:
+		return
+	_open_title_screen(false)                    # 首帧直接摆到「远看棋盘 + 封面」，无动画
+	if shot:
+		return                                   # 截图模式：画出来即可，不能卡在等确认上
+	await title_started
+
+## 打开封面。首次启动 `animated=false`（直接摆好）；对局中按 Esc `animated=true`：
+## 工具栏先滑出 → 相机飞回远处 → 封面再淡入（`_play_exit_to_menu`）。
+func _open_title_screen(animated := false) -> void:
+	if title_screen == null or _title_open or _transition:
+		return
+	_title_open = true
+	if board != null:
+		board.input_blocked = true                # 封面期间 Home / C / 拖拽 / 滚轮都不许动视角
+	title_screen.set_resume_mode(_game_started)   # 首次「开始对局」/ 对局中「继续对局」
+	_idle = false
+	_set_idle_state(false)
+	_refresh_lock()
+	_set_status("主界面：开始 / 设置 / 退出（对局中按 Esc 可回到这里）")
+	if not animated:
+		title_screen.set_alpha(1.0)
+		_enter_menu_view_immediate()
+		title_screen.open()
+		return
+	title_screen.close()                          # 先藏起来：等工具栏退场、相机飞远，再淡入
+	title_screen.set_alpha(0.0)
+	_play_exit_to_menu()
+
+func _close_title_screen() -> void:
+	if not _title_open:
+		return
+	_title_open = false
+	if board != null:
+		board.input_blocked = false
+	if title_screen != null:
+		title_screen.close()
+	_refresh_lock()
+	_bump_activity()                              # 从菜单回来不算「闲置」
+
+## 主界面首帧：两侧栏与贴边开关都收起来，相机直接摆到「远看 + 正对棋盘」取景
+## （`snap_panels(false,false)`：没有侧栏就别留出面板的位置，否则棋盘会偏在一边）。
+func _enter_menu_view_immediate() -> void:
+	_left_open = false
+	_right_open = false
+	_apply_panel_layout(false, 0.0, false)
+	_right_toggle.visible = false
+	_left_toggle.visible = false
+	if _joseki_card != null:
+		_joseki_card.visible = false
+	if board != null:
+		board.snap_panels(false, false)           # 主界面没有侧栏：棋盘正对镜头
+		board.set_view(CAM_MENU_YAW, CAM_MENU_PITCH, CAM_MENU_DIST)
+
+## 工具栏（右侧面板 + 两侧贴边开关）淡出：回主界面那一段
+func _hide_game_chrome(dur: float) -> void:
+	_left_open = false
+	_right_open = false
+	_apply_panel_layout(true, dur, false)         # 只滑出面板，不动棋盘取景（同上，避免跳一下）
+	_right_toggle.visible = false
+	_left_toggle.visible = false
+	if _joseki_card != null:
+		_joseki_card.visible = false
+	if board != null:
+		board.set_panels(false, false)            # 平滑回中间：棋盘跟着工具栏一起让位
+
+## 工具栏飞入：开始 / 继续对局那一段（右侧面板从画面外滑进来，棋盘同时让位）
+func _show_game_chrome(dur: float) -> void:
+	_left_open = false
+	_right_open = true
+	_apply_panel_layout(true, dur)
+	_right_toggle.visible = true
+	_left_toggle.visible = true
+
+## 入场：封面淡出 → 相机从远处缓动到棋盘正面 → 右侧工具栏飞入。
+## 全程 `_title_open` 仍为真（棋盘锁着）；调用方在 `await` 结束后才解锁。
+func _play_enter_game() -> void:
+	_transition = true
+	_refresh_lock()
+	if title_screen != null:
+		await title_screen.fade_out(TITLE_FADE_OUT)
+		title_screen.close()
+	if board != null:
+		board.fly_home(TITLE_FLY_IN)              # 「正对棋盘」＝回到捕获的初始取景
+	await get_tree().create_timer(TITLE_FLY_IN).timeout
+	_show_game_chrome(TITLE_PANEL_IN)
+	await get_tree().create_timer(TITLE_PANEL_IN).timeout
+	_transition = false
+
+## 退场（反向）：工具栏先滑出 → 相机飞回远处 → 封面再淡入
+func _play_exit_to_menu() -> void:
+	_transition = true
+	_hide_game_chrome(TITLE_PANEL_OUT)
+	await get_tree().create_timer(TITLE_PANEL_OUT).timeout
+	if board != null:
+		board.fly_to(CAM_MENU_YAW, CAM_MENU_PITCH, CAM_MENU_DIST, TITLE_FLY_OUT)
+	await get_tree().create_timer(TITLE_FLY_OUT).timeout
+	if title_screen != null:
+		title_screen.open()
+		await title_screen.fade_in(TITLE_FADE_IN)
+	_transition = false
+
+## 开始 / 继续：首次开局先过设置面板（盖在封面上），再走入场运镜。
+func _on_title_primary() -> void:
+	if _transition or _setup_showing:
+		return                                   # 运镜中 / 设置面板已开：不重入
+	var first := not _game_started
+	if first and not _setup_done:
+		_transition = true                       # 面板开着也算「切换中」：Esc 与重复点击都不响应
+		_build_setup_panel()
+		await setup_confirmed
+		_setup_done = true
+	await _play_enter_game()
+	_close_title_screen()
+	if first:
+		_game_started = true
+		title_started.emit()                      # 释放 _ready 的等待，继续起服务 / 问候
+
+## 主界面的「设置」：复用启动设置面板（只换主按钮措辞），改完回主界面、不掉出对局。
+func _on_title_settings() -> void:
+	if _setup_showing or _transition:
+		return
+	_build_setup_panel("保存设置", "改完点「保存设置」回到主界面；改过的值会写回 config.json。", "返回")
+
+## Esc：对局中回主界面；主界面里再按一次回对局。弹窗开着 / 复盘 / 运镜中都不抢。
+## 走 `_input`（与复盘翻页键同一个最早入口）：不然焦点在按钮上时 Esc 会被别处吃掉。
+func _menu_keys(event: InputEvent) -> void:
+	if not (event is InputEventKey):
+		return
+	var k := event as InputEventKey
+	if not k.pressed or k.echo or k.keycode != KEY_ESCAPE:
+		return
+	if _transition:
+		return                                   # 运镜期间不叠加第二次切换
+	if _modal_open():
+		return                                   # 设置面板 / 备注框开着：Esc 不抢它们的键盘
+	if _title_open:
+		if _game_started:
+			get_viewport().set_input_as_handled()
+			_on_title_primary()                  # 反向出场：淡出 → 飞入 → 工具栏飞入
+		return
+	if not _game_started or _reviewing:
+		return
+	var focus := get_viewport().gui_get_focus_owner()
+	if focus is LineEdit or focus is TextEdit:
+		return                                   # 正在输入：Esc 归输入框（别一按就把键盘抢到菜单）
+	_open_title_screen(true)
+	get_viewport().set_input_as_handled()
+
+## 有没有模态遮罩（设置面板 / 重来与总结的备注框）：它们都叫 `ModalVeil`。
+func _modal_open() -> bool:
+	if _ui_root == null:
+		return false
+	for c in _ui_root.get_children():
+		if c is Control and c.name == "ModalVeil" and not (c as Control).is_queued_for_deletion():
+			return true
+	return false
+
+# ================= 思考中的短句（v3.11.2） =================
+
+func _load_thinking_lines() -> void:
+	var f := FileAccess.open(THINKING_LINES_PATH, FileAccess.READ)
+	if f == null:
+		return
+	var text := f.get_as_text()
+	f.close()
+	_thinking_lines = parse_thinking_lines(text)
+	if _thinking_lines.is_empty():
+		print("[UI] %s 没有可用短句，思考中改用旧的省略号动效" % THINKING_LINES_PATH)
+
+## JSON → 短句表（**纯函数**，门卫直接调它）：接受 `{"lines": [...]}` 或裸数组；
+## 非字符串 / 空串 / 重复句一律丢掉（重复句轮换时看起来就像卡住了）。
+static func parse_thinking_lines(text: String) -> PackedStringArray:
+	var out := PackedStringArray()
+	var j := JSON.new()
+	if j.parse(text) != OK:
+		return out                               # 坏 JSON：静默回退（`JSON.parse_string` 会往控制台喷错误）
+	var d = j.data
+	var arr = null
+	if typeof(d) == TYPE_DICTIONARY:
+		arr = (d as Dictionary).get("lines", null)
+	elif typeof(d) == TYPE_ARRAY:
+		arr = d
+	if typeof(arr) != TYPE_ARRAY:
+		return out
+	var seen := {}
+	for v in arr:
+		if typeof(v) != TYPE_STRING:
+			continue
+		var s := (v as String).strip_edges()
+		if s == "" or seen.has(s):
+			continue
+		seen[s] = true
+		out.append(s)
+		if out.size() >= 64:                 # 防御：再长也不会把这一句撑爆气泡
+			break
+	return out
+
+## 下一句的下标（**纯函数**）：随机挑一句、**绝不与上一句相同**（count > 1 时）。
+## `rng_value` 由调用方给（`randf()`），测试里可以钉死，不引入全局随机状态。
+static func next_thinking_index(prev: int, count: int, rng_value: float) -> int:
+	if count <= 0:
+		return -1
+	if count == 1:
+		return 0
+	var r := clampf(rng_value, 0.0, 0.999999)
+	if prev < 0 or prev >= count:
+		return mini(count - 1, int(floor(r * float(count))))
+	var n := int(floor(r * float(count - 1)))     # 0..count-2：把「上一句」那个空位先拿掉
+	if n >= prev:
+		n += 1                                    # 再补回去 ⇒ 一定绕开上一句
+	return n
+
+func _next_thinking_text() -> String:
+	if _thinking_lines.is_empty():
+		return THINKING_FALLBACK
+	_thinking_idx = next_thinking_index(_thinking_idx, _thinking_lines.size(), randf())
+	return _thinking_lines[_thinking_idx]
+
 # ================= 启动设置面板 =================
 
-## 启动设置：思考模式 + LLM / 语音 TTS 的 API 配置（默认全部取当前 config.json 的值）。
-## 确认后写回 config.json，_ready 再继续按新配置起服务。
+## 启动设置：思考模式 + LLM 的 API 配置 + 阿里云语音合成（Key / 音色 ID），默认全部取当前 config.json 的值。
+## 确认后写回 config.json，_ready 再继续按新配置起服务。朗读方式（`tts_mode`）不在这里改——
+## 那是左侧栏「朗读方式」的下拉，启动面板只负责把阿里云那两项配好。
 ## 调试自动化（--shot= / --demo）默认跳过面板；带 --setup 时只把面板画出来（不等确认），供截图核对样式。
 func _maybe_show_setup() -> void:
 	if DisplayServer.get_name() == "headless":
@@ -1573,13 +1931,22 @@ func _maybe_show_setup() -> void:
 			force = true
 	if shot and not force:
 		return
+	if _setup_done and not force:
+		return                                   # 主界面里已经点过「设置」：开局不再弹第二遍
 	_build_setup_panel()
 	if shot:
 		return                                   # 截图模式：画出来即可，不能卡在等确认上
 	await setup_confirmed
+	_setup_done = true
 
-func _build_setup_panel() -> void:
+## 参数只为「主界面 → 设置」复用：主按钮改成「保存设置」、说明改成保存后回主界面、另给一个「返回」不落盘。
+## 首次开局的默认值就是原来的「开始对局 / 出发前的准备」，一个字都没变。
+func _build_setup_panel(primary_text := "开始对局",
+		hint_text := "以下默认就是上次的配置，直接点「开始对局」即可；改过的值会写回 config.json。",
+		cancel_text := "") -> void:
+	_setup_showing = true
 	var back := ColorRect.new()
+	back.name = "ModalVeil"                       # 供 `_modal_open()` 识别（Esc 不抢键盘）
 	back.color = Color(0.09, 0.08, 0.06, 0.55)
 	back.set_anchors_preset(Control.PRESET_FULL_RECT)
 	back.mouse_filter = Control.MOUSE_FILTER_STOP
@@ -1616,7 +1983,7 @@ func _build_setup_panel() -> void:
 	title.add_theme_color_override("font_color", GufengTheme.INK)
 	vb.add_child(title)
 	var sub := Label.new()
-	sub.text = "以下默认就是上次的配置，直接点「开始对局」即可；改过的值会写回 config.json。"
+	sub.text = hint_text
 	sub.add_theme_font_size_override("font_size", 11)
 	sub.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -1640,11 +2007,20 @@ func _build_setup_panel() -> void:
 	var le_llm_key := _setup_field(llm_body, "API Key（只有云端需要）", cfg.llm_api_key,
 		"留空=不发送 Authorization；只会存在本机的 config.json 里")
 
-	var tts_body := _setup_section(vb, "语音 TTS API")
-	var le_tts_url := _setup_field(tts_body, "服务地址", cfg.tts_base_url,
-		"云端 OpenAI 兼容地址，如 https://api.example.com/v1")
-	var le_tts_voice := _setup_field(tts_body, "音色", cfg.tts_voice,
-		"云端服务的音色 id（各服务商不同，如 alloy / 中文女）；进游戏后左侧栏也可下拉改")
+	var tts_body := _setup_section(vb, "阿里云语音合成（Voice Studio）", cfg.tts_mode == "aliyun")
+	var le_tts_key := _setup_field(tts_body, "API Key（Voice Studio 签发）", cfg.tts_aliyun_api_key,
+		"Voice Studio 控制台签发的 sk-…；百炼原生 Key 无法通过鉴权（返回 401）。留空=这条回落系统语音")
+	le_tts_key.secret = true
+	var le_tts_voice := _setup_field(tts_body, "音色 ID（平台音色 UUID）", cfg.tts_aliyun_voice,
+		"在 Voice Studio「音色管理」里复制，形如 9f2a1c4e-7b30-4d51-8a6c-2e5f1b8d0a37；不接受裸音色名")
+	var tts_hint := Label.new()
+	var mode_names := {"system": "系统语音", "openai": "OpenAI 兼容", "aliyun": "阿里云 Voice Studio"}
+	tts_hint.text = "当前朗读方式：%s（进游戏后在左侧栏「朗读方式」切换；这一节只配阿里云的两项）" \
+		% str(mode_names.get(cfg.tts_mode, cfg.tts_mode))
+	tts_hint.add_theme_font_size_override("font_size", 11)
+	tts_hint.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
+	tts_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	tts_body.add_child(tts_hint)
 
 	var sep := ColorRect.new()
 	sep.color = Color(GufengTheme.INK, 0.22)
@@ -1654,13 +2030,23 @@ func _build_setup_panel() -> void:
 	var hb := HBoxContainer.new()
 	hb.alignment = BoxContainer.ALIGNMENT_END
 	outer.add_child(hb)
+	if cancel_text != "":                          # 从主界面进来的「返回」：不落盘、不置 _setup_done
+		var cancel := Button.new()
+		cancel.text = cancel_text
+		GufengTheme.apply_button(cancel)
+		cancel.pressed.connect(func():
+			_setup_showing = false
+			back.queue_free())
+		hb.add_child(cancel)
 	var start := Button.new()
-	start.text = "开始对局"
+	start.text = primary_text
 	start.add_theme_font_size_override("font_size", 16)
 	GufengTheme.apply_seal_button(start)
 	hb.add_child(start)
 	start.pressed.connect(func():
-		_apply_setup(think_opt, le_llm_url, le_llm_model, le_llm_key, le_tts_url, le_tts_voice)
+		_setup_showing = false
+		_setup_done = true                    # 本次运行已经配过：开局不再弹第二遍
+		_apply_setup(think_opt, le_llm_url, le_llm_model, le_llm_key, le_tts_key, le_tts_voice)
 		back.queue_free()
 		setup_confirmed.emit())
 	start.grab_focus()
@@ -1695,27 +2081,34 @@ func _setup_field(parent: Control, label_text: String, value: String, tip := "")
 	parent.add_child(le)
 	return le
 
-## 应用启动设置：写回 config.json（下次启动仍是这些值），随后 _build_services 按新配置起服务
+## 应用启动设置：写回 config.json（下次启动仍是这些值），随后 _build_services 按新配置起服务。
+## TTS 这一节只配阿里云（`tts_aliyun_api_key` / `tts_aliyun_voice`）——**不改 `tts_mode`**：
+## 朗读方式是玩家在左侧栏选的，启动面板不该每次开局都把它悄悄改回去。
 func _apply_setup(think_opt: OptionButton, llm_url: LineEdit, llm_model: LineEdit, llm_key: LineEdit,
-		tts_url: LineEdit, tts_voice: LineEdit) -> void:
+		tts_key: LineEdit, tts_voice_id: LineEdit) -> void:
 	cfg.llm_think_mode = clampi(think_opt.selected, 0, 2)
 	if llm_url.text.strip_edges() != "":         # 地址/模型/音色不允许被清成空：空则保留原值
 		cfg.llm_base_url = llm_url.text.strip_edges()
 	if llm_model.text.strip_edges() != "":
 		cfg.llm_model = llm_model.text.strip_edges()
 	cfg.llm_api_key = llm_key.text.strip_edges() # Key 可以清空
-	if tts_url.text.strip_edges() != "":
-		cfg.tts_base_url = tts_url.text.strip_edges()
-	if tts_voice.text.strip_edges() != "":
-		cfg.tts_voice = tts_voice.text.strip_edges()
+	cfg.tts_aliyun_api_key = tts_key.text.strip_edges()      # Key 可以清空（→ 回落系统语音）
+	if tts_voice_id.text.strip_edges() != "":                # 音色 ID 不允许被清成空：空则保留原值
+		cfg.tts_aliyun_voice = tts_voice_id.text.strip_edges()
 	cfg.save()
+	if agent != null:
+		agent.think_mode = cfg.llm_think_mode       # 主界面「设置」改完即时生效（v3.11.2：不用重启后端）
 	if _tts_url_edit != null:                    # 左侧语音栏建在面板之前：同步显示新值
 		_tts_url_edit.text = cfg.tts_base_url
 		_tts_model_edit.text = cfg.tts_model
 		_tts_voice_edit.text = cfg.tts_voice
-	print("[Setup] 启动设置已保存：思考模式=%d · LLM=%s (%s) · TTS=%s/%s"
-			% [cfg.llm_think_mode, cfg.llm_base_url, cfg.llm_model,
-			   cfg.tts_base_url, cfg.tts_voice])
+		if _tts_aliyun_key_edit != null:
+			_tts_aliyun_key_edit.text = cfg.tts_aliyun_api_key
+		if _tts_aliyun_voice_edit != null:
+			_tts_aliyun_voice_edit.text = cfg.tts_aliyun_voice
+	print("[Setup] 启动设置已保存：思考模式=%d · LLM=%s (%s) · 朗读方式=%s · 阿里云音色=%s%s"
+			% [cfg.llm_think_mode, cfg.llm_base_url, cfg.llm_model, cfg.tts_mode,
+			   cfg.tts_aliyun_voice, "" if cfg.tts_aliyun_api_key != "" else "（未填 Key）"])
 
 # ================= 服务与接线 =================
 
@@ -1730,7 +2123,8 @@ func _build_services() -> void:
 	agent.net_status.connect(_on_net_status)
 	add_child(agent)                              # _ready 里发起 WS 连接（连上先收 hello 同步棋盘与情绪）
 	agent.setup()                                 # 占位：引擎/LLM 由后端持有
-	agent.limit_len = cfg.tts_limit_len           # 转发给后端（连上后自动补发）
+	agent.reply_style = cfg.reply_style           # 说话详略三档（连上后自动补发；旧版后端读 limit_len）
+	agent.think_mode = cfg.llm_think_mode         # 思考强度：运行期可改，不用重启后端
 	agent.joseki_teach = cfg.joseki_teach
 	agent.joseki_rate = cfg.joseki_rate         # 定式提示频率（与开关同一格）：同一通道推给后端
 	# 情绪波动与聊天摘要走**原子入口**（v3.8.0 修复波 / #5）：与 P7 的「不退回两次 setter 各推一次」同一口径
@@ -1909,6 +2303,7 @@ func _greet() -> void:
 
 func _on_intersection_clicked(x: int, y: int) -> void:
 	_allow_tts_fillers()
+	_interrupt_speech_for_move()                # v3.11.1：你一落子，她上一轮没说完的话就让位
 	# 点下就锁（本地闩）：`busy` 事件回来之前还有一瞬，期间再点会发出第二手——后端会挡下，
 	# 但棋盘上已经乐观画上了那颗子，回包又被忽略 ⇒ 撤不掉的幽灵子（v3.9.5）。闩由
 	# busy / state / 拒绝回包解开，另有 MOVE_PENDING_SEC 兜底，绝不把棋盘锁死。
@@ -2204,6 +2599,34 @@ func _on_profile_panel() -> void:
 		var d = JSON.parse_string(body.get_string_from_utf8())
 		_lbl_profile.text = profile_panel_text(d))
 
+## 说话详略下拉（右侧栏常驻）：写回 config.json，再走既有 `_flush_settings` 通道推给后端，立即生效。
+## 旧键 `tts_limit_len` 同步写回（`save()` 里按 `reply_style == 0` 推导），旧版本读到的仍是「开 / 关」。
+func _on_reply_style_selected(i: int) -> void:
+	var lvl := clampi(i, 0, 2)
+	if lvl == cfg.reply_style:
+		return                       # 程序化赋值也可能触发该信号：值没变就不写配置
+	cfg.reply_style = lvl
+	cfg.tts_limit_len = lvl == 0
+	cfg.save()
+	if agent != null:
+		agent.reply_style = lvl
+	var names := ["精简", "适中", "详细"]
+	_set_status("说话详略：%s（立即生效）" % names[lvl])
+	if _tts_status != null:
+		_tts_status.text = "说话详略：%s（立即生效）" % names[lvl]
+
+## 思考强度下拉（⚙ 设置抽屉）：写回 config.json 并推给后端，**不用重启后端**（v3.11.1）。
+func _on_think_mode_selected(i: int) -> void:
+	var lvl := clampi(i, 0, 2)
+	if lvl == cfg.llm_think_mode:
+		return
+	cfg.llm_think_mode = lvl
+	cfg.save()
+	if agent != null:
+		agent.think_mode = lvl
+	var names := ["快速", "中等", "强思考"]
+	_set_status("思考强度：%s（立即生效）" % names[lvl])
+
 ## 定式导学「开关 + 频率」下拉（右侧栏）：写回 config.json，再走既有 `_flush_settings` 通道推给后端，
 ## 并对当前对局立即生效。「关闭」只关开关、**不动 joseki_rate**（重新开启时频率能回来）。
 func _on_joseki_level_selected(i: int) -> void:
@@ -2275,6 +2698,33 @@ func _allow_tts_fillers() -> void:
 		tts.allow_fillers = true
 		tts.begin_filler_turn()          # 本回合语气词限次（think 至多两次，且不连着播同一句）
 
+## 玩家落子时打断她上一轮还没播完的语音（v3.11.1）。
+## 棋盘在「她这一轮结束 + 落子揭示」后就放开了，但她的旧话可能还在念——玩家一动，旧话让位，
+## 新回合的回应不必排在它后面。两条路径都要收账，否则会留下 `got && !played` 的悬空记录
+## （那种记录会让 `audio_in_flight()` 恒真，是本项目最怕的「棋盘锁死」形态）：
+##   · 正在播 / 排队中的：`TTSClient.stop()` 会给每一条补发 `speech_skipped`（文字照常显示）；
+##   · 还在取音频（HTTP 在途 / 排队）的：`TTSClient` 根本不知道它们，这里自己 finish + display，
+##     在途那条回来时 `resolve_fetch` 见到 `played` 会直接判 `done`，不会补播。
+func _interrupt_speech_for_move() -> void:
+	if tts == null:
+		return
+	if not tts.is_speaking() and _speech_fetch.is_empty() and _speech_fetch_current.is_empty():
+		return
+	tts.stop()
+	var jobs: Array[Dictionary] = _speech_fetch.duplicate()
+	_speech_fetch.clear()
+	if not _speech_fetch_current.is_empty():
+		jobs.append(_speech_fetch_current)
+		_speech_fetch_current = {}
+	for job in jobs:
+		var rec: Dictionary = job.get("rec", {})
+		if rec.is_empty() or pairing.played(rec):
+			continue
+		pairing.finish(rec)
+		pairing.display(rec)           # 先显示再收账：打断的只是声音，台词不能丢
+	_speech_hold = _speech_busy()
+	_refresh_lock()
+
 ## 作废走神搭话：文字与语音（在途取音频、播放中、排队中）一起清掉，让新的内容立刻顶上
 func _cancel_idle_speech() -> void:
 	_idle_muted = true
@@ -2329,6 +2779,15 @@ func _on_review_toggle() -> void:
 		return
 	_enter_review()
 
+## 「返回主界面」（v3.11.3）：局后与「复盘」并排的出口。若还在复盘，先把后端那份只读状态解除，
+## 前端同一帧就走反向运镜——不阻塞回封面（解冻回包迟到也不会把界面拽回去）。
+func _on_back_to_title() -> void:
+	if _transition or _title_open:
+		return
+	if _reviewing:
+		_exit_review()
+	_open_title_screen(true)
+
 ## 进入复盘：POST /api/review {"on": true} → 冻结 UI + 空闲收尾 + 用**新鲜**的 state 对齐总手数 + 拉存档。
 ## **不推盘面**：棋盘上本来就是终局那手，玩家按 ◀ 往回看即可。
 func _enter_review() -> void:
@@ -2347,6 +2806,7 @@ func _enter_review() -> void:
 			_btn_prev.visible = true
 			_btn_next.visible = true
 			_btn_review.text = "退出复盘"
+			_btn_home.visible = false           # 复盘时这一行已有 4 个按钮；回封面请先「退出复盘」
 			_refresh_lock()                             # 冻结（只读 / 置灰 / 禁聊天 / 俗手回档与开关）在这里一处收口
 			_set_status("复盘：只读回看中 · 第 %d / %d 手（← → 或按钮翻页）"
 					% [_review_cur, _review_total])
@@ -2379,6 +2839,7 @@ func _exit_review() -> void:
 			_btn_prev.visible = false
 			_btn_next.visible = false
 			_btn_review.text = "复盘"
+			_btn_home.visible = true
 			_refresh_lock()                             # 只读 / 四个按钮 / 聊天逐项回到进入前（V21）
 			agent.fetch_bytes("/api/state", HTTPClient.METHOD_GET, {},
 				func(ok2: bool, code2: int, body2: PackedByteArray):
@@ -2489,6 +2950,7 @@ func _input(event: InputEvent) -> void:
 		_bump_activity()
 	elif event is InputEventKey and (event as InputEventKey).pressed:
 		_bump_activity()
+	_menu_keys(event)                           # Esc：对局 ⇄ 主界面（弹窗开着时不抢）
 	_review_keys(event)
 
 func _bump_activity() -> void:
@@ -2499,9 +2961,8 @@ func _bump_activity() -> void:
 
 func _process(delta: float) -> void:
 	var now := Time.get_ticks_msec()
-	# 复盘期间也按「她占着棋盘」处理（M3）：闲置计时停摆、聊天队列不续发——否则玩家回看时会被算成闲置，
-	# 一退出复盘她就立刻来一句（而且复盘期间本来就该静音）。
-	var hold := _azure_hold_active() or _reviewing
+	# 复盘 / 主界面期间也按「她占着棋盘」处理（M3）：闲置计时停摆、聊天队列不续发——否则玩家回看 / 看菜单时会被算成闲置。
+	var hold := _azure_hold_active() or _reviewing or _title_open
 	if hold:
 		# 她还在思考 / 朗读 / 有句子没播完：棋盘锁着，玩家此刻根本无法落子，
 		# 这段时间不能算「玩家闲置」——否则会出现她边堵着棋盘边问「你在忙什么呀？还要继续下棋吗」
@@ -2515,7 +2976,8 @@ func _process(delta: float) -> void:
 		_set_idle_state(true)
 		_next_talk_ms = now + int(IDLE_TALK_FIRST * 1000.0)
 	# 复盘期间绝不出声（V20/M3）：走神搭话本来该由后端门禁挡住，前端也不许发——不依赖 Task C。
-	if _idle and now >= _next_talk_ms and not _reviewing and agent != null and not agent.busy:
+	if _idle and now >= _next_talk_ms and not _reviewing and not _title_open \
+			and agent != null and not agent.busy:
 		_next_talk_ms = now + randi_range(int(IDLE_TALK_MIN * 1000.0), int(IDLE_TALK_MAX * 1000.0))
 		_idle_muted = false                             # 新的一轮搭话：先解除「玩家已回来」的作废标记
 		agent.idle_remark()                             # 长时间没动静：主动问一句（后端 POST /api/idle）
@@ -2762,8 +3224,10 @@ func _pump_speech_fetch() -> void:
 	_speech_fetch_busy = true
 	var job: Dictionary = _speech_fetch.pop_front()
 	var rec: Dictionary = job["rec"]
+	_speech_fetch_current = job          # v3.11.1：玩家落子打断时，在途这条也要收账
 	if agent == null:
 		_speech_fetch_busy = false
+		_speech_fetch_current = {}
 		pairing.resolve_fetch(rec, false, 0)
 		_note_audio_failed("后端未连接")
 		_pump_speech_fetch()
@@ -2771,6 +3235,7 @@ func _pump_speech_fetch() -> void:
 	agent.fetch_bytes("/api/tts/audio/%s" % str(job["id"]), HTTPClient.METHOD_GET, {},
 		func(ok: bool, code: int, body: PackedByteArray):
 			_speech_fetch_busy = false
+			_speech_fetch_current = {}
 			var verdict := pairing.resolve_fetch(rec, ok, body.size())
 			if verdict == "":
 				# 音频到手：交给 TTSClient 播（取回期间没被作废才走得到这里）
@@ -2795,6 +3260,7 @@ func _on_pairing_display(text: String, reveal: bool) -> void:
 	_add_msg_now("ai", text)
 	if reveal:
 		_reveal_move()                 # 说到这手棋时，才把子放上棋盘
+	_refresh_lock()                    # v3.11.1：落子揭示 ⇒ `pending_reveal()` 清掉 ⇒ 棋盘当场解锁
 
 ## 配对状态机说「有条语音出结果了」：刷新棋盘锁与「思考中…」占位
 func _on_pairing_resolved() -> void:

@@ -47,7 +47,9 @@ DEFAULT_TIMEOUT_SEC = 30.0
 SPEECH_PATH = "/audio/speech"
 
 # 合法朗读方式（对应前端 ``AzureConfig.gd:6`` 的 ``TTS_MODES``）与未知值回落目标
-TTS_MODES = ("system", "openai")
+# ``aliyun`` 由 :mod:`app.tts_aliyun` 的 ``AliyunTTSClient`` 承载（同一套 speak/缓存契约），
+# 本模块只在归一化里认它，不实现那条协议。
+TTS_MODES = ("system", "openai", "aliyun")
 DEFAULT_TTS_MODE = "openai"
 
 

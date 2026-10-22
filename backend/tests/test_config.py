@@ -228,5 +228,104 @@ class ProfileTimeConfigTest(unittest.TestCase):
             self.assertFalse(c.time_aware_enabled, "脏值 %r 必须退回默认 false" % (bad,))
 
 
+class AliyunTtsConfigTest(unittest.TestCase):
+    """阿里云 TTS 配置面：新键必须真的被 ``load()`` 读进来（防「字段加了但没接线」）。"""
+
+    def test_defaults(self):
+        c = AzureConfig()
+        self.assertEqual(c.tts_aliyun_format, "pcm")     # CosyVoice3 系引擎对 mp3 支持因音色而异
+        self.assertEqual(c.tts_aliyun_sample_rate, 24000)  # 22050 会被 400 拒
+        self.assertEqual(c.tts_aliyun_volume, 50)
+        self.assertTrue(c.tts_aliyun_tn)
+        self.assertEqual(c.tts_aliyun_ws_url, "")      # 留空＝tts_aliyun.WS_URL
+
+    def test_round_trip_through_load(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"tts_enabled": True, "tts_mode": "aliyun",
+                           "tts_aliyun_ws_url": "wss://example.test/api-ws/v1/inference",
+                           "tts_aliyun_api_key": "sk-test",
+                           "tts_aliyun_voice": "9f2a1c4e-7b30-4d51-8a6c-2e5f1b8d0a37",
+                           "tts_aliyun_format": "wav",
+                           "tts_aliyun_sample_rate": 16000,
+                           "tts_aliyun_volume": 80,
+                           "tts_aliyun_tn": False}, f)
+            c = AzureConfig.load(p)
+        self.assertEqual(c.tts_mode, "aliyun")
+        self.assertEqual(c.tts_aliyun_api_key, "sk-test")
+        self.assertEqual(c.tts_aliyun_voice, "9f2a1c4e-7b30-4d51-8a6c-2e5f1b8d0a37")
+        self.assertEqual(c.tts_aliyun_format, "wav")
+        self.assertEqual(c.tts_aliyun_sample_rate, 16000)
+        self.assertEqual(c.tts_aliyun_volume, 80)
+        self.assertFalse(c.tts_aliyun_tn)
+
+    def test_bad_values_fall_back(self):
+        """脏值退回默认：不因一个旋钮把后端启动搞崩。"""
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"tts_aliyun_sample_rate": "abc", "tts_aliyun_volume": None}, f)
+            c = AzureConfig.load(p)
+        self.assertEqual(c.tts_aliyun_sample_rate, 24000)
+        self.assertEqual(c.tts_aliyun_volume, 50)
+
+
+class ReplyStyleConfigTest(unittest.TestCase):
+    """说话详略三档（v3.11.0）：新键优先、旧键迁就、脏值不炸。"""
+
+    def _load(self, data):
+        import tempfile, json, os
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            return AzureConfig.load(p)
+
+    def test_default_is_brief(self):
+        """默认 0（精简）：与旧「短回复」开关的默认 true 一致，不静默改变既有行为。"""
+        self.assertEqual(AzureConfig().reply_style, 0)
+
+    def test_new_key_round_trip_and_clamp(self):
+        self.assertEqual(self._load({"reply_style": 1}).reply_style, 1)
+        self.assertEqual(self._load({"reply_style": 2}).reply_style, 2)
+        self.assertEqual(self._load({"reply_style": 9}).reply_style, 2)
+        self.assertEqual(self._load({"reply_style": -3}).reply_style, 0)
+
+    def test_dirty_falls_back_to_brief(self):
+        self.assertEqual(self._load({"reply_style": "oops"}).reply_style, 0)
+        self.assertEqual(self._load({"reply_style": None}).reply_style, 0)
+
+    def test_missing_keys_match_legacy_default(self):
+        self.assertEqual(self._load({}).reply_style, 0)   # 旧默认 tts_limit_len=true
+
+    def test_legacy_tts_limit_len_migrates(self):
+        self.assertEqual(self._load({"tts_limit_len": True}).reply_style, 0)
+        self.assertEqual(self._load({"tts_limit_len": False}).reply_style, 1)
+
+    def test_new_key_wins_over_legacy(self):
+        self.assertEqual(self._load({"reply_style": 2, "tts_limit_len": True}).reply_style, 2)
+
+
+class MainTtsRoutingTest(unittest.TestCase):
+    """``tts_mode`` 决定装配哪个客户端（两者共享同一套 speak/audio 契约）。"""
+
+    def test_build_tts_routes_by_mode(self):
+        from app.main import _build_tts
+        from app.tts import TTSClient
+        from app.tts_aliyun import AliyunTTSClient
+
+        c = AzureConfig()
+        c.tts_mode = "aliyun"
+        self.assertIsInstance(_build_tts(c), AliyunTTSClient)
+        c.tts_mode = "openai"
+        self.assertIsInstance(_build_tts(c), TTSClient)
+        self.assertNotIsInstance(_build_tts(c), AliyunTTSClient)
+        c.tts_mode = "system"
+        self.assertIsInstance(_build_tts(c), TTSClient)
+
+
 if __name__ == "__main__":
     unittest.main()
