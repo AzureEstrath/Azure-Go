@@ -1,5 +1,5 @@
 extends SceneTree
-## 主界面（纸幕封面）自检（v3.11.2）——纯 UI 组装：三键信号 / 「开始 ⇄ 继续」措辞 / 显隐 / 纸幕挡点击。
+## 主界面（纸幕封面）自检（v3.11.2）——纯 UI 组装：三键信号 / 「开始 ⇄ 开始新对局」措辞 / 显隐 / 纸幕挡点击。
 ## 运行：godot --headless --path game --script res://tests/test_title_screen.gd
 
 var _total := 0
@@ -36,7 +36,7 @@ func _press(t: TitleScreen, label: String) -> bool:
 	return false
 
 func _run() -> void:
-	print("[title] 主界面自检（纸幕 / 三键 / 继续对局）")
+	print("[title] 主界面自检（纸幕 / 三键 / 开始新对局）")
 	var t := TitleScreen.new()
 	t.theme = GufengTheme.build_theme(GufengTheme.font())
 	root.add_child(t)
@@ -62,11 +62,11 @@ func _run() -> void:
 	t.close()
 	_check("② close() 后隐藏", not t.visible)
 
-	# —— ③ 「开始 ⇄ 继续」只换措辞，键位与信号不变 ——
-	t.set_resume_mode(true)
-	_check("③ 对局中回来：主按钮变「继续对局」", t.primary_text() == "继续对局")
-	_check("③ 继续模式照样能按主键", _press(t, "继续对局") and _primary_hits == 1)
-	t.set_resume_mode(false)
+	# —— ③ 「开始 ⇄ 开始新对局」只换措辞，键位与信号不变 ——
+	t.set_restart_mode(true)
+	_check("③ 对局中回来：主按钮变「开始新对局」", t.primary_text() == "开始新对局")
+	_check("③ 新对局模式照样能按主键", _press(t, "开始新对局") and _primary_hits == 1)
+	t.set_restart_mode(false)
 	_check("③ 首次启动：回到「开始对局」", t.primary_text() == "开始对局")
 	_check("③ 开始键也能按", _press(t, "开始对局") and _primary_hits == 2)
 
@@ -77,8 +77,8 @@ func _run() -> void:
 		and _settings_hits == 1 and _quit_hits == 1)
 
 	# —— ⑤ 封面不碰游戏状态：只发信号，自己不改任何东西（这里只钉「不抛、不崩」）——
-	t.set_resume_mode(true)
-	t.set_resume_mode(false)
+	t.set_restart_mode(true)
+	t.set_restart_mode(false)
 	_check("⑤ 反复切换措辞不抛、状态稳定", t.primary_text() == "开始对局")
 
 	# —— ⑥ 淡入淡出（运镜用）：透明度由 Main 编排，封面只负责自己那一层 ——

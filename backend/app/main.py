@@ -338,11 +338,12 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         return ok()
 
     @app.post("/api/reset")
-    async def reset():
+    async def reset(body: dict = None):
         s = a()
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
-        s.reset_game()
+        # v3.12.1：从主界面进对局用 ``{"silent": true}``——只清棋局，不添一句「重新来吧」
+        s.reset_game(silent=bool((body or {}).get("silent", False)))
         return ok()
 
     @app.post("/api/config")

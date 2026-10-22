@@ -526,6 +526,96 @@ func _clear_joseki() -> void:
 	_joseki_marks = []
 	_joseki_t = 0.0
 
+## 点目标记（v3.12.0）：后端 `estimate` 事件里的归属小方块。空点贴在棋盘面上，
+## 已有棋子的点**抬到棋子上**（被点死的对手子）——演示图的口径。
+const EST_MARK := 0.30          # 小方块边长（格距 1.0）
+const EST_Y := 0.03             # 空点：压在网格线（0.012）/ 星位（0.015）之上
+const EST_DEAD_Y := STONE_H + 0.02  # 死子：压在棋子顶面（STONE_H = 0.28）之上
+const EST_BLACK := Color(0.129, 0.122, 0.110)
+const EST_WHITE := Color(0.980, 0.953, 0.886)
+
+var _estimate_root: Node3D = null
+
+## 一格点目数据是否可用（静态纯函数：门卫直接断言，JSON 里的数字是 float 也认）。
+static func estimate_cell_ok(c) -> bool:
+	if typeof(c) != TYPE_ARRAY or (c as Array).size() < 3:
+		return false
+	var x = (c as Array)[0]
+	var y = (c as Array)[1]
+	var side = (c as Array)[2]
+	if typeof(x) != TYPE_INT and typeof(x) != TYPE_FLOAT:
+		return false
+	if typeof(y) != TYPE_INT and typeof(y) != TYPE_FLOAT:
+		return false
+	if typeof(side) != TYPE_STRING:
+		return false
+	if not (side == "black" or side == "white"):
+		return false
+	var xi := int(x)
+	var yi := int(y)
+	return xi >= 0 and xi < 19 and yi >= 0 and yi < 19
+
+## 画 / 换一批点目标记；传空数组等于清除。`cells` 形状见 `NetClient.estimate_event`。
+## 全部脏值跳过（不画、不抛）：点目是「锦上添花」，绝不该让棋盘崩掉。
+func set_estimate(cells) -> void:
+	clear_estimate()
+	if typeof(cells) != TYPE_ARRAY:
+		return
+	var black := SurfaceTool.new()
+	var white := SurfaceTool.new()
+	black.begin(Mesh.PRIMITIVE_TRIANGLES)
+	white.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var nb := 0
+	var nw := 0
+	var half := EST_MARK * 0.5
+	for c in (cells as Array):
+		if not estimate_cell_ok(c):
+			continue
+		var x := int((c as Array)[0])
+		var y := int((c as Array)[1])
+		var side := str((c as Array)[2])
+		var h := EST_DEAD_Y if is_occupied(x, y) else EST_Y    # 死子抬到棋子上
+		var p := _world(x, y, h)
+		var st := black if side == "black" else white
+		_mark_quad(st, p, half)
+		if side == "black":
+			nb += 1
+		else:
+			nw += 1
+	if nb == 0 and nw == 0:
+		return
+	_estimate_root = Node3D.new()
+	add_child(_estimate_root)
+	if nb > 0:
+		_estimate_root.add_child(_mark_mesh(black.commit(), EST_BLACK))
+	if nw > 0:
+		_estimate_root.add_child(_mark_mesh(white.commit(), EST_WHITE))
+
+## 一个平躺在棋盘面（XZ 平面）上的方块，边长 2*half。
+func _mark_quad(st: SurfaceTool, p: Vector3, half: float) -> void:
+	st.add_vertex(Vector3(p.x - half, p.y, p.z - half))
+	st.add_vertex(Vector3(p.x + half, p.y, p.z + half))
+	st.add_vertex(Vector3(p.x + half, p.y, p.z - half))
+	st.add_vertex(Vector3(p.x - half, p.y, p.z - half))
+	st.add_vertex(Vector3(p.x - half, p.y, p.z + half))
+	st.add_vertex(Vector3(p.x + half, p.y, p.z + half))
+
+func _mark_mesh(mesh: ArrayMesh, col: Color) -> MeshInstance3D:
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	var m := StandardMaterial3D.new()
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.albedo_color = col
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED      # 平躺方块：两面都画，省去绕序烦恼（与棋盘网格同一做法）
+	mi.material_override = m
+	return mi
+
+## 收起点目标记（玩家下一手 / 重来 / 换局面 / 进主界面）。
+func clear_estimate() -> void:
+	if _estimate_root != null and is_instance_valid(_estimate_root):
+		_estimate_root.queue_free()
+	_estimate_root = null
+
 # ================= 化身视线目标 =================
 
 func _process(delta: float) -> void:

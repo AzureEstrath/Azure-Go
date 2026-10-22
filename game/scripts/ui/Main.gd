@@ -49,7 +49,9 @@ var _tts_aliyun_voice_edit: LineEdit
 ## —— 主界面（纸幕封面，v3.11.2）——
 var title_screen: TitleScreen = null       # 首次启动 / 对局中按 Esc 都是这一块
 var _title_open := false                   # 封面开着：棋盘锁、聊天禁用、不闲置搭话
-var _game_started := false                 # 已经过了首次「开始对局」（决定主按钮是开始还是继续）
+var _game_started := false                 # 已经过了首次「开始对局」（决定主按钮是「开始对局」还是「开始新对局」）
+## 从主界面进入时用：后端 `/api/reset` 在 busy 时会拒绝，忙就先记下，等 `_on_busy_changed(false)` 补发
+var _restart_when_idle := false
 var _setup_done := false                   # 本次运行已在主界面里点过「设置」：开局时不再弹第二遍
 var _setup_showing := false                # 设置面板正在显示（防重入）
 var _transition := false                   # 主界面 ⇄ 对局的运镜正在跑（期间不吃 Esc / 不叠加动画）
@@ -129,6 +131,12 @@ var _lbl_moves: Label
 var _lbl_wr: Label
 var _lbl_score: Label
 var _lbl_score_hint: Label                     # 目差下面那行 11px 小字：量级人话（空串＝还没有形势信息）
+## —— 局面点目（v3.12.0，「局面分析」的形势面板）——
+## 浮在棋盘左上方的 2D 小面板（与定式卡片同一层做法，不进侧栏）；棋盘上的归属小方块在 Board3D。
+var _estimate_box: PanelContainer
+var _estimate_count: Label                     # 「黑 41 目 · 白 4 目」
+var _estimate_lead: Label                      # 「黑领先 29.5 目（贴 7.5 目）」
+var _estimate_move_count := -1                 # 这次判断对应的手数：state 手数一变就收起（-1＝没显示）
 var _lbl_status: Label
 var _status_before_tool := ""                  # 她查资料前状态栏的原文案（end 时恢复）
 var _status_before_tool_bad := false           # 原文案的错误色标记（end 时一并恢复，别把红字洗成灰字）
@@ -176,6 +184,7 @@ func _ready() -> void:
 	await _maybe_show_title()                  # 首次启动：等「开始对局」
 	await _maybe_show_setup()                  # 启动设置面板：思考模式 + 各 API 配置（默认=当前配置）；确认后按新配置起服务
 	_build_services()
+	_start_launch_game()                       # 首次进对局也保证空局（后端可能还留着上次运行的对局）
 	_greet()
 	_handle_cli()
 
@@ -261,6 +270,7 @@ func _build_ui() -> void:
 
 	# 卡片先加：它是浮层，任何既有控件（左右栏 / 开关）都压在它上面——只浮在棋盘上，不挤压既有控件
 	_build_joseki_card(root)
+	_build_estimate_box(root)
 	_build_right_panel(root)
 	_build_left_panel(root)
 	_build_toggles(root)
@@ -275,6 +285,54 @@ func _build_joseki_card(root: Control) -> void:
 	root.add_child(_joseki_card)
 	get_viewport().size_changed.connect(_on_viewport_resized)
 
+## 形势面板（v3.12.0）：浮在棋盘左上方的小纸签，内容全部来自后端 `estimate` 事件。
+## 它是**临时注记**（玩家下一手 / 局面变了就收起），所以不进侧栏、不新增常驻控件。
+func _build_estimate_box(root: Control) -> void:
+	_estimate_box = PanelContainer.new()
+	_estimate_box.visible = false
+	_estimate_box.custom_minimum_size = Vector2(200, 0)
+	_estimate_box.mouse_filter = Control.MOUSE_FILTER_STOP   # 面板上点一下不许穿到棋盘去落子
+	_estimate_box.tooltip_text = "只统计归属明确的点（|归属| ≥ 50%）：空地算目，被点死的对手子也算；\n" \
+		+ "中间大片还没定下来的地方不计入——所以双方点数加起来通常小于棋盘总点数。"
+	_estimate_box.add_theme_stylebox_override("panel", GufengTheme.slip(GufengTheme.PAPER_WARM, 10))
+	root.add_child(_estimate_box)
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", 2)
+	_estimate_box.add_child(vb)
+	var head := HBoxContainer.new()
+	vb.add_child(head)
+	var title := Label.new()
+	title.text = "形势"
+	title.add_theme_font_size_override("font_size", 15)
+	title.add_theme_color_override("font_color", GufengTheme.DAI)
+	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	head.add_child(title)
+	var close := Button.new()
+	close.text = "关闭形势"
+	GufengTheme.apply_bare_button(close)
+	close.pressed.connect(_hide_estimate)
+	head.add_child(close)
+	_estimate_count = Label.new()
+	_estimate_count.add_theme_color_override("font_color", GufengTheme.INK)
+	vb.add_child(_estimate_count)
+	_estimate_lead = Label.new()
+	_estimate_lead.add_theme_font_size_override("font_size", 12)
+	_estimate_lead.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
+	vb.add_child(_estimate_lead)
+	var hint := Label.new()
+	hint.text = "她此刻的判断，仅供参考"
+	hint.add_theme_font_size_override("font_size", 11)
+	hint.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
+	vb.add_child(hint)
+	_place_estimate_box()
+
+## 形势面板落位：左上角；左栏展开时向右让开，别压在侧栏上（棋盘投影在它下方，不会挡棋子）。
+func _place_estimate_box() -> void:
+	if _estimate_box == null:
+		return
+	var x := 20.0 if not _left_open else float(PANEL_W) + 20.0
+	_estimate_box.position = Vector2(x, 20.0)
+
 ## 默认落位：按**棋盘格子**挑一个不与棋盘 / 已展开侧栏相交、且完整落在窗口内的空白角。
 ## 原先硬编码「左下角」在 1280×800 下正压棋盘（棋盘近左角伸进卡片)，卡片一出生就被判 faded——故现算。
 func _place_joseki_card() -> void:
@@ -285,6 +343,8 @@ func _place_joseki_card() -> void:
 
 ## 窗口尺寸变了：只有用户还没动过卡片（还在我们摆的位置上）才重新摆位，绝不抢用户的手
 func _on_viewport_resized() -> void:
+	if _estimate_box != null and _estimate_box.visible:
+		_place_estimate_box()
 	if _joseki_card == null or _joseki_card.position != _joseki_card_home:
 		return
 	_place_joseki_card()
@@ -611,6 +671,7 @@ func _build_right_panel(root: Control) -> void:
 		agent.hint()))
 	_buttons.append(_button(btn_row, "局面分析", func():
 		_allow_tts_fillers()
+		_hide_estimate()                        # 点一次＝重新算：先收起上一张，等新的 estimate 事件
 		agent.analyze_position()))
 	_buttons.append(_button(btn_row, "重来", _ask_reset))
 	var end_btn := _button(btn_row, "结束", _ask_end)
@@ -933,6 +994,7 @@ func _apply_panel_layout(animated := true, dur := 0.18, apply_board := true) -> 
 	_left_toggle.text = "◀" if _left_open else "▶"
 	if apply_board and board != null:
 		board.set_panels(_left_open, _right_open)
+	_place_estimate_box()                      # 形势面板跟着左栏让位（收起时挪回左上角）
 
 func _on_tts_enabled(v: bool) -> void:
 	cfg.tts_enabled = v
@@ -1707,9 +1769,10 @@ func _open_title_screen(animated := false) -> void:
 	if title_screen == null or _title_open or _transition:
 		return
 	_title_open = true
+	_hide_estimate()                              # 回封面：点目是临时注记，不跟着进主界面
 	if board != null:
 		board.input_blocked = true                # 封面期间 Home / C / 拖拽 / 滚轮都不许动视角
-	title_screen.set_resume_mode(_game_started)   # 首次「开始对局」/ 对局中「继续对局」
+	title_screen.set_restart_mode(_game_started)  # 首次「开始对局」/ 对局中回来「开始新对局」
 	_idle = false
 	_set_idle_state(false)
 	_refresh_lock()
@@ -1760,7 +1823,7 @@ func _hide_game_chrome(dur: float) -> void:
 	if board != null:
 		board.set_panels(false, false)            # 平滑回中间：棋盘跟着工具栏一起让位
 
-## 工具栏飞入：开始 / 继续对局那一段（右侧面板从画面外滑进来，棋盘同时让位）
+## 工具栏飞入：开始 / 开始新对局那一段（右侧面板从画面外滑进来，棋盘同时让位）
 func _show_game_chrome(dur: float) -> void:
 	_left_open = false
 	_right_open = true
@@ -1796,7 +1859,9 @@ func _play_exit_to_menu() -> void:
 		await title_screen.fade_in(TITLE_FADE_IN)
 	_transition = false
 
-## 开始 / 继续：首次开局先过设置面板（盖在封面上），再走入场运镜。
+## 开始 / 开始新对局：首次开局先过设置面板（盖在封面上），再走入场运镜。
+## **每次从主界面进对局都是新的一局**（v3.12.1：不再有「继续上一局」）——
+## 入门前先把上一局的棋盘 / 侧栏清干净，再让后端 reset，运镜期间看到的就已经是空棋盘。
 func _on_title_primary() -> void:
 	if _transition or _setup_showing:
 		return                                   # 运镜中 / 设置面板已开：不重入
@@ -1806,11 +1871,70 @@ func _on_title_primary() -> void:
 		_build_setup_panel()
 		await setup_confirmed
 		_setup_done = true
+	if entry_needs_restart(_game_started):
+		_begin_new_game_on_entry()
 	await _play_enter_game()
 	_close_title_screen()
 	if first:
 		_game_started = true
 		title_started.emit()                      # 释放 _ready 的等待，继续起服务 / 问候
+
+## 从主界面进对局要不要重开一局：首次启动不用（后端本来就是空局、服务还没起），
+## 其余每一次都要——「每次从主界面进入游戏刷新棋局，不遗留上一局」。纯函数，门卫可直接断言。
+static func entry_needs_restart(game_started) -> bool:
+	match typeof(game_started):
+		TYPE_BOOL:
+			return game_started
+		TYPE_INT, TYPE_FLOAT:
+			return game_started != 0
+		_:
+			return false
+
+## 从主界面进入＝新的一局：先在本地清屏（运镜期间就看不到旧棋子），再让后端 reset。
+## 后端 `/api/reset` 忙时会拒绝（保护在途回合），所以忙就先挂着，等 `_on_busy_changed(false)` 补发；
+## 不这样做的话，「她还在想的时候按 Esc 回主界面再进来」会静默保留上一局。
+func _begin_new_game_on_entry() -> void:
+	_reset_game_view()
+	_restart_when_idle = true
+	_try_restart_backend()
+
+## 首次进对局也保证是空局：后端是独立进程，可能跨游戏运行（上一次对局还在里面）——
+## 不 reset 的话 `hello` 会把上一局的 stones 推回来。走与「从主界面进来」同一条路（静默 + 忙时等 idle）。
+func _start_launch_game() -> void:
+	if agent == null:
+		return
+	_begin_new_game_on_entry()
+
+func _try_restart_backend() -> void:
+	if not _restart_when_idle or agent == null:
+		return
+	if agent.busy:
+		return                                   # 等这一轮收尾（`_on_busy_changed(false)` 会再进来）
+	_restart_when_idle = false
+	agent.reset_game(true)                       # 静默新局：进门不该每次都多一句「重新来吧」
+
+## 新的一局的侧栏文案（纯函数：从主界面进入 / 「重来」共用，门卫可直接断言）。
+## `state` 事件只带棋盘与俗手，**胜率 / 目差不会自己归零**——必须在这里显式清，否则上一局会留着。
+static func fresh_game_labels() -> Dictionary:
+	return {"moves": "手数: 0", "winrate": "黑胜率: --", "score": score_line(null), "hint": ""}
+
+## 把界面恢复到空局：棋盘 / 手数 / 胜率 / 目差 / 俗手 / 复盘入口 / 点目注记一起清。
+func _reset_game_view() -> void:
+	_hide_estimate()
+	_move_pending = false
+	_last_move_count = 0
+	var lab := fresh_game_labels()
+	_lbl_moves.text = str(lab["moves"])
+	_lbl_wr.text = str(lab["winrate"])
+	_lbl_score.text = str(lab["score"])
+	if _lbl_score_hint != null:
+		_lbl_score_hint.text = str(lab["hint"])
+	_render_bad_moves([])
+	_game_ended = false
+	_refresh_review_entry()
+	if board != null:
+		board.set_stones([])
+		board.set_move_seq([])
 
 ## 主界面的「设置」：复用启动设置面板（只换主按钮措辞），改完回主界面、不掉出对局。
 func _on_title_settings() -> void:
@@ -2156,6 +2280,7 @@ func _wire_agent() -> void:
 	agent.message.connect(_add_msg)
 	agent.state_changed.connect(_on_state_changed)
 	agent.info_changed.connect(_on_info_changed)
+	agent.estimate_event.connect(_on_estimate)
 	agent.busy_changed.connect(_on_busy_changed)
 	agent.move_rejected.connect(_on_move_rejected)   # 这一手被后端拒绝：撤掉乐观子（v3.9.5）
 	agent.mood_changed.connect(_on_mood_changed)
@@ -2303,6 +2428,7 @@ func _greet() -> void:
 
 func _on_intersection_clicked(x: int, y: int) -> void:
 	_allow_tts_fillers()
+	_hide_estimate()                            # 你一落子：上一张点目图立刻收起（v3.12.0）
 	_interrupt_speech_for_move()                # v3.11.1：你一落子，她上一轮没说完的话就让位
 	# 点下就锁（本地闩）：`busy` 事件回来之前还有一瞬，期间再点会发出第二手——后端会挡下，
 	# 但棋盘上已经乐观画上了那颗子，回包又被忽略 ⇒ 撤不掉的幽灵子（v3.9.5）。闩由
@@ -2343,6 +2469,9 @@ func _on_state_changed(p: Dictionary) -> void:
 	board.set_stones(p["stones"])
 	board.set_move_seq(p.get("move_seq", []))       # 悬停已有棋子时推手数用（后端 state 自带 GTP 手顺）
 	var mc := int(p["move_count"])
+	# 点目注记只对「她分析时那个局面」有效：手数一变（重来 / 悔棋 / 复盘翻页）就收起
+	if _estimate_move_count >= 0 and mc != _estimate_move_count:
+		_hide_estimate()
 	if mc > _last_move_count:                       # Azure 每落一子：先注视自己的落点，再交还鼠标跟随
 		var stone := _last_stone(p["stones"])
 		if not stone.is_empty() and str(stone["c"]) == "white":
@@ -2366,6 +2495,53 @@ func _on_info_changed(wr: float, sc: float) -> void:
 	_lbl_score.text = score_line(sc)                       # 原始数字照旧保留
 	if _lbl_score_hint != null:
 		_lbl_score_hint.text = score_hint(sc, wr)          # 下面那行量级人话
+
+## 「局面分析」的点目注记（v3.12.0）：后端在 prepare 阶段、她还在想的时候就发过来，
+## 所以棋盘方块与形势面板和她的思考**同步出现**。前端不加工归属，只把后端的数字排版。
+func _on_estimate(payload: Dictionary) -> void:
+	if board == null:
+		return
+	board.set_estimate(payload.get("cells", []))
+	_estimate_move_count = int(payload.get("move_count", -1))
+	if _estimate_count != null:
+		_estimate_count.text = estimate_count_line(payload.get("black", 0), payload.get("white", 0))
+	if _estimate_lead != null:
+		_estimate_lead.text = estimate_lead_line(payload.get("lead"), payload.get("komi"))
+	_place_estimate_box()
+	if _estimate_box != null:
+		_estimate_box.visible = true
+
+## 收起形势注记（玩家下一手 / 重来 / 局面变了 / 回主界面 / 进复盘 / 点「关闭形势」）。
+func _hide_estimate() -> void:
+	_estimate_move_count = -1
+	if _estimate_box != null:
+		_estimate_box.visible = false
+	if board != null:
+		board.clear_estimate()
+
+## 形势面板「双方点数」：数字是后端标出来的点（空地 + 被点死的对手子）。脏值 ⇒ 「形势: --」。
+static func estimate_count_line(black, white) -> String:
+	var b := _metric(black)
+	var w := _metric(white)
+	if is_nan(b) or is_inf(b) or is_nan(w) or is_inf(w):
+		return "形势: --"
+	return "黑 %d 目 · 白 %d 目" % [int(b), int(w)]
+
+## 形势面板「谁领先」：`lead` 是黑方视角目差（含贴目，正数＝黑好），`komi` 是贴目。
+static func estimate_lead_line(lead, komi) -> String:
+	var s := _metric(lead)
+	var txt := "--"
+	if not is_nan(s) and not is_inf(s):
+		if absf(s) < 0.5:
+			txt = "双方接近"
+		elif s > 0.0:
+			txt = "黑领先 %.1f 目" % s
+		else:
+			txt = "白领先 %.1f 目" % -s
+	var k := _metric(komi)
+	if is_nan(k) or is_inf(k):
+		return txt
+	return "%s（贴 %.1f 目）" % [txt, k]
 
 ## 目差的量级人话（四档；与 `winrate_band` 同一套档位编号）
 const SCORE_PHRASES := ["差不多", "半个角", "一个角的实空", "已经很难追了"]
@@ -2440,6 +2616,7 @@ func _on_busy_changed(busy: bool) -> void:
 		_speech_hold = _speech_busy()      # Azure 还有话没播完（含音频还在取）：继续锁住棋盘，等她说完
 		if not _speech_hold:
 			_reveal_move()                 # 兜底：语音不可用/未播时，也要把落子显示出来
+		_try_restart_backend()             # 主界面进来时她还在想：等这一轮收尾再补发新局 reset
 	_refresh_lock()
 	_clear_thinking_if_idle()
 
@@ -2750,8 +2927,7 @@ func _ask_reset() -> void:
 	_ask_note("重新开始？当前棋局与俗手记录都会清空。", func(_note):
 		_allow_tts_fillers()
 		pairing.mark_text_only()             # 重来提示只有文字（后端同步方法，T20②）
-		_game_ended = false                  # 新的一局：复盘入口收起（V19，本地标志）
-		_refresh_review_entry()
+		_reset_game_view()                   # 棋盘 / 手数 / 胜率 / 目差 / 俗手 / 复盘入口一起清
 		agent.reset_game())
 
 func _ask_end() -> void:
@@ -2794,6 +2970,7 @@ func _enter_review() -> void:
 	if agent == null:
 		_set_status("后端未连接：无法进入复盘")
 		return
+	_hide_estimate()                              # 复盘是只读回看：先把点目注记收掉
 	agent.fetch_bytes("/api/review", HTTPClient.METHOD_POST, {"on": true},
 		func(ok: bool, code: int, body: PackedByteArray):
 			if not ok:

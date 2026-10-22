@@ -4,8 +4,10 @@ extends Node
 ##
 ## 对 Main.gd 暴露的信号与方法面（Main 的 agent.* 调用点只认这套契约）：
 ##   - 命令：REST POST（/api/move /api/hint /api/analyze /api/chat ... 见 docs）
-##   - 事件：WebSocket /ws 推送（message / state / info / busy / mood / joseki / tool / token / speech / memory；连上先收 hello 同步）
+##   - 事件：WebSocket /ws 推送（message / state / info / estimate / busy / mood / joseki / tool / token / speech / memory；连上先收 hello 同步）
 ##     token 是可选（默认关闭）的流式增量：只影响气泡的显示过程，最终内容仍以 message 为准
+##     estimate 是「局面分析」的点目注记（棋盘归属小方块 + 形势面板数字）：只给玩家看，
+##     不改 message / speech，也不参与任何编排
 ##     speech 是每条台词的**语音指令**（`mode=openai` 时按 id 去 GET /api/tts/audio/{id} 取音频；
 ##     `mode=system` 时按 text 交给系统语音）——合成全在后端，前端只取音频 + 播放
 ##     memory 是长期记忆写入/召回的元数据：只记一行日志，不进台词、不产生任何信号
@@ -19,6 +21,9 @@ extends Node
 signal message(kind: String, text: String)
 signal state_changed(payload: Dictionary)
 signal info_changed(winrate: float, score: float)
+## 「局面分析」的点目注记（v3.12.0）：`cells = [[x, y, "black"|"white"], …]` + 双方点数 / 目差 / 贴目。
+## 原样转给 Main（画棋盘小方块 + 形势面板）；玩家下一手由 Main 自己收起，后端不会再发「收起」事件。
+signal estimate_event(payload: Dictionary)
 signal busy_changed(busy: bool)
 signal mood_changed(payload: Dictionary)
 signal joseki_event(payload: Dictionary)
@@ -199,6 +204,9 @@ func _handle_packet(raw: String) -> void:
 			state_changed.emit(_without_type(d))
 		"info":
 			info_changed.emit(float(d.get("winrate", 0.5)), float(d.get("score", 0.0)))
+		"estimate":
+			# 点目注记：原样交给 Main（它只画棋盘 / 面板，不产生台词、不改 busy）
+			estimate_event.emit(_without_type(d))
 		"busy":
 			_apply_busy(bool(d.get("busy", false)))
 		"mood":
@@ -346,8 +354,9 @@ func summarize(note: String) -> void:
 func undo(turn_index: int) -> void:
 	_post("/api/undo", {"turn": turn_index})
 
-func reset_game() -> void:
-	_post("/api/reset")
+## 开新局。`silent=true`（v3.12.1）＝只清棋局、不添「重新来吧」那句——从主界面进对局时用。
+func reset_game(silent := false) -> void:
+	_post("/api/reset", {"silent": silent})
 
 func set_allow_pass(v: bool) -> void:
 	_post("/api/config", {"allow_pass": v})

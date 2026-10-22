@@ -7,6 +7,7 @@
     message       ↔  message(kind, text)        对话/点评/落子宣告（kind 见下）
     state         ↔  state_changed(payload)     棋盘与手数权威快照
     info          ↔  info_changed(winrate, score)
+    estimate      ↔  estimate_event(payload)    点目 / 形势注记（棋盘小方块 + 面板数字）
     busy          ↔  busy_changed(busy)
     mood          ↔  mood_changed(payload)      三维情绪区域（表情/语气词/音高）
     joseki        ↔  joseki_event(payload)      定式高亮轨迹（kind/corner/points）+ 卡片载荷
@@ -30,6 +31,11 @@ message.kind 取值与前端 message 信号一致：
 
 ``tool`` 只描述「她自己查了一次资料」的进度（``phase`` = start/end），**不是台词**：
 前端只用它更新状态栏文案，工具返回的原始文本永远只回到模型手里。
+
+``estimate``（v3.12.0）是**棋盘注记**（点目 / 形势判断）：只在玩家主动点「局面分析」时随那次
+分析一起发出，前端在棋盘上画归属小方块、并弹一块形势面板；玩家下一手 / 局面变了就收起。
+它与 ``info`` 刻意分开（``info`` 是右栏的胜率 / 目差，任何分析都会刷），**不改 ``message`` 的
+形状、不产生 ``speech``、不进任何 LLM 上下文**。
 
 ``joseki``（计划 07 T6）在旧三键之外带出**卡片载荷**：``kind/corner/points`` 是原来那条高亮轨迹
 （取值路径不变），``family/name/k/line/candidates/show_card/mistake`` 供定式教学卡片（前端
@@ -71,6 +77,71 @@ def state(payload):
 
 def info(winrate, score):
     return {"type": "info", "winrate": winrate, "score": score}
+
+
+def estimate(payload):
+    """局面点目（形势判断）的棋盘注记 + 面板数字：**不是台词、不是状态**。
+
+    与 ``info`` 刻意分开：``info`` 是右栏那两个数字（胜率 / 目差），任何分析成功都会刷；
+    ``estimate`` 只在**玩家主动点「局面分析」**时有，且带一整张逐点归属（361 个点的子集）。
+    前端据它在棋盘上画小方块、并弹一块形势面板；玩家下一手 / 换局面就收起。
+
+    载荷（全部有安全缺省，缺字段 / 脏值退化成「不显示」，绝不抛）：
+
+        komi        7.5     贴目（与引擎请求体一致）
+        move_count  0       这次判断对应的手数：前端据它识别「局面已经变了」并收起
+        lead        None    黑方视角目差（正数＝黑领先，含贴目）；非数值 ⇒ None
+        black       0       黑方标出的点数（空地 + 被点死的白子）
+        white       0       白方标出的点数
+        cells       []      ``[[x, y, "black"|"white"], …]``，只含归属明确的点
+
+    ``cells`` 只留合法坐标 / 合法颜色，去重；上限 361 条。它**不进** ``message``、不产生
+    ``speech``、也不进任何 LLM 上下文——事件是给玩家看的。
+    """
+    p = payload if isinstance(payload, dict) else {}
+
+    def _int(v, default=0):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
+    def _num(v):
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return None
+        return n if n == n and n not in (float("inf"), float("-inf")) else None
+
+    cells = []
+    seen = set()
+    raw = p.get("cells")
+    if isinstance(raw, (list, tuple)):
+        for c in raw:
+            if not isinstance(c, (list, tuple)) or len(c) < 3:
+                continue
+            x = _int(c[0], -1)
+            y = _int(c[1], -1)
+            side = str(c[2])
+            if not (0 <= x < 19 and 0 <= y < 19) or side not in ("black", "white"):
+                continue
+            key = (x, y, side)
+            if key in seen:
+                continue
+            seen.add(key)
+            cells.append([x, y, side])
+            if len(cells) >= 361:
+                break
+    komi = _num(p.get("komi"))
+    return {
+        "type": "estimate",
+        "komi": 7.5 if komi is None else komi,
+        "move_count": max(0, _int(p.get("move_count"))),
+        "lead": _num(p.get("lead")),
+        "black": max(0, _int(p.get("black"))),
+        "white": max(0, _int(p.get("white"))),
+        "cells": cells,
+    }
 
 
 def busy(is_busy):

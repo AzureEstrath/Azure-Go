@@ -57,7 +57,7 @@ from typing import TypedDict
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from . import coords, decay, events, prompts
+from . import coords, decay, estimate, events, prompts
 from .llm_chain import ThinkStream, content_of, content_text_of
 from .tools import TOOLS
 
@@ -601,6 +601,12 @@ async def _prepare_analyze(agent, data):
         return
     if not _alive(agent, data):                     # 看门狗守卫：超时后旧一代不再写缓存 / 出话
         return
+    # 点目注记（v3.12.0）：**复用这一次分析**，在 LLM 思考开始前就发出去 —— 玩家点「局面分析」
+    # 后先看到棋盘上的归属方块与形势面板，她的台词随后到。它只是棋盘注记：不发 speech、
+    # 不进提示词、不碰 busy；分析失败（上面已短路）时一条都不发。
+    est = estimate.build(analysis, n, agent.st.board.stones_list())
+    if est is not None:
+        agent._emit(events.estimate(est))
     conv = prompts.to_black_perspective(analysis, n)
     black_wr = float(conv[0])
     score_black = float(conv[1])
