@@ -107,14 +107,16 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 
 ## 分支说明
 
-本仓库以 **发展主版本** 为主线，另保留一条 **历史分支** 完整承载旧版：
+本仓库按 **三条工作支线** 组织，`main` / `legacy` 保留为默认分支与历史别名：
 
-| 分支 | 定位 | 内容概要 | 链接 |
+| 支线 | 分支 | 定位 | 内容概要 |
 | --- | --- | --- | --- |
-| **`main`** | 发展主版本（当前主线，v3.x） | 前后端分离：`game\` 只负责渲染、输入与语音播放，`backend\` 统一编排对局与模型调用，`katago_service\` 独立部署提供 KataGo；支持 LangChain 提示链、发言侧工具与长期记忆。 | [查看 main](https://github.com/AzureEstrath/Azure-Go) |
-| **`legacy`** | 历史分支（发展副版本，v1.0–v2.0.1） | 旧版完整存档：本机运行 KataGo 与本地模型、三维情感模型（valence / curiosity / arousal）、前后端分离 v2.0.1，以及 `peek\` 窥屏脚本等。 | [查看 legacy](https://github.com/AzureEstrath/Azure-Go/tree/legacy) |
+| **经典版** | `classic`（自 `legacy`） | v2.0.1 历史完整存档 | 本机运行 KataGo 与本地模型、三维情感模型、前后端分离 v2.0.1；本地 TTS 由游戏侧自动拉起，`peek\` 窥屏脚本保留。 |
+| **参赛版** | `competition`（与 `main` 同一提交） | v3.12.2 参赛提交版 | 前后端分离、LangGraph 编排、定式导学、棋谱库、全盘复盘、点目、领地热力图、战报与音效；默认语音按提交包配置。 |
+| **自用版** | `personal` | 基于参赛版，供本地自用 | 保留参赛版全部功能；**默认接本地**：本地 LLM / TTS 由 `dev_local.ps1` 拉起。TTS 拉起与接入参考经典版：`.tts_server.lock` 防重复启动、健康检查、等待模型就绪、**仅就绪后才写 `tts_mode=local`**、配置变化后重启后端生效。 |
 
-> `legacy` 为旧版的历史存档，后续功能开发集中在 `main`。
+> `main` 继续作为远端默认分支，与 `competition` 同一提交；`legacy` 保留为历史别名，与 `classic` 同一提交。日常开发在 `personal`。
+> 版本标签：`经典版` = `classic`，`参赛版` / `v3.12.2` = `competition`。
 
 ---
 
@@ -153,7 +155,7 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 │   ├─ tests\               服务单元测试（假引擎，不依赖真实 KataGo）
 │   ├─ requirements.txt     服务依赖（fastapi / uvicorn）
 │   └─ run_server.bat       一键启动服务（监听 127.0.0.1:8100，见第六节）
-├─ server\                  自建语音服务（CosyVoice 3，可选；**需自己启动**，游戏不再拉起）
+├─ server\                  自建语音服务（CosyVoice 3，可选；参赛版手动启动，自用版由 `dev_local.ps1` 自动拉起）
 │   ├─ azure_tts_server.py  FastAPI 服务：OpenAI 兼容 `/v1/audio/speech`、`/health`、`/voices`（另有 `/v1/models`）
 │   ├─ run_hidden.vbs       隐藏窗口启动（手动启动自建服务时用）
 │   ├─ start_tts_server*.bat 手动启动脚本

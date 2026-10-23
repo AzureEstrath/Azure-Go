@@ -189,7 +189,9 @@ def load_sherpa_engine(sd: str, threads: int, provider: str):
                 data_dir=es if os.path.isdir(es) else ''),
             num_threads=threads, provider=provider),
         rule_fsts=','.join(fsts),
-        max_num_sentences=1))
+        # 后端按句末标点分块，块内仍可能有多句 / 多个逗号；上限设 1 时 sherpa 只读第一句，
+        # 听起来像「只说两个字就没声了」。64 足够覆盖 100~160 字的合成块，避免整块被截断。
+        max_num_sentences=64))
 
 
 # ---------- 快速克隆：melo 合成 + OpenVoice 音色转换（CPU 上比 CosyVoice 快一个数量级） ----------

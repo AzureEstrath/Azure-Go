@@ -40,6 +40,25 @@ $LogDir = Join-Path $Root "backend\logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $PidFile = Join-Path $LogDir "dev_local_pids.json"
 
+# 本地语音目录：环境变量 > D:\KataGo\cosyvoice > 仓库内 cosyvoice > 仓库 server。
+# 判定标准与经典版一致：必须同时有 .venv\Scripts\python.exe 与 azure_tts_server.py，
+# 只有源码、没有运行环境的目录不能算「可用」。
+$TtsCandidates = @()
+if ($env:AZURE_TTS_DIR) { $TtsCandidates += $env:AZURE_TTS_DIR }
+$TtsCandidates += @(
+    "D:\KataGo\cosyvoice",
+    (Join-Path $Root "cosyvoice"),
+    (Join-Path $Root "server"),
+    (Join-Path (Split-Path $Root -Parent) "cosyvoice")
+)
+foreach ($d in $TtsCandidates) {
+    if ($d -and (Test-Path (Join-Path $d ".venv\Scripts\python.exe")) -and
+        (Test-Path (Join-Path $d "azure_tts_server.py"))) {
+        $TtsDir = $d
+        break
+    }
+}
+
 function Say([string]$s) { Write-Host $s }
 
 function Test-Url([string]$url, [string]$pattern = "", [int]$timeout = 2) {
@@ -77,6 +96,60 @@ function Warm-Tts([string]$voice) {
                         "-H", "Content-Type: application/json", "--data-binary", "@$f", "-o", "NUL") | Out-Null
 }
 
+# —— 本地语音服务：参考经典版 v2.0.1 的拉起 / 接入逻辑 ——
+# 关键点：模型加载期端口还没监听，光看 /health 会误判成「没在跑」而重复拉起；
+# 经典版用 .tts_server.lock 里的 pid 判断「已在启动」，这里照搬。
+function Get-TtsHealthText {
+    try {
+        return (Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$TtsPort/health").Content
+    } catch { return "" }
+}
+
+function Test-TtsReady {
+    return ((Get-TtsHealthText) -ne "")
+}
+
+function Test-TtsStarting {
+    $lock = Join-Path $TtsDir ".tts_server.lock"
+    if (-not (Test-Path $lock)) { return $false }
+    try {
+        $text = (Get-Content $lock -Raw).Trim()
+        $procId = 0
+        if (-not [int]::TryParse($text, [ref]$procId)) { return $false }
+        if ($procId -le 0) { return $false }
+        return [bool](Get-Process -Id $procId -ErrorAction SilentlyContinue)
+    } catch { return $false }
+}
+
+function Stop-TtsServer {
+    $c = Get-NetTCPConnection -LocalPort $TtsPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { try { Stop-Process -Id $c.OwningProcess -Force } catch { } }
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+        Where-Object { $_.CommandLine -match 'azure_tts_server' } |
+        ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch { } }
+    Start-Sleep -Seconds 2
+    Remove-Item (Join-Path $TtsDir ".tts_server.lock") -Force -ErrorAction SilentlyContinue
+}
+
+function Start-TtsServer {
+    $py = Join-Path $TtsDir ".venv\Scripts\python.exe"
+    $script = Join-Path $TtsDir "azure_tts_server.py"
+    $vbs = Join-Path $TtsDir "run_hidden.vbs"
+    $bat = if ($QualityTts) { "start_tts_server.bat" } else { "start_tts_server_fast.bat" }
+    $batPath = Join-Path $TtsDir $bat
+    if (-not (Test-Path $py) -or -not (Test-Path $script) -or -not (Test-Path $vbs) -or
+        -not (Test-Path $batPath)) {
+        Say ("      [跳过] 本地语音环境不完整：" + $TtsDir)
+        return $false
+    }
+    # 走经典版同一套 VBS（start_tts_server*.bat 内部 start "" wscript run_hidden.vbs）。
+    # 不在 PowerShell 里直接拼 wscript 参数：start 的「空标题」引号在 PS 5.1 下很容易被
+    # Start-Process 的 ArgumentList 重写；批处理已经把这层处理好了。
+    Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$batPath`"") `
+        -WorkingDirectory $TtsDir -WindowStyle Hidden | Out-Null
+    return $true
+}
+
 # ---------------------------------------------------------------- Stop
 if ($Stop) {
     Say "停止本次一键测试启动的进程…"
@@ -92,6 +165,12 @@ if ($Stop) {
             }
         } catch { }
         Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+    }
+    # 本地语音服务由 VBS 拉起，不在 $started 里；按端口 / 命令行收掉，避免留下孤儿进程。
+    $ttsConn = Get-NetTCPConnection -LocalPort $TtsPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($ttsConn) {
+        Stop-TtsServer
+        Say "  停止本地语音服务"
     }
     # 兜底：清掉本仓库启动的 KataGo 服务 / 后端 / katago 引擎
     Get-CimInstance Win32_Process |
@@ -142,55 +221,75 @@ if (Test-Url "http://127.0.0.1:$LlmPort/v1/models") {
 
 # [2/4] 本地语音（默认快引擎 MeloTTS；-QualityTts 用 CosyVoice）
 # 质量引擎每句 15~25 秒（后端同步等合成，一回合要 1~2 分钟）；快引擎每句 ~0.4 秒。
+# 参考经典版：先看 /health；没监听时再看 .tts_server.lock 是否已有实例在加载，
+# 避免「模型还在加载 → 健康检查失败 → 又拉起一个」的重复启动（两个实例抢 CPU 会让启动一直失败）。
 $TtsVoice = if ($QualityTts) { "azure" } else { "xiaoya" }
-$ttsHealth = ""
-try { $ttsHealth = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$TtsPort/health").Content } catch { }
-$runningQuality = ($ttsHealth -match '"model_dir"\s*:\s*"[^"]+"')
-if ($ttsHealth -ne "" -and ($runningQuality -eq [bool]$QualityTts)) {
-    Say ("[2/4] 本地语音已在运行（" + $(if ($QualityTts) { "质量引擎" } else { "快引擎" }) + "）：http://127.0.0.1:$TtsPort")
-} else {
-    if ($ttsHealth -ne "") {
-        Say "[2/4] 切换语音引擎：停止现有服务…"
-        $c = Get-NetTCPConnection -LocalPort $TtsPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($c) { try { Stop-Process -Id $c.OwningProcess -Force } catch { } }
-        Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-            Where-Object { $_.CommandLine -match 'azure_tts_server' } |
-            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch { } }
-        Start-Sleep -Seconds 3
-    }
-    $bat = if ($QualityTts) { "start_tts_server.bat" } else { "start_tts_server_fast.bat" }
-    if (Test-Path (Join-Path $TtsDir $bat)) {
-        Say ("[2/4] 启动本地语音（" + $(if ($QualityTts) { "质量引擎 CosyVoice" } else { "快引擎 MeloTTS" }) + "，后台隐藏窗口）…")
-        $p = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$(Join-Path $TtsDir $bat)`"") `
-            -WorkingDirectory $TtsDir -WindowStyle Hidden -PassThru
-        $started += $p.Id
-        # 批处理只负责拉起 VBS（隐藏窗口）后立刻退出：必须在这里等 /health 真就绪，
-        # 否则游戏先起来、首句语音会因本地服务还没加载好而回落系统语音。
-        $ttsWait = 90
-        if ($QualityTts) { $ttsWait = 300 }
-        if (-not (Wait-Url "http://127.0.0.1:$TtsPort/health" "" $ttsWait "本地语音服务")) {
-            Say "      （本地语音未就绪，游戏会按配置回落系统语音）"
-        }
+$TtsReady = $false
+$ttsHealth = Get-TtsHealthText
+if ($ttsHealth -ne "") {
+    $runningQuality = ($ttsHealth -match '"model_dir"\s*:\s*"[^"]+"')
+    if ($runningQuality -eq [bool]$QualityTts) {
+        $TtsReady = $true
+        Say ("[2/4] 本地语音已在运行（" + $(if ($QualityTts) { "质量引擎" } else { "快引擎" }) + "）：http://127.0.0.1:$TtsPort")
     } else {
-        Say "[2/4] [跳过] 找不到语音服务：$TtsDir（自动降级为系统语音）"
+        Say "[2/4] 切换语音引擎：停止现有服务…"
+        Stop-TtsServer
+    }
+}
+if (-not $TtsReady) {
+    $ttsCanWait = $true
+    if (Test-TtsStarting) {
+        Say "[2/4] 已有语音服务在启动（模型加载中），等待它就绪，不重复拉起…"
+    } else {
+        Say ("[2/4] 启动本地语音（" + $(if ($QualityTts) { "质量引擎 CosyVoice" } else { "快引擎 MeloTTS" }) + "，后台隐藏窗口）…")
+        if (-not (Start-TtsServer)) {
+            $ttsCanWait = $false
+            Say "      （本地语音环境不完整，跳过；游戏仍可用系统语音）"
+        }
+    }
+    if ($ttsCanWait) {
+        # 经典版等 160 次 × 1.5 秒 ≈ 240 秒；质量引擎给到 300 秒。
+        $ttsWait = 240
+        if ($QualityTts) { $ttsWait = 300 }
+        $TtsReady = Wait-Url "http://127.0.0.1:$TtsPort/health" "" $ttsWait "本地语音服务"
+    }
+    if (-not $TtsReady) {
+        Say "      （本地语音未就绪：保持原朗读方式，不把配置伪装成已切到本地）"
     }
 }
 
-# 把后端要用的「本地音色」写回本地配置（game/config.json 是本地开发配置，不入库）
-# 云端音色 (tts_voice) 不动；朗读方式显式切成 local（本地只走本地，失败回落系统语音）。
+# 只在语音服务真就绪时写配置，避免「脚本说切了本地、后端却连不上」的假成功。
 $cfgPath = Join-Path $Root "game\config.json"
+$ttsConfigChanged = $false
+$oldMode = ""
 if (Test-Path $cfgPath) {
     $cfgText = [IO.File]::ReadAllText($cfgPath, [Text.Encoding]::UTF8)
-    $cfgText = [regex]::Replace($cfgText, '"tts_local_base_url"\s*:\s*"[^"]*"',
-                                ('"tts_local_base_url": "http://127.0.0.1:' + $TtsPort + '/v1"'))
-    $cfgText = [regex]::Replace($cfgText, '"tts_local_voice"\s*:\s*"[^"]*"',
-                                ('"tts_local_voice": "' + $TtsVoice + '"'))
-    $cfgText = [regex]::Replace($cfgText, '"tts_mode"\s*:\s*"[^"]*"',
-                                '"tts_mode": "local"')
-    [IO.File]::WriteAllText($cfgPath, $cfgText, (New-Object Text.UTF8Encoding($false)))
-    Say "[2/4] 已把 game/config.json 的朗读方式切到「本地」（若后端已在运行，需重启后端才生效）"
+    if ($cfgText -match '"tts_mode"\s*:\s*"([^"]*)"') { $oldMode = $Matches[1] }
+    if ($TtsReady) {
+        $localUrl = "http://127.0.0.1:$TtsPort/v1"
+        $oldUrl = ""
+        $oldVoice = ""
+        if ($cfgText -match '"tts_local_base_url"\s*:\s*"([^"]*)"') { $oldUrl = $Matches[1] }
+        if ($cfgText -match '"tts_local_voice"\s*:\s*"([^"]*)"') { $oldVoice = $Matches[1] }
+        $cfgText = [regex]::Replace($cfgText, '"tts_local_base_url"\s*:\s*"[^"]*"',
+                                    ('"tts_local_base_url": "' + $localUrl + '"'))
+        $cfgText = [regex]::Replace($cfgText, '"tts_local_voice"\s*:\s*"[^"]*"',
+                                    ('"tts_local_voice": "' + $TtsVoice + '"'))
+        $cfgText = [regex]::Replace($cfgText, '"tts_mode"\s*:\s*"[^"]*"',
+                                    '"tts_mode": "local"')
+        $ttsConfigChanged = ($oldMode -ne "local") -or ($oldUrl -ne $localUrl) -or ($oldVoice -ne $TtsVoice)
+        [IO.File]::WriteAllText($cfgPath, $cfgText, (New-Object Text.UTF8Encoding($false)))
+        Say "[2/4] 已写入本地语音配置（tts_mode=local、voice=$TtsVoice）"
+        if ($ttsConfigChanged) {
+            Say "      （后端在运行时会重启以生效）"
+        } else {
+            Say "      （配置未变化，后端无需重启）"
+        }
+    } else {
+        Say ("[2/4] 保持原朗读方式（tts_mode=" + $oldMode + "），不改 config")
+    }
 }
-Warm-Tts $TtsVoice
+if ($TtsReady) { Warm-Tts $TtsVoice }
 
 # [3/4] KataGo 云服务（8100）
 if (Test-Url "http://127.0.0.1:$KataPort/health" "ready") {
@@ -209,7 +308,16 @@ if (Test-Url "http://127.0.0.1:$KataPort/health" "ready") {
 }
 
 # [4/4] 后端（8000）
-if (Test-Url "http://127.0.0.1:$BackendPort/api/health") {
+# 后端只在启动时读 config.json；本地语音配置变了就必须重启后端，否则 tts_mode 还是旧的。
+$backendRunning = Test-Url "http://127.0.0.1:$BackendPort/api/health"
+if ($backendRunning -and $ttsConfigChanged) {
+    Say "[4/4] 本地语音配置已变化：重启后端以生效…"
+    $bc = Get-NetTCPConnection -LocalPort $BackendPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($bc) { try { Stop-Process -Id $bc.OwningProcess -Force } catch { } }
+    Start-Sleep -Seconds 2
+    $backendRunning = $false
+}
+if ($backendRunning) {
     Say "[4/4] 后端已在运行：http://127.0.0.1:$BackendPort"
 } else {
     Say "[4/4] 启动后端（127.0.0.1:8000）…"
