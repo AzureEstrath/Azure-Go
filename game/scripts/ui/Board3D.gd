@@ -239,28 +239,6 @@ func _build_camera() -> void:
 	add_child(cam)
 	_update_camera()
 	cam.make_current()
-	_build_backdrop()
-
-## 背景：参考 Art-Of-Ink 的青绿山水横幅，贴在相机前 250 单位处——随视角一起转 / 缩放，
-## 像「画中景」，但不参与场景几何（没有墙、没有接缝）。画面略抬高，让山脊落在露台
-## 护栏上方；露台、护栏与木地板负责把地表收住，画面不再像悬在空中。
-func _build_backdrop() -> void:
-	var tex := load("res://assets/ui/ink_backdrop.jpg")
-	if not (tex is Texture2D):
-		return
-	var quad := QuadMesh.new()
-	quad.size = Vector2(460.0, 228.0)         # 与 2.02:1 原图同比例；略大于视锥，超宽屏也不露底
-	var mi := MeshInstance3D.new()
-	mi.mesh = quad
-	mi.position = Vector3(0.0, 18.0, -250.0)
-	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	var mat := StandardMaterial3D.new()
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mat.albedo_texture = tex
-	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
-	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
-	mi.material_override = mat
-	cam.add_child(mi)
 
 ## 侧栏状态：展开的一侧会把棋盘从画面中心推开（单侧沿用既有取景，两侧都开时整体等比推远）。
 ## 平滑过渡（`_step_panel_bias`）：棋盘跟着面板一起挪，不瞬移。
@@ -465,7 +443,10 @@ func _label(text: String, pos: Vector3) -> void:
 	l.text = text
 	l.font_size = 64
 	l.pixel_size = 0.008
-	l.modulate = Color(0.20, 0.18, 0.15)
+	# 自用版没有地板 / 背景板：坐标落在深色虚空里，改用冷白 + 深色描边。
+	l.modulate = Color(0.70, 0.80, 0.84)
+	l.outline_size = 6
+	l.outline_modulate = Color(0.02, 0.04, 0.05, 0.85)
 	l.rotation_degrees = Vector3(-90, 0, 0)
 	l.position = pos
 	add_child(l)
@@ -484,8 +465,9 @@ func _build_ghost() -> void:
 	_tip.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	_tip.font_size = 48
 	_tip.pixel_size = 0.006
-	_tip.modulate = Color(0.20, 0.28, 0.26)
+	_tip.modulate = Color(0.31, 0.82, 0.77)
 	_tip.outline_size = 12
+	_tip.outline_modulate = Color(0.02, 0.04, 0.05, 0.95)
 	_tip.no_depth_test = true
 	_tip.visible = false
 	add_child(_tip)

@@ -338,15 +338,16 @@ func _draw() -> void:
 	# 投影（壳的一部分，跟着 dim 一起淡）：纸压在桌面上的一点点厚度
 	var sh := StyleBoxFlat.new()
 	sh.bg_color = Color(0, 0, 0, 0)
-	sh.shadow_color = Color(0.18, 0.13, 0.07, 0.22 * _dim)
+	sh.shadow_color = Color(0, 0, 0, 0.35 * _dim)
 	sh.shadow_size = 10
 	sh.shadow_offset = Vector2(2, 5)
 	draw_style_box(sh, whole)
-	# 只有「壳」吃 dim：宣纸 + 墨框 + 网格。文字与棋子一律原色（见 `dim()` 的注释）。
-	var sb := StyleBoxTexture.new()
-	sb.texture = GufengTheme.FRAME_TEX                     # 宣纸底 + 手绘墨框（九宫格）
-	sb.set_texture_margin_all(GufengTheme.FRAME_MARGIN)
-	sb.modulate_color = Color(1.0, 1.0, 1.0, _dim)         # 避让：整层按 _dim 淡出
+	# 只有「壳」吃 dim：浅色图卡 + 冷灰描边 + 网格。文字与棋子一律原色（见 `dim()` 的注释）。
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(BG, _dim)
+	sb.border_color = Color(BORDER, 0.9 * _dim)
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(10)
 	draw_style_box(sb, whole)
 
 	var f := get_theme_default_font()
@@ -375,12 +376,12 @@ func _draw_header(f: Font) -> void:
 	# 关闭 ×：悬停时给一层淡墨底（光标形状在 `_gui_input` 里切）
 	if _hover_close:
 		var hsb := StyleBoxFlat.new()
-		hsb.bg_color = Color(GufengTheme.INK, 0.10)
+		hsb.bg_color = Color(BORDER, 0.10)
 		hsb.set_corner_radius_all(2)
 		draw_style_box(hsb, cr.grow(2.0))
 	var c := cr.position + cr.size * 0.5
 	var q := cr.size.x * 0.26
-	var xc := Color(GufengTheme.INK_SOFT, 0.55 if _hover_close else 0.38)
+	var xc := Color(BORDER, 0.55 if _hover_close else 0.38)
 	draw_line(c + Vector2(-q, -q), c + Vector2(q, q), xc, 1.6)
 	draw_line(c + Vector2(-q, q), c + Vector2(q, -q), xc, 1.6)
 	draw_line(Vector2(PAD, HEAD_H), Vector2(CARD_W - PAD, HEAD_H), Color(BORDER, 0.35 * _dim), 1.0)

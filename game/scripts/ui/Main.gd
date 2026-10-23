@@ -268,17 +268,17 @@ func _build_sfx() -> void:
 # ================= 世界与棋盘 =================
 
 func _make_cjk_font() -> Font:
-	# 古风主题：楷体优先（字体定义只在 GufengTheme 一处）
+	# 现代深色主题：无衬线优先（字体定义只在 GufengTheme 一处）
 	return GufengTheme.font()
 
 func _build_world() -> void:
 	var we := WorldEnvironment.new()
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
-	env.background_color = Color(0.878, 0.843, 0.769)   # 与山水纸色一致：远处不出现色阶
+	env.background_color = Color(0.043, 0.063, 0.078)   # 自用版：无背景板 / 无地板，深色虚空
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = Color(0.95, 0.91, 0.84)
-	env.ambient_light_energy = 0.80
+	env.ambient_light_color = Color(0.62, 0.78, 0.84)
+	env.ambient_light_energy = 0.62
 	we.environment = env
 	add_child(we)
 
@@ -288,7 +288,7 @@ func _build_world() -> void:
 	light.shadow_enabled = true
 	add_child(light)
 
-	# 环境：地面 + 风场（粒子与化身摆动共用同一风）
+	# 环境：只保留风场（自用版删掉了地板 / 背景；化身摆动仍采样同一风）
 	ambience = Ambience.new()
 	add_child(ambience)
 	avatar = AzureAvatar.new()
@@ -317,7 +317,7 @@ func _build_ui() -> void:
 	var root := Control.new()
 	root.set_anchors_preset(Control.PRESET_FULL_RECT)
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var th := GufengTheme.build_theme(_font)   # 古风主题：没被单独覆盖的控件也吃到这套皮
+	var th := GufengTheme.build_theme(_font)   # 现代深色主题：没被单独覆盖的控件也吃到这套皮
 	root.theme = th
 	layer.add_child(root)
 	_ui_root = root
@@ -348,7 +348,7 @@ func _build_estimate_box(root: Control) -> void:
 	_estimate_box.mouse_filter = Control.MOUSE_FILTER_STOP
 	_estimate_box.tooltip_text = "只统计归属明确的点（|归属| ≥ 50%）：空地算目，被点死的对手子也算；\n" \
 		+ "中间大片还没定下来的地方不计入——所以双方点数加起来通常小于棋盘总点数。"
-	_estimate_box.add_theme_stylebox_override("panel", GufengTheme.slip(GufengTheme.PAPER_WARM, 10))
+	_estimate_box.add_theme_stylebox_override("panel", GufengTheme.slip(GufengTheme.PAPER, 10))
 	root.add_child(_estimate_box)
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", 2)
@@ -535,7 +535,7 @@ func _build_right_panel(root: Control) -> void:
 	t2.add_theme_color_override("font_color", Color(GufengTheme.PAPER_WARM, 0.88))
 	t2.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hv.add_child(t2)
-	hrow.add_child(GufengTheme.seal_char("弈"))      # 朱砂单字印：整块面板最重的一笔
+	hrow.add_child(GufengTheme.seal_char("弈"))      # 青蓝单字徽标：整块面板最重的一笔
 	_rule(vb)
 
 	# 信息栏
@@ -764,7 +764,7 @@ func _build_right_panel(root: Control) -> void:
 	_buttons.append(_button(btn_row, "重来", _ask_reset))
 	_btn_reset = _buttons[_buttons.size() - 1]
 	var end_btn := _button(btn_row, "结束", _ask_end)
-	GufengTheme.apply_seal_button(end_btn)          # 主操作：朱砂印（古风里唯一的高饱和块）
+	GufengTheme.apply_seal_button(end_btn)          # 主操作：青蓝主按钮（现代主题里唯一的高饱和块）
 	_buttons.append(end_btn)
 
 	# 复盘（v3.7.0）：**只在对局结束后**出现（未结束整组隐藏 ⇒ 界面不变挤，V19）。
@@ -1024,8 +1024,8 @@ func _field_label(text: String) -> Label:
 	l.add_theme_color_override("font_color", GufengTheme.INK)
 	return l
 
-## 统一勾选项样式：面板是白底，默认主题的浅色字/浅色勾选框几乎看不见 → 全部改成深色
-## 一条发丝墨线（分节用）：古风版式靠直线与留白分区，不靠卡片阴影
+## 统一勾选项样式：面板是深底，勾选框文字统一用亮色
+## 一条细分隔线（分节用）：现代版式靠直线与留白分区，不靠卡片阴影
 func _rule(parent: Node, alpha := 0.26) -> void:
 	var r := ColorRect.new()
 	r.color = Color(GufengTheme.INK, alpha)
@@ -1964,7 +1964,7 @@ const TITLE_FADE_IN := 0.45
 ## 建主界面：它是 `_ui_root` 的最后一个孩子，所以压在左右栏 / 定式卡片之上。
 func _build_title_screen() -> void:
 	title_screen = TitleScreen.new()
-	title_screen.theme = _ui_root.theme          # 与棋盘同一套宣纸 / 楷体主题
+	title_screen.theme = _ui_root.theme          # 与棋盘同一套深色 / 无衬线主题
 	title_screen.primary_pressed.connect(_on_title_primary)
 	title_screen.settings_pressed.connect(_on_title_settings)
 	title_screen.library_pressed.connect(_on_title_library)

@@ -1,12 +1,12 @@
 class_name TitleScreen
 extends Control
-## 主界面（纸幕封面，v3.11.3）。
+## 主界面（深色封面，v3.11.3）。
 ##
-## 设计取向：**不另起一套视觉**——纸幕、墨线、朱砂印、楷体全部取自 `GufengTheme`，
-## 3D 棋盘与化身仍在纸幕后面（半透明宣纸），所以从主界面进对局没有"场景切换"的割裂感。
+## 设计取向：**不另起一套视觉**——深色遮罩、青蓝线、强调块、无衬线全部取自 `GufengTheme`，
+## 3D 棋盘与化身仍在深色遮罩后面（半透明），所以从主界面进对局没有"场景切换"的割裂感。
 ##
-## 版式（v3.11.3）：封面是**远看棋盘时**的一枚半透明纸签——纸签偏上（给棋盘留出下半屏），
-## 满屏纸幕只做一层很淡的宣纸色（`Veil` 的 alpha 压在 0.4，棋盘清楚可见）。
+## 版式（v3.11.3）：封面是**远看棋盘时**的一枚半透明深色卡片——卡片偏上（给棋盘留出下半屏），
+## 满屏遮罩只做一层很淡的深色（`Veil` 的 alpha 压在 0.4，棋盘清楚可见）。
 ## 进出对局时的淡入 / 淡出由 `Main` 编排，这里只提供 `fade_in` / `fade_out` / `set_alpha`。
 ##
 ## 这个类只负责画与发信号，**不碰配置、不碰服务、不碰棋盘**：
@@ -35,7 +35,7 @@ func _ready() -> void:
 	visible = false                              # 由 Main 的 open()/close() 控制
 
 func _build() -> void:
-	# ① 淡淡的宣纸色：只做一层「远看」的空气感，棋盘与化身必须看得清
+	# ① 淡淡的深色遮罩：只做一层「远看」的空气感，棋盘与化身必须看得清
 	var veil := ColorRect.new()
 	veil.name = "Veil"
 	veil.color = Color(GufengTheme.PAPER.r, GufengTheme.PAPER.g, GufengTheme.PAPER.b, 0.40)
@@ -43,16 +43,7 @@ func _build() -> void:
 	veil.mouse_filter = Control.MOUSE_FILTER_STOP     # 挡住棋盘点击（菜单期间不落子、不摸头）
 	add_child(veil)
 
-	# ② 纸纤维（程序化贴图只有 256×256，平铺；透明度压得很低，只加质感不加噪点）
-	var fiber := TextureRect.new()
-	fiber.texture = GufengTheme.PAPER_TEX
-	fiber.stretch_mode = TextureRect.STRETCH_TILE
-	fiber.modulate = Color(1.0, 1.0, 1.0, 0.22)
-	fiber.set_anchors_preset(Control.PRESET_FULL_RECT)
-	fiber.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	add_child(fiber)
-
-	# ③ 纸签：略偏上摆（棋盘在下方露出来），纸面半透明，远处的棋子能透过来。
+	# ② 深色卡片：略偏上摆（棋盘在下方露出来），半透明，远处的棋子能透过来。
 	# v3.12.0 微调：原 0.02..0.55 的视觉中心太靠上，整体下移约 8% 屏高。
 	var center := CenterContainer.new()
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -73,7 +64,7 @@ func _build() -> void:
 	vb.alignment = BoxContainer.ALIGNMENT_CENTER
 	box.add_child(vb)
 
-	# 朱砂方印（单字「亚」）：与标题条 / 定式卡片同一枚印
+	# 青蓝徽标（单字「亚」）：与标题条 / 定式卡片同一套强调色
 	var mark := PanelContainer.new()
 	mark.add_theme_stylebox_override("panel", GufengTheme.seal(8))
 	mark.custom_minimum_size = Vector2(50, 50)
@@ -83,7 +74,7 @@ func _build() -> void:
 	mark_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	mark_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	mark_label.add_theme_font_size_override("font_size", 26)
-	mark_label.add_theme_color_override("font_color", GufengTheme.PAPER_WARM)
+	mark_label.add_theme_color_override("font_color", GufengTheme.ON_ACCENT)
 	mark.add_child(mark_label)
 	vb.add_child(mark)
 
@@ -103,7 +94,7 @@ func _build() -> void:
 
 	_rule(vb)
 
-	# 主按钮：朱砂印发（古风里唯一的高饱和块）
+	# 主按钮：青蓝强调块（现代主题里唯一的高饱和块）
 	_primary = Button.new()
 	_primary.text = "开始对局"
 	_primary.custom_minimum_size = Vector2(0, 44)
@@ -149,7 +140,7 @@ func _build() -> void:
 	_hint.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	vb.add_child(_hint)
 
-	# 底部署名（古风册页的落款位）：不显示版本号，避免每次发版都要改这张封面
+	# 底部署名（封面落款位）：不显示版本号，避免每次发版都要改这张封面
 	var sign := Label.new()
 	sign.text = "落子无声，落笔有情"
 	sign.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER

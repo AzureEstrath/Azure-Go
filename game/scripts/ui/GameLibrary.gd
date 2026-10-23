@@ -5,7 +5,7 @@ extends Control
 ## 这个类**只负责界面与本地回放**（`GameReplay` / `MiniBoard`），网络与文件对话框都在 `Main`：
 ## 列表 / 导入 / 导出 / 删除由 Main 发请求，再把数据喂回来。信号都是「请求」语义。
 ##
-## 纯本地、零引擎调用；打开时棋盘仍被主界面纸幕挡着，不会误落子。
+## 纯本地、零引擎调用；打开时棋盘仍被主界面遮罩挡着，不会误落子。
 
 signal closed
 signal refresh_requested

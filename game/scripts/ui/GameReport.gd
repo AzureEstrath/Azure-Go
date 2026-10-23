@@ -141,7 +141,7 @@ func _rebuild_text() -> void:
 	_add_label(_text_root, str(data.get("date", "")), Vector2(700, 118), Vector2(304, 28), 18,
 		GufengTheme.INK_SOFT, HORIZONTAL_ALIGNMENT_RIGHT)
 	_add_label(_text_root, "亚", Vector2(REPORT_SIZE.x - 160, 62), Vector2(78, 78), 42,
-		GufengTheme.PAPER_WARM, HORIZONTAL_ALIGNMENT_CENTER)
+		GufengTheme.ON_ACCENT, HORIZONTAL_ALIGNMENT_CENTER)
 	_add_label(_text_root, "%s · %s" % [pos_line,
 		info_line(float(data.get("winrate", 0.5)), float(data.get("score", 0.0)),
 			bool(data.get("has_info", false)))],
@@ -195,7 +195,6 @@ func _rebuild_text() -> void:
 
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, REPORT_SIZE), GufengTheme.PAPER)
-	draw_texture_rect(GufengTheme.PAPER_TEX, Rect2(Vector2.ZERO, REPORT_SIZE), true, Color(1, 1, 1, 0.24))
 	draw_rect(Rect2(26, 26, REPORT_SIZE.x - 52, REPORT_SIZE.y - 52),
 		Color(GufengTheme.INK, 0.24), false, 2.0)
 	var seal := Rect2(REPORT_SIZE.x - 160, 62, 78, 78)
