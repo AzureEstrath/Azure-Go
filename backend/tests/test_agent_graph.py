@@ -1408,6 +1408,66 @@ class PvDepthCallSiteTest(unittest.TestCase):
         self.assertEqual(agent.katago.calls[i][-1], ["B", "D16"])
 
 
+class AnalyzeEstimateTest(unittest.TestCase):
+    """v3.12.0：点目注记（``estimate``）在 analyze 的 prepare 阶段发出，**在她说台词之前**。
+
+    它复用同一次引擎分析（零新增调用），只是棋盘注记：不产生 ``speech``、不进提示词；
+    分析失败（引擎回 error）时一条都不发，前端保持「已收起」。
+    """
+
+    class _MarkedEngine(StubEngine):
+        async def analyze(self, moves, max_visits=None):
+            out = await super().analyze(moves, max_visits)
+            own = [0.0] * 361
+            own[0] = 1.0                     # 左上 (0,0)：黑空
+            own[2 * 19 + 4] = -1.0           # (4,2)：白空
+            own[3 * 19 + 3] = 1.0            # 玩家那颗黑子 (3,3)：活子，不该被标
+            out["ownership"] = own
+            out["rootInfo"] = {"winrate": 0.5, "scoreLead": 6.5}
+            self.last = out
+            return out
+
+    class _BadEngine(StubEngine):
+        async def analyze(self, moves, max_visits=None):
+            return {"error": "云服务不可用"}
+
+    def _analyze(self, engine_cls):
+        agent, _eng, _llm, bus = _mk()
+        engine = engine_cls()
+        agent.katago = engine
+
+        async def run():
+            await agent.player_move(3, 3)
+            bus.clear()
+            await agent.analyze_position()
+
+        asyncio.run(run())
+        return agent, engine, bus
+
+    def test_estimate_precedes_her_comment(self):
+        agent, engine, bus = self._analyze(self._MarkedEngine)
+        ests = bus.of_type("estimate")
+        self.assertEqual(len(ests), 1, "一次分析只发一条点目注记")
+        e = ests[0]
+        n = len(agent.st.moves)
+        self.assertEqual(e["move_count"], n)
+        self.assertIn([0, 0, "black"], e["cells"])
+        self.assertIn([4, 2, "white"], e["cells"])
+        self.assertNotIn([3, 3, "black"], e["cells"], "活子不叠方块")
+        self.assertEqual((e["black"], e["white"]), (1, 1))
+        self.assertEqual(e["komi"], 7.5)
+        self.assertAlmostEqual(e["lead"], 6.5 if n % 2 == 0 else -6.5)
+        types = [x["type"] for x in bus.events]
+        self.assertLess(types.index("estimate"), types.index("message"),
+                        "点目要跟她的思考同步：在她说话之前就发")
+        self.assertEqual(bus.of_type("speech"), [], "棋盘注记不是台词，不发语音")
+
+    def test_no_estimate_when_engine_fails(self):
+        _agent, _engine, bus = self._analyze(self._BadEngine)
+        self.assertEqual(bus.of_type("estimate"), [])
+        self.assertIn("一时算不清", bus.messages()[0]["text"], "失败照旧走短路提示")
+
+
 class DriftSettlementTest(unittest.TestCase):
     """修复轮 1 / Important #1：偏航**先定案、后记账**——事件必须与最终落点一致。
 
