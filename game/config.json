@@ -64,5 +64,5 @@
   "tts_timeout_sec": 30.0,
   "tts_voice": "中文女",
   "tts_volume": 0.65,
-  "vrm_path": "D:/KataGo/assets/Azure.vrm"
+  "vrm_path": "Azure.vrm"
 }

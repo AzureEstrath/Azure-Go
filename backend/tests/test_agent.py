@@ -173,6 +173,47 @@ class ControlTest(unittest.TestCase):
         joined = " ".join(e["text"] for e in bus.messages(events.AI))
         self.assertIn("重新来吧", joined)
 
+    def test_reset_game_clears_all_per_game_state(self):
+        """「重来」必须把本局的账清干净（v3.12.2 检查）：棋谱 / 逐手存档 / 亏损手 /
+        快照 / 虚着揭示 / 情绪偏航 / 定式冷却 / 归档指纹 / 事件表，一个都不留。"""
+        agent, _eng, _llm, _bus = _mk()
+        st = agent.st
+        st.add_move("B", "Q16")
+        st.add_move("W", "D4")
+        st.make_snapshot()
+        st.note_move(1, "aim", "A", "先占角")
+        st.record_bad_move(0, "Q16", "胜率下滑")
+        st.record_loss("Q16", 0.3, "胜率下滑")
+        st.log_memory("E", "这手有点问题", 1)
+        st.chat_history.append({"role": "user", "content": "你好"})
+        st.pre_analysis = {"n": 1, "a": "x"}
+        st.last_katago = "黑好"
+        st.finished = True
+        agent._reveal_pending = True
+        agent._drift_pending = {"line": "b", "gtp": "D4"}
+        agent._library_sig = ("sig",)
+        agent._joseki_taught = {"小雪崩": 1}
+        agent.event_log.add("test", 1, "事件", "")
+
+        agent.reset_game(silent=True)
+
+        self.assertEqual(st.moves, [])
+        self.assertEqual(st.move_seq, [])
+        self.assertEqual(st.snapshots, [])
+        self.assertEqual(st.move_notes, [])
+        self.assertEqual(st.losses, [])
+        self.assertEqual(st.bad_moves, [])
+        self.assertEqual(st.memory_log, [])
+        self.assertEqual(st.chat_history, [])
+        self.assertIsNone(st.pre_analysis)
+        self.assertEqual(st.last_katago, "")
+        self.assertFalse(st.finished)
+        self.assertFalse(agent._reveal_pending)
+        self.assertIsNone(agent._drift_pending)
+        self.assertIsNone(agent._library_sig)
+        self.assertEqual(agent._joseki_taught, {})
+        self.assertEqual(agent.event_log.all(), [])
+
     def test_chat_and_analyze_and_summary(self):
         async def run():
             agent, eng, llm, bus = _mk()

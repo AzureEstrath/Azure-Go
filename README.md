@@ -174,8 +174,9 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
    ```
    Godot_v4.6.3-stable_win64.exe --path game
    ```
-2. 把 `Azure.vrm`（形象）放到可访问位置，并把 `vrm_path` 填成 **绝对路径**
-   （用相对路径时文件必须能被 Godot 解析到，否则形象加载失败）。
+2. 把 `Azure.vrm`（形象）放到可访问位置，并把 `vrm_path` 填成路径：绝对路径可直接用；
+   相对路径会依次在 **exe 同目录 → `game/` → 仓库根目录 → 进程工作目录** 找，取第一个存在的
+   （发布包把 `Azure.vrm` 与 exe 放一起即可，源码运行可放在仓库根目录）。
    **KataGo 的 `katago.exe` / 权重 / analysis 配置文件归 KataGo 云服务部署侧持有**，客户端不读这些路径。
 3. 先启动 **KataGo 云服务**（`katago_service\run_server.bat`，见第六节「KataGo 服务部署」），
    再启动后端（`backend\run_server.bat`，见第六节），最后启动游戏。
@@ -243,8 +244,8 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
 - **退出**：退出游戏。
 
 首次「开始对局」前仍会弹一次「出发前的准备」设置面板（盖在封面上），确认后才播入场运镜。
-对局中 **`Esc` 回主界面**，动效**反向**播放（工具栏先滑出 → 相机飞回远处 → 封面淡入）；主按钮变「继续对局」，
-再按 `Esc` 或点它，入场运镜再播一遍。封面 / 运镜期间棋盘、四个功能按钮、聊天与回档 / 开关一起冻住，闲置搭话也停。
+对局中 **`Esc` 回主界面**，动效**反向**播放（工具栏先滑出 → 相机飞回远处 → 封面淡入）；主按钮变「开始新对局」
+（每次从封面进来都是新的一局，上一局不保留）。再按 `Esc` 或点它，入场运镜再播一遍。封面 / 运镜期间棋盘、四个功能按钮、聊天与回档 / 开关一起冻住，闲置搭话也停。
 
 **视角与鼠标**（左侧栏默认**收起**，右侧栏默认展开；两侧各有一个贴边按钮收起 / 展开对应面板，
 按钮文案在 `▶` / `◀` 间随状态切换）：
@@ -464,7 +465,7 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
 | 游戏一直显示「未连接后端（…），N 秒后重试…」 | ① 后端没起；② `backend_url` 地址 / 端口不对；③ 后端缺 `websockets`（`/ws` 升级被拒 404）；④ 后端还在等 KataGo 预热（最长 180 秒不监听端口） | 起后端（`backend\run_server.bat`）；核对 `backend_url`（默认 `http://127.0.0.1:8000`）；`pip install -r backend\requirements.txt` 补 `websockets`；若后端控制台停在等 KataGo，先 `curl http://127.0.0.1:8100/health` 确认 `state == "ready"`（见 2.2） |
 | 她有话，但没声音 | ① `tts_enabled=false`；② `tts_mode` 与三件套不配套（如用 `中文女` 调 OpenAI 会被 HTTP 400 拒）；③ `tts_api_key` 空；④ 合成超时（`tts_timeout_sec`）；⑤ 音频被 LRU 淘汰或后端重启过（`GET /api/tts/audio/{id}` 404）；⑥ 走了系统语音（`speech.mode=system`） | 看底部状态栏「语音：…」与后端控制台 `[TTS] …` 行；按第三节把三件套配成**同一家**服务商的取值；`system` 模式本来就是系统语音出声，检查 Windows 音量与音色 |
 | 完全没有声音，系统语音也没声 | PowerShell / SAPI 被策略拦掉（前端用 `OS.create_process("powershell")` 调系统语音，起不来就念不出） | 状态栏会提示「系统语音不可用（无法启动 PowerShell），这条改为只显示文字」；放行 PowerShell，或改用云端 `openai` 模式 |
-| 形象不显示 | `Azure.vrm` 缺失，或 `vrm_path` 是相对路径、Godot 解析不到 | 按 2.1 ③ 放好 `.vrm`，并把 `vrm_path` 写成**绝对路径**（见第三节） |
+| 形象不显示 | `Azure.vrm` 缺失，或 `vrm_path` 指向的文件在候选位置里都找不到 | 按 2.1 ③ 放好 `.vrm`；相对路径会依次找 exe 同目录 / `game/` / 仓库根 / 工作目录（见第三节），日志里会列出试过的路径 |
 | 她算不清，提示说「嗯...我这边一时算不清，稍等再试吧~」 | KataGo 云服务不可用（没起 / 地址或令牌不对 / 引擎 `dead`） | 读 `GET http://127.0.0.1:8000/api/health` 的 `katago_dead` + `katago_error`，**成对读**（见第六节）：`dead=true`＝引擎（或到它的链路）真没了；`dead=false` + 新的非空 `error`＝服务在线但这次没答好。再去看服务侧 `GET http://127.0.0.1:8100/health` 的 `state` |
 | 讲解 / 闲聊变成「唔…我脑子有点转不过来…」这类兜底台词 | LLM 没接 / 401 / 429 / 超时；或请求体扩展字段被服务商拒（HTTP 400/422） | 核对 `llm_base_url` / `llm_model` / `llm_api_key`（第四节）。扩展字段被拒时后端会自动去掉重试一次、且本次会话不再发送（设计好的降级）；要彻底避免就把 `llm_extra_body` / `llm_think_extra_body` 留空 |
 | 长期记忆没生效 | `memory_enabled=false`；或改了字段没重启后端 | 置 `memory_enabled=true` 后**重启后端**；`GET /api/health` 的 `memory_rows` 一眼看出库里有没有东西（见第四节） |
@@ -611,7 +612,7 @@ Godot_v4.6.3-stable_win64.exe --path game -- --title --shot=menu.png   # 只画�
 | `prompt_system` | 后端（启动时） | **覆盖系统提示词（人设全文）**；留空用内置 Azure 人设 |
 | `prompt_user_name` | 后端（启动时） | **玩家称呼**，替换提示词中的「Estarth」（默认 Estarth） |
 | `prompt_phase_notes` | 后端（启动时） | **覆盖各阶段提示**，键：`observe` / `after_player` / `own_turn` / `just_moved` / `analyze` / `chat` / `summary` |
-| `vrm_path` | 客户端 | 虚拟形象 `.vrm` 路径；**建议填绝对路径**（相对路径要能被 Godot 解析到，否则形象加载失败） |
+| `vrm_path` | 客户端 | 虚拟形象 `.vrm` 路径。绝对路径直接用；相对路径依次在 exe 同目录 → `game/` → 仓库根 → 工作目录里找，取第一个存在的 |
 | `tts_enabled` | 客户端 + 后端（启动时） | 是否启用语音；后端据此决定要不要合成（关闭时零请求、不发 `speech` 事件，文字照常） |
 | `tts_mode` | 后端（启动时）+ 客户端 | `openai`（默认；OpenAI 兼容 `/v1/audio/speech`，先本地 `tts_local_base_url` → 云端 `tts_base_url` → 系统语音）/ `aliyun`（阿里云 Voice Studio 实时语音合成，WebSocket 流式）/ `system`（Windows 系统语音）；后端按它决定合成路由，客户端只作本地镜像（两边都把未知值回落 `openai`） |
 | `tts_base_url` | 后端（启动时） | **云端语音服务地址**（OpenAI 兼容，含 `/v1`，如 `https://api.openai.com/v1`）；留空＝不试云端（本地也没有时只出文字） |
@@ -1018,7 +1019,27 @@ KataGo 引擎与权重遵循其上游许可。
 
 ## 九、更新
 
-### v3.12.0（当前）
+### v3.12.2（当前）
+- **化身恢复（VRM 路径解析）**：`vrm_path` 写相对路径时不再只按进程工作目录找一次——
+  依次尝试 **exe 同目录 → `game/` → 仓库根目录 → 工作目录**，取第一个存在的文件并在失败日志里
+  列出全部候选。源码运行可直接使用仓库根的 `Azure.vrm`，发布包把 `Azure.vrm` 与 exe 放一起即可；
+  形象缺失时连带失效的表情 / 视线跟随 / 摸头 / 呼吸 / 风场逻辑随之恢复。
+- **「重来」清账补全**：后端同时清空上一局未揭示的落子（`_reveal_pending`）与待记账的情绪偏航
+  （`_drift_pending`）；前端清空复盘计数 / `_reviewing` 与复盘按钮状态，重来后不再等一条不会来的语音。
+  新增后端门卫覆盖棋谱、快照、逐手存档、亏损手、俗手、聊天、事件表、定式冷却与归档指纹。
+- **局后按钮冻结**：「结束」流程走完后，**提示 / 局面分析 / 结束** 立即置灰（局面已定案），
+  **重来保持可用**作为开新局出口；进入复盘后重来也一起冻结。
+- **门卫**：前端全部脚本 PASS，新增 `test_avatar_path.gd` 9 项；后端 `test_agent` / `test_state` /
+  `test_event_log` / `test_main` 共 **206 OK**。
+
+### v3.12.1
+- **每次从主界面进入都是新的一局**：封面主按钮改为「开始新对局」，进入前先清本地棋盘/手数/胜率/
+  目差/俗手/复盘入口，再静默调用 `POST /api/reset {"silent": true}`；后端忙时挂起，等 `busy=false`
+  补发，避免「她思考时回主界面再进来」保留上一局。首次启动也走同一条路径清掉后端可能残留的棋局。
+- **点目文案守卫**：`estimate_count_line` / `estimate_lead_line` 显式接收字段，JSON 的 float 数字
+  正常显示，缺字段/脏值给「形势: --」，不再把脏值硬报成 0。
+
+### v3.12.0
 - **棋谱库 + SGF（v3.11.5 批）**：主界面第三键打开全屏模态纸签——对局列表（日期 / 手数 / 黑胜率）、
   右侧小棋盘逐手回看、局后总结、导入 / 导出 SGF、删除；库在 `backend\data\games.db`（SQLite），
   导入前后端逐手校验；全新库首次打开自动塞入 24 手内置示例局。列表 / 详情**不碰当前对局、零引擎调用**。
@@ -1034,7 +1055,7 @@ KataGo 引擎与权重遵循其上游许可。
   （\|归属\| ≥ 50%）的定型点收敛成 `estimate` 事件——棋盘上画归属小方块，左上角弹形势纸签
   （黑 / 白目数与黑方视角目差 + 贴目）。活子不叠标记、被点死的对手子画在棋子上；玩家下一手 /
   局面变化 / 重来 / 进复盘时自动收起。**不新增引擎调用、不产生台词或语音、不进任何 LLM 上下文**。
-  本版**只采纳点目**：PR #4 的「每次进对局开新局」不合并，现有「继续对局 / 棋谱库复盘」语义保持不变。
+  本版**只采纳点目**；PR #4 的「每次进对局开新局」在 v3.12.1 单独落地，旧「继续对局」语义同时退场。
 - **门卫**：后端全量 **853 OK**（新增 `test_estimate.py` 8 项 + `test_events` 事件形状 2 项 +
   `EstimateWiringTest` 3 项）；前端 15 支脚本全 PASS，`test_view_helpers.gd` 增至 **43** 项
   （点目两行文案与棋盘格位容错）。
@@ -1061,7 +1082,7 @@ KataGo 引擎与权重遵循其上游许可。
   - **入场**（`Main._play_enter_game`）：封面 `fade_out(0.35)` → `board.fly_home(1.05)`（`Board3D.fly_to` 的
     smoothstep 缓动）→ `_show_game_chrome(0.35)`（右侧面板从画面外滑入、两侧贴边开关亮起）→ 才起服务 / 问候。
   - **回主界面**（`_play_exit_to_menu`）：工具栏滑出（0.22）→ `fly_to(远看, 0.95)` → 封面 `fade_in(0.45)`；
-    `Esc` 与「继续对局」都走这一对函数，**完全对称**。
+    `Esc` 与「开始新对局」都走这一对函数，**完全对称**。
   - **不能回退的规则**：运镜期间 `_transition=true`（Esc 不叠加、按钮不重入）；`_title_open` 一直为真到入场结束
     （棋盘全程锁着）；`Board3D` 的飞行中 `_unhandled_input` 整体让路；首帧用 `board.snap_panels(false,false)`
     （主界面没有侧栏）——**不要**在这种状态留出右侧面板的位置，否则棋盘偏在一边（`--title` 截图能看出来）。
