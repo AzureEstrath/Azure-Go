@@ -1,5 +1,7 @@
 {
   "_说明": "云端模型（LLM / 语音 TTS）与远程后端服务的地址与参数；KataGo 由独立部署的云服务提供（katago_url，部署见 README「KataGo 服务部署」）。打包发布时把本文件放在与可执行文件同一目录即可覆盖。",
+  "adaptive_difficulty": false,
+  "adaptive_difficulty_base": 3,
   "backend_url": "http://127.0.0.1:8000",
   "chat_digest_llm": false,
   "drift_base": 0.03,
@@ -31,20 +33,25 @@
   "memory_enabled": false,
   "memory_max_inject_chars": 240.0,
   "memory_top_k": 3.0,
+  "ownership_enabled": false,
   "profile_enabled": false,
   "prompt_phase_notes": {
 
   },
   "prompt_system": "",
   "prompt_user_name": "Estarth",
+  "reply_style": 0,
   "sfx_enabled": true,
   "sfx_volume": 0.8,
-  "ownership_enabled": false,
-  "adaptive_difficulty": false,
-  "adaptive_difficulty_base": 3,
   "stream_tokens": false,
   "time_aware_enabled": false,
   "tools_enabled": false,
+  "tts_aliyun_api_key": "",
+  "tts_aliyun_format": "pcm",
+  "tts_aliyun_sample_rate": 24000,
+  "tts_aliyun_tn": true,
+  "tts_aliyun_voice": "",
+  "tts_aliyun_ws_url": "",
   "tts_api_key": "",
   "tts_base_url": "",
   "tts_batch_speak": false,
@@ -56,7 +63,7 @@
   "tts_local_timeout_sec": 120.0,
   "tts_local_voice": "xiaoya",
   "tts_long_chunk": false,
-  "tts_mode": "openai",
+  "tts_mode": "local",
   "tts_model": "tts-1",
   "tts_pitch": 1.02,
   "tts_speed": 1.0,
@@ -64,5 +71,5 @@
   "tts_timeout_sec": 30.0,
   "tts_voice": "中文女",
   "tts_volume": 0.65,
-  "vrm_path": "D:/KataGo/assets/Azure.vrm"
+  "vrm_path": "Azure.vrm"
 }

@@ -37,8 +37,9 @@
     GET  /api/state                         当前棋盘权威快照
     GET  /api/health                        引擎/LLM/长期记忆状态
 
-事件通道（WebSocket /ws）——后端把 10 类事件推给客户端，契约见 events.py：
-    message / state / info / busy / mood / joseki / tool / token / speech / memory（连接建立时先发一次 hello 同步；
+事件通道（WebSocket /ws）——后端把 13 类事件推给客户端，契约见 events.py：
+    message / state / info / estimate / ownership / busy / mood / joseki / tool / token / speech / memory
+    / difficulty（连接建立时先发一次 hello 同步；
     若距上次对局够久，紧随 hello 之后还会有一条**主动约战提醒**的 message——只触发一次、模板句、零 LLM 调用）。
     `token` 是可选流式增量（`stream_tokens` 开启时才有，默认关闭；最终内容以 `message` 为准）。
     `speech` 是每条台词的语音（`mode` 为 `openai` 时按 `id` 拉上面那条音频端点；`system` 时用 `text`，
@@ -366,11 +367,12 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         return ok()
 
     @app.post("/api/reset")
-    async def reset():
+    async def reset(body: dict = None):
         s = a()
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
-        s.reset_game()
+        # v3.12.1：从主界面进对局用 ``{"silent": true}``——只清棋局，不添一句「重新来吧」
+        s.reset_game(silent=bool((body or {}).get("silent", False)))
         return ok()
 
     @app.post("/api/config")
@@ -555,6 +557,13 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         rec = await asyncio.to_thread(store.get_game, _int(body.get("game_id"), 0)) if store is not None else None
         if not rec:
             return JSONResponse(status_code=404, content={"ok": False, "error": "棋谱不存在"})
+        # 上面的 to_thread 是一个 await 窗口：两次并发分段请求可能都通过了开头的 busy 检查。
+        # 读库回来后再核一次（这一句与 _set_busy 之间没有 await，事件循环不会切走），
+        # 否则第二个请求会与第一个共用 llm.think_mode / busy，跑成两段并行的「复盘」。
+        if s.busy:
+            return {"ok": False, "busy": True, "state": s.st.payload()}
+        if bool(getattr(s, "review", False)):
+            return {"ok": False, "error": "先退出当前复盘，再开全盘复盘"}
         moves = rec.get("moves") if isinstance(rec.get("moves"), list) else []
         n = len(moves)
         if n <= 0:

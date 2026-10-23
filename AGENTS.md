@@ -69,7 +69,10 @@
   - `godot --path game --headless --script res://tests/test_joseki_level.gd` —— 定式导学档位纯函数（关闭 + 四档频率 / 并列取中 / 越界与脏值不越界），纯逻辑。
   - `godot --path game --headless --script res://tests/test_net_chat.gd` / `res://tests/test_chat_queue.gd` —— 聊天回包判定 / 忙时排队 FIFO 与上限，纯逻辑。
   - `godot --path game --headless --script res://tests/test_thinking_lines.gd` —— 思考中短句（JSON 解析 / 20 句 / 轮换不连复 / 缺表回退）。
-  - `godot --path game --headless --script res://tests/test_title_screen.gd` —— 主界面（纸幕挡点击 / 三键信号 / 开始⇄继续 / 显隐）。
+  - `godot --path game --headless --script res://tests/test_title_screen.gd` —— 主界面（纸幕挡点击 / 三键信号 / 开始⇄开始新对局 / 显隐）。
+  - `godot --path game --headless --script res://tests/test_new_game.gd` —— 每次进对局都重开 / 空局侧栏文案，纯逻辑。
+  - `godot --path game --headless --script res://tests/test_estimate.gd` —— 局面点目文案 / 脏值安全 / 棋盘标记层。
+  - `godot --path game --headless --script res://tests/test_avatar_path.gd` —— 化身 VRM 相对路径候选与解析（不加载模型）。
 - 新增/移动资源后先 `godot --headless --path game --import` 重新生成导入信息。
 - 调试参数走 `OS.get_cmdline_user_args()`，**必须放在 `--` 之后**：`-- --shot=out.png`（渲染数帧后截图退出）、`-- --demo`、`-- --setup`（只画设置面板供截图）、`-- --title`（强制只画主界面纸幕封面供截图）。
 
@@ -79,8 +82,8 @@
 - 配置读取顺序：**可执行文件同目录 `config.json` → `res://config.json`**；`game/config.json` 只是随包模板。游戏内设置面板会**写回** config.json，而 CLI `--llm/--model/--key/--backend-url` 被记进 `cli_locked`、只影响本次运行——改配置逻辑时别破坏这个区分。
 - 后端配置走环境变量 `AZURE_CONFIG`；未设置时 `backend/app/config.py` 的 `load` 依次找 `<当前工作目录>/config.json` → `backend/config.json`（`backend\run_server.bat` 会先把 `..\AzureGoGodot\config.json` 写进 `AZURE_CONFIG`，该文件不存在时才用 `..\game\config.json`）。`katago_*` 只存**服务地址 / 令牌 / 超时**，引擎路径的解析逻辑（`_resolve`）已随服务化删除，不要再加回来。
 - KataGo 服务的健康语义：`/api/health` 的 `katago_dead` 反映**引擎已经没了**——`start()` 探活失败、或分析时**传输层失败**（连接被拒 / 连接或读取错误）都置位，一次成功分析会清除它；**分析**超时与 HTTP 状态响应（503 预热 / 401 / 500）只刷新 `katago_error`、**不**置 `katago_dead`——两者要成对读。
-- 不要拿 `game/config.json` 当字段默认值来源：模板（随包样例：`max_visits=100`、`tts_enabled=true`、`tts_pitch=1.02`、`tts_volume=0.65`、`vrm_path` 用相对值）与 `AzureConfig.gd` 的代码默认值并不一致，这是既有且有意的。以 `AzureConfig.gd` 为准，字段清单看 README 第三节。
-- `vrm_path` 建议写**绝对路径**（相对路径要能被 Godot 解析到，否则形象加载失败）。
+- 不要拿 `game/config.json` 当字段默认值来源：模板（随包样例：`max_visits=100`、`tts_enabled=true`、`tts_pitch=1.02`、`tts_volume=0.65`）与 `AzureConfig.gd` 的代码默认值并不一致，这是既有且有意的。以 `AzureConfig.gd` 为准，字段清单看 README 第三节。
+- `vrm_path` 的相对值（默认 `Azure.vrm`）会依次在 **exe 同目录 → `game/` → 仓库根 → 工作目录** 找，取第一个存在的文件；发布包把 `Azure.vrm` 与 exe 放一起即可。
 - 场景引用带 `uid://`（`Main.tscn` 的 ext_resource），`*.gd.uid` 与 `*.import` 已入库：移动/重命名脚本或资源时同步更新它们，不要手写 uid。
 - **一切外部能力必须优雅降级**（缺后端、缺 KataGo、缺云端 LLM / TTS 都不得崩、不得报错刷屏）：后端返回可读错误且 `busy` 必须归位（不归位＝棋盘永久锁死，本项目最严重的故障形态）；前端连不上后端只在状态栏提示；语音服务不可用时临时降级为系统语音但不改配置。
 - **日志不得把整回合打挂**：`backend/app/main.py` 的启动路径做一次**带守卫**的 `sys.stdout.reconfigure(errors="replace")`（`try/except` + `hasattr`；**只改 `errors`、不改编码**）——中文 Windows 控制台 / 重定向文件是 cp936（strict），而 `llm.py` 打服务商错误体、`profile_store.py` / `joseki_progress.py` / `memory.py` 的 `print("…%s" % e)` 都可能在回合链路上抛 `UnicodeEncodeError`，降级成 `?` 好过打挂回合（也覆盖去重命中时打台词原文那条）。不要去改 `run_server.bat` 的 `PYTHONIOENCODING`。

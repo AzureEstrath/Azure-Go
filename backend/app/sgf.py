@@ -15,7 +15,7 @@ from .board import GoBoard
 SIZE = 19
 MAX_MOVES = 1000
 MAX_TEXT = 200_000
-APP_NAME = "AzureGo:3.11.5"
+APP_NAME = "AzureGo:3.12.0"
 
 
 class SgfError(ValueError):

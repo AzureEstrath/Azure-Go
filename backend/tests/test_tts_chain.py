@@ -83,6 +83,39 @@ class LocalFirstTest(unittest.TestCase):
         self.assertTrue(c.enabled)
 
 
+class LocalModeTest(unittest.TestCase):
+    """``tts_mode="local"``：只走本地端点，失败回落系统语音（**绝不偷偷走云端**）。"""
+
+    def test_local_mode_never_touches_cloud(self):
+        calls = []
+
+        def handler(req):
+            calls.append(req.url.host)
+            return httpx.Response(200, content=WAV)
+
+        c = _client(handler, tts_mode="local")
+        out = asyncio.run(c.speak("你好"))
+        self.assertEqual(out["mode"], "openai")
+        self.assertEqual(calls, ["127.0.0.1"])
+
+    def test_local_mode_failure_degrades_to_system_without_cloud(self):
+        calls = []
+
+        def handler(req):
+            calls.append(req.url.host)
+            return httpx.Response(500)
+
+        c = _client(handler, tts_mode="local")
+        out = asyncio.run(c.speak("你好"))
+        self.assertEqual(out["mode"], "system")
+        self.assertEqual(calls, ["127.0.0.1"], "选了本地就不该产生云端调用")
+
+    def test_local_mode_without_address_is_enabled_and_system(self):
+        c = TTSClient(_cfg(tts_mode="local", tts_local_base_url=""))
+        self.assertTrue(c.enabled, "本地地址为空也要有系统语音兜底，不能整条静音")
+        self.assertEqual(asyncio.run(c.speak("你好"))["mode"], "system")
+
+
 class FallbackTest(unittest.TestCase):
     def test_local_failure_falls_back_to_cloud(self):
         calls = []

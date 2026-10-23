@@ -11,7 +11,7 @@ extends Node3D
 const HIP_H_MODEL := 0.9279      # 静止站立时髋骨高度（模型米制，由静态探测得到）
 const SIT_HIP_H := 0.19          # 坐下后髋部离地高度（模型米制；留出裙摆铺地的余量）
 
-var vrm_path := "D:/KataGo/assets/Azure.vrm"
+var vrm_path := "Azure.vrm"
 var scale_factor := 13.5         # 棋盘 1 格 = 1 世界单位，化身按此比例缩到「同伴」尺寸
 var floor_y := -0.6              # 地面高度（与棋盘底面一致）
 var seat_z := -15.2              # 坐在棋盘对面（远端之后；裙摆/手都不越过棋盘边线）
@@ -103,12 +103,56 @@ func _ready() -> void:
 
 # ================= 加载 =================
 
+## 相对路径的候选位置（按优先级去重）：
+##   ① 可执行文件同目录（发布包：`Azure.vrm` 与 exe 并列）→ ② `res://`（源码运行时就是 `game/`）
+##   → ③ `res://` 的上一级（仓库布局：VRM 放在工程根目录）→ ④ 进程工作目录。
+## 绝对路径原样返回。`Globalize` 对 `res://` 是必需的一步：`FileAccess` 只认文件系统路径。
+static func vrm_candidates(path: String) -> PackedStringArray:
+	var out := PackedStringArray()
+	var p := path.strip_edges()
+	if p == "":
+		return out
+	if p.is_absolute_path() or p.begins_with("res://") or p.begins_with("user://"):
+		out.append(p)
+		return out
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	if exe_dir != "":
+		out.append(exe_dir.path_join(p))
+	var res_dir := ProjectSettings.globalize_path("res://")
+	if res_dir != "":
+		var res_path := res_dir.path_join(p)
+		if not out.has(res_path):
+			out.append(res_path)
+		var parent_path := res_dir.trim_suffix("/").get_base_dir().path_join(p)
+		if not out.has(parent_path):
+			out.append(parent_path)
+	var cwd := ""
+	var dir := DirAccess.open(".")
+	if dir != null:
+		cwd = dir.get_current_dir()
+	if cwd != "":
+		var cwd_path := cwd.path_join(p)
+		if not out.has(cwd_path):
+			out.append(cwd_path)
+	return out
+
+## 把 `vrm_path` 解析成一个真实存在的文件：绝对路径原样用；相对路径按 `vrm_candidates`
+## 依次尝试（先 exe 同目录，再 res://，再工程根），取第一个存在的。都找不到返回空串。
+static func resolve_vrm_path(path: String) -> String:
+	for cand in vrm_candidates(path):
+		if FileAccess.file_exists(cand):
+			return cand
+	return ""
+
 func _load() -> String:
-	if not FileAccess.file_exists(vrm_path):
-		return "找不到 VRM：%s" % vrm_path
-	var bytes := FileAccess.get_file_as_bytes(vrm_path)
+	var path := resolve_vrm_path(vrm_path)
+	if path == "":
+		var tried := vrm_candidates(vrm_path)
+		return "找不到 VRM：%s（已试：%s）" % [vrm_path, ", ".join(tried)]
+	vrm_path = path
+	var bytes := FileAccess.get_file_as_bytes(path)
 	if bytes.is_empty():
-		return "VRM 读取失败：%s" % vrm_path
+		return "VRM 读取失败：%s" % path
 	var doc := GLTFDocument.new()
 	var state := GLTFState.new()
 	if doc.append_from_buffer(bytes, "", state) != OK:

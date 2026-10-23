@@ -16,6 +16,8 @@ const LOSSES_LIMIT := 2
 
 var data: Dictionary = {}
 var _text_root: Control = null
+## 一张战报要叠一百多个 Label：字体只建一次（`GufengTheme.font()` 每次都会新建 SystemFont + 回退）
+static var _report_font: Font = null
 
 func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -104,12 +106,14 @@ static func info_line(wr: float, score: float, has_info: bool) -> String:
 
 func _add_label(parent: Node, text: String, pos: Vector2, box: Vector2, fs: int,
 		color: Color, align := HORIZONTAL_ALIGNMENT_LEFT, wrap := false) -> Label:
+	if _report_font == null:
+		_report_font = GufengTheme.font()
 	var l := Label.new()
 	l.text = text
 	l.position = pos
 	l.size = box
 	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	l.add_theme_font_override("font", GufengTheme.font())
+	l.add_theme_font_override("font", _report_font)
 	l.add_theme_font_size_override("font_size", fs)
 	l.add_theme_color_override("font_color", color)
 	l.horizontal_alignment = align

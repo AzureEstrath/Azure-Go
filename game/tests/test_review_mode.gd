@@ -85,6 +85,15 @@ func _run() -> void:
 			bool(during["readonly"]) and bool(during["buttons_disabled"])
 			and not bool(during["chat_editable"]))
 	_check("⑤ 退出后逐项回到进入前（同一输入 ⇒ 同一状态）", after == before)
+	# v3.12.2：「结束」之后，提示 / 局面分析 / 结束不再可用，但重来必须留着（开新局的出口）。
+	var ended := main_script.review_lock_state(false, false, false, false, false, false, false, true)
+	_check("⑤ 对局结束后：提示 / 局面分析 / 结束置灰，重来仍可用",
+			bool(ended["buttons_disabled"]) and not bool(ended["reset_disabled"]))
+	var ended_review := main_script.review_lock_state(true, false, false, false, false, false, false, true)
+	_check("⑤ 对局结束并进入复盘：四个按钮（含重来）一起冻住",
+			bool(ended_review["buttons_disabled"]) and bool(ended_review["reset_disabled"]))
+	_check("⑤ 对局未结束时（默认参数）重来不受影响",
+			not bool(main_script.review_lock_state(false, false, false)["reset_disabled"]))
 	_check("⑤ 她思考中（busy）不设只读、但按钮置灰（既有行为不变、聊天不受影响）",
 			not bool(main_script.review_lock_state(false, true, false)["readonly"])
 			and bool(main_script.review_lock_state(false, true, false)["buttons_disabled"])

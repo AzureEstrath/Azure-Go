@@ -249,6 +249,10 @@ func set_status(text: String, bad := false) -> void:
 func selected_id() -> int:
 	return _selected_id
 
+## 当前是否已经载入一盘（「纯刷新」据此保留玩家正在看的回看位置，不重新载入）
+func has_selection() -> bool:
+	return _selected_id > 0 and not _record.is_empty()
+
 func set_games(games: Array) -> void:
 	_games = games.duplicate(true)
 	if _list_box == null:

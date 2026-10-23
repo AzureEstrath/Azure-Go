@@ -2421,7 +2421,7 @@ class AzureAgent:
         self._emit(events.state(self.st.payload()))
         self._emit(events.message(events.AI, "嗯~ 那我们退回第%d手，重新想想…" % len(self.st.moves)))
 
-    def reset_game(self):
+    def reset_game(self, silent=False):
         # v3.7.0：开新一代——新一局开始，上一代（可能还在后台收尾）的迟到写入一律作废
         self.begin_epoch()
         keep_pass = self.st.allow_pass
@@ -2430,6 +2430,11 @@ class AzureAgent:
         self._reset_adaptive()                    # 新一局：难度回到基线（按画像修正）
         self.st.allow_pass = keep_pass
         self._joseki_taught = {}                 # 新一局：门控的冷却表清空（手数从头数）
+        # v3.12.2：上一局还没揭示的落子 / 待记账的情绪偏航不许漏进新局。
+        # 两者都是**局内瞬时状态**，重开即失效；不写回 False 会让重来后的第一份
+        # state 仍按「有一手等着 reveal」处理（前端要等一次永远不会来的语音）。
+        self._reveal_pending = False
+        self._drift_pending = None
         # v3.8.0：事件表是**局内内存**——新一局不带上一局的账（与「不随悔棋回退」是两回事，
         # 设计 §5 E/F：悔棋＝「发生过就是发生过」，重开＝另起一局）
         self.event_log.reset()
@@ -2439,7 +2444,10 @@ class AzureAgent:
         self.mood.reset()                        # 新一局：情绪回到基线（平静）
         self.sync_mood(True)
         self._emit(events.state(self.st.payload()))
-        self._emit(events.message(events.AI, "嗯~ 重新来吧..."))
+        # v3.12.1：从主界面进对局用 ``silent=True``——开场不该每次都多一句「重新来吧」；
+        # 玩家点「重来」仍走默认（有这一句）。
+        if not silent:
+            self._emit(events.message(events.AI, "嗯~ 重新来吧..."))
 
     def set_allow_pass(self, v):
         self.st.allow_pass = bool(v)

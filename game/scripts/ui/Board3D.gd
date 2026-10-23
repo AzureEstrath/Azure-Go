@@ -182,6 +182,7 @@ var _sphere: SphereMesh
 var _dot_tex: ImageTexture
 var _ownership_plane: MeshInstance3D = null
 var _ownership_tex: ImageTexture = null
+var _ownership_img: Image = null          # 复用的 19×19 画布：每手只改像素、不新建纹理对象
 var _ownership_has_data := false
 var _ownership_values: Array = []
 
@@ -238,6 +239,28 @@ func _build_camera() -> void:
 	add_child(cam)
 	_update_camera()
 	cam.make_current()
+	_build_backdrop()
+
+## 背景：参考 Art-Of-Ink 的青绿山水横幅，贴在相机前 250 单位处——随视角一起转 / 缩放，
+## 像「画中景」，但不参与场景几何（没有墙、没有接缝）。画面略抬高，让山脊落在露台
+## 护栏上方；露台、护栏与木地板负责把地表收住，画面不再像悬在空中。
+func _build_backdrop() -> void:
+	var tex := load("res://assets/ui/ink_backdrop.jpg")
+	if not (tex is Texture2D):
+		return
+	var quad := QuadMesh.new()
+	quad.size = Vector2(460.0, 228.0)         # 与 2.02:1 原图同比例；略大于视锥，超宽屏也不露底
+	var mi := MeshInstance3D.new()
+	mi.mesh = quad
+	mi.position = Vector3(0.0, 18.0, -250.0)
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.albedo_texture = tex
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
+	mi.material_override = mat
+	cam.add_child(mi)
 
 ## 侧栏状态：展开的一侧会把棋盘从画面中心推开（单侧沿用既有取景，两侧都开时整体等比推远）。
 ## 平滑过渡（`_step_panel_bias`）：棋盘跟着面板一起挪，不瞬移。
@@ -345,9 +368,9 @@ func _build_board() -> void:
 ## 每个像素对应一个交叉点；线性过滤让色块变柔和，不挡棋子 / 网格 / 点击。
 func _build_ownership() -> void:
 	_ownership_tex = ImageTexture.new()
-	var img := Image.create(19, 19, false, Image.FORMAT_RGBA8)
-	img.fill(Color(0, 0, 0, 0))
-	_ownership_tex.set_image(img)
+	_ownership_img = Image.create(19, 19, false, Image.FORMAT_RGBA8)
+	_ownership_img.fill(Color(0, 0, 0, 0))
+	_ownership_tex.set_image(_ownership_img)
 	var pm := PlaneMesh.new()
 	pm.size = Vector2(19.0 * CELL, 19.0 * CELL)
 	_ownership_plane = MeshInstance3D.new()
@@ -375,22 +398,29 @@ static func ownership_color(v: float) -> Color:
 	return Color(0.06, 0.08, 0.10, a) if f > 0.0 else Color(0.99, 0.97, 0.92, a)
 
 ## 后端 ownership 事件 → 贴图。长度必须 361；脏值退 0，绝不抛。
+## 复用同一块 Image / ImageTexture：每手只改 361 个像素再 update，不再新建纹理对象。
 func set_ownership(values: Array) -> void:
 	if values.size() != 19 * 19:
 		clear_ownership()
 		return
-	var img := Image.create(19, 19, false, Image.FORMAT_RGBA8)
+	if _ownership_img == null:
+		_ownership_img = Image.create(19, 19, false, Image.FORMAT_RGBA8)
+		_ownership_img.fill(Color(0, 0, 0, 0))
 	for y in 19:
 		for x in 19:
 			var raw = values[y * 19 + x]
 			var v := 0.0
 			if typeof(raw) == TYPE_FLOAT or typeof(raw) == TYPE_INT:
 				v = float(raw)
-			img.set_pixel(x, y, ownership_color(v))
-	_ownership_tex.set_image(img)
+			_ownership_img.set_pixel(x, y, ownership_color(v))
+	if _ownership_tex == null:
+		_ownership_tex = ImageTexture.create_from_image(_ownership_img)
+	else:
+		_ownership_tex.update(_ownership_img)
 	_ownership_values = values.duplicate()
 	_ownership_has_data = true
-	_ownership_plane.visible = ownership_enabled
+	if _ownership_plane != null:
+		_ownership_plane.visible = ownership_enabled
 
 func set_ownership_enabled(on: bool) -> void:
 	ownership_enabled = on

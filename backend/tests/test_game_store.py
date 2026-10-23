@@ -1,5 +1,6 @@
 """棋谱库存储层（games.db）：增删查、示例局播种、脏值与降级。"""
 
+import math
 import os
 import shutil
 import sys
@@ -82,6 +83,40 @@ class GameStoreTest(unittest.TestCase):
 
         fresh = GameStore(os.path.join(self.dir, "fresh.db"))
         self.assertGreater(fresh.ensure_demo(), 0)              # 新库：示例重新出现
+
+    def test_nan_and_inf_never_poison_json(self):
+        """NaN / inf 不许进库：它们会让 `/api/games` 的 JSON 序列化整页 500。"""
+        gid = self.store.add_game({
+            "ts": float("nan"), "moves": [["black", "Q16"]], "move_count": 1,
+            "final_black_wr": float("nan"), "final_score": float("inf"),
+        })
+        self.assertGreater(gid, 0)
+        row = self.store.list_games()[0]
+        self.assertTrue(math.isfinite(row["ts"]))
+        self.assertIsNone(row["final_black_wr"])
+        self.assertIsNone(row["final_score"])
+        rec = self.store.get_game(gid)
+        self.assertIsNone(rec["final_black_wr"])
+        self.assertIsNone(rec["final_score"])
+
+    def test_ensure_demo_is_thread_safe(self):
+        """并发首访（连点两次刷新）只许塞一盘示例：检查 → 写入在同一把锁里。"""
+        import threading
+        results = []
+        barrier = threading.Barrier(6)
+
+        def work():
+            barrier.wait()
+            results.append(self.store.ensure_demo())
+
+        threads = [threading.Thread(target=work) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(self.store.count(), 1, "并发首访只能留下一盘示例")
+        self.assertEqual(sum(1 for r in results if r > 0), 1, "只有真正写入的那一次返回 id")
 
     def test_fail_open_on_unusable_path(self):
         blocked = os.path.join(self.dir, "blocked")

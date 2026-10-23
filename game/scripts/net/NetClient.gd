@@ -44,6 +44,7 @@ signal move_rejected(state: Dictionary)
 
 const RECONNECT_MIN := 1.0
 const RECONNECT_MAX := 8.0
+const CONNECT_TIMEOUT := 8.0     # 远端地址黑洞时 TCP 可能要等 20 秒：超时后主动重连，别一直「连接中」
 const POST_TIMEOUT := 30.0   # REST 请求超时：后端卡住时也能回调释放节点，避免泄漏
 const CHAT_RETRY_GAP_MS := 2000  # 聊天发送失败（含被后端挡下）后的重试间隔：Main 每帧催一次也不会变成请求风暴
 
@@ -132,6 +133,7 @@ var _ws: WebSocketPeer = null
 var _opened_once := false
 var _retry_wait := RECONNECT_MIN
 var _retry_in := 0.0
+var _connecting_for := 0.0       # 本次「连接中」已等了多少秒（CONNECT_TIMEOUT 后主动放弃）
 var _settings_dirty := false
 
 ## 占位（引擎/LLM 都在后端，这里不需要初始化；保留签名让 Main 的调用点统一）
@@ -154,14 +156,25 @@ func _process(delta: float) -> void:
 			if not _opened_once:
 				_opened_once = true
 				_retry_wait = RECONNECT_MIN
+				_connecting_for = 0.0
 				net_status.emit("后端已连接：%s" % _strip_slash(base_url), false)
+				_settings_dirty = true          # 新连接可能就是新起的后端进程：把当前设置再对齐一次
 				_flush_settings()
 			while _ws.get_available_packet_count() > 0:
 				_handle_packet(_ws.get_packet().get_string_from_utf8())
+		WebSocketPeer.STATE_CONNECTING:
+			_connecting_for += delta
+			if _connecting_for >= CONNECT_TIMEOUT:
+				_ws.close()                     # 远端一直不响应：放弃这次，按退避重来
+				_ws = null
+				_opened_once = false
+				_connecting_for = 0.0
+				_schedule_retry()
 		WebSocketPeer.STATE_CLOSED:
 			_ws.close()
 			_ws = null
 			_opened_once = false
+			_connecting_for = 0.0
 			_schedule_retry()
 
 func _exit_tree() -> void:
@@ -172,6 +185,7 @@ func _exit_tree() -> void:
 
 func _connect_ws() -> void:
 	_ws = WebSocketPeer.new()
+	_connecting_for = 0.0
 	var err := _ws.connect_to_url(_ws_url())
 	if err != OK:
 		_ws = null
@@ -371,8 +385,9 @@ func summarize(note: String) -> void:
 func undo(turn_index: int) -> void:
 	_post("/api/undo", {"turn": turn_index})
 
-func reset_game() -> void:
-	_post("/api/reset")
+## 开新局。`silent=true`（v3.12.1）＝只清棋局、不添「重新来吧」那句——从主界面进对局时用。
+func reset_game(silent := false) -> void:
+	_post("/api/reset", {"silent": silent})
 
 func set_allow_pass(v: bool) -> void:
 	_post("/api/config", {"allow_pass": v})

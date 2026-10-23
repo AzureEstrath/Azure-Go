@@ -92,7 +92,8 @@ class AzureConfig:
         self.tts_volume = 1.0
         self.tts_timeout_sec = 30           # 云端单次合成超时；超时整条降级
         self.tts_long_chunk = False         # 打开后单块字数上限放宽（templates 里该键已在）
-        # —— 本地语音（优先）：tts_mode=openai 时非空则先试它，失败再试云端 tts_base_url，最后系统语音 ——
+        # —— 本地语音：tts_mode=local 时只走它（失败回落系统语音）；tts_mode=openai 时非空则先试它，
+        #    失败再试云端 tts_base_url，最后系统语音（旧配置兼容）——
         self.tts_local_base_url = ""        # 本地 OpenAI 兼容地址（如 http://127.0.0.1:9880/v1）
         self.tts_local_model = ""           # 留空沿用 tts_model
         self.tts_local_api_key = ""         # 留空沿用 tts_api_key

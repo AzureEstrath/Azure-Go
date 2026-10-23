@@ -46,10 +46,11 @@ DEFAULT_TIMEOUT_SEC = 30.0
 # 合成端点（OpenAI 兼容的 /audio/speech）
 SPEECH_PATH = "/audio/speech"
 
-# 合法朗读方式（对应前端 ``AzureConfig.gd:6`` 的 ``TTS_MODES``）与未知值回落目标
+# 合法朗读方式（对应前端 ``AzureConfig.gd`` 的 ``TTS_MODES``）与未知值回落目标
+# ``local``＝只走本地端点（CosyVoice/MeloTTS；失败回落系统语音）；
 # ``aliyun`` 由 :mod:`app.tts_aliyun` 的 ``AliyunTTSClient`` 承载（同一套 speak/缓存契约），
 # 本模块只在归一化里认它，不实现那条协议。
-TTS_MODES = ("system", "openai", "aliyun")
+TTS_MODES = ("system", "local", "openai", "aliyun")
 DEFAULT_TTS_MODE = "openai"
 
 
@@ -81,39 +82,52 @@ def _mode(cfg) -> str:
 
 
 def _endpoints(cfg) -> list:
-    """合成端点的**尝试顺序**：本地（``tts_local_base_url``）→ 云端（``tts_base_url``）。
+    """合成端点的**尝试顺序**，按朗读方式分流：
 
-    这是「有本地 TTS 优先本地，没有/失败才用云端，云端也不通才系统语音」的唯一实现处。
-    本地端点的 model / voice / api_key 留空时**沿用云端字段**，所以老配置（没有 local 字段）
-    的行为与之前逐项一致；两个地址都空 ⇒ 返回空列表（``enabled`` 判为未启用）。
+    - ``system``  → 空列表（``speak`` 直接回系统语音指令，零请求）；
+    - ``local``   → **只**试本地（``tts_local_base_url``）；地址缺失 / 合成失败都回落系统语音，
+      不再偷偷走云端（用户明确选了「本地」，不该产生云端调用或费用）；
+    - ``openai``  → 本地（若有）→ 云端（``tts_base_url``）；这是旧配置的兼容行为，
+      老用户把云端模式与本地地址混着用时仍能「本地优先」；
+    - ``aliyun``  → 本模块不用（由 ``AliyunTTSClient`` 承载）。
+    本地端点的 model / voice / api_key 留空时**沿用云端字段**。
     """
-    out = []
-    seen = set()
+    mode = _mode(cfg)
+    if mode in ("system", "aliyun"):
+        return []
     local = _text_of(cfg, "tts_local_base_url").strip()
+    cloud = _text_of(cfg, "tts_base_url").strip()
+    local_ep = None
+    cloud_ep = None
     if local:
         t = _float_cfg(cfg, "tts_local_timeout_sec", 0.0)
         if t <= 0.0:
             t = _float_cfg(cfg, "tts_timeout_sec", DEFAULT_TIMEOUT_SEC)
-        out.append({
+        local_ep = {
             "name": "local",
             "base_url": local,
             "model": _text_of(cfg, "tts_local_model").strip() or _text_of(cfg, "tts_model"),
             "voice": _text_of(cfg, "tts_local_voice").strip() or _text_of(cfg, "tts_voice"),
             "api_key": _text_of(cfg, "tts_local_api_key").strip() or _text_of(cfg, "tts_api_key"),
             "timeout": t if t > 0 else DEFAULT_TIMEOUT_SEC,
-        })
-        seen.add(local.rstrip("/"))
-    cloud = _text_of(cfg, "tts_base_url").strip()
-    if cloud and cloud.rstrip("/") not in seen:      # 同一个地址不重复试
+        }
+    if mode == "local":
+        return [local_ep] if local_ep else []
+    if cloud and (not local_ep or cloud.rstrip("/") != local.rstrip("/")):   # 同一地址不重复试
         t = _float_cfg(cfg, "tts_timeout_sec", DEFAULT_TIMEOUT_SEC)
-        out.append({
+        cloud_ep = {
             "name": "cloud",
             "base_url": cloud,
             "model": _text_of(cfg, "tts_model"),
             "voice": _text_of(cfg, "tts_voice"),
             "api_key": _text_of(cfg, "tts_api_key"),
             "timeout": t if t > 0 else DEFAULT_TIMEOUT_SEC,
-        })
+        }
+    out = []
+    if local_ep:
+        out.append(local_ep)
+    if cloud_ep:
+        out.append(cloud_ep)
     return out
 
 
@@ -144,7 +158,9 @@ class TTSClient:
         if not bool(getattr(self.cfg, "tts_enabled", False)):
             return False
         mode = _mode(self.cfg)
-        if mode == "system":
+        if mode in ("system", "local"):
+            # 本地模式地址缺失 / 服务没起时仍算启用：speak() 会退回系统语音指令，
+            # 不能因为本地地址为空就整条静音（用户选的是「本地」，至少还有系统语音兜底）。
             return True
         return len(_endpoints(self.cfg)) > 0
 

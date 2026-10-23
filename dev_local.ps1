@@ -164,13 +164,20 @@ if ($ttsHealth -ne "" -and ($runningQuality -eq [bool]$QualityTts)) {
         $p = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$(Join-Path $TtsDir $bat)`"") `
             -WorkingDirectory $TtsDir -WindowStyle Hidden -PassThru
         $started += $p.Id
+        # 批处理只负责拉起 VBS（隐藏窗口）后立刻退出：必须在这里等 /health 真就绪，
+        # 否则游戏先起来、首句语音会因本地服务还没加载好而回落系统语音。
+        $ttsWait = 90
+        if ($QualityTts) { $ttsWait = 300 }
+        if (-not (Wait-Url "http://127.0.0.1:$TtsPort/health" "" $ttsWait "本地语音服务")) {
+            Say "      （本地语音未就绪，游戏会按配置回落系统语音）"
+        }
     } else {
         Say "[2/4] [跳过] 找不到语音服务：$TtsDir（自动降级为系统语音）"
     }
 }
 
 # 把后端要用的「本地音色」写回本地配置（game/config.json 是本地开发配置，不入库）
-# 云端音色 (tts_voice) 不动；本地端点优先，失败才用云端。
+# 云端音色 (tts_voice) 不动；朗读方式显式切成 local（本地只走本地，失败回落系统语音）。
 $cfgPath = Join-Path $Root "game\config.json"
 if (Test-Path $cfgPath) {
     $cfgText = [IO.File]::ReadAllText($cfgPath, [Text.Encoding]::UTF8)
@@ -178,7 +185,10 @@ if (Test-Path $cfgPath) {
                                 ('"tts_local_base_url": "http://127.0.0.1:' + $TtsPort + '/v1"'))
     $cfgText = [regex]::Replace($cfgText, '"tts_local_voice"\s*:\s*"[^"]*"',
                                 ('"tts_local_voice": "' + $TtsVoice + '"'))
+    $cfgText = [regex]::Replace($cfgText, '"tts_mode"\s*:\s*"[^"]*"',
+                                '"tts_mode": "local"')
     [IO.File]::WriteAllText($cfgPath, $cfgText, (New-Object Text.UTF8Encoding($false)))
+    Say "[2/4] 已把 game/config.json 的朗读方式切到「本地」（若后端已在运行，需重启后端才生效）"
 }
 Warm-Tts $TtsVoice
 

@@ -10,13 +10,13 @@ extends Control
 ## 进出对局时的淡入 / 淡出由 `Main` 编排，这里只提供 `fade_in` / `fade_out` / `set_alpha`。
 ##
 ## 这个类只负责画与发信号，**不碰配置、不碰服务、不碰棋盘**：
-##   · `primary_pressed`  —— 开始对局 / 继续对局（由 `Main` 决定是首次开局还是从菜单返回）
+##   · `primary_pressed`  —— 开始对局 / 开始新对局（由 `Main` 决定是不是首次开局）
 ##   · `settings_pressed` —— 打开 `Main` 的启动设置面板（复用同一块面板，不另写一份设置）
 ##   · `library_pressed`  —— 打开棋谱库（v3.11.5；列表 / SGF 由 `Main` 接线）
 ##   · `quit_pressed`     —— 退出游戏
 ##
-## `set_resume_mode(true)` 把主按钮改成「继续对局」、提示行改成「Esc 继续对局」——
-## 首次启动与对局中按 Esc 回来的两种语义，用同一个界面表达。
+## `set_restart_mode(true)` 把主按钮改成「开始新对局」、提示行明说**上一局不保留**——
+## 对局中按 Esc 回来时，进入就是新的一局（v3.12.1），不再有「继续上一局」这条路径。
 
 signal primary_pressed
 signal settings_pressed
@@ -52,11 +52,12 @@ func _build() -> void:
 	fiber.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(fiber)
 
-	# ③ 纸签：**偏上**摆（棋盘在下方露出来），纸面半透明，远处的棋子能透过来
+	# ③ 纸签：略偏上摆（棋盘在下方露出来），纸面半透明，远处的棋子能透过来。
+	# v3.12.0 微调：原 0.02..0.55 的视觉中心太靠上，整体下移约 8% 屏高。
 	var center := CenterContainer.new()
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
-	center.anchor_top = 0.02
-	center.anchor_bottom = 0.55
+	center.anchor_top = 0.10
+	center.anchor_bottom = 0.62
 	center.offset_top = 0.0
 	center.offset_bottom = 0.0
 	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -163,12 +164,13 @@ func _rule(parent: Node) -> void:
 	r.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	parent.add_child(r)
 
-## 首次启动 vs 对局中按 Esc：只换主按钮与提示行的措辞，其余一字不动
-func set_resume_mode(on: bool) -> void:
+## 首次启动 vs 对局中按 Esc：只换主按钮与提示行的措辞，其余一字不动。
+## 对局中回来时**没有「继续」语义**：进入就是新的一局（`Main` 会清棋盘并 reset 后端）。
+func set_restart_mode(on: bool) -> void:
 	if _primary != null:
-		_primary.text = "继续对局" if on else "开始对局"
+		_primary.text = "开始新对局" if on else "开始对局"
 	if _hint != null:
-		_hint.text = ("Esc 继续对局，左键落子，右键拖拽旋转视角" if on
+		_hint.text = ("Esc 开始新对局（上一局不保留） · 左键落子，右键拖拽旋转视角" if on
 			else "左键落子，右键拖拽旋转视角 · 对局中按 Esc 回主界面")
 
 ## 主按钮文字（门卫用；不暴露内部节点）

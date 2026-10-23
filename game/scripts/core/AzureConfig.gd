@@ -2,9 +2,10 @@ class_name AzureConfig
 extends RefCounted
 ## 配置加载/保存：优先读「可执行文件同目录 / config.json」，其次项目内 res://config.json
 
-## 朗读方式（与左侧栏下拉一一对应）：system（Windows 系统语音）/ openai（OpenAI 兼容 /v1/audio/speech）/
+## 朗读方式（与左侧栏下拉一一对应）：system（Windows 系统语音）/ local（本地 CosyVoice/MeloTTS）/
+## openai（云端 OpenAI 兼容 /v1/audio/speech；有本地地址时本地优先，兼容旧配置）/
 ## aliyun（阿里云 Voice Studio 实时语音合成，WebSocket）。旧配置里的 "cosyvoice" 等未知值一律回落云端 openai
-const TTS_MODES := ["system", "openai", "aliyun"]
+const TTS_MODES := ["system", "local", "openai", "aliyun"]
 ## 旧配置里已废弃的本地引擎音色 id → 回落模板默认音色；清单是**唯一副本**，UI（`Main._is_removed_voice()`）直接引用它。
 ## 自建 CosyVoice 服务仍在用的活音色（azure / azure-fast / melo）**不在此列**，必须原样保留（该服务默认音色就是 azure）。
 ## 这里用黑名单而非白名单：tts_voice 允许手填任意服务商音色，白名单会把用户自填值冲掉。
@@ -53,14 +54,14 @@ var llm_think_mode := 0           # 思考档位：0=快速（不思考） 1=中
 ## 与旧字段 `tts_limit_len`（布尔）同一件事的扩档：读配置时 `reply_style` 优先，只有旧键时按旧语义迁移
 ## （true → 0 / false → 1）；写回时两个键一起写，保证旧版本读到的仍是「开 / 关」两档。
 var reply_style := 0
-var vrm_path := "D:/KataGo/assets/Azure.vrm"
+var vrm_path := "Azure.vrm"
 # —— 提示词自定义（留空则用内置 Azure 人设）——
 var prompt_system := ""           # 覆盖系统提示词（人设全文）；留空用内置
 var prompt_user_name := "Estarth" # 玩家称呼；会替换提示词中的「Estarth」
 var prompt_phase_notes: Dictionary = {}  # 覆盖阶段提示，键为阶段名（如 after_player / own_turn）
 # —— 云端语音（OpenAI 兼容 /v1/audio/speech；system=Windows 系统语音兜底）——
 var tts_enabled := false
-var tts_mode := "openai"          # openai（云端 OpenAI 兼容 /v1/audio/speech）/ system（Windows 系统语音兜底）
+var tts_mode := "openai"          # system / local / openai / aliyun；后端按它装配 TTS 客户端
 var tts_base_url := "https://api.openai.com/v1"
 var tts_model := "tts-1"
 var tts_api_key := ""             # 云端 TTS（OpenAI 兼容 /v1/audio/speech）的 API Key；留空则不发送
@@ -187,15 +188,20 @@ func tts_route_label() -> String:
 		if tts_aliyun_api_key != "" and tts_aliyun_voice != "":
 			return "阿里云 Voice Studio（实时流式）"
 		return "阿里云 Voice Studio（未配置 Key/音色，将回落系统语音）"
+	if tts_mode == "local":
+		if tts_local_base_url.strip_edges() == "":
+			return "本地语音（未配置 tts_local_base_url，将回落系统语音）"
+		var lv := (" · 音色 " + tts_local_voice) if tts_local_voice != "" else ""
+		return "本地语音%s%s（失败回落系统语音）" % [tts_local_base_url, lv]
 	if tts_local_base_url != "":
 		var v := (" · 音色 " + tts_local_voice) if tts_local_voice != "" else ""
-		return "本地语音（优先）%s%s" % [tts_local_base_url, v]
+		return "云端语音（本地优先）%s%s" % [tts_local_base_url, v]
 	if tts_base_url.strip_edges() != "":
 		return "云端语音 %s" % tts_base_url
-	return "系统语音（Windows；本地/云端地址都未配置）"
+	return "未配置语音地址（不会出声）"
 
 ## 旧配置归一化：v2.x 的 "cosyvoice"（本地 CosyVoice 表单接口）已不是合法朗读方式，一律回落 openai，
-## 避免「存储值 ≠ 下拉显示值」（下拉是 system / openai / aliyun，未知值会让它默认落在 system 上）
+## 避免「存储值 ≠ 下拉显示值」（下拉是 system / local / openai / aliyun，未知值会让它默认落在 system 上）
 static func _normalize_tts_mode(v: String) -> String:
 	var m := v.strip_edges().to_lower()
 	return m if m in TTS_MODES else "openai"

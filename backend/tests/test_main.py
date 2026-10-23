@@ -784,6 +784,25 @@ class TtsAsyncPathTest(unittest.TestCase):
         self.assertEqual(bus.of_type("speech"), [], "同步方法的短提示不得发 speech（T20②）")
 
 
+class ResetSilentTest(unittest.TestCase):
+    """v3.12.1：从主界面进对局走 ``silent`` reset——只推 state，不添「重新来吧」。"""
+
+    def test_silent_reset_skips_the_hint(self):
+        agent, bus = _mk_tts_agent(tts=None)
+        asyncio.run(agent.player_move(3, 3))
+        bus.clear()
+        agent.reset_game(silent=True)
+        self.assertEqual(bus.of_type("message"), [], "静默 reset 不该有台词")
+        self.assertTrue(bus.of_type("state"), "棋盘快照照发")
+
+    def test_endpoint_accepts_no_body_and_silent(self):
+        """旧调用（不带 body）与从主界面进门（``silent``）都返回 ok。"""
+        app = create_app(engine=StubEngine(), llm=StubLLM(), autostart=False)
+        with TestClient(app) as client:
+            self.assertTrue(client.post("/api/reset").json()["ok"])
+            self.assertTrue(client.post("/api/reset", json={"silent": True}).json()["ok"])
+
+
 # ================= 计划 08 · Task C：后端复盘模式（v3.7.0） =================
 # 复盘是**后端的模式**（只把前端棋盘设成只读挡不住她出声）：这里守门禁（复盘先于 busy）、
 # 只读重放、静音、存档形状，以及阶段一顺延的 V13 剪枝。

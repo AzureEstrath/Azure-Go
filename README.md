@@ -16,7 +16,10 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 > （`katago_service\`）提供，**人设与提示词也能在 `config.json` 里直接改**。
 > 客户端（`game\`）只做渲染、输入与语音播放，连不上后端时只在状态栏提示。
 >
-> 当前版本 **v3.12.0**：**棋谱库 / 全盘复盘 / 自适应难度 / 领地热力图 / 音效与战报，以及 PR #4 的「局面点目」**——
+> 当前版本 **v3.12.2**：**合并 PR #5（每次从主界面进入都是新的一局 / 化身 VRM 路径恢复 /
+> 「重来」清账 / 局后按钮冻结）**，并保留本地 v3.12.0 的**棋谱库 / 全盘复盘 / 自适应难度 /
+> 领地热力图 / 音效与战报 / 局面点目**，以及 **TTS 四档（系统 / 本地 / 云端 / 阿里云）**、
+> **圆形胡桃木露台 + 水墨山水背景**。
 > 主界面第三键打开棋谱库（含 24 手示例局），选中一盘即可让 Azure 按分段强思考从头讲到尾；
 > 设置里可开自适应难度、领地热力图与对局音效；局后一键生成 1200×1600 PNG 战报。
 > **点「局面分析」时**，棋盘会标出已定型的归属点、左上角弹出形势纸签（黑 / 白目数与黑方视角目差）——
@@ -174,8 +177,9 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
    ```
    Godot_v4.6.3-stable_win64.exe --path game
    ```
-2. 把 `Azure.vrm`（形象）放到可访问位置，并把 `vrm_path` 填成 **绝对路径**
-   （用相对路径时文件必须能被 Godot 解析到，否则形象加载失败）。
+2. 把 `Azure.vrm`（形象）放到可访问位置，并把 `vrm_path` 填成路径：绝对路径可直接用；
+   相对路径会依次在 **exe 同目录 → `game/` → 仓库根目录 → 进程工作目录** 找，取第一个存在的
+   （发布包把 `Azure.vrm` 与 exe 放一起即可，源码运行可放在仓库根目录）。
    **KataGo 的 `katago.exe` / 权重 / analysis 配置文件归 KataGo 云服务部署侧持有**，客户端不读这些路径。
 3. 先启动 **KataGo 云服务**（`katago_service\run_server.bat`，见第六节「KataGo 服务部署」），
    再启动后端（`backend\run_server.bat`，见第六节），最后启动游戏。
@@ -184,9 +188,12 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
 4. 玩家**执黑先行**：左键落子，右键拖拽旋转视角，滚轮缩放。
 
 `config.json` 放在**可执行文件同目录**即可覆盖包内默认值（源码运行时读 `game\config.json`）。
-语音默认走 OpenAI 兼容链路（`tts_mode=openai`）：`tts_local_base_url` 非空时先走本地，失败才用
-`tts_base_url`，两路都不通才自动整条降级为 **Windows 系统语音**；也可切到 `aliyun` 走
-**阿里云 Voice Studio 实时语音合成**（要填 `tts_aliyun_api_key` 与 `tts_aliyun_voice`，平台音色 ID 为 UUID）。
+朗读方式（左侧栏下拉，`tts_mode`）现在有四档同级选项：
+**系统语音**（Windows）/ **本地**（只走本地 CosyVoice/MeloTTS，失败回落系统语音）/
+**云端 OpenAI 兼容**（有本地地址时仍本地优先，兼容旧配置）/ **阿里云 Voice Studio**。
+本地服务地址写在 `tts_local_base_url`（如 `http://127.0.0.1:9880/v1`）；`dev_local.ps1`
+会启动本地语音、等 `/health` 就绪，并把 `game/config.json` 的朗读方式切成 `local`。
+阿里云要填 `tts_aliyun_api_key` 与 `tts_aliyun_voice`（平台音色 ID 为 UUID）。
 **合成在后端**，文字始终照常显示；左侧栏「实际朗读」一行显示当前生效路线。
 聊天/讲解需要按第四节接上一个大模型 API。
 
@@ -243,8 +250,9 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
 - **退出**：退出游戏。
 
 首次「开始对局」前仍会弹一次「出发前的准备」设置面板（盖在封面上），确认后才播入场运镜。
-对局中 **`Esc` 回主界面**，动效**反向**播放（工具栏先滑出 → 相机飞回远处 → 封面淡入）；主按钮变「继续对局」，
-再按 `Esc` 或点它，入场运镜再播一遍。封面 / 运镜期间棋盘、四个功能按钮、聊天与回档 / 开关一起冻住，闲置搭话也停。
+对局中 **`Esc` 回主界面**，动效**反向**播放（工具栏先滑出 → 相机飞回远处 → 封面淡入）；主按钮变「开始新对局」
+（每次从封面进来都是新的一局，上一局不保留）。再按 `Esc` 或点它，入场运镜再播一遍。
+封面 / 运镜期间棋盘、四个功能按钮、聊天与回档 / 开关一起冻住，闲置搭话也停。
 
 **视角与鼠标**（左侧栏默认**收起**，右侧栏默认展开；两侧各有一个贴边按钮收起 / 展开对应面板，
 按钮文案在 `▶` / `◀` 间随状态切换）：
@@ -359,8 +367,10 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
 **左侧栏「🔊 语音朗读」**（默认收起）：
 
 - `朗读 Azure 的话`：语音总开关（写回 `config.json`；关掉即刻停止播放与取音频，**后端重启后**才真正零请求、零 `speech` 事件；文字照常）。
-- `朗读方式` 下拉：`系统语音` / `CosyVoice OpenAI 接口`（对应 `system` / `openai`；**重启后端后生效**）。
-- `服务地址（上面第 2 项才需要）` / `模型` / `音色（可下拉选）`；`重填音色候选` 按钮 + 可手填音色 id 的输入框。
+- `朗读方式` 下拉：`系统语音` / `本地 CosyVoice` / `云端 OpenAI 兼容` / `阿里云 Voice Studio（实时流式）`
+  （对应 `system` / `local` / `openai` / `aliyun`；**重启后端后生效**）。
+- `云端服务地址（上面第 3 项才需要）` / `模型` / `音色（可下拉选）`；`重填音色候选` 按钮 + 可手填音色 id 的输入框。
+  本地地址与本地音色仍在 `config.json` 的 `tts_local_base_url` / `tts_local_voice`（`dev_local.ps1` 自动写入）。
   下拉候选是**本地静态列表**：`alloy` / `echo` / `fable` / `nova` / `onyx` / `shimmer` / `中文女` / `粤语女` / `英文女`，
   也可直接手填服务商的音色 id。
 - `语速`（0.5~2.0）/ `音调（播放层变调，会略带动语速）`（0.8~1.3）/ `音量`（0.0~1.5）三个滑块。
@@ -464,7 +474,7 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
 | 游戏一直显示「未连接后端（…），N 秒后重试…」 | ① 后端没起；② `backend_url` 地址 / 端口不对；③ 后端缺 `websockets`（`/ws` 升级被拒 404）；④ 后端还在等 KataGo 预热（最长 180 秒不监听端口） | 起后端（`backend\run_server.bat`）；核对 `backend_url`（默认 `http://127.0.0.1:8000`）；`pip install -r backend\requirements.txt` 补 `websockets`；若后端控制台停在等 KataGo，先 `curl http://127.0.0.1:8100/health` 确认 `state == "ready"`（见 2.2） |
 | 她有话，但没声音 | ① `tts_enabled=false`；② `tts_mode` 与三件套不配套（如用 `中文女` 调 OpenAI 会被 HTTP 400 拒）；③ `tts_api_key` 空；④ 合成超时（`tts_timeout_sec`）；⑤ 音频被 LRU 淘汰或后端重启过（`GET /api/tts/audio/{id}` 404）；⑥ 走了系统语音（`speech.mode=system`） | 看底部状态栏「语音：…」与后端控制台 `[TTS] …` 行；按第三节把三件套配成**同一家**服务商的取值；`system` 模式本来就是系统语音出声，检查 Windows 音量与音色 |
 | 完全没有声音，系统语音也没声 | PowerShell / SAPI 被策略拦掉（前端用 `OS.create_process("powershell")` 调系统语音，起不来就念不出） | 状态栏会提示「系统语音不可用（无法启动 PowerShell），这条改为只显示文字」；放行 PowerShell，或改用云端 `openai` 模式 |
-| 形象不显示 | `Azure.vrm` 缺失，或 `vrm_path` 是相对路径、Godot 解析不到 | 按 2.1 ③ 放好 `.vrm`，并把 `vrm_path` 写成**绝对路径**（见第三节） |
+| 形象不显示 | `Azure.vrm` 缺失，或 `vrm_path` 指向的文件在候选位置里都找不到 | 按 2.1 ③ 放好 `.vrm`；相对路径会依次找 exe 同目录 / `game/` / 仓库根 / 工作目录（见第三节），日志里会列出试过的路径 |
 | 她算不清，提示说「嗯...我这边一时算不清，稍等再试吧~」 | KataGo 云服务不可用（没起 / 地址或令牌不对 / 引擎 `dead`） | 读 `GET http://127.0.0.1:8000/api/health` 的 `katago_dead` + `katago_error`，**成对读**（见第六节）：`dead=true`＝引擎（或到它的链路）真没了；`dead=false` + 新的非空 `error`＝服务在线但这次没答好。再去看服务侧 `GET http://127.0.0.1:8100/health` 的 `state` |
 | 讲解 / 闲聊变成「唔…我脑子有点转不过来…」这类兜底台词 | LLM 没接 / 401 / 429 / 超时；或请求体扩展字段被服务商拒（HTTP 400/422） | 核对 `llm_base_url` / `llm_model` / `llm_api_key`（第四节）。扩展字段被拒时后端会自动去掉重试一次、且本次会话不再发送（设计好的降级）；要彻底避免就把 `llm_extra_body` / `llm_think_extra_body` 留空 |
 | 长期记忆没生效 | `memory_enabled=false`；或改了字段没重启后端 | 置 `memory_enabled=true` 后**重启后端**；`GET /api/health` 的 `memory_rows` 一眼看出库里有没有东西（见第四节） |
@@ -492,20 +502,23 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
 **测试**（后端与 KataGo 服务都用标准库 `unittest`，不用 pytest）：
 
 ```bash
-cd backend && python -m unittest discover -s tests          # 后端全量（853）
+cd backend && python -m unittest discover -s tests          # 后端全量（861）
 cd katago_service && python -m unittest discover -s tests   # KataGo 云服务全量（36；假引擎，不依赖真实 KataGo 与公网）
 godot --path game --headless --script res://tests/test_tts.gd              # 语音播放器（22）
 godot --path game --headless --script res://tests/test_speech_pairing.gd   # 语音配对状态机（82；纯逻辑）
 godot --path game --headless --script res://tests/test_joseki_card.gd      # 定式参考图卡片（79；纯逻辑）
-godot --path game --headless --script res://tests/test_config.gd           # 客户端配置读写（189）
-godot --path game --headless --script res://tests/test_review_mode.gd      # 复盘冻结 / 翻页夹取 / 存档渲染 / 全盘分段 / 行为标签（47；纯逻辑）
-godot --path game --headless --script res://tests/test_view_helpers.gd     # 视角 / 运镜 / 悬停文案 / 摸头 / 领地图 / 点目文案（43；纯逻辑）
+godot --path game --headless --script res://tests/test_config.gd           # 客户端配置读写（192）
+godot --path game --headless --script res://tests/test_review_mode.gd      # 复盘冻结 / 翻页夹取 / 存档渲染 / 全盘分段 / 行为标签（50；纯逻辑）
+godot --path game --headless --script res://tests/test_view_helpers.gd     # 视角 / 运镜 / 悬停文案 / 摸头 / 领地图 / 点目文案（45；纯逻辑）
 godot --path game --headless --script res://tests/test_score_phrase.gd     # 目差量级人话（17；纯逻辑）
 godot --path game --headless --script res://tests/test_joseki_level.gd     # 定式档位纯函数（15；纯逻辑）
 godot --path game --headless --script res://tests/test_net_chat.gd         # 聊天回包与排队（14；纯逻辑）
 godot --path game --headless --script res://tests/test_chat_queue.gd       # 聊天队列 FIFO / 上限（17；纯逻辑）
 godot --path game --headless --script res://tests/test_thinking_lines.gd   # 思考短句解析 / 不连复（19；纯逻辑）
-godot --path game --headless --script res://tests/test_title_screen.gd     # 主界面纸幕 / 四键 / 淡入淡出（19；纯逻辑）
+godot --path game --headless --script res://tests/test_title_screen.gd     # 主界面纸幕 / 四键 / 开始·开始新对局 / 淡入淡出（19；纯逻辑）
+godot --path game --headless --script res://tests/test_new_game.gd         # 每次进对局都重开 / 空局文案（8；纯逻辑）
+godot --path game --headless --script res://tests/test_estimate.gd         # 局面点目文案 / 脏值 / 棋盘标记（17）
+godot --path game --headless --script res://tests/test_avatar_path.gd      # VRM 相对路径候选与解析（9；纯逻辑）
 godot --path game --headless --script res://tests/test_sfx.gd              # 对局音效资源 / 音量换算 / 静默（8；纯逻辑）
 godot --path game --headless --script res://tests/test_report.gd           # 战报布局纯函数：坐标 / 点评 / 亏损手 / 手顺（9；纯逻辑）
 godot --path game --headless --script res://tests/test_replay.gd           # 棋谱本地回放：落子 / 提子 / 虚着 / 脏值（10；纯逻辑）
@@ -525,6 +538,8 @@ godot --path game --headless --script res://tests/test_replay.gd           # 棋
 > `tests\test_full_review_api.py`（全盘复盘端点 + WS 推送）、`tests\test_adaptive.py`（自适应难度：画像 / 聊天 / 表现信号、基线夹取、冷却、落点弱化）。
 > v3.12.0 新增的后端门卫模块：`tests\test_estimate.py`（点目纯函数：归属方向 / 50% 阈值 / 活子与死子 / 脏值降级），
 > `tests\test_agent_graph.py` 追加 `EstimateWiringTest`（只在「局面分析」发一次、先于台词、普通落子不发）。
+> v3.12.2 追加：`test_agent.py` 的「重来清账」全账目断言、`test_main.py` 的 `ResetSilentTest`；
+> 前端新增 `test_avatar_path.gd` / `test_new_game.gd` / `test_estimate.gd`。
 
 **调试参数**（走 `OS.get_cmdline_user_args()`，**必须放在 `--` 之后**）：
 
@@ -611,9 +626,9 @@ Godot_v4.6.3-stable_win64.exe --path game -- --title --shot=menu.png   # 只画�
 | `prompt_system` | 后端（启动时） | **覆盖系统提示词（人设全文）**；留空用内置 Azure 人设 |
 | `prompt_user_name` | 后端（启动时） | **玩家称呼**，替换提示词中的「Estarth」（默认 Estarth） |
 | `prompt_phase_notes` | 后端（启动时） | **覆盖各阶段提示**，键：`observe` / `after_player` / `own_turn` / `just_moved` / `analyze` / `chat` / `summary` |
-| `vrm_path` | 客户端 | 虚拟形象 `.vrm` 路径；**建议填绝对路径**（相对路径要能被 Godot 解析到，否则形象加载失败） |
+| `vrm_path` | 客户端 | 虚拟形象 `.vrm` 路径。绝对路径直接用；相对路径依次在 exe 同目录 → `game/` → 仓库根 → 工作目录里找，取第一个存在的 |
 | `tts_enabled` | 客户端 + 后端（启动时） | 是否启用语音；后端据此决定要不要合成（关闭时零请求、不发 `speech` 事件，文字照常） |
-| `tts_mode` | 后端（启动时）+ 客户端 | `openai`（默认；OpenAI 兼容 `/v1/audio/speech`，先本地 `tts_local_base_url` → 云端 `tts_base_url` → 系统语音）/ `aliyun`（阿里云 Voice Studio 实时语音合成，WebSocket 流式）/ `system`（Windows 系统语音）；后端按它决定合成路由，客户端只作本地镜像（两边都把未知值回落 `openai`） |
+| `tts_mode` | 后端（启动时）+ 客户端 | `system`（Windows 系统语音）/ `local`（**只**走本地 `tts_local_base_url`，失败回落系统语音，不产生云端调用）/ `openai`（云端 OpenAI 兼容；本地地址非空时仍本地优先，兼容旧配置）/ `aliyun`（阿里云 Voice Studio 实时合成）；后端按它决定合成路由，客户端只作本地镜像（两边都把未知值回落 `openai`） |
 | `tts_base_url` | 后端（启动时） | **云端语音服务地址**（OpenAI 兼容，含 `/v1`，如 `https://api.openai.com/v1`）；留空＝不试云端（本地也没有时只出文字） |
 | `tts_model` | 后端（启动时） | 云端语音模型名 |
 | `tts_voice` | 后端（启动时）+ 客户端 | 音色 id（随服务商而定，也可手填）；后端用它合成，客户端系统语音兜底时也拿它选音色 |
@@ -628,7 +643,7 @@ Godot_v4.6.3-stable_win64.exe --path game -- --title --shot=menu.png   # 只画�
 | `tts_timeout_sec` | 后端（启动时） | **云端**单次合成超时（秒，默认 `30`）；`≤0` **钳到 1 秒**、脏值退回默认；超时一律改用下一路（本地超时另见 `tts_local_timeout_sec`） |
 | `tts_limit_len` | 客户端 + 后端（实时） | **旧键**（v3.11.1 起由 `reply_style` 取代）：`true` ⇔ `reply_style=0`（精简）。仍随 `save()` 一起写回，旧版本客户端 / 后端读到的仍是「短回复 开 / 关」 |
 | `reply_style` | 客户端 + 后端（实时） | **说话详略三档**（v3.11.1）：`0` 精简（点评 1 句 / 聊天最多 2 句，默认）/ `1` 适中（不加额外约束）/ `2` 详细（2~3 句、约 80 字内）；经 `/api/config` 转发后端，**立即生效**。脏值退回默认，越界夹到 `0~2`；文件里只有旧键 `tts_limit_len` 时按旧语义迁移 |
-| `tts_local_base_url` | 后端（启动时） | **本地语音服务地址**（OpenAI 兼容，含 `/v1`，如 `http://127.0.0.1:9880/v1`）。**非空时优先于云端**：本地整条合成失败 → 自动改用 `tts_base_url`；云端也不通 → Windows 系统语音 |
+| `tts_local_base_url` | 后端（启动时） | **本地语音服务地址**（OpenAI 兼容，含 `/v1`，如 `http://127.0.0.1:9880/v1`）。`tts_mode=local` 时只走它、失败回落系统语音；`tts_mode=openai` 时作为本地优先的第一路，失败再走云端，云端也不通才系统语音 |
 | `tts_local_model` / `tts_local_voice` / `tts_local_api_key` | 后端（启动时） | 本地端点专用；**留空沿用云端同名字段**（旧配置零迁移） |
 | `tts_local_timeout_sec` | 后端（启动时） | 本地单次合成超时（默认 `120`；本地模型冷启动较慢）；`0` / 脏值沿用 `tts_timeout_sec` |
 | `tts_sync_speak` | 客户端 | **同步说话**：开启后她的**朗读台词**（含聊天与闲置搭话）文字等这条语音**开始播放**后再显示；**取音频失败 / 合成超时 / 超过 45 秒配对窗口**时会兜底立即显示文字（不卡字、不丢字）。聊天与闲置搭话看起来接近即时，是因为它们的回合在发话前就已解锁、前端会立刻放字——不是因为音频已就绪；**立即生效** |
@@ -888,11 +903,14 @@ curl -o line.wav http://127.0.0.1:8000/api/tts/audio/音频id
 
 > `-d '…'` 的单引号写法在 **PowerShell 7 / Git Bash** 可用；**cmd.exe** 要改写成 `-d "{\"text\":\"…\"}"`。
 
-**自建 CosyVoice 也走 `openai`**：`server\` 的 `azure_tts_server.py` 同样实现了 OpenAI 兼容的
-`/v1/audio/speech`，把 `tts_mode` 保持 `openai`、`tts_base_url` 指向 `http://127.0.0.1:9880/v1` 即可。
+**自建 CosyVoice 用 `local` 档**：`server\` 的 `azure_tts_server.py` 实现了 OpenAI 兼容的
+`/v1/audio/speech`。把左侧栏「朗读方式」选 `本地 CosyVoice`（`tts_mode=local`），
+并确认 `tts_local_base_url` 指向 `http://127.0.0.1:9880/v1` 即可；本地失败会回落系统语音，
+不会偷偷产生云端调用。
 1. 自备 CosyVoice 权重，放到 `server\pretrained_models\` 下；
 2. 建虚拟环境并安装依赖（`server\requirements_win.txt`、`requirements.txt`）；
 3. 双击 `server\start_tts_server.bat` 手动启动服务（游戏不会自动拉起），服务监听 `http://127.0.0.1:9880`。
+   开发时用 `dev_local.ps1` 会自动启动本地服务并等它就绪。
 
 ---
 
@@ -1018,7 +1036,28 @@ KataGo 引擎与权重遵循其上游许可。
 
 ## 九、更新
 
-### v3.12.0（当前）
+### v3.12.2（当前）
+- **每次从主界面进入都是新的一局（v3.12.1 / PR #5）**：封面主按钮改为「开始新对局」，进入前先清本地
+  棋盘 / 手数 / 胜率 / 目差 / 俗手 / 复盘入口，再静默调用 `POST /api/reset {"silent": true}`；
+  后端忙时挂起，等 `busy=false` 补发，避免「她思考时回主界面再进来」保留上一局。首次启动也走同一条
+  路径清掉后端可能残留的棋局；旧「继续对局」语义退场。
+- **化身 VRM 路径恢复（v3.12.2 / PR #5）**：`vrm_path` 写相对路径时依次尝试 **exe 同目录 →
+  `game/` → 仓库根目录 → 工作目录**，取第一个存在的文件并在失败日志里列出全部候选；源码运行可直接
+  使用仓库根的 `Azure.vrm`，发布包把 `Azure.vrm` 与 exe 放一起即可。
+- **「重来」清账补全（v3.12.2 / PR #5）**：后端同时清空上一局未揭示的落子（`_reveal_pending`）与待记账的
+  情绪偏航（`_drift_pending`）；前端清空复盘计数 / `_reviewing` 与复盘按钮状态，重来后不再等一条不会来的语音。
+- **局后按钮冻结（v3.12.2 / PR #5）**：「结束」流程走完后，**提示 / 局面分析 / 结束** 立即置灰，
+  **重来保持可用**作为开新局出口；进入复盘后重来也一起冻结。
+- **点目文案守卫（PR #5）**：`estimate_count_line` / `estimate_lead_line` 显式接收字段，JSON 的 float 正常
+  显示，缺字段 / 脏值给「形势: --」，不再把脏值硬报成 0。
+- **视觉（本地）**：地板改为**圆形胡桃木露台**（半径 22，棋盘落在圆心），64 段环形矮护栏用
+  `MultiMeshInstance3D` 合成两个 draw call；台面手写三角扇 + 平面投影 UV（木纹保持直纹），
+  侧壁给出台面厚度；地板 `albedo_color` 压到 0.80 融入宣纸 / 墨色，背景仍是相机上的青绿山水横幅。
+- **门卫**：后端全量 **861 OK**（新增「重来清账」1 项 + `ResetSilentTest` 2 项）；前端 **18 支脚本全 PASS**
+  （新增 `test_avatar_path.gd` 9 项 / `test_new_game.gd` 8 项 / `test_estimate.gd` 17 项；
+  `test_title_screen.gd` 19 项、`test_review_mode.gd` 50 项、`test_view_helpers.gd` 45 项）。
+
+### v3.12.0
 - **棋谱库 + SGF（v3.11.5 批）**：主界面第三键打开全屏模态纸签——对局列表（日期 / 手数 / 黑胜率）、
   右侧小棋盘逐手回看、局后总结、导入 / 导出 SGF、删除；库在 `backend\data\games.db`（SQLite），
   导入前后端逐手校验；全新库首次打开自动塞入 24 手内置示例局。列表 / 详情**不碰当前对局、零引擎调用**。
@@ -1034,10 +1073,28 @@ KataGo 引擎与权重遵循其上游许可。
   （\|归属\| ≥ 50%）的定型点收敛成 `estimate` 事件——棋盘上画归属小方块，左上角弹形势纸签
   （黑 / 白目数与黑方视角目差 + 贴目）。活子不叠标记、被点死的对手子画在棋子上；玩家下一手 /
   局面变化 / 重来 / 进复盘时自动收起。**不新增引擎调用、不产生台词或语音、不进任何 LLM 上下文**。
-  本版**只采纳点目**：PR #4 的「每次进对局开新局」不合并，现有「继续对局 / 棋谱库复盘」语义保持不变。
-- **门卫**：后端全量 **853 OK**（新增 `test_estimate.py` 8 项 + `test_events` 事件形状 2 项 +
-  `EstimateWiringTest` 3 项）；前端 15 支脚本全 PASS，`test_view_helpers.gd` 增至 **43** 项
-  （点目两行文案与棋盘格位容错）。
+  PR #4 的「每次进对局开新局」在 v3.12.1 单独落地（见上），旧「继续对局」语义同时退场。
+- **最终微调（发布后复盘）**：棋谱库首访播种加线程锁（连点刷新不会出现两盘示例局）、
+  全盘复盘的分段请求在读库回来后再核一次 `busy`（两次并发请求不会并行跑两段）、
+  棋谱库的列表 / 详情回包带请求序号（慢回包不会覆盖后来点选的那盘；纯刷新不重置回看位置）；
+  领地热力图复用同一块 Image / ImageTexture（每手只更新像素，不再新建纹理）；定式卡片收起时
+  跳过每帧的棋盘投影（常态零开销）；形势纸签与定式卡片互相让位（不再叠在左上角）；
+  战报的字体只建一次（一张战报一百多个 Label 不再各建一个 SystemFont）；
+  全盘复盘段间先等 WS 台词落地（HTTP 回包先到时不会「上一段还没开口就排下一段」）；
+  WS 连接加 8 秒超时（远端地址黑洞时不会一直停在「连接中」），重连时重推一次当前设置。
+- **棋谱库数据健壮性**：`games.db` 的 NaN / inf 时间戳与形势值一律落成「未知」，
+  不会再让 `/api/games` 的 JSON 序列化整页 500。
+- **最终体验调整（v3.12.0 收尾）**：朗读方式改为 **系统 / 本地 / 云端 / 阿里云** 四档同级；
+  `local` 档**只走**本地 CosyVoice/MeloTTS（失败回落系统语音、不产生云端调用），
+  `dev_local.ps1` 会启动本地服务、等 `/health` 就绪并把配置切到 `local`。
+  v3.12.1 起每次从主界面进入都是新的一局（见 v3.12.2 一节）。开始封面整体下移约 8% 屏高。
+  3D 背景改为**相机上的一张青绿山水画**（参考 Art-Of-Ink 的构图与配色，AI 生成的独立素材），
+  地板改用用户提供的 **walnut_veneer_02 4K**（漫反射 + 法线降采样到 2K），铺成圆形木露台并略微压暗；
+  不再叠 3D 纸幕 / 木框 / 棋笥 / 暗角 / 雾 / 暖灯。
+- **门卫**：后端全量 **858 OK**（新增 `test_estimate.py` 8 项 + `test_events` 事件形状 2 项 +
+  `EstimateWiringTest` 3 项 + 棋谱库并发播种 / NaN 清洗 2 项 + 本地 TTS 档 3 项）；
+  前端 15 支脚本全 PASS：`test_config.gd` **192** 项、`test_title_screen.gd` **22** 项、
+  `test_view_helpers.gd` **45** 项。
 
 ### v3.11.4
 - **语音自然打断**：玩家落子时不再 `stop()` 硬切——当前句先 0.25 秒音量淡出（文字立即照常显示），
@@ -1061,7 +1118,7 @@ KataGo 引擎与权重遵循其上游许可。
   - **入场**（`Main._play_enter_game`）：封面 `fade_out(0.35)` → `board.fly_home(1.05)`（`Board3D.fly_to` 的
     smoothstep 缓动）→ `_show_game_chrome(0.35)`（右侧面板从画面外滑入、两侧贴边开关亮起）→ 才起服务 / 问候。
   - **回主界面**（`_play_exit_to_menu`）：工具栏滑出（0.22）→ `fly_to(远看, 0.95)` → 封面 `fade_in(0.45)`；
-    `Esc` 与「继续对局」都走这一对函数，**完全对称**。
+    `Esc` 与「开始新对局」都走这一对函数，**完全对称**。
   - **不能回退的规则**：运镜期间 `_transition=true`（Esc 不叠加、按钮不重入）；`_title_open` 一直为真到入场结束
     （棋盘全程锁着）；`Board3D` 的飞行中 `_unhandled_input` 整体让路；首帧用 `board.snap_panels(false,false)`
     （主界面没有侧栏）——**不要**在这种状态留出右侧面板的位置，否则棋盘偏在一边（`--title` 截图能看出来）。
