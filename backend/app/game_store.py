@@ -10,8 +10,10 @@
 """
 
 import json
+import math
 import os
 import sqlite3
+import threading
 import time
 
 # 默认库路径：<backend>/data/games.db
@@ -102,13 +104,18 @@ def _load(v, default):
 
 
 def _num(v):
-    """可空数值列：None / 脏值 → None（不是 0——「没量过」与「0.0」必须能分开）。"""
+    """可空数值列：None / 脏值 / NaN / inf → None（不是 0——「没量过」与「0.0」必须能分开）。
+
+    NaN / inf 必须挡掉：它们会原样写进 SQLite，再经 `/api/games` 的 JSON 序列化变成
+    「Out of range float values are not JSON compliant」→ 整个列表 500。
+    """
     if isinstance(v, bool) or v is None:
         return None
     try:
-        return float(v)
+        n = float(v)
     except (TypeError, ValueError):
         return None
+    return n if math.isfinite(n) else None
 
 
 def _clean_moves(moves) -> list:
@@ -141,6 +148,9 @@ class GameStore:
     def __init__(self, db_path: str = ""):
         self._db_path = str(db_path or "").strip() or DEFAULT_DB_PATH
         self._warned = set()
+        # 首访播种的「检查 → 写入」必须原子：前端连点两次「刷新」会并发打两次 /api/games，
+        # 两次都看到空库就会各塞一盘示例（列表里出现两条一模一样的示例局）。
+        self._demo_lock = threading.Lock()
 
     # —— 内部 ——
 
@@ -186,6 +196,8 @@ class GameStore:
             ts = float(rec.get("ts") if rec.get("ts") is not None else time.time())
         except (TypeError, ValueError):
             ts = time.time()
+        if not math.isfinite(ts):
+            ts = time.time()                   # NaN / inf 时间戳同样会毒化列表 JSON
         summary = str(rec.get("summary") or "")[:SUMMARY_KEEP]
         result = str(rec.get("result") or "")[:64]
         demo = 1 if bool(meta.get("demo")) else 0
@@ -224,7 +236,7 @@ class GameStore:
                         meta = {}
                     out.append({
                         "id": int(r["id"]),
-                        "ts": float(r["ts"] or 0.0),
+                        "ts": float(_num(r["ts"]) or 0.0),
                         "move_count": int(r["move_count"] or 0),
                         "final_black_wr": _num(r["final_black_wr"]),
                         "final_score": _num(r["final_score"]),
@@ -262,7 +274,7 @@ class GameStore:
                 moves = []
             return {
                 "id": int(r["id"]),
-                "ts": float(r["ts"] or 0.0),
+                "ts": float(_num(r["ts"]) or 0.0),
                 "move_count": int(r["move_count"] or len(moves)),
                 "final_black_wr": _num(r["final_black_wr"]),
                 "final_score": _num(r["final_score"]),
@@ -312,30 +324,31 @@ class GameStore:
         ``meta.demo_seeded`` 记住「已经给过示例」：用户把示例删掉后不会再自动塞回来
         （否则每点一次刷新它就复活，很像删不掉）。库文件整个删掉 = 新库，示例重新出现。
         """
-        try:
-            conn = self._connect()
-            try:
-                n = int(conn.execute("SELECT COUNT(*) FROM games").fetchone()[0] or 0)
-                row = conn.execute("SELECT value FROM meta WHERE key = 'demo_seeded'").fetchone()
-                seeded = row is not None and str(row[0]) == "1"
-            finally:
-                conn.close()
-        except Exception as e:          # noqa: BLE001
-            self._warn("示例播种检查失败", e)
-            return 0
-        if n > 0 or seeded:
-            return 0
-        rec = dict(DEMO_RECORD)
-        rec["ts"] = time.time()
-        game_id = self.add_game(rec)
-        if game_id:
+        with self._demo_lock:
             try:
                 conn = self._connect()
                 try:
-                    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('demo_seeded', '1')")
-                    conn.commit()
+                    n = int(conn.execute("SELECT COUNT(*) FROM games").fetchone()[0] or 0)
+                    row = conn.execute("SELECT value FROM meta WHERE key = 'demo_seeded'").fetchone()
+                    seeded = row is not None and str(row[0]) == "1"
                 finally:
                     conn.close()
-            except Exception as e:      # noqa: BLE001 —— 示例已写进去，标记失败最多再试一次
-                self._warn("示例标记失败", e)
-        return game_id
+            except Exception as e:              # noqa: BLE001
+                self._warn("示例播种检查失败", e)
+                return 0
+            if n > 0 or seeded:
+                return 0
+            rec = dict(DEMO_RECORD)
+            rec["ts"] = time.time()
+            game_id = self.add_game(rec)
+            if game_id:
+                try:
+                    conn = self._connect()
+                    try:
+                        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('demo_seeded', '1')")
+                        conn.commit()
+                    finally:
+                        conn.close()
+                except Exception as e:  # noqa: BLE001 —— 示例已写进去，标记失败最多再试一次
+                    self._warn("示例标记失败", e)
+            return game_id

@@ -181,6 +181,9 @@ var _btn_review: Button                    # 📖 复盘 / ✅ 退出复盘
 var _btn_home: Button                      # 🏠 返回主界面（v3.11.3：对局结束后与复盘并排）
 var _btn_report: Button                    # 战报（v3.11.5）：生成 PNG，局后与复盘并排
 var game_library: GameLibrary = null       # 棋谱库（v3.11.5）：主界面打开的全屏模态
+## 棋谱库请求序号：慢请求回来时若已有更新的请求 / 已换过一个库实例，就丢弃旧回包（防止点 A 看 B）
+var _games_list_seq := 0
+var _games_open_seq := 0
 ## —— 全盘 AI 复盘（v3.11.5）：棋谱库选一盘 → 主棋盘只读回放 + 分段点评 ——
 var _fr_active := false                    # 全盘复盘模式：棋盘只读、聊天禁用、闲话停
 var _fr_record: Dictionary = {}            # 正在复盘的那盘棋（来自棋谱库）
@@ -189,6 +192,7 @@ var _fr_index := 0                         # 下一段要请求的序号
 var _fr_step := 0                          # 棋盘当前回放到第几手（0..总手数）
 var _fr_paused := false                    # 暂停自动解说
 var _fr_requesting := false                # 当前有段请求在途（暂停 / 重试时判断用）
+var _fr_msg_seen := false                  # 这一段 WS 台词已到（HTTP 回包可能先到：等它落地再排下一段）
 var _fr_token := 0                         # 退出 / 重开后旧回调一律作废
 var _fr_last_text := ""                    # 上一段点评原文（喂给下一段防重复）
 var _fr_saved_own: Array = []               # 进复盘前的领地图：退出时还原（不用再等一次分析）
@@ -271,7 +275,7 @@ func _build_world() -> void:
 	var we := WorldEnvironment.new()
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
-	env.background_color = Color(0.878, 0.843, 0.769)   # 与 Ambience 桌面同色：远处不出现色阶
+	env.background_color = Color(0.878, 0.843, 0.769)   # 与山水纸色一致：远处不出现色阶
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	env.ambient_light_color = Color(0.95, 0.91, 0.84)
 	env.ambient_light_energy = 0.80
@@ -432,6 +436,8 @@ func _joseki_card_anchor() -> Vector2:
 		panels.append(_left_panel.get_global_rect())
 	if _right_open and _right_panel != null:
 		panels.append(_right_panel.get_global_rect())
+	if _estimate_box != null and _estimate_box.visible:
+		panels.append(_estimate_box.get_global_rect())    # 形势纸签也是「别压」的矩形
 	var prefer := _joseki_card.position if _joseki_card != null else Vector2.ZERO
 	return joseki_anchor(vp, board_cells, panels, prefer,
 			Vector2(JosekiCard.CARD_W, JosekiCard.CARD_H), _left_open, _right_open)
@@ -867,13 +873,14 @@ func _build_left_panel(root: Control) -> void:
 	var opt := OptionButton.new()
 	opt.fit_to_longest_item = false                  # 不让长选项文字撑宽面板（保证左右侧栏等宽）
 	opt.add_item("系统语音", 0)
-	opt.add_item("CosyVoice OpenAI 接口", 1)
-	opt.add_item("阿里云 Voice Studio（实时流式）", 2)
-	opt.selected = maxi(0, ["system", "openai", "aliyun"].find(cfg.tts_mode))
+	opt.add_item("本地 CosyVoice", 1)
+	opt.add_item("云端 OpenAI 兼容", 2)
+	opt.add_item("阿里云 Voice Studio（实时流式）", 3)
+	opt.selected = maxi(0, ["system", "local", "openai", "aliyun"].find(cfg.tts_mode))
 	opt.item_selected.connect(_on_tts_mode)
 	vb.add_child(opt)
 
-	vb.add_child(_field_label("服务地址（上面第 2 项才需要）"))
+	vb.add_child(_field_label("云端服务地址（上面第 3 项才需要）"))
 	var le_url := LineEdit.new()
 	le_url.text = cfg.tts_base_url
 	le_url.tooltip_text = "云端 OpenAI 兼容语音服务地址，例如 https://api.openai.com/v1（自建服务填它的地址）"
@@ -1000,9 +1007,10 @@ func _build_left_panel(root: Control) -> void:
 	_refresh_tts_route()
 
 	var tip := Label.new()
-	tip.text = "语音由后端合成：openai 模式按「本地 → 云端 → Windows 系统语音」逐级降级；阿里云模式走 Voice Studio 实时流式。本端只负责播放。\n" \
-		+ "· 本地地址写在 config.json 的 tts_local_base_url（dev_local.ps1 会自动写入 127.0.0.1:9880/v1）\n" \
-		+ "· 上面第 2 项是云端备选；第 3 项阿里云要填「API Key + 平台音色 ID」\n" \
+	tip.text = "语音由后端合成：系统＝Windows；本地＝只走本地 CosyVoice/MeloTTS（失败回落系统语音）；云端＝OpenAI 兼容（有本地地址时仍本地优先）；阿里云＝Voice Studio 实时流式。本端只负责播放。\n" \
+		+ "· 本地地址 / 音色写在 config.json 的 tts_local_base_url / tts_local_voice（dev_local.ps1 会自动写入并切到本地）\n" \
+		+ "· 上面第 3 项才是云端备选；第 4 项阿里云要填「API Key + 平台音色 ID」\n" \
+		+ "· 切换朗读方式后重启后端生效\n" \
 		+ "· 本地/云端/阿里云都不可用时，后端直接用系统语音念"
 	tip.add_theme_font_size_override("font_size", 11)
 	tip.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
@@ -1119,12 +1127,14 @@ func _on_tts_enabled(v: bool) -> void:
 	cfg.save()
 
 func _on_tts_mode(i: int) -> void:
-	var m: String = ["system", "openai", "aliyun"][clampi(i, 0, 2)]
+	var m: String = ["system", "local", "openai", "aliyun"][clampi(i, 0, 3)]
 	if m == cfg.tts_mode:
 		return                       # 程序化赋值也可能触发该信号：值没变就不写配置
 	cfg.tts_mode = m
 	if tts != null:
 		tts.mode = m                 # 本地镜像：只影响「导演层犹豫节拍」的快慢估计
+		# 本地模式按本地音色估引擎快慢；云端 / 系统 / 阿里云沿用云端音色
+		tts.voice = (cfg.tts_local_voice if m == "local" and cfg.tts_local_voice != "" else cfg.tts_voice)
 		tts.stop()
 	cfg.save()
 	_tts_status.text = "朗读方式：%s（合成在后端，重启后端后生效）" % m
@@ -1298,6 +1308,8 @@ func _add_msg(kind: String, text: String) -> void:
 		if wants_speech:
 			_register_tomb("")                   # 已经退出全盘复盘：迟到的点评连同它的语音一起丢掉
 		return
+	if kind == "ai_review":
+		_fr_msg_seen = true                      # 这一段台词已落到前端（段间等待据此不再空等）
 	if kind == "ai_idle" and _idle_muted:
 		_register_tomb(speak_kind)           # 本地作废：留个占位吃掉它自己那条 speech
 		return                               # 玩家已经回来继续下棋：这句走神搭话作废（不出声也不显示）
@@ -1794,6 +1806,8 @@ func _refresh_lock() -> void:
 ## `game_ended`（v3.12.2）＝「结束」流程已经走完：提示 / 局面分析 / 结束三个按钮从此置灰
 ## （局面已经定案，不该再要提示、再点一次结束）；**重来不灰**——那是玩家开新局的出口。
 ## `menu_open`（v3.11.2）＝主界面纸幕开着：棋盘、按钮、聊天与「别的改动入口」一起冻住。
+## `game_ended`（v3.12.2）＝「结束」流程已经走完：提示 / 局面分析 / 结束三个按钮从此置灰
+## （局面已经定案，不该再要提示、再点一次结束）；**重来不灰**——那是玩家开新局的出口。
 static func review_lock_state(reviewing: bool, busy: bool, speech_hold: bool,
 		move_pending := false, reveal_pending := false, menu_open := false,
 		full_review := false, game_ended := false) -> Dictionary:
@@ -2045,7 +2059,7 @@ func _hide_game_chrome(dur: float) -> void:
 	if board != null:
 		board.set_panels(false, false)            # 平滑回中间：棋盘跟着工具栏一起让位
 
-## 工具栏飞入：开始 / 继续对局那一段（右侧面板从画面外滑进来，棋盘同时让位）
+## 工具栏飞入：开始 / 开始新对局那一段（右侧面板从画面外滑进来，棋盘同时让位）
 func _show_game_chrome(dur: float) -> void:
 	_left_open = false
 	_right_open = true
@@ -2148,8 +2162,13 @@ static func fresh_game_labels() -> Dictionary:
 ## v3.12.2：复盘计数与「回看中」标志也在这里归零——从主界面进来时，上一局的复盘态不许漏进新局。
 func _reset_game_view() -> void:
 	_hide_estimate()
-	_move_pending = false
+	_release_move_pending()
 	_last_move_count = 0
+	_last_stone_count = 0
+	_last_move_seq = []
+	_last_wr = 0.5
+	_last_score = 0.0
+	_info_ready = false
 	_sfx_ready = false                       # 下一份空盘 state 只对齐，不把收子声当提子
 	_reviewing = false
 	_review_total = 0
@@ -2169,6 +2188,8 @@ func _reset_game_view() -> void:
 	if _lbl_score_hint != null:
 		_lbl_score_hint.text = str(lab["hint"])
 	_render_bad_moves([])
+	if _joseki_card != null:
+		_joseki_card.clear()
 	_game_ended = false
 	_refresh_review_entry()
 	if board != null:
@@ -2228,10 +2249,13 @@ func _games_error_text(code: int, body: PackedByteArray) -> String:
 func _games_refresh(select_id := 0) -> void:
 	if game_library == null or agent == null:
 		return
+	_games_list_seq += 1
+	var seq := _games_list_seq
+	var lib := game_library
 	agent.fetch_bytes("/api/games", HTTPClient.METHOD_GET, {},
 		func(ok: bool, code: int, body: PackedByteArray):
-			if game_library == null:
-				return
+			if game_library != lib or seq != _games_list_seq:
+				return                              # 旧回包 / 已经换过一个库实例：直接丢弃
 			if not ok:
 				game_library.set_status("棋谱库读取失败：" + _games_error_text(code, body), true)
 				return
@@ -2244,6 +2268,8 @@ func _games_refresh(select_id := 0) -> void:
 			var target := int(select_id)
 			if target <= 0:
 				target = game_library.selected_id()
+				if target > 0 and game_library.has_selection():
+					target = 0                      # 纯刷新：保留玩家正在看的回看位置，不重载整盘
 			if target <= 0 and not (list as Array).is_empty():
 				target = int(((list as Array)[0] as Dictionary).get("id", 0))
 			if target > 0:
@@ -2252,10 +2278,13 @@ func _games_refresh(select_id := 0) -> void:
 func _games_open(game_id: int) -> void:
 	if game_library == null or agent == null or game_id <= 0:
 		return
+	_games_open_seq += 1
+	var seq := _games_open_seq
+	var lib := game_library
 	agent.fetch_bytes("/api/games/%d" % game_id, HTTPClient.METHOD_GET, {},
 		func(ok: bool, code: int, body: PackedByteArray):
-			if game_library == null:
-				return
+			if game_library != lib or seq != _games_open_seq:
+				return                              # 又点了别的棋谱 / 库已换实例：旧回包作废
 			if not ok:
 				game_library.set_status("读到第 %d 盘失败：%s" % [game_id, _games_error_text(code, body)], true)
 				return
@@ -2376,10 +2405,13 @@ func _on_game_review(record: Dictionary) -> void:
 	_fr_step = 0
 	_fr_paused = false
 	_fr_requesting = false
+	_fr_msg_seen = false
 	_fr_last_text = ""
 	# 先置模式再放 title_started：`_ready` 可能同步恢复并 `_greet()`，别让开场白插进复盘
 	_fr_active = true
 	_hide_estimate()
+	if _joseki_card != null:
+		_joseki_card.clear()                        # 上一局残留的定式卡片不许压在这盘复盘上
 	# 从主界面进来：先把封面收掉、飞进对局视野（首次还要释放 _ready 的等待）
 	if _title_open:
 		var first := not _game_started
@@ -2458,6 +2490,7 @@ func _fr_next_segment(token: int) -> void:
 	_set_status("全盘复盘 · 第 %d/%d 段（第 %d-%d 手）· 她正在算…"
 			% [_fr_index + 1, total, from_no + 1, to_no])
 	_fr_requesting = true
+	_fr_msg_seen = false
 	var body := {
 		"game_id": int(_fr_record.get("id", 0)),
 		"from": from_no,
@@ -2467,9 +2500,9 @@ func _fr_next_segment(token: int) -> void:
 		"previous": _fr_last_text,
 	}
 	var done := func(ok: bool, code: int, data: PackedByteArray):
-		_fr_requesting = false
 		if not _fr_active or token != _fr_token:
-			return
+			return                                  # 旧回包不许改新一次复盘的「请求在途」状态
+		_fr_requesting = false
 		if not ok:
 			_fr_paused = true
 			_fr_toggle.text = "继续"
@@ -2488,6 +2521,15 @@ func _fr_next_segment(token: int) -> void:
 func _fr_wait_then_next(token: int) -> void:
 	if not _fr_active or token != _fr_token:
 		return
+	# HTTP 回包可能先于 WS 台词到达：先给它 2 秒落地，否则会「上一段还没开口就排下一段」。
+	var landed := 0
+	while landed < 10 and not _fr_msg_seen:
+		if not _fr_active or token != _fr_token:
+			return
+		if tts != null and tts.enabled and tts.is_speaking():
+			break                                          # 已经在播：台词必然已到
+		await get_tree().create_timer(0.2).timeout
+		landed += 1
 	var guard := 0
 	while guard < 300:                                   # 最多等 60 秒，绝不把复盘卡死
 		if not _fr_active or token != _fr_token:
@@ -2526,6 +2568,7 @@ func _exit_full_review() -> void:
 	_fr_token += 1
 	_fr_paused = false
 	_fr_requesting = false
+	_fr_msg_seen = false
 	_fr_record = {}
 	_fr_segments = []
 	_fr_index = 0
@@ -2913,7 +2956,7 @@ func _build_client_tts() -> void:
 	tts = TTSClient.new()
 	tts.enabled = cfg.tts_enabled
 	tts.mode = cfg.tts_mode
-	tts.voice = cfg.tts_voice
+	tts.voice = (cfg.tts_local_voice if cfg.tts_mode == "local" and cfg.tts_local_voice != "" else cfg.tts_voice)
 	tts.speed = cfg.tts_speed
 	tts.pitch = cfg.tts_pitch
 	tts.volume = cfg.tts_volume
@@ -3020,6 +3063,7 @@ func _on_mood_changed(p: Dictionary) -> void:
 func _on_joseki_event(payload: Dictionary) -> void:
 	if _joseki_card != null:
 		_joseki_card.apply_event(payload)
+		_follow_joseki_card()                   # 形势纸签正开着时，新出的卡片别压在它上面
 	if board == null:
 		return
 	var pts := joseki_points(payload)
@@ -3245,6 +3289,7 @@ func _on_estimate(payload: Dictionary) -> void:
 		board.set_estimate(cells if typeof(cells) == TYPE_ARRAY else [])
 	_place_estimate_box()
 	_estimate_box.visible = true
+	_follow_joseki_card()                       # 定式卡片若正好在左上角，立刻让开形势纸签
 
 ## 收起形势面板（连同棋盘上的点目小方块）：幂等，任何出口都可直接调用。
 func _hide_estimate() -> void:
@@ -4029,8 +4074,8 @@ func _process(delta: float) -> void:
 ## 定式浮层卡片的每帧避让：把「棋盘落点热区」「鼠标附近的小方块」「展开的侧栏」喂给卡片。
 ## 几何计算留在本文件（U39：卡片只认矩形，U39 里那两个是最小集）；兜底 TTL 由卡片自己的 `_process` 推进。
 func _tick_joseki_card() -> void:
-	if _joseki_card == null:
-		return
+	if _joseki_card == null or _joseki_card.state() == "hidden":
+		return                                      # 卡片收起时不必每帧投影 4×4 棋盘格子（常态零开销）
 	var mp := get_viewport().get_mouse_position()
 	var rects: Array = _board_cell_rects()
 	if rects.is_empty():
@@ -4039,13 +4084,15 @@ func _tick_joseki_card() -> void:
 	rects.append_array(_panel_rects())                 # 展开的侧栏也算「别挡」：不挤压既有控件
 	_joseki_card.set_panel_overlap(rects)
 
-## 已展开的侧栏矩形（避让与「跟随落位」共用同一份判据）
+## 已展开的侧栏 + 正在显示的形势纸签（避让与「跟随落位」共用同一份判据）
 func _panel_rects() -> Array:
 	var out: Array = []
 	if _left_open and _left_panel != null:
 		out.append(_left_panel.get_global_rect())
 	if _right_open and _right_panel != null:
 		out.append(_right_panel.get_global_rect())
+	if _estimate_box != null and _estimate_box.visible:
+		out.append(_estimate_box.get_global_rect())
 	return out
 
 ## 棋盘在屏幕上的**格子矩形**（BOARD_CELLS×BOARD_CELLS 片）：旋转后的棋盘是菱形，用外接矩形判重叠
@@ -4185,8 +4232,12 @@ const TTS_FETCH_TIMEOUT := 60.0     # 取音频/试听合成：比普通 REST �
 ## 后端可读错误（409/404 都回 {"ok":false,"error":"..."}）：取它的 error 文案，取不到就回 HTTP 码
 static func _api_error_text(code: int, body: PackedByteArray) -> String:
 	var d = JSON.parse_string(body.get_string_from_utf8())
-	if typeof(d) == TYPE_DICTIONARY and str((d as Dictionary).get("error", "")) != "":
-		return str((d as Dictionary)["error"])
+	if typeof(d) == TYPE_DICTIONARY:
+		var msg := str((d as Dictionary).get("error", ""))
+		if msg != "":
+			return msg
+		if bool((d as Dictionary).get("busy", false)):
+			return "她还在忙（上一轮没结束），稍后再试"   # busy 拒绝是 HTTP 200，不能只显示「HTTP 200」
 	return "HTTP %d" % code
 
 ## 响应体 → Dictionary：非 JSON 对象 / 解析失败一律空字典（调用方不必自己判类型）

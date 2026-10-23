@@ -99,6 +99,48 @@
 - 「说多少 / 想多久」是运行期设置：`reply_style`（0/1/2）与 `think_mode`（0/1/2）都能经 `/api/config` 即时改；`tts_limit_len` 只是 `reply_style == 0` 的旧键别名，不是独立字段。新增长度约束只能加在系统消息末尾（`prompt_chains` 的 `len_note`）。
 - 思考中短句只走 `Main.parse_thinking_lines`（`JSON.new().parse()` 静默失败），文案只改 `game/data/thinking_lines.json`，不要在 `Main.gd` 里写死句子。
 - 发言侧工具默认关（`tools_enabled=false`，关时行为与没有工具完全一致），只在 `hint()` 与落子宣告启用；工具次数有硬上限、单工具 10 秒超时；工具输出只回模型，`tool` WS 事件只喂前端状态栏，**永不进台词**；候选落点必须过 `board.is_legal(...)`，任何情况下都要产出可用落点。
+- 运行游戏：`Godot_v4.6.3-stable_win64.exe --path game`（工程按 Godot 4.6 配置）。
+  - 本机若只有 4.7（`E:\Godot\Godot_v4.7.1-stable_win64_console.exe`），跑完务必 `git status` 检查，把 `game/project.godot` 的 `config/features`、`*.import`、`*.uid` 等任务意图之外的改动还原。
+- 启动后端：`backend\run_server.bat`（内部 `cd` 到 `backend\` 再 `python -m app.main`，监听 `127.0.0.1:8000`）；等价的手动命令是 `cd backend && python -m app.main`。
+- 启动 KataGo 云服务：`katago_service\run_server.bat`（脚本自己 `cd` 到**仓库根目录**再 `python -m katago_service.server`，**必须原样跑**；监听 `127.0.0.1:8100`）。等价的手动命令在仓库根目录执行：`python -m katago_service.server --port 8100 --katago-exe <exe> --model <bin> --config <cfg> [--analysis-threads N]`；参数留空由环境变量兜底：`KATAGO_HOST` / `KATAGO_SERVICE_TOKEN` / `KATAGO_EXE` / `KATAGO_MODEL` / `KATAGO_CONFIG`（直接执行与经 `run_server.bat` 都生效）。后端要连它（`katago_url`，默认 `http://127.0.0.1:8100`），服务没起时后端不崩、只报「云服务不可用」。注意启动顺序：先起服务并等 `/health` 的 `state` 变 `ready` 再起后端——后端在 lifespan 里会等它就绪（最长 180s）才绑端口，预热期启动的后端在就绪前不监听任何端口（看起来像没起来）。
+- 测试：
+  - `cd backend && python -m unittest discover -s tests` —— 后端全量（标准库 `unittest`，不用 pytest；先 `pip install -r backend/requirements.txt`）。
+  - `cd katago_service && python -m unittest discover -s tests` —— KataGo 云服务全量（同样 `unittest`，用假引擎，不依赖真实 KataGo 与公网）。
+  - `godot --path game --headless --script res://tests/test_tts.gd` —— 语音播放器（WAV / MP3 解析、队列上限、系统语音指令），不需要外部服务（会真的拉起一次系统语音进程，音量已压到最低）。
+  - `godot --path game --headless --script res://tests/test_speech_pairing.gd` —— 语音配对状态机（不变量 / TTL / 兜底），纯逻辑、无外部依赖。
+  - `godot --path game --headless --script res://tests/test_config.gd` —— 客户端配置读写（含未知键原样保留、`joseki_rate` 口径）。
+  - `godot --path game --headless --script res://tests/test_joseki_card.gd` —— 定式参考图卡片状态机（事件 / 避让 / 兜底 TTL / 合法棋子数），纯逻辑、不依赖场景树。
+  - `godot --path game --headless --script res://tests/test_review_mode.gd` —— 复盘冻结范围 / 翻页夹取 / 逐手存档展示，纯逻辑。
+  - `godot --path game --headless --script res://tests/test_view_helpers.gd` —— 视角便捷（回初始 / 四角）、悬停文案（坐标 + 手数三分支）与主界面运镜（`fly_ease` / 远看取景 / `fly_home`），纯逻辑。
+  - `godot --path game --headless --script res://tests/test_score_phrase.gd` —— 目差量级人话（分档 / 两信号打架取保守档 / 原始数字保留），纯逻辑。
+  - `godot --path game --headless --script res://tests/test_joseki_level.gd` —— 定式导学档位纯函数（关闭 + 四档频率 / 并列取中 / 越界与脏值不越界），纯逻辑。
+  - `godot --path game --headless --script res://tests/test_net_chat.gd` / `res://tests/test_chat_queue.gd` —— 聊天回包判定 / 忙时排队 FIFO 与上限，纯逻辑。
+  - `godot --path game --headless --script res://tests/test_thinking_lines.gd` —— 思考中短句（JSON 解析 / 20 句 / 轮换不连复 / 缺表回退）。
+  - `godot --path game --headless --script res://tests/test_title_screen.gd` —— 主界面（纸幕挡点击 / 三键信号 / 开始⇄开始新对局 / 显隐）。
+  - `godot --path game --headless --script res://tests/test_new_game.gd` —— 每次进对局都重开 / 空局侧栏文案，纯逻辑。
+  - `godot --path game --headless --script res://tests/test_estimate.gd` —— 局面点目文案 / 脏值安全 / 棋盘标记层。
+  - `godot --path game --headless --script res://tests/test_avatar_path.gd` —— 化身 VRM 相对路径候选与解析（不加载模型）。
+- 新增/移动资源后先 `godot --headless --path game --import` 重新生成导入信息。
+- 调试参数走 `OS.get_cmdline_user_args()`，**必须放在 `--` 之后**：`-- --shot=out.png`（渲染数帧后截图退出）、`-- --demo`、`-- --setup`（只画设置面板供截图）、`-- --title`（强制只画主界面纸幕封面供截图）。
+
+## 约束与坑
+
+- **仓库 clone 下来跑不起来是正常的**：`katago.exe`/`*.dll`、`model*.bin(.gz)`（这两类归 **KataGo 云服务部署侧**持有）、CosyVoice / OpenVoice 权重与云端 LLM / VLM 模型都不入库（见 `.gitignore` 与 README「模型与资产」，走 GitHub Releases）。不要试图补齐、生成或提交这些大文件。**例外**：人物模型 `Azure.vrm`（约 14MB）自 v3.12.2 起入库（仓库根），不要删除或忽略。
+- 配置读取顺序：**可执行文件同目录 `config.json` → `res://config.json`**；`game/config.json` 只是随包模板。游戏内设置面板会**写回** config.json，而 CLI `--llm/--model/--key/--backend-url` 被记进 `cli_locked`、只影响本次运行——改配置逻辑时别破坏这个区分。
+- 后端配置走环境变量 `AZURE_CONFIG`；未设置时 `backend/app/config.py` 的 `load` 依次找 `<当前工作目录>/config.json` → `backend/config.json`（`backend\run_server.bat` 会先把 `..\AzureGoGodot\config.json` 写进 `AZURE_CONFIG`，该文件不存在时才用 `..\game\config.json`）。`katago_*` 只存**服务地址 / 令牌 / 超时**，引擎路径的解析逻辑（`_resolve`）已随服务化删除，不要再加回来。
+- KataGo 服务的健康语义：`/api/health` 的 `katago_dead` 反映**引擎已经没了**——`start()` 探活失败、或分析时**传输层失败**（连接被拒 / 连接或读取错误）都置位，一次成功分析会清除它；**分析**超时与 HTTP 状态响应（503 预热 / 401 / 500）只刷新 `katago_error`、**不**置 `katago_dead`——两者要成对读。
+- 不要拿 `game/config.json` 当字段默认值来源：模板（随包样例：`max_visits=100`、`tts_enabled=true`、`tts_pitch=1.02`、`tts_volume=0.65`）与 `AzureConfig.gd` 的代码默认值并不一致，这是既有且有意的。以 `AzureConfig.gd` 为准，字段清单看 README 第三节。
+- `vrm_path` 的相对值（默认 `Azure.vrm`）会依次在 **exe 同目录 → `game/` → 仓库根 → 工作目录** 找，取第一个存在的文件；发布包把 `Azure.vrm` 与 exe 放一起即可。
+- 场景引用带 `uid://`（`Main.tscn` 的 ext_resource），`*.gd.uid` 与 `*.import` 已入库：移动/重命名脚本或资源时同步更新它们，不要手写 uid。
+- **一切外部能力必须优雅降级**（缺后端、缺 KataGo、缺云端 LLM / TTS 都不得崩、不得报错刷屏）：后端返回可读错误且 `busy` 必须归位（不归位＝棋盘永久锁死，本项目最严重的故障形态）；前端连不上后端只在状态栏提示；语音服务不可用时临时降级为系统语音但不改配置。
+- **日志不得把整回合打挂**：`backend/app/main.py` 的启动路径做一次**带守卫**的 `sys.stdout.reconfigure(errors="replace")`（`try/except` + `hasattr`；**只改 `errors`、不改编码**）——中文 Windows 控制台 / 重定向文件是 cp936（strict），而 `llm.py` 打服务商错误体、`profile_store.py` / `joseki_progress.py` / `memory.py` 的 `print("…%s" % e)` 都可能在回合链路上抛 `UnicodeEncodeError`，降级成 `?` 好过打挂回合（也覆盖去重命中时打台词原文那条）。不要去改 `run_server.bat` 的 `PYTHONIOENCODING`。
+- **长期记忆库是运行产物**：默认落在 `backend/data/memory.db`（`backend/data/` 已 gitignore，不要提交、不要拿它当测试夹具），且**只在 `memory_enabled=true` 时**才会被创建。改 `prompts.context_block` 时必须保持「`long_term` 为空串时输出**逐字符不变**」（`tests/golden/prompts.json` 锁定）：新内容只能插在铁律段**之前**，铁律段本身不许动。
+- 坐标语义：内部 `Vector2i(x, y)` 中 x=列、y=行，`Coords.gd` 与 GTP 一致（A..T 跳过 I，行号上大下小）。给玩家写方位词前必须按坐标核对：同列只能说「上下」，同行才能说「左右」，核不上就不说方位（README v1.5.0 的硬性要求）。
+- 发言链路有几条不能回退的硬规则：**音画同步**（`ai_move` 事件带坐标，客户端等「落子宣告」的语音开始播放才揭示棋子，见 `backend/app/agent.py` 文件头与 `POST /api/reveal`）、AI 原话按最近 8 条窗口去重（后端常量 `AI_DEDUP_WINDOW = 8`，见 `backend/app/agent.py`，闸门在 `agent_graph` 的 `finalize`；前端 `Main.gd` 的同名常量只兜 WS 重连乱序）、模型推理段永不显示给玩家、落子宣告不参与复读抑制、走神搭话可整批作废。改 `backend/app/agent.py` / `agent_graph.py` / `prompts.py` 时保留这些前提（台词一律经 `clean_reply()` / `content_of()`），也别在提示词里放可被模型照抄的示例句。
+- **「说多少 / 想多久」是运行期设置**（v3.11.1）：`reply_style`（0 精简 / 1 适中 / 2 详细，走提示词末尾的长度约束）与 `think_mode`（0/1/2，走推理预算 + `llm_think_extra_body`）都能经 `/api/config` 即时改；`tts_limit_len` 只是 `reply_style == 0` 的**旧键别名**，`agent.limit_len` 也是属性（读写映射到 0 / 1），别再把它写成独立字段。新增长度约束只能加在**系统消息末尾**（`prompt_chains` 的 `len_note`），人设段与铁律段不许动。
+- **棋盘锁（前端 `review_lock_state`）只看三件事**：`busy`（后端这一轮在跑）、`move_pending`（点下就锁）、`pending_reveal()`（她的落子还没揭示）。**绝不能把 `_speech_hold` 加回 `locked`**——那会让玩家必须听完她整段话才能落子（v3.11.1 明确修掉）；`_speech_hold` 只挡四个功能按钮与复盘入口。玩家落子时 `_interrupt_speech_for_move()` 会停播并**收账**：`TTSClient.stop()` 负责在播 / 排队的，`_speech_fetch` + `_speech_fetch_current` 负责在途取音频的——两条路径都必须 `finish + display`，否则留下 `got && !played` 就会锁死棋盘。
+- **主界面（`title_screen` / `TitleScreen.gd`，v3.11.2 / 运镜 v3.11.3）**：启动先过封面再进设置面板 / 起服务（`_ready` 里 `await _maybe_show_title()`），对局中 `Esc` 经 `_menu_keys()` 开合。**入场**＝封面淡出 → `board.fly_home()` → 右侧面板滑入，**退场严格反向**；两个方向只在 `_play_enter_game` / `_play_exit_to_menu` 两处编排。**五条不能回退的规则**：① 封面 / 运镜期间必须 `review_lock_state(..., menu_open=true)`（棋盘 / 四个按钮 / 聊天 / 回档与开关一起冻），`_process` 的 `hold` 与主动搭话条件都要算上 `_title_open`；② 运镜期间 `_transition=true`（Esc 不叠加、按钮不重入），**入场结束才**把 `_title_open` 置假（棋盘全程锁着）；③ `TitleScreen._ready` 用 `set_anchors_and_offsets_preset`，**不要**改回 `set_anchors_preset`（后者会把纸幕算成 0×0）；④ 无窗口 / `--shot` / `--demo` / `--setup` 一律不等待封面（`--title` 才强制画出来），否则 headless 会卡死；⑤ 主界面首帧用 `board.snap_panels(false, false)`（封面期间没有侧栏，棋盘要正对镜头），**不要**留着右侧让位让棋盘偏在一边。`Board3D.set_panels` 的让位现在是平滑过渡（`_step_panel_bias`），封面期间 `board.input_blocked`、飞行中 `is_flying()` 都让 `_unhandled_input` 整体让路（视角键 / 滚轮 / 拖拽不许动开场取景）。设置面板与备注框的遮罩节点必须叫 `ModalVeil`（`_modal_open()` 据此让 Esc 不抢键盘）。
+- **思考中短句（`game/data/thinking_lines.json`，v3.11.2）**：气泡里每秒换一句，随机且不连复；解析只走 `Main.parse_thinking_lines`（`JSON.new().parse()` 静默失败，**不要**换回会喷错误的 `JSON.parse_string`），文件缺失 / 写坏时回退旧的「Azure 思考中…」省略号。改文案只动 JSON，不要在 `Main.gd` 里再写死句子。
 
 ## 提交
 

@@ -71,7 +71,17 @@ func _run() -> void:
 	_check("阿里云 Key 读入", c1b.tts_aliyun_api_key == "sk-test")
 	_check("阿里云 TN 开关读入", c1b.tts_aliyun_tn == false)
 
-	# —— 1c) 对局音效（v3.11.5）：开关 / 音量；脏值不炸、越界夹到 [0,1] ——
+	# —— 1c) local 是合法朗读方式（与阿里云同级）：原样保留，且路线文案指向本地 ——
+	_write_raw({"tts_mode": "local", "tts_local_base_url": "http://127.0.0.1:9880/v1",
+		"tts_local_voice": "xiaoya"})
+	var c1c_local := AzureConfig.load_config(TMP)
+	_check("tts_mode=local 原样保留", c1c_local.tts_mode == "local")
+	_check("local 路线文案含本地地址与音色",
+		c1c_local.tts_route_label().contains("本地语音") and c1c_local.tts_route_label().contains("xiaoya"))
+	_check("四种朗读方式都在 TTS_MODES 里",
+		AzureConfig.TTS_MODES == ["system", "local", "openai", "aliyun"])
+
+	# —— 1d) 对局音效（v3.11.5）：开关 / 音量；脏值不炸、越界夹到 [0,1] ——
 	_write_raw({"sfx_enabled": false, "sfx_volume": 0.35})
 	var c1c := AzureConfig.load_config(TMP)
 	_check("音效开关读入", c1c.sfx_enabled == false)

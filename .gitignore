@@ -9,12 +9,15 @@ dist/
 AzureGoGodot.exe
 
 # —— 模型权重（体积大，另行分发，见 README「模型与资产」）——
+# 人物模型 Azure.vrm 自 v3.12.2 起入库（仓库根），不再忽略。
 model.bin
+**/*.bin.gz
 **/pretrained_models/
 **/sherpa_models/
 **/*.onnx
 **/*.pth
-Azure.vrm
+**/*.gguf
+**/*.safetensors
 
 # —— Python ——
 **/.venv/

@@ -173,6 +173,22 @@ func _test_ownership_color() -> void:
 			Board3D.ownership_color(9.0).a <= 0.50 + 0.001
 			and Board3D.ownership_color(-9.0).a <= 0.50 + 0.001
 			and is_zero_approx(Board3D.ownership_color(NAN).a))
+	# 实例：不 `_ready`（没有平面 / 纹理）也要能写；第二次走复用画布 + update
+	var b := Board3D.new()
+	var vals: Array = []
+	vals.resize(361)
+	vals.fill(0.0)
+	vals[0] = 0.8
+	b.set_ownership(vals)
+	var ok_first := b.ownership_values().size() == 361
+	vals[0] = -0.8
+	b.set_ownership(vals)
+	_check("⑥′ 领地图写入不依赖场景树、可重复更新",
+			ok_first and b.ownership_values().size() == 361
+			and is_equal_approx(float(b.ownership_values()[0]), -0.8))
+	b.set_ownership([0.0])
+	_check("⑥′ 形状不对（非 361）⇒ 清空而不是崩", b.ownership_values().is_empty())
+	b.free()
 
 ## ⑦ 局面点目（v3.12.0 采纳）：面板两行文案 + 棋盘小方块的格位容错。
 ## `Main.gd` 没有 `class_name` ⇒ `preload` 调静态函数（同 test_joseki_level 的做法）。

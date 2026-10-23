@@ -52,11 +52,12 @@ func _build() -> void:
 	fiber.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(fiber)
 
-	# ③ 纸签：**偏上**摆（棋盘在下方露出来），纸面半透明，远处的棋子能透过来
+	# ③ 纸签：略偏上摆（棋盘在下方露出来），纸面半透明，远处的棋子能透过来。
+	# v3.12.0 微调：原 0.02..0.55 的视觉中心太靠上，整体下移约 8% 屏高。
 	var center := CenterContainer.new()
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
-	center.anchor_top = 0.02
-	center.anchor_bottom = 0.55
+	center.anchor_top = 0.10
+	center.anchor_bottom = 0.62
 	center.offset_top = 0.0
 	center.offset_bottom = 0.0
 	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
