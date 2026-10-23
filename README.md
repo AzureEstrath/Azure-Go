@@ -122,20 +122,23 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 
 ```
 .
+├─ Azure.vrm                人物模型（约 14MB；v3.12.2 起随仓库提供，分享包与 exe 并列）
 ├─ game\                    游戏本体（Godot 4.6 工程）
 │   ├─ scenes\Main.tscn     主场景
 │   ├─ scripts\             GDScript 源码（按职责分类）
 │   │   ├─ ui\              Main.gd          主控：3D 棋盘 + 左右面板 + 接线
 │   │   │                   Board3D.gd       3D 棋盘绘制与交互（含定式高亮轨迹）
 │   │   │                   AzureAvatar.gd   VRM 形象、表情、视线、风场
-│   │   │                   Ambience.gd      环境/风
+│   │   │                   Ambience.gd      圆形木露台 / 环形护栏 / 环境风
 │   │   ├─ services\        TTSClient.gd     语音播放器（按后端 speech 指令出声）
 │   │   │                   SpeechPairing.gd 台词与语音的配对状态机（兜底不丢字）
 │   │   ├─ core\            AzureConfig.gd   config.json 读写
 │   │   │                   Coords.gd        坐标换算（棋盘坐标标签）
 │   │   └─ net\             NetClient.gd     后端客户端（REST + WebSocket）
 │   ├─ assets\voice\        预制语音：开场欢迎语 + 20 条语气词（即播零等待，与情绪/表情绑定）
-│   ├─ tests\               纯逻辑门卫脚本（十五支，清单见 2.7：语音 / 配对 / 定式卡片 / 配置 / 复盘 / 视角 / 目差 / 定式档位 / 聊天 / 音效 / 战报 / 棋谱回放）
+│   ├─ assets\textures\floor\ 胡桃木地板（diffuse + normal，用户提供的 walnut_veneer_02）
+│   ├─ assets\ui\           纸幕 / 印框 / 青绿山水背景
+│   ├─ tests\               纯逻辑门卫脚本（十八支，清单见 2.7：语音 / 配对 / 定式卡片 / 配置 / 复盘 / 视角 / 目差 / 定式档位 / 聊天 / 音效 / 战报 / 棋谱回放 / 新局 / 点目 / 化身路径）
 │   ├─ config.json          客户端参数模板（见第三节）
 │   └─ export_presets.cfg   Godot 导出预设（个人导出用）
 ├─ backend\                 本机后端（唯一权威：对局编排 / LLM / 情绪 / 定式；FastAPI + REST + WebSocket）
@@ -161,11 +164,13 @@ FUN WHERE:市场上有各种ai围棋陪练，但都是基于katago的直接应�
 └─ peek\                    窥屏 VLM 脚本（azure_peek.py / start_vlm_server.py）；v3.x 未接线，保留供后续功能
 ```
 
-**模型与资产**（体积大，不随源码仓库分发，见 GitHub **Releases**）：
+**模型与资产**（大体积模型不随源码仓库分发，见 GitHub **Releases**）：
 `katago.exe` + `*.dll`、`model-b18c384nbt.bin.gz`（KataGo 权重）——这两个归 **KataGo 云服务的部署侧**持有
 （见第六节「KataGo 服务部署」），本仓库只含连它的客户端；
-`Azure.vrm`（形象）、CosyVoice 权重（`pretrained_models` / `sherpa_models`）、
-OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端 LLM / VLM 的 gguf。
+CosyVoice 权重（`pretrained_models` / `sherpa_models`）、
+OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端 LLM / VLM 的 gguf 均不入库。
+**人物模型 `Azure.vrm`（约 14MB）自 v3.12.2 起随仓库根目录提供**，源码运行不需要另外下载；
+分享包把它放在 exe 同目录即可（客户端路径解析顺序见 2.1）。
 
 ---
 
@@ -177,9 +182,9 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
    ```
    Godot_v4.6.3-stable_win64.exe --path game
    ```
-2. 把 `Azure.vrm`（形象）放到可访问位置，并把 `vrm_path` 填成路径：绝对路径可直接用；
-   相对路径会依次在 **exe 同目录 → `game/` → 仓库根目录 → 进程工作目录** 找，取第一个存在的
-   （发布包把 `Azure.vrm` 与 exe 放一起即可，源码运行可放在仓库根目录）。
+2. 人物模型 `Azure.vrm` 已随仓库放在**仓库根目录**，源码运行不需要另放；若使用自己的形象，把
+   `vrm_path` 指过去即可：绝对路径可直接用；相对路径会依次在 **exe 同目录 → `game/` → 仓库根目录
+   → 进程工作目录** 找，取第一个存在的（分享包把 `Azure.vrm` 与 exe 放一起）。
    **KataGo 的 `katago.exe` / 权重 / analysis 配置文件归 KataGo 云服务部署侧持有**，客户端不读这些路径。
 3. 先启动 **KataGo 云服务**（`katago_service\run_server.bat`，见第六节「KataGo 服务部署」），
    再启动后端（`backend\run_server.bat`，见第六节），最后启动游戏。
@@ -203,7 +208,7 @@ OpenVoice 权重（`third_party/OpenVoice/checkpoints_v2` 的 `.pth`）、云端
 | --- | --- | --- |
 | ① | **Python 环境** | `pip install -r backend\requirements.txt`（`fastapi` / `uvicorn` / `websockets` / `httpx` / `langchain-core` / `langchain-openai` / `langgraph`）与 `pip install -r katago_service\requirements.txt`（`fastapi` / `uvicorn`，`httpx` 只给测试用） |
 | ② | **KataGo 云服务部署侧** | 备好 `katago.exe` + 配套 `*.dll`、权重 `model-b18c384nbt.bin.gz`、analysis 配置文件（如 `analysis_example.cfg`）——**都不入库**（见第一节「模型与资产」与第六节「KataGo 服务部署」） |
-| ③ | **客户端** | **Godot 4.6** 打开 `game\` 工程；`Azure.vrm` 形象（`vrm_path` 建议绝对路径，见第三节） |
+| ③ | **客户端** | **Godot 4.6** 打开 `game\` 工程；人物模型 `Azure.vrm` 已在仓库根（也可自备，见 `vrm_path`） |
 | ④ | **可选（缺了也能跑）** | 云端 LLM 的地址 / 模型名 / Key（第四节）、云端 TTS 三件套 + Key（第五节）、embedding 三件套（长期记忆，第四节）、自建 CosyVoice（第五节） |
 
 > `websockets` **不能省**：裸装 `uvicorn` 不带 WebSocket 实现，缺了它 `/ws` 会拒绝升级（404），
