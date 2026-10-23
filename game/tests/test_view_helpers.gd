@@ -179,16 +179,18 @@ func _test_ownership_color() -> void:
 func _test_estimate_helpers() -> void:
 	var m := preload("res://scripts/ui/Main.gd")
 	_check("⑦ 点目计数：黑 41 目 · 白 4 目",
-			m.estimate_count_line({"black": 41, "white": 4}) == "黑 41 目 · 白 4 目")
-	_check("⑦ 计数认 JSON 的 float 数字", m.estimate_count_line({"black": 40.6, "white": 3.9}) == "黑 40 目 · 白 3 目")
-	_check("⑦ 计数缺字段 / 脏值 / 负数一律退 0", m.estimate_count_line({}) == "黑 0 目 · 白 0 目"
-			and m.estimate_count_line({"black": "x", "white": -5}) == "黑 0 目 · 白 0 目")
-	_check("⑦ 黑领先：正数 + 贴目", m.estimate_lead_line({"lead": 29.5, "komi": 7.5}) == "黑领先 29.5 目（贴 7.5 目）")
-	_check("⑦ 白领先：负数取绝对值", m.estimate_lead_line({"lead": -3.0, "komi": 6.5}) == "白领先 3.0 目（贴 6.5 目）")
-	_check("⑦ 持平 / 缺数据 / null 各有话说",
-			m.estimate_lead_line({"lead": 0.0}) == "盘面持平（贴 7.5 目）"
-			and m.estimate_lead_line({}) == "目差暂缺（贴 7.5 目）"
-			and m.estimate_lead_line({"lead": null}) == "目差暂缺（贴 7.5 目）")
+			m.estimate_count_line(41, 4) == "黑 41 目 · 白 4 目")
+	_check("⑦ 计数认 JSON 的 float 数字", m.estimate_count_line(40.6, 3.9) == "黑 40 目 · 白 3 目")
+	_check("⑦ 计数脏值 ⇒ 「形势: --」，不硬报 0",
+			m.estimate_count_line(null, 4) == "形势: --"
+			and m.estimate_count_line("x", -5) == "形势: --")
+	_check("⑦ 黑领先：正数 + 贴目", m.estimate_lead_line(29.5, 7.5) == "黑领先 29.5 目（贴 7.5 目）")
+	_check("⑦ 白领先：负数取绝对值", m.estimate_lead_line(-3.0, 6.5) == "白领先 3.0 目（贴 6.5 目）")
+	_check("⑦ 接近均势 / 缺数据 / 缺贴目各有话说",
+			m.estimate_lead_line(0.0, 7.5) == "双方接近（贴 7.5 目）"
+			and m.estimate_lead_line(null, 7.5) == "--（贴 7.5 目）"
+			and m.estimate_lead_line("x", 7.5) == "--（贴 7.5 目）"
+			and m.estimate_lead_line(2.0, null) == "黑领先 2.0 目")
 	_check("⑦ 点目格：合法 / 越界 / 颜色 / 非数组",
 			Board3D.estimate_cell_ok([3, 15, "black"])
 			and Board3D.estimate_cell_ok([0.0, 18.0, "white"])

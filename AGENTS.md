@@ -95,7 +95,7 @@
 - 日志不得打挂回合：`main.py` 启动路径做一次带守卫的 `sys.stdout.reconfigure(errors="replace")`（只改 `errors`）；不要去改 `run_server.bat` 的 `PYTHONIOENCODING`。
 - 坐标语义：内部 `Vector2i(x, y)` 中 x=列、y=行，`Coords.gd` 与 GTP 一致（A..T 跳过 I，行号上大下小）。给玩家写方位词前必须按坐标核对：同列只能说「上下」，同行才能说「左右」，核不上就不说方位。
 - 场景引用带 `uid://`，`*.gd.uid` 与 `*.import` 已入库：移动 / 重命名脚本或资源时同步更新它们，不要手写 uid。
-- `vrm_path` 建议写绝对路径（相对路径要能被 Godot 解析到，否则形象加载失败）。
+- `vrm_path` 绝对路径直接用；相对路径依次找 exe 同目录 → `game/` → 仓库根 → 工作目录（发布包把 `Azure.vrm` 放 exe 旁边即可）。
 - 「说多少 / 想多久」是运行期设置：`reply_style`（0/1/2）与 `think_mode`（0/1/2）都能经 `/api/config` 即时改；`tts_limit_len` 只是 `reply_style == 0` 的旧键别名，不是独立字段。新增长度约束只能加在系统消息末尾（`prompt_chains` 的 `len_note`）。
 - 思考中短句只走 `Main.parse_thinking_lines`（`JSON.new().parse()` 静默失败），文案只改 `game/data/thinking_lines.json`，不要在 `Main.gd` 里写死句子。
 - 发言侧工具默认关（`tools_enabled=false`，关时行为与没有工具完全一致），只在 `hint()` 与落子宣告启用；工具次数有硬上限、单工具 10 秒超时；工具输出只回模型，`tool` WS 事件只喂前端状态栏，**永不进台词**；候选落点必须过 `board.is_legal(...)`，任何情况下都要产出可用落点。
@@ -108,7 +108,7 @@
 fix(chat,ai): 非相邻原样复读窗口去重 + 方位词按坐标核对（v1.5.0）
 ```
 
-版本号同时写进 `README.md` 的「九、更新」（当前 v3.12.1）。
+版本号同时写进 `README.md` 的「九、更新」（当前 v3.12.2）。
 
 ## 参考
 

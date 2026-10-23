@@ -53,7 +53,7 @@ var llm_think_mode := 0           # 思考档位：0=快速（不思考） 1=中
 ## 与旧字段 `tts_limit_len`（布尔）同一件事的扩档：读配置时 `reply_style` 优先，只有旧键时按旧语义迁移
 ## （true → 0 / false → 1）；写回时两个键一起写，保证旧版本读到的仍是「开 / 关」两档。
 var reply_style := 0
-var vrm_path := "D:/KataGo/assets/Azure.vrm"
+var vrm_path := "Azure.vrm"
 # —— 提示词自定义（留空则用内置 Azure 人设）——
 var prompt_system := ""           # 覆盖系统提示词（人设全文）；留空用内置
 var prompt_user_name := "Estarth" # 玩家称呼；会替换提示词中的「Estarth」

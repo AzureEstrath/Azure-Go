@@ -371,8 +371,9 @@ func summarize(note: String) -> void:
 func undo(turn_index: int) -> void:
 	_post("/api/undo", {"turn": turn_index})
 
-func reset_game() -> void:
-	_post("/api/reset")
+## 开新局。`silent=true`（v3.12.1）＝只清棋局、不添「重新来吧」那句——从主界面进对局时用。
+func reset_game(silent := false) -> void:
+	_post("/api/reset", {"silent": silent})
 
 func set_allow_pass(v: bool) -> void:
 	_post("/api/config", {"allow_pass": v})

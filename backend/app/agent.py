@@ -2430,6 +2430,11 @@ class AzureAgent:
         self._reset_adaptive()                    # 新一局：难度回到基线（按画像修正）
         self.st.allow_pass = keep_pass
         self._joseki_taught = {}                 # 新一局：门控的冷却表清空（手数从头数）
+        # v3.12.2：上一局还没揭示的落子 / 待记账的情绪偏航不许漏进新局。
+        # 两者都是**局内瞬时状态**，重开即失效；不写回 False 会让重来后的第一份
+        # state 仍按「有一手等着 reveal」处理（前端要等一次永远不会来的语音）。
+        self._reveal_pending = False
+        self._drift_pending = None
         # v3.8.0：事件表是**局内内存**——新一局不带上一局的账（与「不随悔棋回退」是两回事，
         # 设计 §5 E/F：悔棋＝「发生过就是发生过」，重开＝另起一局）
         self.event_log.reset()
