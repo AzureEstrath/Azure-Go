@@ -9,8 +9,8 @@
 - `game/` —— 游戏本体（GDScript）。`scenes/Main.tscn` 只挂了 `scripts/ui/Main.gd`，其余节点与 UI 全在代码里构建；`scripts/` 按 `core`（配置/坐标）、`net`（后端客户端）、`services`（语音播放器 / 配对状态机）、`ui`（渲染与交互）分类。
 - `backend/` —— **唯一权威**：对局编排、定式识别、情绪模型、提示词都在这里，通过 REST + WebSocket 对外；KataGo 只是它连的一个 HTTP 服务（`katago_url`），`game/` 只连它的 `backend_url`，自身不含任何编排实现。
 - `katago_service/` —— **KataGo 云服务**（独立部署，可先起、也可单独重启）：FastAPI + 常驻 `katago analysis` 子进程，对外 `POST /analyze`（请求/响应都是引擎原文）与 `GET /health`（`warming`/`ready`/`dead`），可选 Bearer 鉴权，启动即后台预热。后端 `app/engine.py` 只是它的客户端；引擎本体与权重归**部署侧**持有，不入库。
-- `server/` —— CosyVoice 3 语音服务（可选自建，**不再由游戏拉起**，要自己跑 `start_tts_server*.bat`）。**288/370 个入库文件是上游 CosyVoice 代码**（`server/cosyvoice/`、`examples/`、`runtime/`、`.github/`、根 `README.md` 都是上游内容），本项目自己写的只有 `azure_tts_server.py`、`clone_voice.py`、`voices.json`、`sherpa_voices.json`、`run_hidden.vbs`、`start_tts_server*.bat`。不要顺手重排/美化上游目录。`server/third_party/Matcha-TTS` 是 git submodule。
-- 根目录没有 CI / lint / formatter / 包管理器配置，只有 `main` 一条分支；`server/.github/workflows/` 是上游 CosyVoice 的，与本项目无关。
+- `server/` —— CosyVoice 3 语音服务（可选自建；参赛快照手动跑 `start_tts_server*.bat`，自用版由 `dev_local.ps1` 自动拉起并等 `/health` 就绪）。**288/370 个入库文件是上游 CosyVoice 代码**（`server/cosyvoice/`、`examples/`、`runtime/`、`.github/`、根 `README.md` 都是上游内容），本项目自己写的只有 `azure_tts_server.py`、`clone_voice.py`、`voices.json`、`sherpa_voices.json`、`run_hidden.vbs`、`start_tts_server*.bat`。不要顺手重排/美化上游目录。`server/third_party/Matcha-TTS` 是 git submodule。
+- 根目录没有 CI / lint / formatter / 包管理器配置。分支分三条：`main` 是 v3.12.2 参赛提交快照（冻结）；`personal` 是自用版默认开发线，本地目录 `AzureGo-Creative`；`classic` 是 v2.0.1 历史存档，本地目录 `AzureGo-classic`。`server/.github/workflows/` 是上游 CosyVoice 的，与本项目无关。
 
 ## 架构（v3.0.0 起）
 
