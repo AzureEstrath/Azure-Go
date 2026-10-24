@@ -443,10 +443,10 @@ func _label(text: String, pos: Vector3) -> void:
 	l.text = text
 	l.font_size = 64
 	l.pixel_size = 0.008
-	# 自用版没有地板 / 背景板：坐标落在深色虚空里，改用冷白 + 深色描边。
-	l.modulate = Color(0.70, 0.80, 0.84)
+	# 自用版没有地板 / 背景板：坐标颜色跟随主题（浅色底用深字、深色底用亮字）。
+	l.modulate = GufengTheme.LABEL_FG
 	l.outline_size = 6
-	l.outline_modulate = Color(0.02, 0.04, 0.05, 0.85)
+	l.outline_modulate = GufengTheme.LABEL_OUTLINE
 	l.rotation_degrees = Vector3(-90, 0, 0)
 	l.position = pos
 	add_child(l)
@@ -465,9 +465,9 @@ func _build_ghost() -> void:
 	_tip.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	_tip.font_size = 48
 	_tip.pixel_size = 0.006
-	_tip.modulate = Color(0.31, 0.82, 0.77)
+	_tip.modulate = GufengTheme.TIP_FG
 	_tip.outline_size = 12
-	_tip.outline_modulate = Color(0.02, 0.04, 0.05, 0.95)
+	_tip.outline_modulate = GufengTheme.LABEL_OUTLINE
 	_tip.no_depth_test = true
 	_tip.visible = false
 	add_child(_tip)

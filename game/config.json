@@ -71,5 +71,6 @@
   "tts_timeout_sec": 30.0,
   "tts_voice": "中文女",
   "tts_volume": 0.65,
+  "ui_theme": "mist",
   "vrm_path": "Azure.vrm"
 }

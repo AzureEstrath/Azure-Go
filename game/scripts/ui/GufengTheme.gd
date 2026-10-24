@@ -1,46 +1,196 @@
 class_name GufengTheme
 extends RefCounted
-## 自用版主题：**现代深色 + 青蓝强调**（不再使用宣纸 / 墨框 / 朱砂印）。
+## 自用版主题：四套预设（暖白 / 宣纸 / 雾蓝 / 深色）。
 ##
-## 保留类名与工厂函数签名，避免 `Main` / `TitleScreen` / `GameLibrary` / `GameReport`
-## 大范围改引用；内部配色、字体、面与控件全部换成深色扁平语言：
-##   · 深色底 + 半透明面板 + 1px 冷灰描边 + 10~14px 圆角；
-##   · Azure 的青蓝 `ACCENT` 作为唯一高饱和强调色（主按钮、选中、焦点、滚动条）；
-##   · 珊瑚红只做错误 / 亏损；琥珀只做分岔提示；
-##   · 字体换无衬线（微软雅黑 / PingFang / Noto Sans），不再用楷体。
+## 布局、尺寸、控件位置完全不变，只换底色 / 面板 / 文字 / 强调色 / 字体。
+## 由 `Main._ready()` 按 `config.json` 的 `ui_theme` 调 `apply_preset()`；默认 `mist`。
 ##
-## 仍然**不引入字体文件、不改任何几何**：侧栏宽、卡片尺寸、避让落位全部沿用原值。
+## 保留类名与工厂函数签名，避免大范围改引用。仍然**不引入字体文件、不改几何**。
 
-## —— 色 ——
-const BG := Color(0.043, 0.063, 0.078)            # #0B1114 深色虚空
-const PAPER := BG                                  # 兼容旧名：现在是大面积深色底
-const PAPER_WARM := Color(0.902, 0.933, 0.945)    # #E6EEF1 主文字 / 亮面
-const PAPER_TONE := Color(0.086, 0.122, 0.145)    # #16232A 次级面 / 悬停
-const INK := Color(0.902, 0.933, 0.945)           # 兼容旧名：现在用于亮色文字
-const INK_SOFT := Color(0.624, 0.706, 0.749)      # #9FB4BF 次级文字
-const CINNABAR := Color(0.878, 0.424, 0.459)      # #E06C75 珊瑚红（错误 / 亏损）
-const DAI := Color(0.310, 0.820, 0.773)           # #4FD1C5 Azure 青蓝
-const DEEP := Color(0.055, 0.090, 0.110)          # 标题条底色
-const OCHRE := Color(0.855, 0.667, 0.302)         # #DAA94D 琥珀（分岔 / 提示）
-const ACCENT := DAI
-const ON_ACCENT := Color(0.031, 0.055, 0.063)     # 强调块上的深色字
+## —— 预设 ——
+## 每个预设只定义一套语义色，工厂函数只读这些语义色，不再各自写死颜色。
+static var PALETTES := {
+	"warm": {
+		"paper": Color(0.953, 0.941, 0.918),        # #F3F0EA
+		"paper_warm": Color(0.984, 0.973, 0.957),   # #FBF8F4（深色条上的字）
+		"paper_tone": Color(0.933, 0.918, 0.886),
+		"ink": Color(0.141, 0.161, 0.184),          # #24292F
+		"ink_soft": Color(0.420, 0.447, 0.502),     # #6B7280
+		"accent": Color(0.180, 0.490, 0.451),       # #2E7D73
+		"danger": Color(0.753, 0.341, 0.310),       # #C0574F
+		"warn": Color(0.722, 0.525, 0.184),
+		"deep": Color(0.192, 0.255, 0.235),          # 标题条
+		"on_accent": Color(1, 1, 1),
+		"panel": Color(1, 1, 1, 0.94),
+		"panel_soft": Color(0.933, 0.918, 0.886, 0.96),
+		"panel_dark": Color(0.953, 0.941, 0.918, 0.98),
+		"border": Color(0.847, 0.816, 0.769, 0.90),
+		"bubble_user": Color(0.902, 0.949, 0.933, 0.95),
+		"hover": Color(0.965, 0.957, 0.941, 0.98),
+		"world": Color(0.953, 0.941, 0.918),
+		"ambient": Color(0.98, 0.96, 0.93),
+		"energy": 0.90,
+		"label": Color(0.420, 0.447, 0.502),
+		"label_outline": Color(0.984, 0.973, 0.957, 0.90),
+		"shadow": 0.14,
+		"serif": false,
+	},
+	"classic": {
+		"paper": Color(0.937, 0.894, 0.796),        # #EFE4CB
+		"paper_warm": Color(0.984, 0.965, 0.918),   # #FBF6EA
+		"paper_tone": Color(0.941, 0.902, 0.816),
+		"ink": Color(0.173, 0.165, 0.149),          # #2C2A26
+		"ink_soft": Color(0.420, 0.384, 0.341),     # #6B6256
+		"accent": Color(0.651, 0.231, 0.180),       # #A63B2E 朱砂
+		"danger": Color(0.651, 0.231, 0.180),
+		"warn": Color(0.557, 0.400, 0.169),         # 赭石
+		"deep": Color(0.173, 0.165, 0.149),
+		"on_accent": Color(0.984, 0.965, 0.918),
+		"panel": Color(0.984, 0.965, 0.918, 0.94),
+		"panel_soft": Color(0.937, 0.894, 0.796, 0.96),
+		"panel_dark": Color(0.937, 0.894, 0.796, 0.98),
+		"border": Color(0.851, 0.788, 0.659, 0.90),
+		"bubble_user": Color(0.961, 0.902, 0.847, 0.95),
+		"hover": Color(0.961, 0.914, 0.831, 0.98),
+		"world": Color(0.937, 0.894, 0.796),
+		"ambient": Color(0.98, 0.94, 0.86),
+		"energy": 0.85,
+		"label": Color(0.420, 0.384, 0.341),
+		"label_outline": Color(0.984, 0.965, 0.918, 0.90),
+		"shadow": 0.18,
+		"serif": true,
+	},
+	"mist": {
+		"paper": Color(0.918, 0.953, 0.973),        # #EAF3F8
+		"paper_warm": Color(0.973, 0.988, 0.992),   # #F8FCFD
+		"paper_tone": Color(0.886, 0.933, 0.953),
+		"ink": Color(0.118, 0.227, 0.275),          # #1E3A46
+		"ink_soft": Color(0.369, 0.467, 0.514),     # #5E7783
+		"accent": Color(0.137, 0.478, 0.455),       # #227A74
+		"danger": Color(0.753, 0.341, 0.310),       # #C0574F
+		"warn": Color(0.722, 0.525, 0.184),
+		"deep": Color(0.122, 0.290, 0.333),          # 标题条
+		"on_accent": Color(1, 1, 1),
+		"panel": Color(0.973, 0.988, 0.992, 0.94),
+		"panel_soft": Color(0.886, 0.933, 0.953, 0.96),
+		"panel_dark": Color(0.918, 0.953, 0.973, 0.98),
+		"border": Color(0.788, 0.871, 0.910, 0.90),
+		"bubble_user": Color(0.875, 0.941, 0.957, 0.95),
+		"hover": Color(0.933, 0.969, 0.984, 0.98),
+		"world": Color(0.918, 0.953, 0.973),
+		"ambient": Color(0.95, 0.97, 0.98),
+		"energy": 0.90,
+		"label": Color(0.369, 0.467, 0.514),
+		"label_outline": Color(0.973, 0.988, 0.992, 0.90),
+		"shadow": 0.14,
+		"serif": false,
+	},
+	"dark": {
+		"paper": Color(0.043, 0.063, 0.078),        # #0B1114
+		"paper_warm": Color(0.902, 0.933, 0.945),   # #E6EEF1
+		"paper_tone": Color(0.086, 0.122, 0.145),
+		"ink": Color(0.902, 0.933, 0.945),
+		"ink_soft": Color(0.624, 0.706, 0.749),
+		"accent": Color(0.310, 0.820, 0.773),       # #4FD1C5
+		"danger": Color(0.878, 0.424, 0.459),       # #E06C75
+		"warn": Color(0.855, 0.667, 0.302),
+		"deep": Color(0.055, 0.090, 0.110),
+		"on_accent": Color(0.031, 0.055, 0.063),
+		"panel": Color(0.071, 0.102, 0.122, 0.94),
+		"panel_soft": Color(0.090, 0.129, 0.153, 0.96),
+		"panel_dark": Color(0.047, 0.071, 0.086, 0.98),
+		"border": Color(0.180, 0.255, 0.290, 0.90),
+		"bubble_user": Color(0.070, 0.145, 0.155, 0.95),
+		"hover": Color(0.105, 0.165, 0.190, 0.98),
+		"world": Color(0.043, 0.063, 0.078),
+		"ambient": Color(0.62, 0.78, 0.84),
+		"energy": 0.62,
+		"label": Color(0.70, 0.80, 0.84),
+		"label_outline": Color(0.02, 0.04, 0.05, 0.85),
+		"shadow": 0.35,
+		"serif": false,
+	},
+}
 
-const PANEL_BG := Color(0.071, 0.102, 0.122, 0.94)
-const PANEL_SOFT := Color(0.090, 0.129, 0.153, 0.96)
-const PANEL_DARK := Color(0.047, 0.071, 0.086, 0.98)
-const BORDER := Color(0.180, 0.255, 0.290, 0.90)
-const BORDER_SOFT := Color(0.180, 0.255, 0.290, 0.45)
+static var THEME_ID := "mist"
+static var FONT_SERIF := false
+static var PAPER := Color(0.918, 0.953, 0.973)
+static var PAPER_WARM := Color(0.973, 0.988, 0.992)
+static var PAPER_TONE := Color(0.886, 0.933, 0.953)
+static var INK := Color(0.118, 0.227, 0.275)
+static var INK_SOFT := Color(0.369, 0.467, 0.514)
+static var CINNABAR := Color(0.753, 0.341, 0.310)
+static var DAI := Color(0.137, 0.478, 0.455)
+static var DEEP := Color(0.122, 0.290, 0.333)
+static var OCHRE := Color(0.722, 0.525, 0.184)
+static var ACCENT := DAI
+static var ON_ACCENT := Color(1, 1, 1)
+static var PANEL_BG := Color(0.973, 0.988, 0.992, 0.94)
+static var PANEL_SOFT := Color(0.886, 0.933, 0.953, 0.96)
+static var PANEL_DARK := Color(0.918, 0.953, 0.973, 0.98)
+static var BORDER := Color(0.788, 0.871, 0.910, 0.90)
+static var BORDER_SOFT := Color(0.788, 0.871, 0.910, 0.45)
+static var BUBBLE_USER_BG := Color(0.875, 0.941, 0.957, 0.95)
+static var HOVER_BG := Color(0.933, 0.969, 0.984, 0.98)
+static var WORLD_BG := PAPER
+static var AMBIENT_COLOR := Color(0.95, 0.97, 0.98)
+static var AMBIENT_ENERGY := 0.90
+static var LABEL_FG := Color(0.369, 0.467, 0.514)
+static var LABEL_OUTLINE := Color(0.973, 0.988, 0.992, 0.90)
+static var TIP_FG := ACCENT
+static var SHADOW_ALPHA := 0.14
+
+## 切换预设。未知值回落 mist；调用方应在建 UI 之前调一次。
+static func apply_preset(id: String) -> void:
+	var key := id.strip_edges().to_lower()
+	if not PALETTES.has(key):
+		key = "mist"
+	THEME_ID = key
+	var p: Dictionary = PALETTES[key]
+	PAPER = p["paper"]
+	PAPER_WARM = p["paper_warm"]
+	PAPER_TONE = p["paper_tone"]
+	INK = p["ink"]
+	INK_SOFT = p["ink_soft"]
+	CINNABAR = p["danger"]
+	DAI = p["accent"]
+	DEEP = p["deep"]
+	OCHRE = p["warn"]
+	ACCENT = p["accent"]
+	ON_ACCENT = p["on_accent"]
+	PANEL_BG = p["panel"]
+	PANEL_SOFT = p["panel_soft"]
+	PANEL_DARK = p["panel_dark"]
+	BORDER = p["border"]
+	BORDER_SOFT = Color(p["border"], 0.45)
+	BUBBLE_USER_BG = p["bubble_user"]
+	HOVER_BG = p["hover"]
+	WORLD_BG = p["world"]
+	AMBIENT_COLOR = p["ambient"]
+	AMBIENT_ENERGY = float(p["energy"])
+	LABEL_FG = p["label"]
+	LABEL_OUTLINE = p["label_outline"]
+	TIP_FG = p["accent"]
+	SHADOW_ALPHA = float(p["shadow"])
+	FONT_SERIF = bool(p["serif"])
+
+static func theme_options() -> Array:
+	return [
+		{"id": "warm", "label": "暖白简约"},
+		{"id": "classic", "label": "宣纸古风"},
+		{"id": "mist", "label": "雾蓝清透"},
+		{"id": "dark", "label": "深色青蓝"},
+	]
 
 # ================= 字体 =================
 
-## 无衬线优先：现代 UI 的骨架。取不到就顺着往系统 sans-serif 退。
 static func font() -> Font:
 	var f := SystemFont.new()
-	f.font_names = PackedStringArray([
-		"Microsoft YaHei UI", "Microsoft YaHei",
-		"PingFang SC", "Noto Sans CJK SC", "sans-serif",
-	])
-	# 状态行/日志里仍可能混进符号，留一条 emoji 兜底（主题本身不再主动使用 emoji）
+	if FONT_SERIF:
+		f.font_names = PackedStringArray(["KaiTi", "STKaiti", "华文楷体", "Kaiti SC", "SimSun", "宋体", "serif"])
+	else:
+		f.font_names = PackedStringArray(["Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+			"Noto Sans CJK SC", "sans-serif"])
 	var emoji := SystemFont.new()
 	emoji.font_names = PackedStringArray(["Segoe UI Symbol", "Segoe UI Emoji"])
 	f.fallbacks = [emoji]
@@ -58,23 +208,19 @@ static func _panel_box(bg: Color, border: Color, radius: int, pad: int, shadow :
 	sb.content_margin_right = pad + 2
 	sb.content_margin_top = pad
 	sb.content_margin_bottom = pad
-	if shadow:
-		sb.shadow_color = Color(0, 0, 0, 0.35)
+	if shadow and SHADOW_ALPHA > 0.0:
+		sb.shadow_color = Color(0, 0, 0, SHADOW_ALPHA)
 		sb.shadow_size = 10
 		sb.shadow_offset = Vector2(0, 4)
 	return sb
 
-## 大面板：深色半透明 + 冷灰描边 + 圆角 + 轻阴影
 static func panel(pad := 12) -> StyleBoxFlat:
 	return _panel_box(PANEL_BG, BORDER, 14, pad)
 
-## 主界面卡片：更深的半透明底 + 青蓝描边（棋盘/化身从后面透出来）
 static func veil_card(alpha := 0.82, pad := 30) -> StyleBoxFlat:
 	var bg := Color(PANEL_BG.r, PANEL_BG.g, PANEL_BG.b, alpha)
-	var sb := _panel_box(bg, Color(ACCENT, 0.55), 18, pad)
-	return sb
+	return _panel_box(bg, Color(ACCENT, 0.55), 18, pad)
 
-## 标题条：深色底 + 底部青蓝线；顶部两角跟随面板圆角
 static func header() -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = DEEP
@@ -89,13 +235,11 @@ static func header() -> StyleBoxFlat:
 	sb.content_margin_bottom = 9
 	return sb
 
-## 纸签 / 抽屉 / 确认框：深色圆角卡片
 static func slip(bg := PANEL_SOFT, pad := 12) -> StyleBoxFlat:
 	return _panel_box(bg, BORDER_SOFT, 10, pad, false)
 
-# ================= 对话气泡（三种） =================
+# ================= 对话气泡 =================
 
-## 她的话：深色面 + 左侧青蓝竖线
 static func bubble_ai() -> StyleBoxFlat:
 	var sb := slip(PANEL_SOFT, 10)
 	sb.border_color = Color(ACCENT, 0.70)
@@ -105,15 +249,13 @@ static func bubble_ai() -> StyleBoxFlat:
 	sb.border_width_bottom = 0
 	return sb
 
-## 系统提示：更暗的面 + 极轻描边
 static func bubble_sys() -> StyleBoxFlat:
 	var sb := slip(PANEL_DARK, 10)
 	sb.border_color = BORDER_SOFT
 	return sb
 
-## 玩家的话：青蓝染色面 + 右侧青蓝竖线
 static func bubble_user() -> StyleBoxFlat:
-	var sb := slip(Color(0.070, 0.145, 0.155, 0.95), 10)
+	var sb := slip(BUBBLE_USER_BG, 10)
 	sb.border_color = Color(ACCENT, 0.85)
 	sb.border_width_left = 0
 	sb.border_width_right = 3
@@ -121,11 +263,10 @@ static func bubble_user() -> StyleBoxFlat:
 	sb.border_width_bottom = 0
 	return sb
 
-## 强调块：青蓝底 + 深色字（主按钮 / 徽标 / 印章位）
 static func seal(pad := 10) -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = ACCENT
-	sb.border_color = Color(0.18, 0.62, 0.58)
+	sb.border_color = Color(ACCENT.darkened(0.25))
 	sb.set_border_width_all(1)
 	sb.set_corner_radius_all(8)
 	sb.content_margin_left = pad
@@ -136,15 +277,14 @@ static func seal(pad := 10) -> StyleBoxFlat:
 
 # ================= 控件 =================
 
-## 按钮：深色面 + 1px 冷灰边；悬停青蓝字，按下青蓝底反深色字。
 static func apply_button(b: Button, big := false) -> void:
 	var fs := 16 if big else 14
 	b.add_theme_font_size_override("font_size", fs)
 	b.add_theme_stylebox_override("normal", _btn_box(PANEL_SOFT, BORDER_SOFT, false))
-	b.add_theme_stylebox_override("hover", _btn_box(Color(0.105, 0.165, 0.190, 0.98), Color(ACCENT, 0.75), false))
+	b.add_theme_stylebox_override("hover", _btn_box(HOVER_BG, Color(ACCENT, 0.75), false))
 	b.add_theme_stylebox_override("pressed", _btn_box(ACCENT, ACCENT, true))
 	b.add_theme_stylebox_override("focus", _btn_box(Color(0, 0, 0, 0), Color(ACCENT, 0.55), false))
-	b.add_theme_stylebox_override("disabled", _btn_box(Color(0.06, 0.08, 0.10, 0.55), BORDER_SOFT, false))
+	b.add_theme_stylebox_override("disabled", _btn_box(Color(PANEL_DARK, 0.55), BORDER_SOFT, false))
 	b.add_theme_color_override("font_color", INK)
 	b.add_theme_color_override("font_hover_color", ACCENT)
 	b.add_theme_color_override("font_pressed_color", ON_ACCENT)
@@ -162,12 +302,11 @@ static func _btn_box(bg: Color, border: Color, inverted := false) -> StyleBoxFla
 	sb.content_margin_bottom = 8
 	return sb
 
-## 青蓝主按钮：整块强调色，深色字
 static func apply_seal_button(b: Button, big := true) -> void:
 	b.add_theme_font_size_override("font_size", 16 if big else 14)
 	b.add_theme_stylebox_override("normal", seal(12))
-	b.add_theme_stylebox_override("hover", _seal_variant(Color(0.38, 0.88, 0.82)))
-	b.add_theme_stylebox_override("pressed", _seal_variant(Color(0.22, 0.66, 0.61)))
+	b.add_theme_stylebox_override("hover", _seal_variant(ACCENT.lightened(0.12)))
+	b.add_theme_stylebox_override("pressed", _seal_variant(ACCENT.darkened(0.18)))
 	b.add_theme_stylebox_override("focus", _seal_variant(Color(0, 0, 0, 0)))
 	b.add_theme_color_override("font_color", ON_ACCENT)
 	b.add_theme_color_override("font_hover_color", ON_ACCENT)
@@ -178,7 +317,6 @@ static func _seal_variant(bg: Color) -> StyleBoxFlat:
 	sb.bg_color = bg
 	return sb
 
-## 画面边缘的收起/展开小按钮：透明底，悬停给一层青蓝淡底
 static func apply_bare_button(b: Button) -> void:
 	b.add_theme_font_size_override("font_size", 14)
 	var empty := StyleBoxFlat.new()
@@ -194,7 +332,6 @@ static func apply_bare_button(b: Button) -> void:
 	b.add_theme_color_override("font_hover_color", ACCENT)
 	b.add_theme_color_override("font_pressed_color", ACCENT)
 
-## 单字青蓝徽标（标题条右端 / 卡片角标）
 static func seal_char(ch: String) -> Control:
 	var p := PanelContainer.new()
 	p.custom_minimum_size = Vector2(30, 30)
@@ -210,28 +347,8 @@ static func seal_char(ch: String) -> Control:
 	p.add_child(l)
 	return p
 
-## 输入框：深色面 + 1px 冷灰边 + 圆角；焦点仍用同一套面，光标青蓝
-static func apply_line_edit(e: LineEdit) -> void:
-	e.add_theme_stylebox_override("normal", _input_box())
-	e.add_theme_stylebox_override("focus", _input_box())
-	e.add_theme_color_override("font_color", INK)
-	e.add_theme_color_override("font_placeholder_color", Color(INK_SOFT, 0.78))
-	e.add_theme_color_override("caret_color", ACCENT)
-
-## 下拉框：与按钮同一套语言
-static func apply_option(o: OptionButton) -> void:
-	o.add_theme_font_size_override("font_size", 13)
-	o.add_theme_stylebox_override("normal", _btn_box(PANEL_SOFT, BORDER_SOFT, false))
-	o.add_theme_stylebox_override("hover", _btn_box(Color(0.105, 0.165, 0.190, 0.98), Color(ACCENT, 0.75), false))
-	o.add_theme_stylebox_override("pressed", _btn_box(ACCENT, ACCENT, true))
-	o.add_theme_stylebox_override("focus", _btn_box(Color(0, 0, 0, 0), Color(ACCENT, 0.55), false))
-	o.add_theme_color_override("font_color", INK)
-	o.add_theme_color_override("font_hover_color", ACCENT)
-	o.add_theme_color_override("font_pressed_color", ON_ACCENT)
-
 # ================= 组装 =================
 
-## 根主题：没被单独覆盖的控件（Label / Button / LineEdit …）也吃到这套皮
 static func build_theme(f: Font) -> Theme:
 	var th := Theme.new()
 	th.default_font = f
@@ -243,10 +360,10 @@ static func build_theme(f: Font) -> Theme:
 	th.set_color("font_color", "LineEdit", INK)
 	th.set_stylebox("panel", "PanelContainer", panel(10))
 	th.set_stylebox("normal", "Button", _btn_box(PANEL_SOFT, BORDER_SOFT, false))
-	th.set_stylebox("hover", "Button", _btn_box(Color(0.105, 0.165, 0.190, 0.98), Color(ACCENT, 0.75), false))
+	th.set_stylebox("hover", "Button", _btn_box(HOVER_BG, Color(ACCENT, 0.75), false))
 	th.set_stylebox("pressed", "Button", _btn_box(ACCENT, ACCENT, true))
 	th.set_stylebox("normal", "OptionButton", _btn_box(PANEL_SOFT, BORDER_SOFT, false))
-	th.set_stylebox("hover", "OptionButton", _btn_box(Color(0.105, 0.165, 0.190, 0.98), Color(ACCENT, 0.75), false))
+	th.set_stylebox("hover", "OptionButton", _btn_box(HOVER_BG, Color(ACCENT, 0.75), false))
 	th.set_stylebox("pressed", "OptionButton", _btn_box(ACCENT, ACCENT, true))
 	th.set_stylebox("focus", "OptionButton", _btn_box(Color(0, 0, 0, 0), Color(ACCENT, 0.55), false))
 	th.set_color("font_pressed_color", "OptionButton", ON_ACCENT)
@@ -254,9 +371,8 @@ static func build_theme(f: Font) -> Theme:
 	th.set_stylebox("focus", "LineEdit", _input_box())
 	th.set_color("font_placeholder_color", "LineEdit", Color(INK_SOFT, 0.78))
 	th.set_color("caret_color", "LineEdit", ACCENT)
-	# 滑杆：冷灰细线 + 青蓝已选段 + 青蓝圆点
 	var track := StyleBoxFlat.new()
-	track.bg_color = Color(0.20, 0.30, 0.36, 0.55)
+	track.bg_color = Color(INK_SOFT, 0.32)
 	track.set_corner_radius_all(2)
 	track.content_margin_top = 1
 	track.content_margin_bottom = 1
@@ -266,15 +382,12 @@ static func build_theme(f: Font) -> Theme:
 	var grab := _grabber_icon()
 	th.set_icon("grabber", "HSlider", grab)
 	th.set_icon("grabber_highlight", "HSlider", grab)
-	# 复选框：深色方框 / 青蓝勾
 	th.set_icon("unchecked", "CheckBox", _check_icon(false))
 	th.set_icon("checked", "CheckBox", _check_icon(true))
-	# 勾选态在 Godot 里走 Button 的 "pressed" 样式 ⇒ 会继承成强调色块把字吞掉：显式清空
 	for st in ["normal", "pressed", "hover", "disabled", "focus"]:
 		th.set_stylebox(st, "CheckBox", _empty_box())
 	for st in ["font_color", "font_pressed_color", "font_hover_color", "font_focus_color", "font_disabled_color"]:
 		th.set_color(st, "CheckBox", INK)
-	# 滚动条：细青蓝条
 	th.set_stylebox("scroll", "VScrollBar", _scroll_grabber(Color(0, 0, 0, 0), 3))
 	th.set_stylebox("scroll_focus", "VScrollBar", _scroll_grabber(Color(0, 0, 0, 0), 3))
 	th.set_stylebox("grabber", "VScrollBar", _scroll_grabber(Color(ACCENT, 0.35), 3))
@@ -303,7 +416,7 @@ static func _bar(col: Color) -> StyleBoxFlat:
 
 static func _input_box() -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.047, 0.071, 0.086, 0.96)
+	sb.bg_color = PANEL_DARK
 	sb.border_color = BORDER
 	sb.set_border_width_all(1)
 	sb.set_corner_radius_all(8)
@@ -313,9 +426,6 @@ static func _input_box() -> StyleBoxFlat:
 	sb.content_margin_bottom = 7
 	return sb
 
-# ================= 程序化图标（不引入图片资源） =================
-
-## 滑杆圆点：16×16 青蓝实心圆
 static func _grabber_icon() -> Texture2D:
 	var img := Image.create(16, 16, false, Image.FORMAT_RGBA8)
 	img.fill(Color(0, 0, 0, 0))
@@ -326,11 +436,10 @@ static func _grabber_icon() -> Texture2D:
 				img.set_pixel(x, y, ACCENT)
 	return ImageTexture.create_from_image(img)
 
-## 复选框：深色方框 + 青蓝勾；勾用 1px 线，16px 下够清楚
 static func _check_icon(on: bool) -> Texture2D:
 	var img := Image.create(16, 16, false, Image.FORMAT_RGBA8)
 	img.fill(Color(0, 0, 0, 0))
-	var box := Color(0.20, 0.30, 0.36, 0.95)
+	var box := Color(INK_SOFT, 0.70)
 	for i in range(2, 14):
 		img.set_pixel(i, 2, box)
 		img.set_pixel(i, 13, box)
@@ -344,7 +453,6 @@ static func _check_icon(on: bool) -> Texture2D:
 		_draw_icon_line(img, Vector2i(7, 11), Vector2i(12, 5), ON_ACCENT)
 	return ImageTexture.create_from_image(img)
 
-## 简易 Bresenham 画线（只给 16px 图标用）
 static func _draw_icon_line(img: Image, a: Vector2i, b: Vector2i, col: Color) -> void:
 	var dx := absi(b.x - a.x)
 	var dy := -absi(b.y - a.y)

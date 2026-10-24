@@ -386,8 +386,9 @@ func undo(turn_index: int) -> void:
 	_post("/api/undo", {"turn": turn_index})
 
 ## 开新局。`silent=true`（v3.12.1）＝只清棋局、不添「重新来吧」那句——从主界面进对局时用。
-func reset_game(silent := false) -> void:
-	_post("/api/reset", {"silent": silent})
+## 返回 false 表示请求没发出去，调用方应保留「待重开」标志并重试。
+func reset_game(silent := false) -> bool:
+	return _post("/api/reset", {"silent": silent})
 
 func set_allow_pass(v: bool) -> void:
 	_post("/api/config", {"allow_pass": v})
@@ -477,7 +478,7 @@ func _flush_settings() -> void:
 		"adaptive_difficulty": adaptive_difficulty,
 		"adaptive_difficulty_base": adaptive_difficulty_base})
 
-func _post(path: String, body: Dictionary = {}) -> void:
+func _post(path: String, body: Dictionary = {}) -> bool:
 	var req := HTTPRequest.new()
 	req.timeout = POST_TIMEOUT        # 超时也会触发 request_completed → 回调里 queue_free
 	add_child(req)
@@ -486,6 +487,8 @@ func _post(path: String, body: Dictionary = {}) -> void:
 			["Content-Type: application/json"], HTTPClient.METHOD_POST, JSON.stringify(body))
 	if err != OK:
 		req.queue_free()
+		return false
+	return true
 
 ## 取一次响应体（GET 音频 / POST 试听合成）。与 _post 的「发完不管」不同，这里把结果交给回调：
 ## `callback(ok: bool, code: int, body: PackedByteArray)`，只有 HTTP 2xx 才算 ok。

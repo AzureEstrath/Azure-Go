@@ -48,12 +48,14 @@ var _tts_voice_edit: LineEdit
 var _tts_voice_opt: OptionButton
 var _tts_aliyun_key_edit: LineEdit
 var _tts_aliyun_voice_edit: LineEdit
+var _tts_aliyun_box: VBoxContainer          # 阿里云配置：挂在朗读方式下拉正下方，仅选阿里云时展开
 ## —— 主界面（纸幕封面，v3.11.2）——
 var title_screen: TitleScreen = null       # 首次启动 / 对局中按 Esc 都是这一块
 var _title_open := false                   # 封面开着：棋盘锁、聊天禁用、不闲置搭话
 var _game_started := false                 # 已经过了首次「开始对局」（决定主按钮是「开始对局」还是「开始新对局」）
 ## 从主界面进入时用：后端 `/api/reset` 在 busy 时会拒绝，忙就先记下，等 `_on_busy_changed(false)` 补发
 var _restart_when_idle := false
+var _restart_retry_ms := 0                 # reset 请求没发出去时的重试时刻（不把新局静默吞掉）
 var _setup_done := false                   # 本次运行已在主界面里点过「设置」：开局时不再弹第二遍
 var _setup_showing := false                # 设置面板正在显示（防重入）
 var _transition := false                   # 主界面 ⇄ 对局的运镜正在跑（期间不吃 Esc / 不叠加动画）
@@ -215,6 +217,7 @@ func _ready() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
 	cfg = AzureConfig.load_config()
 	_apply_cli_overrides()
+	GufengTheme.apply_preset(cfg.ui_theme)     # 建任何 UI 之前先落主题（默认雾蓝）
 	_build_pairing()                           # 语音配对状态机：只做决策，副作用回调回本文件
 	_build_sfx()                               # 对局音效：预加载 6 个音频、4 个播放器轮转
 	_font = _make_cjk_font()
@@ -228,6 +231,8 @@ func _ready() -> void:
 		_handle_cli()                          # 只拍封面：不起服务 / 不叠问候，避免聊天面板透在纸幕后
 		return
 	await _maybe_show_setup()                  # 启动设置面板：思考模式 + 各 API 配置（默认=当前配置）；确认后按新配置起服务
+	if not _shot_requested:
+		_begin_new_game_on_entry()             # 先立「等 reset」闸：hello 里上一局的迟到 state 不许闪出来
 	if agent == null:
 		_build_services()                      # 从主界面直接进过棋谱库时已经起过：不重复装配
 	_start_launch_game()                       # 首次进对局也保证空局（后端可能还留着上次运行的棋局）
@@ -250,6 +255,9 @@ func _apply_cli_overrides() -> void:
 		elif a.begins_with("--key="):
 			cfg.llm_api_key = a.substr("--key=".length())
 			cfg.cli_locked["llm_api_key"] = true
+		elif a.begins_with("--theme="):
+			cfg.ui_theme = a.substr("--theme=".length())
+			cfg.cli_locked["ui_theme"] = true
 
 ## 语音配对状态机：纯决策（谁该显示、谁还在忙、什么该清出），副作用都由信号回到本文件
 func _build_pairing() -> void:
@@ -275,10 +283,10 @@ func _build_world() -> void:
 	var we := WorldEnvironment.new()
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
-	env.background_color = Color(0.043, 0.063, 0.078)   # 自用版：无背景板 / 无地板，深色虚空
+	env.background_color = GufengTheme.WORLD_BG   # 自用版：无背景板 / 无地板，只留主题底色
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = Color(0.62, 0.78, 0.84)
-	env.ambient_light_energy = 0.62
+	env.ambient_light_color = GufengTheme.AMBIENT_COLOR
+	env.ambient_light_energy = GufengTheme.AMBIENT_ENERGY
 	we.environment = env
 	add_child(we)
 
@@ -880,7 +888,33 @@ func _build_left_panel(root: Control) -> void:
 	opt.item_selected.connect(_on_tts_mode)
 	vb.add_child(opt)
 
-	vb.add_child(_field_label("云端服务地址（上面第 3 项才需要）"))
+	# 阿里云配置直接挂在朗读方式下拉下面：选阿里云才展开，其他模式收起。
+	# Key 与平台音色 ID 各留各的，切模式不互相覆盖。
+	_tts_aliyun_box = VBoxContainer.new()
+	_tts_aliyun_box.add_theme_constant_override("separation", 4)
+	_tts_aliyun_box.visible = cfg.tts_mode == "aliyun"
+	vb.add_child(_tts_aliyun_box)
+
+	_tts_aliyun_box.add_child(_field_label("阿里云 API Key"))
+	_tts_aliyun_key_edit = LineEdit.new()
+	_tts_aliyun_key_edit.text = cfg.tts_aliyun_api_key
+	_tts_aliyun_key_edit.secret = true
+	_tts_aliyun_key_edit.placeholder_text = "sk-…（Voice Studio 签发）"
+	_tts_aliyun_key_edit.tooltip_text = "Voice Studio 控制台签发的 API Key；百炼原生 Key 无法通过鉴权（返回 401）"
+	_tts_aliyun_key_edit.text_submitted.connect(func(_t): _apply_tts_fields())
+	_tts_aliyun_key_edit.focus_exited.connect(_apply_tts_fields)
+	_tts_aliyun_box.add_child(_tts_aliyun_key_edit)
+
+	_tts_aliyun_box.add_child(_field_label("阿里云音色 ID（UUID）"))
+	_tts_aliyun_voice_edit = LineEdit.new()
+	_tts_aliyun_voice_edit.text = cfg.tts_aliyun_voice
+	_tts_aliyun_voice_edit.placeholder_text = "在 Voice Studio「音色管理」里复制"
+	_tts_aliyun_voice_edit.tooltip_text = "平台音色 ID（UUID 形式）；不接受 {model}:{voice} 或裸音色名"
+	_tts_aliyun_voice_edit.text_submitted.connect(func(_t): _apply_tts_fields())
+	_tts_aliyun_voice_edit.focus_exited.connect(_apply_tts_fields)
+	_tts_aliyun_box.add_child(_tts_aliyun_voice_edit)
+
+	vb.add_child(_field_label("云端服务地址（选云端 OpenAI 时填写）"))
 	var le_url := LineEdit.new()
 	le_url.text = cfg.tts_base_url
 	le_url.tooltip_text = "云端 OpenAI 兼容语音服务地址，例如 https://api.openai.com/v1（自建服务填它的地址）"
@@ -922,26 +956,6 @@ func _build_left_panel(root: Control) -> void:
 	_tts_voice_edit.text = cfg.tts_voice
 	_tts_voice_edit.tooltip_text = "手动输入音色 id（服务商不同，音色名也不同）"
 	vrow.add_child(_tts_voice_edit)
-
-	# —— 阿里云 Voice Studio（上面第 3 项才需要）：Key 与平台音色 ID 各留各的，切模式不互相覆盖 ——
-	vb.add_child(_field_label("阿里云 API Key（上面第 3 项才需要）"))
-	_tts_aliyun_key_edit = LineEdit.new()
-	_tts_aliyun_key_edit.text = cfg.tts_aliyun_api_key
-	_tts_aliyun_key_edit.secret = true
-	_tts_aliyun_key_edit.placeholder_text = "sk-…（Voice Studio 签发）"
-	_tts_aliyun_key_edit.tooltip_text = "Voice Studio 控制台签发的 API Key；百炼原生 Key 无法通过鉴权（返回 401）"
-	_tts_aliyun_key_edit.text_submitted.connect(func(_t): _apply_tts_fields())
-	_tts_aliyun_key_edit.focus_exited.connect(_apply_tts_fields)
-	vb.add_child(_tts_aliyun_key_edit)
-
-	vb.add_child(_field_label("阿里云音色 ID（UUID，如 9f2a1c4e-…）"))
-	_tts_aliyun_voice_edit = LineEdit.new()
-	_tts_aliyun_voice_edit.text = cfg.tts_aliyun_voice
-	_tts_aliyun_voice_edit.placeholder_text = "在 Voice Studio「音色管理」里复制"
-	_tts_aliyun_voice_edit.tooltip_text = "平台音色 ID（UUID 形式）；不接受 {model}:{voice} 或裸音色名"
-	_tts_aliyun_voice_edit.text_submitted.connect(func(_t): _apply_tts_fields())
-	_tts_aliyun_voice_edit.focus_exited.connect(_apply_tts_fields)
-	vb.add_child(_tts_aliyun_voice_edit)
 
 	vb.add_child(_field_label("语速"))
 	var sp := HSlider.new()
@@ -1138,6 +1152,8 @@ func _on_tts_mode(i: int) -> void:
 		tts.stop()
 	cfg.save()
 	_tts_status.text = "朗读方式：%s（合成在后端，重启后端后生效）" % m
+	if _tts_aliyun_box != null:
+		_tts_aliyun_box.visible = m == "aliyun"
 	_refresh_tts_route()
 
 func _apply_tts_fields() -> void:
@@ -2139,6 +2155,10 @@ func _begin_new_game_on_entry() -> void:
 ## 首次进对局也保证是空局：后端是独立进程，可能跨游戏运行（上一次对局还在里面）——
 ## 不 reset 的话 `hello` 会把上一局的 stones 推回来。走与「从主界面进来」同一条路（静默 + 忙时等 idle）。
 func _start_launch_game() -> void:
+	if _shot_requested:                          # 截图 / 演示模式只清本地，不误重置真实后端棋局
+		_reset_game_view()
+		_restart_when_idle = false
+		return
 	if agent == null:
 		return
 	_begin_new_game_on_entry()
@@ -2148,8 +2168,10 @@ func _try_restart_backend() -> void:
 		return
 	if agent.busy:
 		return                                   # 等这一轮收尾（`_on_busy_changed(false)` 会再进来）
+	if not agent.reset_game(true):                # 静默新局：进门不该每次都多一句「重新来吧」
+		_restart_retry_ms = Time.get_ticks_msec() + 1500
+		return                                   # 请求没发出去：保留标志，_process 里重试
 	_restart_when_idle = false
-	agent.reset_game(true)                       # 静默新局：进门不该每次都多一句「重新来吧」
 
 ## 新的一局的侧栏文案（纯函数：从主界面进入 / 「重来」共用，门卫可直接断言）。
 ## `state` 事件只带棋盘与俗手，**胜率 / 目差不会自己归零**——必须在这里显式清，否则上一局会留着。
@@ -2780,6 +2802,19 @@ func _build_setup_panel(primary_text := "开始对局",
 	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(sub)
 
+	vb.add_child(_field_label("界面主题（重启游戏后生效）"))
+	var theme_opt := OptionButton.new()
+	theme_opt.fit_to_longest_item = false
+	for t in GufengTheme.theme_options():
+		theme_opt.add_item(str(t["label"]))
+		theme_opt.set_item_metadata(theme_opt.item_count - 1, str(t["id"]))
+	for i in theme_opt.item_count:
+		if str(theme_opt.get_item_metadata(i)) == cfg.ui_theme:
+			theme_opt.select(i)
+			break
+	theme_opt.tooltip_text = "四套主题只换 UI 皮肤：暖白 / 宣纸 / 雾蓝 / 深色。设置面板本身不会即时换皮，重启游戏后应用。"
+	vb.add_child(theme_opt)
+
 	vb.add_child(_field_label("思考模式（只影响 Qwen3 这类思考型模型）"))
 	var think_opt := OptionButton.new()
 	think_opt.fit_to_longest_item = false
@@ -2798,7 +2833,7 @@ func _build_setup_panel(primary_text := "开始对局",
 	var le_llm_key := _setup_field(llm_body, "API Key（只有云端需要）", cfg.llm_api_key,
 		"留空=不发送 Authorization；只会存在本机的 config.json 里")
 
-	var tts_body := _setup_section(vb, "语音 TTS（本地 / 云端）")
+	var tts_body := _setup_section(vb, "语音 TTS（本地 / 云端 / 阿里云）", cfg.tts_mode == "aliyun")
 	var le_tts_url := _setup_field(tts_body, "云端服务地址（本地没有时才用）", cfg.tts_base_url,
 		"OpenAI 兼容地址，如 https://api.example.com/v1；本地优先地址由 config.json 的 tts_local_base_url 配置")
 	var le_tts_voice := _setup_field(tts_body, "云端音色", cfg.tts_voice,
@@ -2810,7 +2845,8 @@ func _build_setup_panel(primary_text := "开始对局",
 	tts_route.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	tts_body.add_child(tts_route)
 
-	var aliyun_body := _setup_section(vb, "阿里云语音合成（Voice Studio，可选）", cfg.tts_mode == "aliyun")
+	# 阿里云不再单独占一块：收进「语音 TTS」分节里，和朗读方式在同一栏。
+	var aliyun_body := _setup_section(tts_body, "阿里云 Voice Studio（可选）", cfg.tts_mode == "aliyun")
 	var le_tts_key := _setup_field(aliyun_body, "API Key（Voice Studio 签发）", cfg.tts_aliyun_api_key,
 		"Voice Studio 控制台签发的 sk-…；百炼原生 Key 无法通过鉴权（返回 401）。留空=这条回落系统语音")
 	le_tts_key.secret = true
@@ -2850,15 +2886,16 @@ func _build_setup_panel(primary_text := "开始对局",
 		_setup_showing = false
 		_setup_done = true                    # 本次运行已经配过：开局不再弹第二遍
 		_apply_setup(think_opt, le_llm_url, le_llm_model, le_llm_key,
-			le_tts_url, le_tts_voice, le_tts_key, le_tts_voice_id)
+			le_tts_url, le_tts_voice, le_tts_key, le_tts_voice_id, theme_opt)
 		back.queue_free()
 		setup_confirmed.emit())
 	start.grab_focus()
 	# 高度随内容自适应（折叠时紧凑，展开分节后变高），并保持垂直居中；+64 是底部固定的动作区
 	await get_tree().process_frame
 	var h := clampf(vb.get_combined_minimum_size().y + 24.0 + 64.0, 240.0, 640.0)
-	box.offset_top = -h * 0.5
-	box.offset_bottom = h * 0.5
+	var shift_y := 26.0                         # 设置面板整体略微下移（约 3% 屏高）
+	box.offset_top = -h * 0.5 + shift_y
+	box.offset_bottom = h * 0.5 + shift_y
 
 ## 面板里可折叠的分节（默认收起，减少第一眼信息量）
 func _setup_section(vb: VBoxContainer, title_text: String, expanded := false) -> VBoxContainer:
@@ -2889,8 +2926,11 @@ func _setup_field(parent: Control, label_text: String, value: String, tip := "")
 ## TTS 分两节：云端/本地（`tts_base_url` / `tts_voice`）与阿里云（`tts_aliyun_api_key` / `tts_aliyun_voice`）——
 ## **不改 `tts_mode`**：朗读方式是玩家在左侧栏选的，启动面板不该每次开局都把它悄悄改回去。
 func _apply_setup(think_opt: OptionButton, llm_url: LineEdit, llm_model: LineEdit, llm_key: LineEdit,
-		tts_url: LineEdit, tts_voice: LineEdit, tts_key: LineEdit, tts_voice_id: LineEdit) -> void:
+		tts_url: LineEdit, tts_voice: LineEdit, tts_key: LineEdit, tts_voice_id: LineEdit,
+		theme_opt: OptionButton) -> void:
 	cfg.llm_think_mode = clampi(think_opt.selected, 0, 2)
+	if theme_opt != null:
+		cfg.ui_theme = str(theme_opt.get_item_metadata(clampi(theme_opt.selected, 0, theme_opt.item_count - 1)))
 	if llm_url.text.strip_edges() != "":         # 地址/模型/音色不允许被清成空：空则保留原值
 		cfg.llm_base_url = llm_url.text.strip_edges()
 	if llm_model.text.strip_edges() != "":
@@ -3200,6 +3240,8 @@ func _on_move_rejected(st: Dictionary) -> void:
 func _on_state_changed(p: Dictionary) -> void:
 	if _fr_active:
 		return                                  # 全盘复盘：棋盘由本地回放掌控，别被 WS state 盖掉
+	if _restart_when_idle:
+		return                                  # 正在等新局 reset：旧回合的迟到 state 不许把旧盘面推回来
 	_release_move_pending()                # 权威快照到了：乐观落子已经被它取代
 	var stones = p.get("stones", [])
 	if typeof(stones) != TYPE_ARRAY:
@@ -4047,6 +4089,8 @@ func _process(delta: float) -> void:
 			_idle = false
 			_set_idle_state(false)
 	_tick_chat_queue(hold)                              # 她这一轮结束、语音也播完：自动续发排队的聊天
+	if _restart_when_idle and agent != null and not agent.busy and now >= _restart_retry_ms:
+		_try_restart_backend()                          # reset 没发出去 / 后端刚回来：补发，别吞掉新局
 	if not _idle and now - _last_activity_ms >= int(IDLE_SEC * 1000.0):
 		_idle = true                                    # 长时间没操作：看向玩家、准备歪头
 		_set_idle_state(true)

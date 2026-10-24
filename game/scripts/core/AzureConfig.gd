@@ -6,6 +6,8 @@ extends RefCounted
 ## openai（云端 OpenAI 兼容 /v1/audio/speech；有本地地址时本地优先，兼容旧配置）/
 ## aliyun（阿里云 Voice Studio 实时语音合成，WebSocket）。旧配置里的 "cosyvoice" 等未知值一律回落云端 openai
 const TTS_MODES := ["system", "local", "openai", "aliyun"]
+## 自用版界面主题（只影响客户端，后端不读）：暖白 / 宣纸 / 雾蓝 / 深色。
+const UI_THEMES := ["warm", "classic", "mist", "dark"]
 ## 旧配置里已废弃的本地引擎音色 id → 回落模板默认音色；清单是**唯一副本**，UI（`Main._is_removed_voice()`）直接引用它。
 ## 自建 CosyVoice 服务仍在用的活音色（azure / azure-fast / melo）**不在此列**，必须原样保留（该服务默认音色就是 azure）。
 ## 这里用黑名单而非白名单：tts_voice 允许手填任意服务商音色，白名单会把用户自填值冲掉。
@@ -46,6 +48,8 @@ var time_aware_enabled := false
 # —— 前后端架构 ——
 # 编排（KataGo / LLM / 定式 / 情绪）全部在后端服务进程，游戏只做渲染与语音，经 REST + WebSocket 通信
 var backend_url := "http://127.0.0.1:8000"   # 后端服务地址（WS 地址由其推导）
+## 自用版主视觉：warm / classic / mist / dark；默认雾蓝清透。只给客户端 `GufengTheme` 用。
+var ui_theme := "mist"
 var llm_base_url := "https://api.deepseek.com/v1"   # 云端 LLM（OpenAI 兼容）地址；示例见 README 第四节
 var llm_model := "deepseek-chat"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
@@ -129,6 +133,7 @@ static func load_config(path := "") -> AzureConfig:
 			c.profile_enabled = _normalize_flag(d.get("profile_enabled"), c.profile_enabled)
 			c.time_aware_enabled = _normalize_flag(d.get("time_aware_enabled"), c.time_aware_enabled)
 			c.backend_url = str(d.get("backend_url", c.backend_url))
+			c.ui_theme = _normalize_ui_theme(str(d.get("ui_theme", c.ui_theme)))
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
 			c.llm_api_key = str(d.get("llm_api_key", c.llm_api_key))
@@ -205,6 +210,11 @@ func tts_route_label() -> String:
 static func _normalize_tts_mode(v: String) -> String:
 	var m := v.strip_edges().to_lower()
 	return m if m in TTS_MODES else "openai"
+
+## 主题归一化：未知值回落雾蓝（默认），避免旧配置 / 手写值让启动落进空主题。
+static func _normalize_ui_theme(v: String) -> String:
+	var m := v.strip_edges().to_lower()
+	return m if m in UI_THEMES else "mist"
 
 ## 旧配置归一化：UI 视为「已移除」的旧音色（男声 / 韩语女 / 旧克隆音色）→ 回落模板默认音色；
 ## 自建服务仍在用的活音色（azure / azure-fast / melo）与手填 id 一律原样保留
@@ -333,6 +343,7 @@ func save() -> bool:
 	d["time_aware_enabled"] = time_aware_enabled  # 时间感知（默认关）：两个字段一起原子推一次 `/api/config`
 	d.erase("backend_mode")                       # 只剩「连后端」一条路径：旧配置里的 backend_mode 不再写回
 	d["backend_url"] = backend_url
+	d["ui_theme"] = ui_theme
 	d["llm_base_url"] = llm_base_url
 	d["llm_model"] = llm_model
 	d["llm_api_key"] = llm_api_key
