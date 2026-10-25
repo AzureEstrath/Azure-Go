@@ -722,6 +722,8 @@ func _animate_tilt(dt: float) -> void:
 
 ## 思考中（KataGo 分析 / LLM 生成）保持中性表情，结束后回到常态微笑
 func set_thinking(v: bool) -> void:
+	if v:
+		clear_expression()          # 开始思考：先把上一句残留的笑/惊讶收掉，别挂着表情发呆
 	_expr_thinking = v
 	_update_baseline()
 
@@ -774,6 +776,14 @@ func play_expression(kind: String) -> void:
 	_expr_t = 0.0
 	_expr_targets.clear()
 	_apply_expr_stage()
+
+## 清掉一次性表情队列（一句读完 / 摸头结束 / 开始思考）：目标立刻交还情绪层与常态微笑，
+## 已经写上去的数值由 `_animate_expression` 的回落路径自然退回。不会动三维情绪的持续层。
+func clear_expression() -> void:
+	_expr_queue.clear()
+	_expr_stage = 0
+	_expr_t = 0.0
+	_expr_targets.clear()
 
 func _expr_steps_for(kind: String) -> Array:
 	match kind:

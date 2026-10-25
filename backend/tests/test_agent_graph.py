@@ -838,7 +838,7 @@ class JosekiActiveSpeechTest(unittest.TestCase):
         text = _phase_texts(llm)[-1]
         self.assertNotIn(prompts.joseki_close_prompt("点三三·基本型", "（要点）", "左上", "azure"), text)
         self.assertNotIn(prompts.joseki_short_prompt("点三三·基本型", "（要点）", ai_gtp), text)
-        self.assertIn("换一句新话", text, "退回普通感想")
+        self.assertIn("全局局面分析", text, "退回普通感想（全局局面分析）")
         self.assertEqual(
             [e for e in agent.bus.of_type("joseki") if str(e.get("kind", "")) == "formed"], [],
             "未命中：她那一步也不发 joseki 事件")
@@ -992,7 +992,7 @@ class HerStructureSpeechTest(_HerJosekiFixture):
                 else:
                     self.assertIn(prompts.joseki_branch_prompt(
                         name, key, list(result["candidates"])), text)
-                self.assertNotIn("换一句新话", text, "顶替：普通感想那一档一个字都不在")
+                self.assertNotIn("全局局面分析", text, "顶替：普通感想那一档一个字都不在")
                 self.assertEqual(len(agent.bus.messages()), 3,
                                  "结构点顶替本来那条：气泡数仍是 3，不新增")
                 self.assertEqual(len(calls), 2, "她那一步只许识别一次")
@@ -1547,7 +1547,7 @@ class PlayerEventWriteTest(unittest.TestCase):
         self.assertEqual(ev["move_no"], 1)
         self.assertEqual(ev["detail"]["rank"], -1)
         self.assertEqual(ev["detail"]["drop"], 0.0)
-        self.assertIn("他", ev["text"], "玩家口径是第三人称（第一人称会把玩家的坏手说成 Azure 自己下的）")
+        self.assertIn("对面", ev["text"], "玩家口径用中性第二方（第一人称会把玩家的坏手说成 Azure 自己下的）")
         self.assertNotIn("我", ev["text"])
         # 事件原文**永不进台词**：它只进事件表 / 提示词，不产生 message
         self.assertNotIn(ev["text"], " ".join(m["text"] for m in _bus.messages()))

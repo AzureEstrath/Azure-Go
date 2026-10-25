@@ -43,19 +43,19 @@ func _build() -> void:
 	veil.mouse_filter = Control.MOUSE_FILTER_STOP     # 挡住棋盘点击（菜单期间不落子、不摸头）
 	add_child(veil)
 
-	# ② 深色卡片：略偏上摆（棋盘在下方露出来），半透明，远处的棋子能透过来。
-	# v3.12.0 微调：原 0.02..0.55 的视觉中心太靠上，整体下移约 8% 屏高。
+	# ② 深色卡片：摆在屏幕视觉中心（锚点区间上下对称于 50%），棋盘在下方露出来。
+	# v3.12.1：继续下调到正中——上半屏留白，卡片不再贴着上方。
 	var center := CenterContainer.new()
 	center.set_anchors_preset(Control.PRESET_FULL_RECT)
-	center.anchor_top = 0.10
-	center.anchor_bottom = 0.62
+	center.anchor_top = 0.24
+	center.anchor_bottom = 0.76
 	center.offset_top = 0.0
 	center.offset_bottom = 0.0
 	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(center)
 
 	var box := PanelContainer.new()
-	box.add_theme_stylebox_override("panel", GufengTheme.veil_card(0.80, 26))
+	box.add_theme_stylebox_override("panel", GufengTheme.veil_card(0.92, 26))   # 下调后压在棋盘上：提高不透明度保证文字可读
 	box.custom_minimum_size = Vector2(560, 0)
 	center.add_child(box)
 

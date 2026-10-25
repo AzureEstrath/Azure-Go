@@ -139,7 +139,7 @@ class TestParsersAndTables(unittest.TestCase):
         self.assertEqual(names[26], "惊喜")
 
     def test_event_desc(self):
-        self.assertEqual(EmotionModel.event_desc("player_good"), "他下出了一手好棋")
+        self.assertEqual(EmotionModel.event_desc("player_good"), "对面下出了一手好棋")
         self.assertEqual(EmotionModel.event_desc("__unknown__"), "")
 
 

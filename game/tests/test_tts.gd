@@ -108,6 +108,16 @@ func _run() -> void:
 	t._cooldown = 0.0                      # 机器上真起不了 PowerShell 时别让冷却拖累后面的队列用例
 	await _wait(0.2)
 
+	# —— 4′) suppress_system：CosyVoice 加载期不出系统语音（只显示文字） ——
+	t.stop()
+	_skipped.clear()
+	t.set_suppress_system(true)
+	var g6 := t.speak_system("加载期不该念出来", 40)
+	await _wait(0.2)
+	_check("suppress_system：不出声、只补 speech_skipped",
+			_count(_skipped, g6) == 1 and _count(_started, g6) == 0)
+	t.set_suppress_system(false)
+
 	# —— 5) 队列溢出：丢最旧的一条并补 speech_skipped ——
 	# 第 1 条会立刻开播（不在队列里），随后 3 条把队列填满，第 5 条进来必须挤掉最旧的那条。
 	t.voice = "melo"                       # is_slow_engine()==false ⇒ 上限 QUEUE_MAX(3)

@@ -228,6 +228,54 @@ class ProfileTimeConfigTest(unittest.TestCase):
             self.assertFalse(c.time_aware_enabled, "脏值 %r 必须退回默认 false" % (bad,))
 
 
+class PersonaConfigTest(unittest.TestCase):
+    """人格化：总开关默认开；关系阶段与称呼默认关，称呼名只认字符串、最多 16 字。"""
+
+    def test_defaults(self):
+        c = AzureConfig()
+        self.assertTrue(c.persona_enabled)
+        self.assertFalse(c.persona_relationship_enabled, "关系称呼必须默认关（称呼保持原名）")
+        self.assertEqual(c.persona_address_name, "")
+
+    def test_round_trip(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"persona_enabled": False, "persona_relationship_enabled": True,
+                           "persona_address_name": "  搭档  "}, f)
+            c = AzureConfig.load(p)
+        self.assertFalse(c.persona_enabled)
+        self.assertTrue(c.persona_relationship_enabled)
+        self.assertEqual(c.persona_address_name, "搭档")
+
+    def test_dirty_values_fall_back(self):
+        import tempfile, json
+        for bad in ("true", 1, None, []):
+            with tempfile.TemporaryDirectory() as d:
+                p = os.path.join(d, "config.json")
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump({"persona_relationship_enabled": bad}, f)
+                c = AzureConfig.load(p)
+            self.assertFalse(c.persona_relationship_enabled, "脏值 %r 必须退回默认 false" % (bad,))
+        for bad in (1, None, [], {}):
+            with tempfile.TemporaryDirectory() as d:
+                p = os.path.join(d, "config.json")
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump({"persona_address_name": bad}, f)
+                c = AzureConfig.load(p)
+            self.assertEqual(c.persona_address_name, "", "脏值 %r 必须退回空串" % (bad,))
+
+    def test_address_name_is_truncated(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"persona_address_name": "12345678901234567890"}, f)
+            c = AzureConfig.load(p)
+        self.assertEqual(len(c.persona_address_name), 16)
+
+
 class AliyunTtsConfigTest(unittest.TestCase):
     """阿里云 TTS 配置面：新键必须真的被 ``load()`` 读进来（防「字段加了但没接线」）。"""
 

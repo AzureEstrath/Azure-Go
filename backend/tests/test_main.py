@@ -63,9 +63,14 @@ class RestTest(unittest.TestCase):
             self.assertTrue(client.post("/api/reset").json()["ok"])
             self.assertEqual(client.get("/api/state").json()["move_count"], 0)
 
-    def test_peer_endpoint_gone(self):
+    def test_peer_endpoint_forwards_info(self):
+        """窥屏端点恢复：客户端把前台窗口 / OCR / VLM 描述交给后端组织台词。"""
         with _client() as client:
-            self.assertEqual(client.post("/api/peer", json={"fg_title": "x"}).status_code, 404)
+            r = client.post("/api/peer", json={"fg_title": "Bilibili",
+                                               "ocr": "围棋教学视频",
+                                               "vlm": "他正在看一个围棋教学视频"})
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.json()["ok"])
 
     def test_config_forwards_emotion_drift(self):
         """``/api/config`` 透传情绪波动开关与参数（v3.8.0）：脏值不生效、越界按上限夹取、绝不 500。
@@ -167,6 +172,24 @@ class ProfileTimeSwitchTest(unittest.TestCase):
             self.assertTrue(agent.profile_enabled)
             self.assertTrue(agent.time_aware_enabled)
             self.assertIsNotNone(agent.profile_store, "注入的 agent 也接上同一个画像库实例")
+
+
+class LocalVoiceConfigTest(unittest.TestCase):
+    """``/api/config`` 本地音色：只改后端内存里的 TTS 配置（不重启、不丢棋局），脏值不生效。"""
+
+    def test_config_updates_live_tts_voice(self):
+        cfg = AzureConfig()
+        cfg.tts_local_voice = "xiaoya"
+        app = create_app(cfg=cfg, engine=StubEngine(), llm=StubLLM(), autostart=False)
+        with TestClient(app) as client:
+            tts = app.state.tts
+            self.assertIsNotNone(tts, "TTS 客户端无条件装配")
+            self.assertIsNotNone(getattr(tts, "cfg", None), "TTS 持有配置对象（运行期音色就改它）")
+            r = client.post("/api/config", json={"tts_local_voice": "azure"})
+            self.assertTrue(r.json()["ok"])
+            self.assertEqual(tts.cfg.tts_local_voice, "azure")
+            client.post("/api/config", json={"tts_local_voice": 7})   # 脏值不生效
+            self.assertEqual(tts.cfg.tts_local_voice, "azure")
 
 
 class ProfileApiTest(unittest.TestCase):
@@ -833,14 +856,39 @@ class ReviewModeTest(unittest.TestCase):
                 return e
         self.fail("没收到 state 事件")
 
+    def test_review_intro_uses_real_state(self):
+        """复盘开场白：空盘温和提示；有亏损手时点出第几手 / 大致掉多少；复盘模式下拒绝。"""
+        app, client = self._client()
+        with client:
+            r = client.post("/api/review/intro")
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.json()["ok"])
+            self.assertIn("空着", r.json()["text"])
+
+            st = app.state.agent.st
+            st.add_move("B", "Q16")
+            st.record_loss("Q16", 0.23, "测试")
+            st.add_move("W", "D4")
+            r2 = client.post("/api/review/intro")
+            text = r2.json()["text"]
+            self.assertIn("第 1 手", text)
+            self.assertIn("23%", text)
+
+            self._enter(client)
+            r3 = client.post("/api/review/intro")
+            self.assertEqual(r3.status_code, 200)
+            self.assertFalse(r3.json()["ok"])
+            self.assertEqual(r3.json()["error"], "复盘模式中")
+
     def test_review_blocks_move_chat_idle(self):
-        """① 复盘期间五个入口一律可读拒绝（V6 形状），且**不碰 busy**、一条都落不下去。"""
+        """① 复盘期间六个入口一律可读拒绝（V6 形状），且**不碰 busy**、一条都落不下去。"""
         app, client = self._client()
         with client:
             self.assertEqual(self._enter(client), {"ok": True, "on": True})
             for path, body in (("/api/move", {"x": 3, "y": 3}),
                                ("/api/chat", {"text": "在吗"}),
                                ("/api/idle", {}),
+                               ("/api/peer", {"fg_title": "Bilibili"}),
                                ("/api/hint", {}),
                                ("/api/analyze", {})):
                 with self.subTest(path=path):

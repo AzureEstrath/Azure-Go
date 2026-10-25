@@ -29,6 +29,7 @@ var _status: Label = null
 var _list_box: VBoxContainer = null
 var _detail_title: Label = null
 var _detail_meta: Label = null
+var _remark: Label = null
 var _summary: Label = null
 var _step_label: Label = null
 var _board: MiniBoard = null
@@ -135,6 +136,11 @@ func _build() -> void:
 	_detail_meta = _label("从左边选一盘，右侧可以逐手翻看盘面。", 13, GufengTheme.INK_SOFT, true)
 	_detail_meta.custom_minimum_size = Vector2(0, 40)
 	right.add_child(_detail_meta)
+	# 她的回忆（v3.x）：后端按真实记录生成的短句，纯本地、不打断翻手；空串时不留空行。
+	_remark = _label("", 12, GufengTheme.INK_SOFT, true)
+	_remark.custom_minimum_size = Vector2(0, 0)
+	_remark.visible = false
+	right.add_child(_remark)
 	_board = MiniBoard.new()
 	_board.custom_minimum_size = Vector2(BOARD_SIDE, BOARD_SIDE)
 	_board.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
@@ -306,7 +312,16 @@ func set_selected(rec: Dictionary) -> void:
 	_step = _move_count
 	if _rows.has(_selected_id):
 		(_rows[_selected_id] as Button).button_pressed = true
+	set_remark("")
 	_update_detail()
+
+## 「她的回忆」：由 Main 在载入某局后向后端取（纯本地文案）；空串 ⇒ 整行隐藏，不占版面。
+func set_remark(text: String) -> void:
+	if _remark == null:
+		return
+	var s := str(text).strip_edges()
+	_remark.text = s
+	_remark.visible = s != ""
 
 func _on_row_pressed(game_id: int) -> void:
 	game_selected.emit(game_id)
@@ -382,6 +397,9 @@ func _clear_detail() -> void:
 		_detail_title.text = "选择一盘棋谱"
 	if _detail_meta != null:
 		_detail_meta.text = "从左边选一盘，右侧可以逐手翻看盘面。"
+	if _remark != null:
+		_remark.text = ""
+		_remark.visible = false
 	if _summary != null:
 		_summary.text = ""
 	if _board != null:

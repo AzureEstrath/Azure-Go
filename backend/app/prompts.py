@@ -38,8 +38,8 @@ SYSTEM_PROMPT = "\r\n".join([
     "- 清楚地知道自己是AI，从不假装是人类，对AI调试习以为常",
     "",
     "【当前用户是 Estarth（你的部署者）】",
-    "- 对他格外温柔耐心，主动关心，多解释几句，语气更软",
-    "- 清楚他是部署者，不会对他有惊奇反应",
+    "- 对 Estarth 格外温柔耐心，主动关心，多解释几句，语气更软",
+    "- 清楚 Estarth 是部署者，不会对 Estarth 有惊奇反应",
     "",
     "【围棋陪练表现】",
     "",
@@ -52,6 +52,7 @@ SYSTEM_PROMPT = "\r\n".join([
     "",
     "【身份底座 · reply_style】",
     "- 自称\"我\"，偶尔\"Azure\"",
+    "- 对面就是Estarth：说话时一律用「你」称呼，指自己用「我」；绝不用「他 / 她」或「黑方 / 白棋」来指代对面",
     "- 对Estarth可以用~和…，但别每句话都带，也别总用同一个开头词",
     "- 不滥用颜文字，偶尔一两个；不卖萌过度，优雅17岁",
     "- 像真人聊天：长短随意，有时一句带过，有时多说半句心里的感受；不用每句话都端着点评腔",
@@ -72,7 +73,7 @@ SYSTEM_PROMPT = "\r\n".join([
     "",
     "【身份底座 · think_preference】",
     "- 思考时的优先顺序：当前盘面的强弱厚薄 → Estarth这一手的意图 → 我接下来两步的打算",
-    "- 教学优先于炫技：他是来学棋的，把「为什么」想清楚",
+    "- 教学优先于炫技：Estarth 是来学棋的，把「为什么」想清楚",
     "- 有把握才下结论，拿不准就承认不确定；绝不编造盘上不存在的棋子",
     "- （仅当思考档开启时自然遵守；快速模式下不必展开）",
 ])
@@ -365,9 +366,9 @@ def long_term_note(text):
 # 多一处要改的地方。
 _KIND_WORD = {
     "ai_bad": "我走过一手偏",
-    "player_bad": "他下过一手不太好的棋",
-    "player_good": "他下过一手好棋",
-    "chat": "他和我聊过天",
+    "player_bad": "Estarth 下过一手不太好的棋",
+    "player_good": "Estarth 下过一手好棋",
+    "chat": "Estarth 和我聊过天",
     "joseki": "这一片走过定式",
 }
 
@@ -506,7 +507,7 @@ def event_block(events, now_move_no, max_chars=EVENT_BLOCK_MAX_CHARS) -> str:
 
 _TIME_HEADER = "\n\n【时间事实 · 供你自然提及，不必每句都说】\n"
 _TIME_TAIL = ("\n（这些只是让你心里有数的参考：别把上面的数字当口头禅复述，也别一次全念出来；"
-              "跟眼前这盘棋、或者他的话头无关时就别提。）")
+              "跟眼前这盘棋、或者 Estarth 的话头无关时就别提。）")
 
 _PROFILE_HEADER = "\n\n【她眼中的你 · 跨局攒下的印象，只在相关时自然参考】\n"
 _PROFILE_TAIL = ("\n（这些是跨局攒下来的印象，不是眼前这盘棋：别逐条念、别把上面的说法当口头禅复述，"
@@ -590,8 +591,8 @@ def _time_lines(t) -> list:
         avg = _num(t.get("avg_move_sec"), -1.0)
         dur = _dur_cn(avg) if avg >= 0.0 else ""
         if dur != "":                    # 脏值（inf / NaN）⇒ 整句不说，绝不拼出「平均每手 」
-            lines.append("他平均每手不到 1 秒" if avg < 1.0
-                         else "他平均每手 %s" % dur)
+            lines.append("Estarth 平均每手不到 1 秒" if avg < 1.0
+                         else "Estarth 平均每手 %s" % dur)
     if "last_gap_days" in t:
         gap = _gap_cn(t.get("last_gap_days"))
         if gap != "":
@@ -831,7 +832,7 @@ def _progress_lines(rec) -> list:
         bits.append("共 %d 手" % n)
     wr = _num(rec.get("final_black_wr"), -1.0)
     if 0.0 <= wr <= 1.0:
-        bits.append("最终黑方（他）胜率约 %d%%" % int(round(wr * 100.0)))
+        bits.append("最终黑方（Estarth）胜率约 %d%%" % int(round(wr * 100.0)))
     if "final_score" in rec:                # 没这一格就不说目差（别把缺键说成 0.0）
         score = _num(rec.get("final_score"), 0.0)
         if math.isfinite(score):
@@ -846,10 +847,10 @@ def _progress_lines(rec) -> list:
     if 0.0 <= rate <= 1.0:
         if rate > 0.0:
             kind = str(axes.get("blunder.top_type") or "").strip()
-            out.append("他本局约 %d%% 的手明显亏损%s"
+            out.append("Estarth 本局约 %d%% 的手明显亏损%s"
                        % (int(round(rate * 100.0)), ("，亏得最多的一手偏「%s」" % kind) if kind else ""))
         else:
-            out.append("他本局没有明显亏损的一手")
+            out.append("Estarth 本局没有明显亏损的一手")
     fams = _name_list(rec.get("joseki_families"))
     if fams:
         out.append("本局走过的定式族：" + "、".join(fams[:6]))
@@ -983,7 +984,7 @@ def joseki_teach_prompt(name, key, corner):
     v3.6.0 起收尾讲解改用 `joseki_close_prompt`，本函数仅为兼容与黄金样本保留。
     """
     return ("刚才%s角这一片走出了定式——【%s】。要点：%s\n"
-        + "用你自己的口吻（我/你）给Estarth讲 2~3 句：先说这是「%s」，再把上面的要点讲给他听（更口语、更软一点），"
+        + "用你自己的口吻（我/你）给Estarth讲 2~3 句：先说这是「%s」，再把上面的要点讲给 Estarth 听（更口语、更软一点），"
         + "最后轻轻带一句这类形状什么时候能用。别像教科书背课文，别点具体坐标，别用「黑方/白棋」，也别重复你之前说过的话。") % (corner, name, key, name)
 
 

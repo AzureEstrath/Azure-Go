@@ -46,6 +46,13 @@ class AzureConfig:
         #    读入口径与 `emotion_drift` / `chat_digest_llm` 同形：只认 JSON 的 true / false。
         self.profile_enabled = False
         self.time_aware_enabled = False
+        # 人格化（关系阶段 / 情绪余温 / 小目标 / 夜間语气）：默认开；关掉＝提示词逐字符不变。
+        # 与 `profile_enabled` 解耦：画像记棋风，人格化记「你们一起下过多少盘、她心里还留着什么」。
+        self.persona_enabled = True
+        # 关系阶段与称呼变化：**默认关**（称呼保持 prompt_user_name，默认 Estarth 不变）。
+        # 开启后才按局数推进称呼；`persona_address_name` 为空 ⇒ 即便开启也仍用原名。
+        self.persona_relationship_enabled = False
+        self.persona_address_name = ""
         # 画像库路径：留空＝<backend>/data/profile.db（由 profile_store.DEFAULT_DB_PATH 决定，
         # 已 gitignore、属运行产物）。与 memory_db_path 同一形状：只存路径、不在这里碰盘。
         self.profile_db_path = ""
@@ -178,6 +185,13 @@ class AzureConfig:
         self.profile_enabled = v if isinstance(v, bool) else self.profile_enabled
         v = d.get("time_aware_enabled")
         self.time_aware_enabled = v if isinstance(v, bool) else self.time_aware_enabled
+        v = d.get("persona_enabled")
+        self.persona_enabled = v if isinstance(v, bool) else self.persona_enabled
+        v = d.get("persona_relationship_enabled")
+        self.persona_relationship_enabled = v if isinstance(v, bool) else self.persona_relationship_enabled
+        v = d.get("persona_address_name")
+        if isinstance(v, str):                  # null / 数字 / 对象都是脏值：保留默认空串
+            self.persona_address_name = v.strip()[:16]
         self.profile_db_path = str(d.get("profile_db_path", self.profile_db_path))
         self.game_db_path = str(d.get("game_db_path", self.game_db_path))
         v = d.get("adaptive_difficulty")        # 只认 JSON true / false（与 profile_enabled 同口径）

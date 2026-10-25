@@ -63,15 +63,18 @@ func _run() -> void:
 			and main_script.review_step_target(99, 0, 9) == 9)
 	_check("③ total 为负（脏值）当 0 处理", main_script.review_step_target(3, 1, -4) == 0)
 
-	# —— ④ 只读与摸头**同源**：`_unhandled_input` 里落子与摸头问的是同一个 `placement_allowed()` ——
+	# —— ④ 复盘只读挡摸头；她思考中只挡落子（与经典版一致） ——
 	var b2 := Board3D.new()
 	b2.set_readonly(true)
-	_check("④ 只读后摸头判据（同一入口 placement_allowed）同样为假", not b2.placement_allowed())
+	_check("④ 只读后摸头判据（pat_allowed）同样为假", not b2.pat_allowed())
 	b2.locked = true
 	_check("④ readonly 与 locked 彼此独立（两个标志各管各的，可同时为真）",
-			b2.readonly and b2.locked and not b2.placement_allowed())
+			b2.readonly and b2.locked and not b2.placement_allowed() and not b2.pat_allowed())
 	b2.set_readonly(false)
-	_check("④ 只解除只读、locked 仍真 ⇒ 依旧为假", not b2.placement_allowed())
+	_check("④ 只解除只读、locked 仍真 ⇒ 落子仍假，但摸头恢复",
+			not b2.placement_allowed() and b2.pat_allowed())
+	b2.locked = false
+	_check("④ 只 locked（她思考中）⇒ 仍可摸头", b2.pat_allowed())
 	b2.free()
 
 	# —— ⑤ 退出复盘的逐项恢复（V21）：UI 冻结状态抽成纯函数（V20：沿用既有 _refresh_lock 的思路） ——
@@ -114,6 +117,11 @@ func _run() -> void:
 	_check("⑤ 主界面关着时回到原状态（默认参数不受影响）",
 			not bool(main_script.review_lock_state(false, false, false)["locked"])
 			and bool(main_script.review_lock_state(false, false, false)["chat_editable"]))
+	# 启动等待期（NetClient 还没装配）：棋盘 / 按钮 / 聊天一起锁，避免点到 `agent` Nil。
+	var no_client := main_script.review_lock_state(false, false, false, false, false, false, false, false, true)
+	_check("⑤ 后端未装配：棋盘锁 / 按钮灰 / 聊天禁用",
+			bool(no_client["locked"]) and bool(no_client["buttons_disabled"])
+			and not bool(no_client["chat_editable"]))
 	# v3.11.5 全盘复盘：棋盘只读、按钮灰、聊天禁用、别的改动入口一起冻（与普通复盘同一判据）
 	var fr := main_script.review_lock_state(false, false, false, false, false, false, true)
 	_check("⑤ 全盘复盘期间：棋盘只读 + 按钮灰 + 聊天禁用 + 别的入口冻",

@@ -1,6 +1,6 @@
 # Azure · 围棋陪练 — 详细技术文档
 
-> 适用版本：`personal`（自用版），基线 v3.12.2；本地工作目录 `AzureGo-Creative`。
+> 适用分支：`personal`（自用版）；本地工作目录 `AzureGo-Creative`。
 > 本文描述当前代码的真实实现，配置默认值以 `game/config.json` 与 `backend/app/config.py` 为准。
 > 最后更新：2026-10-24。
 
@@ -33,18 +33,17 @@ Azure · 围棋陪练是一个 **本地优先的 AI 围棋陪练**：
 - 对话、讲解、定式教学与复盘由 LLM 驱动，支持任意 OpenAI 兼容服务（云端 DeepSeek 或本机 llama.cpp）；
 - 语音支持系统语音、本地 CosyVoice/MeloTTS、云端 OpenAI 兼容 TTS、阿里云 Voice Studio 四档；
 - 客户端为 Godot 3D 界面：程序化 19×19 棋盘、VRM 化身、情绪表情、领地热力图、定式卡片、棋谱库、全盘复盘与战报；
-- 前端只做渲染、输入与音频播放，**对局编排与所有模型调用都在后端进程**。
+- 前端只做渲染、输入与音频播放，**对局编排与所有模型调用都在后端进程**；本地服务链由 `dev_local.ps1` 代办，客户端启动时可自动触发。只要游戏会接管本地语音，客户端会在主界面 / 设置面板期间先用 `dev_local.ps1 -TtsOnly -QualityTts` 预热 CosyVoice（不写配置、不起其他服务），进对局时不再阻塞等待；加载期客户端压掉系统语音降级（只显示文字），就绪后自动换回 Azure 克隆音色。本地音色在左侧栏下拉里直接选（运行期只推 `/api/config` 改后端内存，不重启、不丢棋局）。
 
-### 1.1 版本线
+### 1.1 当前分支布局
 
-| 版本线 | 分支 | 本地目录 | 说明 |
-| --- | --- | --- | --- |
-| 参赛提交快照 | `main` | — | v3.12.2 参赛提交，保持冻结 |
-| 自用版（默认开发线） | `personal` | `AzureGo-Creative` | 保留参赛版全部功能，默认接本地 LLM/TTS，四套主题 |
-| 经典版 | `classic` | `AzureGo-classic` | v2.0.1 历史完整存档 |
-| 标签 | `参赛版` / `v3.12.2` / `经典版` / `自用版` | — | 分别指向对应提交 |
+| 分支 | 本地目录 | 用途 |
+| --- | --- | --- |
+| `main` | — | 对外发布快照，保持冻结，不接收日常提交 |
+| `personal` | `AzureGo-Creative` | 当前开发线，本文档描述的对象 |
+| `classic` | `AzureGo-classic` | 历史存档，只读为主 |
 
-日常开发只在 `personal`；`main` 不再单独维护 `competition` 分支。
+日常开发只在 `personal`。
 
 ### 1.2 代码规模
 
@@ -52,7 +51,7 @@ Azure · 围棋陪练是一个 **本地优先的 AI 围棋陪练**：
 | --- | --- |
 | 后端 `backend/app` | 约 11,565 行 Python |
 | 前端 `game/scripts` | 约 9,554 行 GDScript |
-| 后端测试 | 861 个用例（40 个测试文件） |
+| 后端测试 | 897 个用例（40 个测试文件） |
 | KataGo 服务测试 | 36 个用例 |
 | 前端 headless 测试 | 18 个脚本 |
 
@@ -64,7 +63,7 @@ Azure · 围棋陪练是一个 **本地优先的 AI 围棋陪练**：
 ┌──────────────────────────────┐
 │ Godot 客户端（game/）         │
 │ 3D 棋盘 / UI / VRM / 音频播放 │
-│ 只连后端，不启动任何模型       │
+│ 只连后端；可代办拉起服务       │
 └──────────────┬───────────────┘
                │ REST 命令 + WebSocket 事件
                │ http://127.0.0.1:8000
@@ -136,7 +135,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 .
 ├─ Azure.vrm                    人物模型（约 14MB，随仓库提供）
 ├─ TECHNICAL.md                 本文档
-├─ README.md                    使用说明、配置字段、版本历史
+├─ README.md                    使用说明、配置字段与接口契约
 ├─ AGENTS.md                    开发约定与测试清单
 ├─ game/                        Godot 工程
 │  ├─ scenes/Main.tscn          主场景（仅一个 Node3D 根节点）
@@ -148,13 +147,13 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 │  │  ├─ core/                  AzureConfig / Coords / GameReplay
 │  │  └─ net/                   NetClient / ChatQueue
 │  ├─ assets/                   voice（27 个 wav）、sfx（棋子/提子/终局/虚着）
-│  ├─ data/thinking_lines.json  思考中台词
+│  ├─ data/thinking_lines.json  思考短句解析工具的数据（当前运行路径不轮播）
 │  ├─ tests/                    18 个 headless 测试脚本
 │  ├─ config.json               客户端配置模板（前后端共读）
 │  └─ export_presets.cfg        Windows Desktop 导出预设
 ├─ backend/
 │  ├─ app/                      FastAPI 应用与全部编排逻辑
-│  ├─ tests/                    861 个用例
+│  ├─ tests/                    897 个用例
 │  ├─ data/                     运行产物（gitignore）：memory/profile/games/joseki_progress.db
 │  ├─ logs/                     dev_local 日志与 PID 文件（gitignore）
 │  ├─ requirements.txt
@@ -162,7 +161,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 ├─ katago_service/              KataGo 云服务（server.py / proc.py / tests）
 ├─ server/                      自建语音服务（azure_tts_server.py、OpenVoice、sherpa）
 ├─ tools/                       start_llm_server.py、joseki_extract.py
-├─ peek/                        VLM 窥屏脚本（保留，未接线）
+├─ peek/                        VLM 窥屏脚本（azure_peek.py 截图/OCR/VLM、start_vlm_server.py 拉起服务）
 ├─ docs/                       设计文档与实施计划
 ├─ dev_local.ps1                本机一键开发启动/停止
 └─ run_test_env.bat             全栈启动与全量测试入口
@@ -184,10 +183,13 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 6. `_build_board()`：3D 棋盘与交互信号；
 7. `_build_ui()`：左右栏、设置、定式卡片、点目面板等；
 8. 读取思考台词，构建纸幕封面 `TitleScreen`；
-9. 首次启动等待「开始对局」；可选显示启动设置面板；
-10. `_begin_new_game_on_entry()` 先立「等 reset」闸，避免上一局迟到的 `hello/state` 闪出；
-11. `_build_services()` 装配 `NetClient`，`_start_launch_game()` 保证空局；
-12. `_greet()` 播放入场欢迎语。
+9. 首次启动等待「开始对局」；
+10. 可选显示启动设置面板；
+11. 若 `auto_start_services=true` 且后端在本机，检查 CosyVoice：未就绪时弹窗询问是否等待；
+    等待用 `-QualityTts` 拉起并轮询 `/health`，不等用 `-QualityTts -NoWaitTts` 让它在后台加载；
+12. `_begin_new_game_on_entry()` 先立「等 reset」闸，避免上一局迟到的 `hello/state` 闪出；
+13. `_build_services()` 装配 `NetClient`，`_start_launch_game()` 保证空局；
+14. `_greet()` 播放入场欢迎语。
 
 所有控件都是运行时 `new()` 出来并挂在 `CanvasLayer` 下，没有大量 `.tscn` 资源，因此改 UI 主要改 `Main.gd` 与 `GufengTheme.gd`。
 
@@ -210,12 +212,12 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 
 - 19×19 交叉点、星位、坐标标签，全部程序化生成；
 - `_world()` 把棋盘坐标映射到 3D 空间；相机根据侧栏展开状态偏移视点；
-- 左键落子，右键拖拽旋转，滚轮缩放，Home / C 回正；
+- 左键落子，右键拖拽旋转，滚轮缩放，Home 回正，C 键平滑转到下一个角（0.35s smoothstep；飞行期间视角输入让路）；
 - 棋盘点击信号 `intersection_clicked`、摸头信号 `head_patted`、视角变化 `view_changed`；
 - `ownership` 事件用 19×19 半透明贴图绘制领地热力图，可开关；
 - `joseki` 事件绘制定式轨迹与高亮；
 - 悬停显示坐标与手数；落子、提子、终局、虚着触发 `SfxPlayer` 音效；
-- 自用版删除了山水背景板、圆形木地板与护栏，只保留主题底色与风场。
+- 当前客户端删除了山水背景板、圆形木地板与护栏，只保留主题底色与风场。
 
 ### 5.4 化身与环境
 
@@ -253,7 +255,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 
 | 组 | 字段 |
 | --- | --- |
-| 后端 | `backend_url` |
+| 后端 | `backend_url`、`auto_start_services` |
 | LLM | `llm_base_url`、`llm_model`、`llm_api_key`、`llm_think_mode`、`extra_body` |
 | 棋力 | `max_visits`、`katago_url`、`katago_token`、`katago_timeout_ms` |
 | 教学 | `joseki_teach`、`joseki_rate`、`adaptive_difficulty` 系列 |
@@ -294,12 +296,12 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 
 - `ai_notice` 明确声明「这条没有语音」，不登记配对，避免挤掉后续真语音；
 - 语音缺失/超时不会锁死棋盘，配对状态机有超时兜底；
-- 预制开场欢迎语与语气词在 `game/assets/voice`，即播零等待；
+- 预制开场欢迎语；情绪语气词只在「Azure 思考中…」占位出现的**思考节点**插入，候选音优先匹配上一句的 `[[tone]]` / `{行为}`，频率由当前情绪强度决定（语义匹配约 8%~50%，纯情绪约 2%~22%，另有 2 节点 + 6 秒连播闸）；思考、逐句 tone、落子打断都不插；摸头保留一声 `pat` 反应；
 - `tts_sync_speak` 控制文字是否等语音；`tts_batch_speak` 控制多条消息是否合并朗读。
 
 ### 5.9 前端测试
 
-`game/tests/` 下 18 个 headless 脚本，覆盖：配置读写、标题屏、新局、视角与悬停、定式卡片与档位、聊天队列、语音配对、TTS、口语化目差、复盘、战报、棋谱回放、点目、形象路径、音效、思考台词。运行方式见第 10 节。
+`game/tests/` 下 18 个 headless 脚本，覆盖：配置读写、标题屏、新局、视角与悬停、定式卡片与档位、聊天队列、语音配对、TTS、口语化目差、复盘、战报、棋谱回放、点目、形象路径、音效、思考短句解析工具。运行方式见第 10 节。
 
 ---
 
@@ -334,13 +336,16 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | POST | `/api/config` | 运行时改设置（朗读详略、思考档位、定式、情绪、画像、自适应等） |
 | POST | `/api/reveal` | 语音开始时揭示 AI 已下的一手 |
 | POST | `/api/interaction` | 玩家互动（摸头等） |
-| POST | `/api/idle` | 空闲搭话 |
+| POST | `/api/idle` | 空闲搭话（普通走神） |
+| POST | `/api/peer` | 窥屏搭话（前台窗口 + OCR + VLM 画面描述） |
 | POST | `/api/mood/tick` | 情绪自然衰减/波动 |
 | POST | `/api/review` | 进入/退出局后复盘 |
+| POST | `/api/review/intro` | 复盘开场白（纯本地，只显示不发声） |
 | POST | `/api/review/goto` | 复盘只读重放到第 N 手 |
 | GET | `/api/review/notes` | 逐手注记 + 真亏手账 |
 | POST | `/api/review/full/segment` | 全盘 AI 复盘（按段） |
 | GET | `/api/games` | 棋谱库列表 |
+| GET | `/api/games/{id}/remark` | 某局的「她的回忆」（纯本地短文案） |
 | GET | `/api/games/{id}` | 单局详情 |
 | GET | `/api/games/{id}/sgf` | 导出 SGF |
 | POST | `/api/games/import` | 导入 SGF |
@@ -413,6 +418,7 @@ START → prepare → decide ──(需要工具且未超预算)──→ tools 
 | 复盘 | `full_review.py`、`pv_lines.py`、`estimate.py` | 分段全盘复盘、预测线、点目 |
 | 记忆 | `memory.py`、`memory_service.py` | 长期记忆，可选 embedding，默认关 |
 | 画像 | `profile.py`、`profile_store.py` | 棋风画像、时间感知，默认关 |
+| 人格化 | `persona.py`、`profile_store.py`（persona 表） | 关系阶段（默认关，可开关并自选称呼名）、情绪余温、今天的小心思、旧局回忆、夜間节奏；`persona_enabled=false` 时零变化 |
 | 自适应 | `adaptive.py` | 1~5 档，局内 ±spread |
 | 棋谱 | `game_store.py`、`sgf.py` | SQLite 棋谱库、SGF 导入导出 |
 | 语音 | `tts.py`、`tts_aliyun.py`、`speech_text.py` | 四档 TTS、文本清洗与分块、缓存 |
@@ -466,9 +472,13 @@ KataGo 服务（`katago_service/server.py`）：
 
 本地语音服务（`server/azure_tts_server.py`）兼容 CosyVoice 3/2、MeloTTS、sherpa，提供 `/inference_sft`、`/v1/audio/speech`、`/health`、`/voices`、`/v1/models`；`voices.json` 与 `sherpa_voices.json` 定义音色。
 
+本地服务按 `tts_local_voice` 选择引擎：`melo` / `xiaoya` / `shaonv` / `nvsheng` 等走 sherpa 轻量 VITS；`azure`（及 SFT 预设音色）才走 CosyVoice。**即使 CosyVoice 已加载，`tts_local_voice=xiaoya` 仍会合成轻量声线**；要质量音色必须把 voice 设为 `azure`，并让后端在配置写入后重启。
+
+CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no audio produced`）。本地服务内部按 `cross-lingual → SFT 预设 → sherpa 轻量` 三级兜底，保证本地始终有声音；只有服务不可达或三级都失败时，后端才按 fail-closed 整条降级为系统语音。
+
 ### 6.9 后端测试
 
-`backend/tests` 共 861 个用例，覆盖：
+`backend/tests` 共 897 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -513,10 +523,10 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
 | 文件 | 位置 | 内容 | 写入时机 |
 | --- | --- | --- | --- |
 | `memory.db` | `backend/data/` | 长期记忆与可选向量 | 记忆写入/局末 |
-| `profile.db` | `backend/data/` | 玩家棋风画像、每局记录 | `summarize()` 且开关打开 |
+| `profile.db` | `backend/data/` | 玩家棋风画像、每局记录、人格化状态（关系 / 情绪余温 / 互动数） | `summarize()`；画像总开关关着时不写画像，人格化仍按 `persona_enabled` 写 persona 表 |
 | `games.db` | `backend/data/` | 棋谱库、逐手、总结、注记 | 局末归档 / 导入 |
 | `joseki_progress.db` | `backend/data/` | 定式族出现计数 | 定式命中时 |
-| `thinking_lines.json` | `game/data/` | 思考中台词 | 只读 |
+| `thinking_lines.json` | `game/data/` | 思考短句解析工具的数据（当前运行路径不轮播） | 只读 |
 | `assets/voice` | `game/assets/` | 27 条预制语音 | 只读 |
 | `backend/logs` | `backend/logs/` | 服务日志、PID 文件、TTS 探针 | 运行时 |
 | 事件日志 | 内存 | 每局逐手事件、注记 | 对局中，随复盘读取 |
@@ -539,10 +549,12 @@ powershell ... -File dev_local.ps1 -Stop                                   # 停
 启动顺序：
 
 1. 本机 LLM（8080，`tools/start_llm_server.py`）；
-2. 本地 TTS（9880，若找到 `.venv` 与 `azure_tts_server.py`）：`.tts_server.lock` 防重复、轮询 `/health`、就绪后才把 `game/config.json` 的 `tts_mode` 写为 `local`，并重启后端使配置生效；
+2. 本地 TTS（9880，若找到 `.venv` 与 `azure_tts_server.py`）：`.tts_server.lock` 防重复、轮询 `/health`、就绪后才把 `game/config.json` 的 `tts_mode` 写为 `local`，并重启后端使配置生效；`-QualityTts` 用 CosyVoice（`--cosyvoice 1`），`-NoWaitTts` 时先继续起后端、让 CosyVoice 在后台加载；
 3. KataGo 云服务（8100），轮询 `/health` 到 `ready`；
 4. 后端（8000），轮询 `/api/health`；
 5. Godot 客户端。
+
+客户端从 Godot 编辑器或 `dev_local.ps1` 启动时：若 `auto_start_services=true`、`backend_url` 与 `tts_local_base_url` 都是本机、且源码目录存在 `dev_local.ps1`，会先读一次 TTS `/health`：CosyVoice 已就绪则直接沿用；未就绪则弹窗询问是否等待。选择等待时用 `dev_local.ps1 -QualityTts -NoGame` 拉起并轮询 `/health`（最长 300 秒）；选择不等时用 `-QualityTts -NoWaitTts` 让 CosyVoice 后台加载，先用轻量 / 系统语音，起好后后端下一次合成自动接上。由 `dev_local.ps1` 拉起游戏时设置了 `AZURE_SERVICES_MANAGED=1`，客户端不重复拉起基础服务；但若当前仍是轻量引擎，仍会询问是否切换。无头测试、截图模式和导出包均跳过。
 
 停止时按 PID 文件与端口清理进程。
 
@@ -582,7 +594,7 @@ Godot --path game                  → 客户端
 
 ```powershell
 cd backend
-python -m unittest discover -s tests        # 861 个用例
+python -m unittest discover -s tests        # 897 个用例
 ```
 
 ### 10.2 KataGo 服务
@@ -606,14 +618,14 @@ godot --path game --headless --script res://tests/test_config.gd
 
 ## 11. 关键设计取舍
 
-1. **后端是唯一编排权威**：前端不启动模型、不做对局逻辑，只渲染和播放。这样换前端、做 Web 版或多端时不复制编排。
+1. **后端是唯一编排权威**：前端不内嵌模型、不做对局逻辑，只渲染和播放；本地模型链由 `dev_local.ps1` 代办，客户端只负责触发启动器。这样换前端、做 Web 版或多端时不复制编排。
 2. **REST 命令 + WS 事件单向推送**：命令有明确返回值与错误处理，事件只负责广播；避免双向 WS 的请求/响应配对复杂度。
 3. **音画同步在客户端完成**：AI 已算好落点，但等「落子宣告」语音开始才 `reveal`，保证「先说话、后落子」。
 4. **TTS fail-closed 到系统语音**：合成失败绝不给半截音频、绝不抛异常，防止 `busy` 卡死。
 5. **乐观落子 + 权威回滚**：客户端立即显示玩家落子，后端拒绝时用 `move_rejected` 快照撤回幽灵子。
 6. **SQLite fail-open**：记忆、画像、棋谱、定式计数任一库损坏都不影响对局。
 7. **默认关闭重型功能**：记忆、画像、工具、流式、情绪偏航、自适应默认关，关闭时行为与旧版逐项一致，避免无意增加延迟与费用。
-8. **本地优先、云端可选**：自用版默认本地 LLM/TTS；所有云端地址都可替换为任意 OpenAI 兼容服务。
+8. **本地优先、云端可选**：默认本地 LLM/TTS；所有云端地址都可替换为任意 OpenAI 兼容服务。
 9. **程序化 UI**：只保留一个空场景，UI 全部代码生成，主题与布局集中，便于统一改版；代价是 `Main.gd` 很大。
 10. **安全边界**：KataGo 服务默认只监听回环；跨机部署必须配 token 并放在内网/TLS 反代后。
 
@@ -629,10 +641,12 @@ godot --path game --headless --script res://tests/test_config.gd
 - 阿里云 TTS 需要 Voice Studio 签发的 Key（`sk-…`），百炼原生 Key 会 401。
 - 流式输出默认关闭；开启后仍以最终 `message` 为准。
 - 长期记忆的 embedding 三件套任一为空时退化为关键词检索。
-- `peek/` 的 VLM 窥屏脚本保留但未接入主流程。
+- `peek/` 的窥屏脚本由客户端在「长时间无操作且游戏窗口不在前台」时拉起：截图 + RapidOCR + 本机 VLM 后 POST `/api/peer`；缺 Python/模型/服务时自动退回普通走神搭话。
 - 仓库没有 CI；测试需本地手动运行。
 - `Main.gd`、`agent.py`、`agent_graph.py`、`prompts.py` 体积较大，修改时优先定位函数与阶段，避免全文件重排。
-- `main` 是参赛提交快照，不接收日常提交；所有开发走 `personal`。
+- 自动拉起本地服务只在源码目录、`backend_url` 与 `tts_local_base_url` 均为本机、`auto_start_services=true` 时生效；导出包没有 `dev_local.ps1` 时静默跳过。
+- CosyVoice 询问只在上述条件且 CosyVoice 未就绪时出现；已就绪则不再询问。等待超时为 300 秒。
+- 无头测试与截图模式不会拉起服务或弹窗。
 
 ---
 
@@ -666,8 +680,8 @@ godot --path game --headless --script res://tests/test_config.gd
 ### 13.4 分支与提交
 
 - 日常开发：`personal`（`AzureGo-Creative`）；
-- 经典存档：`classic`（`AzureGo-classic`），只读为主；
-- 参赛提交：`main` 冻结；如需新参赛版，从 `personal` 取提交另打标签，不直接改 `main`；
+- 历史存档：`classic`（`AzureGo-classic`），只读为主；
+- 对外发布：`main` 保持冻结，不直接提交；
 - 提交信息建议：`feat(personal): …`、`fix(personal): …`、`docs(personal): …`。
 
 ---

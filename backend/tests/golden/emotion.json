@@ -1987,7 +1987,7 @@
       "filler": "happy",
       "idx": 18,
       "morphs": {
-        "Fcl_ALL_Joy": 0.35,
+        "Fcl_ALL_Fun": 0.3,
         "Fcl_ALL_Neutral": 0.15
       },
       "name": "惬意",
@@ -1998,7 +1998,8 @@
       "filler": "cheer",
       "idx": 19,
       "morphs": {
-        "Fcl_ALL_Joy": 0.5
+        "Fcl_ALL_Fun": 0.3,
+        "Fcl_ALL_Joy": 0.12
       },
       "name": "愉悦",
       "pitch": 0.04
@@ -2008,8 +2009,9 @@
       "filler": "cheer",
       "idx": 20,
       "morphs": {
-        "Fcl_ALL_Joy": 0.5,
-        "Fcl_ALL_Surprised": 0.3
+        "Fcl_ALL_Fun": 0.28,
+        "Fcl_ALL_Joy": 0.15,
+        "Fcl_ALL_Surprised": 0.24
       },
       "name": "兴奋",
       "pitch": 0.06
@@ -2019,7 +2021,8 @@
       "filler": "happy",
       "idx": 21,
       "morphs": {
-        "Fcl_ALL_Joy": 0.6
+        "Fcl_ALL_Fun": 0.32,
+        "Fcl_ALL_Joy": 0.16
       },
       "name": "开心",
       "pitch": 0.05
@@ -2029,8 +2032,8 @@
       "filler": "happy",
       "idx": 22,
       "morphs": {
-        "Fcl_ALL_Fun": 0.25,
-        "Fcl_ALL_Joy": 0.6
+        "Fcl_ALL_Fun": 0.36,
+        "Fcl_ALL_Joy": 0.16
       },
       "name": "欢喜",
       "pitch": 0.05
@@ -2040,9 +2043,9 @@
       "filler": "cheer",
       "idx": 23,
       "morphs": {
-        "Fcl_ALL_Fun": 0.4,
-        "Fcl_ALL_Joy": 0.6,
-        "Fcl_ALL_Surprised": 0.2
+        "Fcl_ALL_Fun": 0.38,
+        "Fcl_ALL_Joy": 0.18,
+        "Fcl_ALL_Surprised": 0.16
       },
       "name": "欢腾",
       "pitch": 0.07
@@ -2052,7 +2055,8 @@
       "filler": "happy",
       "idx": 24,
       "morphs": {
-        "Fcl_ALL_Joy": 0.35,
+        "Fcl_ALL_Fun": 0.28,
+        "Fcl_ALL_Joy": 0.14,
         "Fcl_ALL_Surprised": 0.2
       },
       "name": "期待",
@@ -2063,8 +2067,8 @@
       "filler": "proud",
       "idx": 25,
       "morphs": {
-        "Fcl_ALL_Fun": 0.2,
-        "Fcl_ALL_Joy": 0.4,
+        "Fcl_ALL_Fun": 0.3,
+        "Fcl_ALL_Joy": 0.16,
         "Fcl_ALL_Surprised": 0.3
       },
       "name": "跃跃欲试",
@@ -2075,9 +2079,9 @@
       "filler": "surprise",
       "idx": 26,
       "morphs": {
-        "Fcl_ALL_Fun": 0.25,
-        "Fcl_ALL_Joy": 0.6,
-        "Fcl_ALL_Surprised": 0.6
+        "Fcl_ALL_Fun": 0.28,
+        "Fcl_ALL_Joy": 0.22,
+        "Fcl_ALL_Surprised": 0.5
       },
       "name": "惊喜",
       "pitch": 0.08
@@ -2189,7 +2193,7 @@
         2,
         0
       ],
-      "hint": "此刻心境平缓：思考放慢半拍，多确认一步再开口；多揣摩他的意图和后续变化。"
+      "hint": "此刻心境平缓：思考放慢半拍，多确认一步再开口；多揣摩对面的意图和后续变化。"
     },
     {
       "bands": [
@@ -2213,7 +2217,7 @@
         2,
         1
       ],
-      "hint": "按平时节奏思考即可；多揣摩他的意图和后续变化。"
+      "hint": "按平时节奏思考即可；多揣摩对面的意图和后续变化。"
     },
     {
       "bands": [
@@ -2237,7 +2241,7 @@
         2,
         2
       ],
-      "hint": "此刻精神很活跃：可以顺着棋感放开算，允许一点跳跃和冒险的念头；多揣摩他的意图和后续变化。"
+      "hint": "此刻精神很活跃：可以顺着棋感放开算，允许一点跳跃和冒险的念头；多揣摩对面的意图和后续变化。"
     }
   ]
 }

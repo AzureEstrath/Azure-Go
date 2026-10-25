@@ -16,18 +16,55 @@ import sys
 import urllib.request
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent          # 开发机 = D:\KataGo\peek
+HERE = Path(__file__).resolve().parent          # 开发机 = repo/peek
+
+
+def _hide_console() -> None:
+    """由游戏用 python.exe 拉起时，Windows 会给控制台程序分配一个可见窗口；
+    第一行就把它藏掉（用 pythonw 时本来就没有窗口，这里是兜底）。
+    """
+    if os.name != "nt":
+        return
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)      # SW_HIDE
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+def _log(*args) -> None:
+    """pythonw 下 sys.stdout 是 None，print 会抛；日志可有可无，绝不能因此崩。"""
+    try:
+        print(*args)
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+def _find_root(start: Path) -> Path:
+    """从本脚本所在目录向上找含 models/ 的根（仓库内 models 通常在外层 D:\\KataGo，而非 AzureGo-Creative）。"""
+    for p in [start, *start.parents]:
+        if (p / "models").is_dir():
+            return p
+    return start.parent
+
+
+ROOT = _find_root(HERE)
 LOCK = HERE / ".vlm_server.lock"
 LOGF = HERE / ".vlm_server.log"
 
 EXE_CANDIDATES = [
+    ROOT / "llamacpp-rocm" / "llama-server.exe",
     HERE.parent / "llamacpp-rocm" / "llama-server.exe",
+    Path(r"E:\AI.2\llama ROCm\llama-server.exe"),
     HERE / "llama-server.exe",
 ]
 MODEL_CANDIDATES = [
+    ROOT / "models" / "Qwen2.5-VL-3B-Instruct-IQ4_NL.gguf",
     HERE.parent / "models" / "Qwen2.5-VL-3B-Instruct-IQ4_NL.gguf",
 ]
 MMPROJ_CANDIDATES = [
+    ROOT / "models" / "mmproj-BF16.gguf",
     HERE.parent / "models" / "mmproj-BF16.gguf",
     Path(r"E:\AI_Omni\models\mmproj-BF16.gguf"),
 ]
@@ -60,6 +97,7 @@ def _first(paths):
 
 
 def main() -> int:
+    _hide_console()
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", default="")
     ap.add_argument("--model", default="")
@@ -73,12 +111,12 @@ def main() -> int:
         try:
             pid = int(LOCK.read_text(encoding="utf-8").strip())
             if pid > 0 and _alive(pid):
-                print("[vlm] 服务已在运行（pid=%d），跳过" % pid)
+                _log("[vlm] 服务已在运行（pid=%d），跳过" % pid)
                 return 0
         except Exception:                            # noqa: BLE001
             pass
     if _health_ok(a.port):
-        print("[vlm] 端口 %d 已有 VLM 服务响应，跳过拉起" % a.port)
+        _log("[vlm] 端口 %d 已有 VLM 服务响应，跳过拉起" % a.port)
         return 0
 
     exe = a.exe or _first(EXE_CANDIDATES)
@@ -86,7 +124,7 @@ def main() -> int:
     mmproj = a.mmproj or _first(MMPROJ_CANDIDATES)
     missing = [n for n, v in (("llama-server", exe), ("模型", model), ("mmproj", mmproj)) if not v]
     if missing:
-        print("[vlm] 缺少 %s，无法拉起服务" % "/".join(missing))
+        _log("[vlm] 缺少 %s，无法拉起服务" % "/".join(missing))
         return 2
 
     args = [str(exe), "-m", str(model), "--mmproj", str(mmproj),
@@ -104,7 +142,7 @@ def main() -> int:
     p = subprocess.Popen(args, cwd=str(Path(exe).parent), stdout=logf, stderr=logf,
                          creationflags=flags, startupinfo=si, close_fds=True)
     LOCK.write_text(str(p.pid), encoding="utf-8")
-    print("[vlm] 已启动 llama-server（pid=%d，端口 %d），日志：%s" % (p.pid, a.port, LOGF))
+    _log("[vlm] 已启动 llama-server（pid=%d，端口 %d），日志：%s" % (p.pid, a.port, LOGF))
     return 0
 
 

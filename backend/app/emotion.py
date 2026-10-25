@@ -51,17 +51,20 @@ REGIONS = [
     {"name": "兴致", "morphs": {"Fcl_ALL_Surprised": 0.35, "Fcl_ALL_Fun": 0.30}, "filler": "cheer", "pitch": 0.05, "burst": "pleased"},
     {"name": "激动", "morphs": {"Fcl_ALL_Surprised": 0.50, "Fcl_ALL_Fun": 0.30}, "filler": "surprise", "pitch": 0.07, "burst": "delight"},
     # —— 积极 · 淡漠 ——
-    {"name": "惬意", "morphs": {"Fcl_ALL_Joy": 0.35, "Fcl_ALL_Neutral": 0.15}, "filler": "happy", "pitch": 0.02, "burst": ""},
-    {"name": "愉悦", "morphs": {"Fcl_ALL_Joy": 0.50}, "filler": "cheer", "pitch": 0.04, "burst": "pleased"},
-    {"name": "兴奋", "morphs": {"Fcl_ALL_Joy": 0.50, "Fcl_ALL_Surprised": 0.30}, "filler": "cheer", "pitch": 0.06, "burst": "delight"},
+    {"name": "惬意", "morphs": {"Fcl_ALL_Fun": 0.30, "Fcl_ALL_Neutral": 0.15}, "filler": "happy", "pitch": 0.02, "burst": ""},
+    {"name": "愉悦", "morphs": {"Fcl_ALL_Fun": 0.30, "Fcl_ALL_Joy": 0.12}, "filler": "cheer", "pitch": 0.04, "burst": "pleased"},
+    {"name": "兴奋", "morphs": {"Fcl_ALL_Fun": 0.28, "Fcl_ALL_Joy": 0.15, "Fcl_ALL_Surprised": 0.24}, "filler": "cheer", "pitch": 0.06, "burst": "delight"},
     # —— 积极 · 平常 ——
-    {"name": "开心", "morphs": {"Fcl_ALL_Joy": 0.60}, "filler": "happy", "pitch": 0.05, "burst": "pleased"},
-    {"name": "欢喜", "morphs": {"Fcl_ALL_Joy": 0.60, "Fcl_ALL_Fun": 0.25}, "filler": "happy", "pitch": 0.05, "burst": "delight"},
-    {"name": "欢腾", "morphs": {"Fcl_ALL_Joy": 0.60, "Fcl_ALL_Fun": 0.40, "Fcl_ALL_Surprised": 0.20}, "filler": "cheer", "pitch": 0.07, "burst": "delight"},
+    # 持续层以 Fcl_ALL_Fun（睁眼微笑）为主、Fcl_ALL_Joy（闭眼大笑形）只留一点：
+    # 之前 Joy 0.5~0.6 会让情绪层长期挂着「闭眼大笑」，一句说完也停不下来；
+    # 真正的大笑交给 burst / 一次性表情（几秒后回落）。
+    {"name": "开心", "morphs": {"Fcl_ALL_Fun": 0.32, "Fcl_ALL_Joy": 0.16}, "filler": "happy", "pitch": 0.05, "burst": "pleased"},
+    {"name": "欢喜", "morphs": {"Fcl_ALL_Fun": 0.36, "Fcl_ALL_Joy": 0.16}, "filler": "happy", "pitch": 0.05, "burst": "delight"},
+    {"name": "欢腾", "morphs": {"Fcl_ALL_Fun": 0.38, "Fcl_ALL_Joy": 0.18, "Fcl_ALL_Surprised": 0.16}, "filler": "cheer", "pitch": 0.07, "burst": "delight"},
     # —— 积极 · 好奇 ——
-    {"name": "期待", "morphs": {"Fcl_ALL_Joy": 0.35, "Fcl_ALL_Surprised": 0.20}, "filler": "happy", "pitch": 0.04, "burst": "pleased"},
-    {"name": "跃跃欲试", "morphs": {"Fcl_ALL_Joy": 0.40, "Fcl_ALL_Surprised": 0.30, "Fcl_ALL_Fun": 0.20}, "filler": "proud", "pitch": 0.05, "burst": "delight"},
-    {"name": "惊喜", "morphs": {"Fcl_ALL_Joy": 0.60, "Fcl_ALL_Surprised": 0.60, "Fcl_ALL_Fun": 0.25}, "filler": "surprise", "pitch": 0.08, "burst": "delight"},
+    {"name": "期待", "morphs": {"Fcl_ALL_Fun": 0.28, "Fcl_ALL_Joy": 0.14, "Fcl_ALL_Surprised": 0.20}, "filler": "happy", "pitch": 0.04, "burst": "pleased"},
+    {"name": "跃跃欲试", "morphs": {"Fcl_ALL_Fun": 0.30, "Fcl_ALL_Joy": 0.16, "Fcl_ALL_Surprised": 0.30}, "filler": "proud", "pitch": 0.05, "burst": "delight"},
+    {"name": "惊喜", "morphs": {"Fcl_ALL_Fun": 0.28, "Fcl_ALL_Joy": 0.22, "Fcl_ALL_Surprised": 0.50}, "filler": "surprise", "pitch": 0.08, "burst": "delight"},
 ]
 
 # 本地事件 → 三维增量（事件点即时结算；数值刻意偏小，避免情绪跳变）
@@ -77,27 +80,29 @@ EVENT_DELTAS = {
     "chat_normal": (0.02, 0.03, 0.02),      # 普通闲聊
     "patted": (0.12, -0.02, 0.10),          # 摸头
     "idle_bored": (-0.03, 0.06, -0.04),     # 玩家长时间无动静
+    "peek": (-0.01, 0.10, 0.05),            # 悄悄看到玩家切去了别的窗口：好奇、轻微被晾着
     "undo": (-0.03, 0.04, 0.02),            # 悔棋
     "summary_win": (0.08, 0.0, 0.03),       # 对局结束：自己赢了
-    "summary_lose": (-0.06, 0.03, -0.02),   # 对局结束：他赢了
+    "summary_lose": (-0.06, 0.03, -0.02),   # 对局结束：玩家赢了
 }
 
-# 事件的中文短描述（喂给 LLM「情绪变化」提示词）
+# 事件的中文短描述（喂给 LLM「情绪变化」提示词；玩家一律称「对面」——「他」会被台词照抄成第三人称）
 EVENT_DESCS = {
-    "player_good": "他下出了一手好棋",
-    "player_ok": "他下了一手不错的棋",
-    "player_off": "他下了一手不太常见的棋",
-    "player_bad": "他下出了俗手，局面变差了",
-    "chat_praise": "他夸了你",
-    "chat_laugh": "他和你开玩笑，气氛轻松",
-    "chat_sad": "他说了些难过的事",
-    "chat_question": "他问了你一个问题",
-    "chat_normal": "他和你聊了几句",
-    "patted": "他摸了摸你的头",
-    "idle_bored": "他很久没有动静了",
-    "undo": "他悔棋重下了",
+    "player_good": "对面下出了一手好棋",
+    "player_ok": "对面下了一手不错的棋",
+    "player_off": "对面下了一手不太常见的棋",
+    "player_bad": "对面下出了俗手，局面变差了",
+    "chat_praise": "对面夸了你",
+    "chat_laugh": "对面和你开玩笑，气氛轻松",
+    "chat_sad": "对面说了些难过的事",
+    "chat_question": "对面问了你一个问题",
+    "chat_normal": "对面和你聊了几句",
+    "patted": "对面摸了摸你的头",
+    "idle_bored": "对面很久没有动静了",
+    "peek": "你悄悄看了一眼屏幕，对面正在忙别的事",
+    "undo": "对面悔棋重下了",
     "summary_win": "对局结束，你赢了",
-    "summary_lose": "对局结束，他赢了",
+    "summary_lose": "对局结束，对面赢了",
 }
 
 # LLM「情绪变化」输出的解析正则（含全角冒号/逗号）
@@ -166,7 +171,7 @@ class EmotionModel:
         else:
             parts.append("按平时节奏思考即可")
         if self._bands[1] >= 2:
-            parts.append("多揣摩他的意图和后续变化")
+            parts.append("多揣摩对面的意图和后续变化")
         elif self._bands[1] == 0:
             parts.append("不用发散，盯住盘面本身")
         return "；".join(parts) + "。"
@@ -191,6 +196,29 @@ class EmotionModel:
         self.v = self.baseline[0]
         self.c = self.baseline[1]
         self.a = self.baseline[2]
+        self._bands = [self._raw_band(self.v), self._raw_band(self.c), self._raw_band(self.a)]
+        self._region = self._bands[0] * 9 + self._bands[1] * 3 + self._bands[2]
+
+    def carry(self, mood, keep=0.5):
+        """把上一局的**情绪余温**带进新局：``keep`` 是保留比例，其余回落到基线。
+
+        人格化用：刚结束的一局若有点低落 / 得意，下一局开头不必假装什么都没发生；
+        ``keep=0.5`` 即「一半余温、一半平静」。``mood`` 脏值 / 缺维 ⇒ 退回 ``reset()``。
+        """
+        src = mood if isinstance(mood, dict) else {}
+        try:
+            v, c, a = float(src.get("v")), float(src.get("c")), float(src.get("a"))
+        except (TypeError, ValueError):
+            self.reset()
+            return
+        try:
+            k = max(0.0, min(1.0, float(keep)))
+        except (TypeError, ValueError):
+            k = 0.5
+        bv, bc, ba = self.baseline
+        self.v = _clampf(bv + (v - bv) * k, 0.0, 1.0)
+        self.c = _clampf(bc + (c - bc) * k, 0.0, 1.0)
+        self.a = _clampf(ba + (a - ba) * k, 0.0, 1.0)
         self._bands = [self._raw_band(self.v), self._raw_band(self.c), self._raw_band(self.a)]
         self._region = self._bands[0] * 9 + self._bands[1] * 3 + self._bands[2]
 

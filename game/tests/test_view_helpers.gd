@@ -29,9 +29,12 @@ func _run() -> void:
 	_test_corners()
 	_test_reset_view()
 	_test_camera_flight()
+	_test_corner_flight()
 	_test_pat_zone_distance()
 	_test_ownership_color()
 	_test_estimate_helpers()
+	_test_idle_talk_delay()
+	_test_hidden_launcher_args()
 
 	if _fail == 0:
 		print("[view] PASS：", _total, " 项断言全部通过")
@@ -61,7 +64,53 @@ func test_tip_text_outside_board_is_empty() -> void:
 			and Board3D.tip_text_at(0, -1, 0) == "" and Board3D.tip_text_at(0, 19, 0) == "")
 	_check("① 盘外即便带手数也给空串（不硬造坐标）", Board3D.tip_text_at(-3, 30, 9) == "")
 
-## ② 手数由 `move_seq` 推：取最后一次出现（提子后再下以最近一手为准）
+## ⑨ 闲置搭话节奏（人格化）：白天 18 秒首句；深夜 ×1.5；轮到玩家长考时至少 30 秒；脏 roll 不越界。
+func _test_idle_talk_delay() -> void:
+	var main_script := preload("res://scripts/ui/Main.gd")
+	_check("⑨ 白天首句 18 秒", is_equal_approx(main_script.idle_talk_delay(14, false, true, 0.0), 18.0))
+	_check("⑨ 深夜首句 ×1.5 = 27 秒", is_equal_approx(main_script.idle_talk_delay(23, false, true, 0.0), 27.0))
+	_check("⑨ 轮到玩家长考：至少 30 秒",
+		main_script.idle_talk_delay(14, true, true, 0.0) >= 30.0
+		and main_script.idle_talk_delay(23, true, true, 0.0) >= 30.0)
+	_check("⑨ 后续间隔 45~80 秒（roll 两端）",
+		is_equal_approx(main_script.idle_talk_delay(14, false, false, 0.0), 45.0)
+		and is_equal_approx(main_script.idle_talk_delay(14, false, false, 1.0), 80.0))
+	_check("⑨ 脏 roll（NAN / 越界）不越界",
+		is_equal_approx(main_script.idle_talk_delay(14, false, false, NAN), 62.5)
+		and is_equal_approx(main_script.idle_talk_delay(14, false, false, 5.0), 80.0))
+
+
+## ⑩ wscript 隐藏启动参数：第一个必须是 VBS，第二个是 dev_local.ps1；顺序错了会报
+## 「没有 .ps1 的脚本引擎」。质量引擎 / 等待开关按原语义追加。
+func _test_hidden_launcher_args() -> void:
+	var main_script := preload("res://scripts/ui/Main.gd")
+	var a := main_script.hidden_launcher_args("C:/x/run.vbs", "C:/x/dev_local.ps1", true, true)
+	_check("⑩ wscript 参数：VBS 在前、dev_local.ps1 在后",
+		a.size() == 3 and a[0] == "C:/x/run.vbs" and a[1] == "C:/x/dev_local.ps1")
+	_check("⑩ 等待质量引擎：带 -QualityTts、不带 -NoWaitTts",
+		a.has("-QualityTts") and not a.has("-NoWaitTts"))
+	var b := main_script.hidden_launcher_args("v", "s", true, false)
+	_check("⑩ 不等待：同时带 -NoWaitTts", b.has("-QualityTts") and b.has("-NoWaitTts"))
+	var c := main_script.hidden_launcher_args("v", "s", false, false)
+	_check("⑩ 基础服务：不带质量 / 等待开关", not c.has("-QualityTts") and not c.has("-NoWaitTts"))
+	# ⑪ 启动预热：-TtsOnly 只起语音（主界面 / 设置面板期间），且排在质量 / 等待开关之前。
+	var d := main_script.hidden_launcher_args("v", "s", true, true, true)
+	_check("⑪ 预热质量引擎：-TtsOnly 在前，随后 -QualityTts、不带 -NoWaitTts",
+		d.size() == 4 and d[0] == "v" and d[1] == "s" and d[2] == "-TtsOnly"
+		and d[3] == "-QualityTts" and not d.has("-NoWaitTts"))
+	var e := main_script.hidden_launcher_args("v", "s", false, true, true)
+	_check("⑪ 预热轻量引擎：只多一个 -TtsOnly",
+		e.size() == 3 and e[2] == "-TtsOnly" and not e.has("-QualityTts"))
+	_check("⑪ 完整启动不带 -TtsOnly（预热开关只属于预热入口）", not c.has("-TtsOnly"))
+	_check("⑪ Azure 克隆 / SFT 预设要质量引擎",
+		main_script.local_voice_wants_quality("azure")
+		and main_script.local_voice_wants_quality("中文女"))
+	_check("⑪ 轻量音色不升级质量（xiaoya / melo / 空）",
+		not main_script.local_voice_wants_quality("xiaoya")
+		and not main_script.local_voice_wants_quality("melo")
+		and not main_script.local_voice_wants_quality(""))
+
+
 func _test_move_no_from_seq() -> void:
 	var seq := ["Q16", "D4", "pass", "Q4", "D4"]
 	_check("② 手数 = 该点在 move_seq 里的最后一次出现的序号（1 基）",
@@ -150,6 +199,26 @@ func _test_camera_flight() -> void:
 	_check("⑤ 缓动曲线单调不回弹", monotonic)
 	_check("⑤ 越界进度夹到 0..1（脏值不把相机甩出去）",
 			is_zero_approx(Board3D.fly_ease(-3.0)) and is_equal_approx(Board3D.fly_ease(9.0), 1.0))
+	b.free()
+
+## ⑤′ C 键平滑转视角：给时长时先进入飞行，推进后落到目标角；俯仰与距离不丢
+func _test_corner_flight() -> void:
+	var b := Board3D.new()
+	b.fly_to_corner(1, 0.0)
+	_check("⑤′ fly_to_corner(1, 0)：立即到 135°",
+			not b.is_flying()
+			and is_equal_approx(float(b.view_state()["yaw_deg"]), 135.0)
+			and is_equal_approx(float(b.view_state()["pitch_deg"]), 38.0)
+			and is_equal_approx(float(b.view_state()["dist"]), 42.0))
+	b.fly_to_corner(2, 0.4)
+	_check("⑤′ 给时长时进入飞行，朝向不瞬移",
+			b.is_flying() and is_equal_approx(float(b.view_state()["yaw_deg"]), 135.0))
+	b._step_fly(0.4)
+	_check("⑤′ 飞行结束落到 225°，俯仰 / 距离保持",
+			not b.is_flying()
+			and is_equal_approx(float(b.view_state()["yaw_deg"]), 225.0)
+			and is_equal_approx(float(b.view_state()["pitch_deg"]), 38.0)
+			and is_equal_approx(float(b.view_state()["dist"]), 42.0))
 	b.free()
 
 ## ④′ 摸头判定：头出画时用「头 → 髋 → 脚」折线，点在可见的身体上仍算命中

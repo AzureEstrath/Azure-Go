@@ -317,7 +317,32 @@ def synth(text: str, voice: str, speed: float = 1.0) -> bytes:
         else:
             gen = mdl.inference_sft(text, voice, speed=speed)
         chunks = [out['tts_speech'] for out in gen]
+        # CosyVoice3 的 zero-shot 对很短的中文台词可能一个 chunk 都不出（例如「你好。」）；
+        # 依次用 cross-lingual（只带参考音频、不依赖 prompt_text）和 SFT 预设兜底，
+        # 再不行退回轻量引擎，保证本地一定有声音，不让后端整条降级到系统语音。
+        if not chunks and not use_sft and prof.get('prompt_wav') and hasattr(mdl, 'inference_cross_lingual'):
+            zid = voice if voice in zero_shot_registered else ''
+            print('[tts] %s zero-shot 无音频，改试 cross-lingual' % voice)
+            gen = mdl.inference_cross_lingual(text, os.path.join(ROOT, prof['prompt_wav']),
+                                              zero_shot_spk_id=zid, speed=speed)
+            chunks = [out['tts_speech'] for out in gen]
+        if not chunks and model_sft is not None:
+            try:
+                spks = list(model_sft.list_available_spks())
+            except Exception:                                  # noqa: BLE001
+                spks = []
+            fb = '中文女' if '中文女' in spks else (spks[0] if spks else '')
+            if fb:
+                print('[tts] %s 仍无音频，改用 SFT 预设 %s' % (voice, fb))
+                gen = model_sft.inference_sft(text, fb, speed=speed)
+                chunks = [out['tts_speech'] for out in gen]
+                mdl = model_sft
     if not chunks:
+        if sherpa is not None:
+            print('[tts] %s 仍无音频，改用轻量引擎' % voice)
+            wav = synth_sherpa(text, speed)
+            _cache[key] = (wav, time.time())
+            return wav
         raise RuntimeError('no audio produced')
     audio = torch.concat(chunks, dim=1)
     sr = int(getattr(mdl, 'sample_rate', sample_rate))

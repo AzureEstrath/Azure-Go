@@ -134,6 +134,12 @@ func look_at_corner(corner: int) -> void:
 	_yaw = deg_to_rad(corner_yaw_deg(_corner))
 	_update_camera()
 
+## C 键：平滑转到下一个角（只动方位角，保留当前俯仰与距离）。
+## 复用 `fly_to` 的 smoothstep 飞行；飞行期间 `_unhandled_input` 整体让路，连按也不会叠加速度。
+func fly_to_corner(corner: int, duration := 0.35) -> void:
+	_corner = posmod(corner, CORNER_COUNT)
+	fly_to(corner_yaw_deg(_corner), rad_to_deg(_pitch), _dist, duration)
+
 ## 当前视角（度 / 距离）：门卫与调试核对用（纯读，不碰场景树）
 func view_state() -> Dictionary:
 	return {"yaw_deg": rad_to_deg(_yaw), "pitch_deg": rad_to_deg(_pitch), "dist": _dist}
@@ -148,6 +154,7 @@ var cam: Camera3D = null
 var _stones_root: Node3D = null
 var _ghost: MeshInstance3D = null
 var _tip: Label3D = null
+var _coord_labels: Array[Label3D] = []   # 四边坐标 A–T / 19–1：可一键隐藏（设置抽屉）
 var _yaw := 0.0
 var _pitch := deg_to_rad(38.0)   # 开局取景：平视偏俯，不做「俯视」视角
 var _dist := 42.0
@@ -450,6 +457,13 @@ func _label(text: String, pos: Vector3) -> void:
 	l.rotation_degrees = Vector3(-90, 0, 0)
 	l.position = pos
 	add_child(l)
+	_coord_labels.append(l)
+
+## 显示 / 隐藏棋盘四边的坐标（本局内即时生效；不影响落子与摸头）。
+func set_coords_visible(v: bool) -> void:
+	for l in _coord_labels:
+		if is_instance_valid(l):
+			l.visible = v
 
 func _build_ghost() -> void:
 	_ghost = MeshInstance3D.new()
@@ -851,10 +865,15 @@ func pick(mouse_pos: Vector2) -> Vector2i:
 		return Vector2i(-1, -1)
 	return Vector2i(bx, by)
 
-## 能不能在棋盘上动手（**落子与摸头同源**，V20）：复盘只读或她思考中都不行。
+## 能不能落子：复盘只读或她思考中都不行。
 ## 纯函数、只读两个标志、不碰场景树 ⇒ `Board3D.new()` 就能断言（V11，不必合成输入事件）。
 func placement_allowed() -> bool:
 	return not readonly and not locked
+
+## 能不能摸头：**只有复盘只读挡**；她思考中（`locked`）仍可摸——与经典版一致。
+## 摸头只是互动，不改棋局，没有理由跟着落子一起冻。
+func pat_allowed() -> bool:
+	return not readonly
 
 ## 复盘只读开关（进入/退出复盘时由 `Main._refresh_lock()` 逐次对齐）：
 ## 顺手作废进行中的摸头手势——否则手势的松手与 `_process` 触发会落到只读期间。
@@ -870,9 +889,9 @@ func _unhandled_input(event: InputEvent) -> void:
 		var mb := event as InputEventMouseButton
 		if mb.button_index == MOUSE_BUTTON_LEFT:
 			if mb.pressed:
-				if not placement_allowed():
-					return                     # 复盘只读 / 她思考中：落子与摸头一起被挡（V20）
 				if _in_head_zone(mb.position):
+					if not pat_allowed():
+						return                 # 只有复盘只读挡摸头；她思考中（locked）照样能摸
 					# 摸头模式：视角不动，头部/视线跟着鼠标微动；滑动/按住在 _process 里触发，快速点一下松手补一次
 					_pat_active = true
 					_pat_fired = false
@@ -880,6 +899,8 @@ func _unhandled_input(event: InputEvent) -> void:
 					_pat_down_ms = Time.get_ticks_msec()
 					get_viewport().set_input_as_handled()
 					return
+				if not placement_allowed():
+					return                     # 复盘只读 / 她思考中：只挡落子
 				var hit := pick(mb.position)
 				if hit.x >= 0 and not is_occupied(hit.x, hit.y):
 					add_optimistic(hit.x, hit.y, "black")
@@ -938,7 +959,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				reset_view()
 				view_changed.emit("视角：已回到初始取景")
 			KEY_C:
-				look_at_corner(_corner + 1)
+				fly_to_corner(_corner + 1, 0.35)
 				view_changed.emit("视角：看%s角（%s）" % [CORNER_NAMES[_corner], CORNER_GTPS[_corner]])
 			_:
 				return

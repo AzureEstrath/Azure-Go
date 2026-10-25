@@ -605,7 +605,7 @@ class TestProfileTimeBlocks(_Base):
         full = prompts.time_note(_facts())
         self.assertIn("现在是 2026-10-19 周一 21:03", full)
         self.assertIn("本局已下 2 小时 3 分", full)
-        self.assertIn("他平均每手 42 秒", full)
+        self.assertIn("Estarth 平均每手 42 秒", full)
         self.assertIn("距上次对局 3 天", full)
         self.assertIn("连续第 4 天在陪 Estarth", full)
 
@@ -700,7 +700,7 @@ class TestProfileTimeBlocks(_Base):
                                game_ts_list=[1792414980.0])
         out = prompts.time_note(facts)
         self.assertIn("本局已下 2 小时 3 分", out)
-        self.assertIn("他平均每手 1 分 24 秒", out)
+        self.assertIn("Estarth 平均每手 1 分 24 秒", out)
         self.assertIn("距上次对局 3 天", out)
         self.assertIn("连续第 1 天在陪 Estarth", out)
 
@@ -721,7 +721,7 @@ class TestProfileTimeBlocks(_Base):
         self.assertNotIn("很少脱先", prompts.profile_note(axes, 40), "只落 1 手 ⇒ 脱先无信号")
 
     def test_infinite_values_do_not_produce_broken_lines(self):
-        """修复轮 1 / Minor #5：``inf`` 不许抛、也不许拼出「他平均每手 」这种半句话。"""
+        """修复轮 1 / Minor #5：``inf`` 不许抛、也不许拼出「Estarth 平均每手 」这种半句话。"""
         inf = float("inf")
         t = {"date": "2026-10-19", "weekday": "周一", "clock": "21:03",
              "session_sec": inf, "avg_move_sec": inf, "last_gap_days": inf, "streak_days": inf}

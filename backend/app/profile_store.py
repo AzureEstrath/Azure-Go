@@ -1,4 +1,4 @@
-"""玩家棋风画像的存储层（``profile.db``）：**对局记录** + **每维画像** 两张表。
+"""玩家棋风画像的存储层（``profile.db``）：**对局记录** + **每维画像** + **人格化状态** 三张表。
 
 与 ``memory.db`` / ``joseki_progress.db`` 同性质：运行产物、已 gitignore、**独立文件**
 （设计 §五 I：``profile.db`` 与 ``memory.db`` 互不依赖，memory 关着画像照常工作）。
@@ -9,11 +9,13 @@
 - ``profile`` —— 每维一行：``value``（数值维是 ``[0,1]``；``blunder.top_type`` /
   ``persona.address_pref`` 这两个**非数值维**存自然字符串，SQLite 的 NUMERIC 亲和度
   存不了数字的文本会原样留成 TEXT）+ ``confidence`` + ``n_games`` + ``updated_ts``。
+- ``persona`` —— 键值对：跨局关系 / 情绪余温 / 互动次数（人格化，与画像开关解耦）。
+  值按 JSON 文本存，读回时还原类型；坏值原样返回文本，绝不抛。
 
-降级策略（fail-open）：**六个方法一个都不许抛异常**——库被删 / 只读 / 目录不存在 /
+降级策略（fail-open）：**所有方法一个都不许抛异常**——库被删 / 只读 / 目录不存在 /
 库文件是垃圾内容，一律只 ``print("[Profile] …")`` 一行后返回降级值
-（``add_game`` / ``upsert_axes`` → ``0``、``last_game_ts`` → ``None``、
-``games`` / ``recent_game_ts`` / ``get_profile`` → ``[]`` / ``[]`` / ``{}``），绝不影响对局；且
+（``add_game`` / ``upsert_axes`` / ``set_persona`` → ``0``、``last_game_ts`` → ``None``、
+``games`` / ``recent_game_ts`` / ``get_profile`` / ``get_persona`` → ``[]`` / ``[]`` / ``{}`` / ``{}``），绝不影响对局；且
 **同类原因每个实例只打一行**（口径同 ``joseki_progress.py`` / ``memory.py`` 的 ``_embed_warned``）。
 
 线程与连接：所有方法都是**同步阻塞**的纯文件操作，**每次调用自开自关一条连接**、
@@ -53,6 +55,9 @@ _SCHEMA = (
         axis TEXT PRIMARY KEY,
         value REAL, confidence REAL,
         n_games INTEGER, updated_ts REAL)""",
+    """CREATE TABLE IF NOT EXISTS persona(
+        key TEXT PRIMARY KEY,
+        value TEXT, updated_ts REAL)""",
 )
 
 
@@ -270,6 +275,58 @@ class ProfileStore:
             return len(rows)
         except Exception as e:              # noqa: BLE001 —— 写不进去只丢这一次，绝不抛
             return self._degrade("写入画像", e, 0)
+
+    def get_persona(self) -> dict:
+        """人格化状态（键值对）：读不出来一律 ``{}``（＝没有历史，按初识处理）。
+
+        值按 JSON 还原（数字 / 布尔 / 对象都能回原类型）；存进去时不是合法 JSON 的脏值
+        原样返回文本，不丢、不抛。
+        """
+        try:
+            with self._open(create=False) as conn:
+                rows = conn.execute("SELECT key, value FROM persona").fetchall()
+        except Exception as e:              # noqa: BLE001
+            return self._degrade("读取人格化状态", e, {})
+        out = {}
+        for row in rows:
+            key = str(row[0] or "")
+            if key == "":
+                continue
+            out[key] = _parse_json(row[1], None)
+        return out
+
+    def set_persona(self, items: dict) -> int:
+        """按 key 写入 / 覆盖人格化状态，返回**写入的键数**；任何存储故障返回 ``0``。
+
+        ``None`` / 空 key 的条目跳过；值统一 ``json.dumps`` 成文本（读时还原）。写入点只在
+        ``summarize()`` 成功跑完之后（与画像同一条纪律，回合内零写入）。
+        """
+        data = items if isinstance(items, dict) else {}
+        rows = []
+        for key, value in data.items():
+            name = str(key or "")
+            if name == "" or value is None:
+                continue
+            try:
+                text = json.dumps(value, ensure_ascii=False)
+            except Exception:               # noqa: BLE001 —— 序列化不了的单个值跳过
+                continue
+            rows.append((name, text))
+        if not rows:
+            return 0
+        now = time.time()
+        try:
+            with self._open(create=True) as conn:
+                for name, text in rows:
+                    conn.execute(
+                        "INSERT INTO persona(key, value, updated_ts) VALUES(?,?,?)"
+                        " ON CONFLICT(key) DO UPDATE SET"
+                        " value = excluded.value, updated_ts = excluded.updated_ts",
+                        (name, text, now))
+                conn.commit()
+            return len(rows)
+        except Exception as e:              # noqa: BLE001 —— 写不进去只丢这一次，绝不抛
+            return self._degrade("写入人格化状态", e, 0)
 
     # —— 内部 ——
 

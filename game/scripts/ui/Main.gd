@@ -13,11 +13,9 @@ signal setup_confirmed
 ## 主界面「开始对局」（首次启动时 _ready 里 await 它，之后才进设置面板 / 起服务）
 signal title_started
 
-## —— 思考中的短句（v3.11.2）——
-## 20 句预存在 JSON 里，气泡里**每秒换一句**、随机且不连复（见 `_update_thinking`）。
-## 文件缺失 / 写坏时退回旧的「Azure 思考中…」省略号动效，绝不因一句话把游戏搞崩。
-const THINKING_LINES_PATH := "res://data/thinking_lines.json"
-const THINKING_SWITCH_MS := 1000               # 换句间隔（用户口径：每秒一句）
+## —— 思考中的占位 ——
+## 固定显示「Azure 思考中…」+ 省略号动效，不再轮播 JSON 短句。
+## JSON 解析工具与数据文件保留给后续可选功能，但当前运行路径不读取、不轮播。
 const THINKING_FALLBACK := "Azure 思考中"
 
 var cfg: AzureConfig
@@ -61,9 +59,9 @@ var _setup_showing := false                # 设置面板正在显示（防重�
 var _transition := false                   # 主界面 ⇄ 对局的运镜正在跑（期间不吃 Esc / 不叠加动画）
 var _cover_only := false                   # --title：只画封面（截图调试）——不叠问候 / 设置面板
 var _shot_requested := false               # 命令行带 --shot= / --demo：截图模式
-## —— 思考中的短句 ——
-var _thinking_lines: PackedStringArray = PackedStringArray()
-var _thinking_idx := -1                    # 当前句下标（-1 = 还没挑过）
+## —— 启动预热（和经典版一样：主界面 / 设置面板期间先把 CosyVoice 起起来）——
+var _services_prewarmed := false           # 已经拉过「只起语音」的预热启动器（只对质量引擎用）
+var _local_tts_loading := false            # 本地质量引擎正在加载：客户端不出系统语音（只显示文字）
 const AI_DEDUP_WINDOW := 8                 # 防复读窗口（兜底判据）：后端已按同样窗口去重，这里只兜 WS 重连后的乱序
 var _recent_ai_texts: Array[String] = []   # 最近说过的 AI 原话（含落子宣告）：只兜 WS 重连后乱序到达的重复句
 
@@ -96,7 +94,7 @@ const HESITATE_SLOW_MAX := 1.4
 const TYPING_SEC_PER_CHAR := 0.045         # 打字节奏：每字时长（秒），总时长再限制在 0.5~2.4s
 const TYPING_MIN_SEC := 0.5
 const TYPING_MAX_SEC := 2.4
-var _msg_queue: Array[Dictionary] = []     # 待投递消息 {kind,text,tone,seq}：犹豫/延迟期间顺序不乱
+var _msg_queue: Array[Dictionary] = []     # 待投递消息 {kind,text,tone,seq,rec}：犹豫/延迟期间顺序不乱
 var _msg_queue_busy := false               # 投递协程正在跑
 var _msg_seq := 0                          # 入队序号（快进判定用）
 var _queue_rush_seq := 0                   # 序号 ≤ 此值的消息立即投递（玩家/系统消息到达时快进）
@@ -107,9 +105,19 @@ var _typing_cps := 0.0                     # 当前打字速度（字/秒）
 var _typing_queue: Array[Dictionary] = []  # 排队等待打字的 {label,text}（单活跃顺序播放，防抢跑）
 static var _tone_re := RegEx.new()         # [[tone:xxx]] 语气标记（首次使用时编译）
 static var _action_re := RegEx.new()       # {行为} 标签（首次使用时编译）
-var _mood := ""                            # 当前情绪基调：同一情绪延续时只刷新计时、不再出声（治「语气太多」）
-var _mood_ms := 0                          # 最近一次情绪刷新的时刻
-const MOOD_KEEP_MS := 30000                # 同一情绪 30 秒内视为延续；情绪变化或久未出现才出声
+## 情绪语气词：按「思考节点」插入，频率由当前情绪强度决定；预制音必须匹配上一句的语气 / 行为标签。
+const FILLER_MIN_NODES := 2                # 两个思考节点内不重复插（节点内的连播闸）
+const FILLER_MIN_GAP_MS := 6000            # 两个语气词之间的最短间隔
+const FILLER_SEMANTIC_MAX_AGE_MS := 9000   # 上一句的语义标签只在最近 9 秒内有效
+var _mood_v := 0.5                         # 当前愉悦度（0~1）
+var _mood_c := 0.5                         # 当前好奇度（0~1）
+var _mood_a := 0.5                         # 当前唤醒度（0~1）
+var _last_mood_filler := ""                # 当前情绪区域自带的语气词（无上一句语义时的候选）
+var _last_ai_tone := ""                    # 上一句 AI 台词的 [[tone]]（sigh / cheer / proud）
+var _last_ai_acts: Array = []              # 上一句 AI 台词的行为标签（笑 / 得意 / 惊讶 / 担心 / 难过）
+var _last_ai_semantic_ms := 0              # 上一句语义标签的时刻（过期不用于选语气词）
+var _filler_nodes := 0                     # 距上次语气词经过的思考节点数
+var _last_filler_ms := 0                   # 上次语气词的时刻（最短间隔）
 
 ## Azure 连着冒的多条消息在这么长时间内合并成一段再合成（CPU 合成慢，分开发会句间空很久）
 const BATCH_WINDOW := 0.35
@@ -130,6 +138,17 @@ var _report_busy := false                  # 战报生成中：按钮防重入
 ## 音色候选（静态列表）：云端服务商各有音色名，这里只给常见几种；右侧输入框可手填任意音色 id
 const VOICE_PRESETS := ["alloy", "echo", "fable", "nova", "onyx", "shimmer",
 	"中文女", "粤语女", "英文女"]
+## 需要 CosyVoice 质量引擎的本机音色（azure=经典版克隆音色；其余为 SFT 预设女声）。
+const LOCAL_QUALITY_VOICES := ["azure", "中文女", "粤语女", "英文女"]
+## 本地音色下拉（朗读方式=本地时显示）：把经典版的 Azure 克隆音色加回来。
+const LOCAL_VOICE_PRESETS := [
+	["azure", "Azure 克隆（最像 · CosyVoice）"],
+	["melo", "MeloTTS（轻量）"],
+	["xiaoya", "小雅 · 清亮少女（轻量）"],
+	["shaonv", "少女音 · 高音（轻量）"],
+	["shaonv2", "少女音 · 中音（轻量）"],
+	["nvsheng", "女声 · 温柔（轻量）"],
+]
 
 ## 闲置互动：玩家长时间无操作 → 看向玩家 + 歪头 + 偶尔主动搭话（搭话走后端 POST /api/idle）
 const IDLE_SEC := 12.0
@@ -137,19 +156,49 @@ const IDLE_TALK_FIRST := 18.0
 const IDLE_TALK_MIN := 45.0
 const IDLE_TALK_MAX := 80.0
 
+## 长时间闲置窥屏（本地 RapidOCR + Qwen2.5-VL，独立 python 进程一跑一停）
+const PEEK_COOLDOWN_MS := 60000            # 两次窥屏至少隔 1 分钟（搭话本身也要间隔 45 秒起）
+const PEEK_TIMEOUT_MS := 240000            # 窥屏进程超时：放弃，退回普通搭话
+var _last_player_activity_ms := 0          # 只有玩家自己动鼠标/键盘才刷新（窥屏门槛用，不被她说话重置）
+var _peek_busy := false
+var _peek_started_ms := 0
+var _peek_last_ms := 0
+var _peek_ctx_activity := 0                # 发起窥屏时的玩家活动时刻：对不上说明玩家已回来，结果作废
+var _peek_out := ""                        # 窥屏结果 json 路径
+var _peek_exe := ""                        # 跑窥屏的 python（需装好 rapidocr / PIL / llama_cpp）
+var _peek_script := ""                     # azure_peek.py 路径
+var _peek_probed := false
+var _peek_ok := false
+var _peek_pid := -1                        # 正在跑的窥屏进程（退出/超时清掉，别留孤儿）
+var _vlm_url := ""                         # 已解析的 VLM 地址（空串=没有，窥屏脚本回退 CPU）
+var _vlm_starter := ""                     # start_vlm_server.py 路径
+
 var _font: Font
 var _ui_root: Control
 var _chat_box: VBoxContainer
 var _chat_scroll: ScrollContainer
+var _btn_new_msg: Button                        # 玩家向上翻看时来了新消息：右下角提示，点了回底部
+var _chat_follow := true                        # 是否跟随最新消息（在底部 = true）
+var _chat_font_px := 15                         # 聊天正文字号（本局内可调，不改 config）
+var _chat_line_px := 6                          # 气泡内行距
 var _lbl_moves: Label
 var _lbl_wr: Label
 var _lbl_score: Label
 var _lbl_score_hint: Label                     # 目差下面那行 11px 小字：量级人话（空串＝还没有形势信息）
 ## —— 局面点目（v3.12.0 采纳）——
 var _estimate_box: PanelContainer
-var _estimate_count: Label                     # 「黑 41 目 · 白 4 目」
+var _estimate_count: Label                     # 「点目（第 N 手）：黑 41 目 · 白 4 目」
 var _estimate_lead: Label                      # 「黑领先 29.5 目（贴 7.5 目）」
-var _estimate_move_count := -1                 # 这次判断对应的手数：state 手数一变就收起（-1＝没显示）
+var _estimate_move_count := -1                 # 上次点目对应的手数（只用于标注 / 收棋盘方块）
+var _card_wr_bar: ProgressBar                  # 全局形势卡的胜率条（黑方占比）
+var _card_wr_black: Label
+var _card_wr_white: Label
+var _card_score: Label                         # 目差（与右栏同源）
+var _card_score_hint: Label                    # 量级人话
+var _card_body: VBoxContainer                  # 可折叠部分
+var _card_toggle: Button
+var _card_global: Label                        # 她落子后那句全局判断
+var _last_ai_kind := ""                        # 上一句 AI 消息类型：识别「落子宣告 → 全局判断」
 var _lbl_status: Label
 var _status_before_tool := ""                  # 她查资料前状态栏的原文案（end 时恢复）
 var _status_before_tool_bad := false           # 原文案的错误色标记（end 时一并恢复，别把红字洗成灰字）
@@ -215,6 +264,9 @@ var _btn_send: Button                      # 聊天发送（复盘期间与输�
 
 func _ready() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
+	_last_player_activity_ms = _last_activity_ms  # 窥屏门槛用真实玩家操作时钟
+	_peek_last_ms = -PEEK_COOLDOWN_MS             # 允许开局后第一次长闲置就窥屏
+	_last_filler_ms = _last_activity_ms           # 开局先给一个最短间隔，不因初始 mood 立刻响语气词
 	cfg = AzureConfig.load_config()
 	_apply_cli_overrides()
 	GufengTheme.apply_preset(cfg.ui_theme)     # 建任何 UI 之前先落主题（默认雾蓝）
@@ -224,20 +276,337 @@ func _ready() -> void:
 	_build_world()
 	_build_board()
 	_build_ui()
-	_load_thinking_lines()                     # 思考中的 20 句：读不到就用旧的「Azure 思考中…」
 	_build_title_screen()                      # 主界面：纸幕封面（棋盘与化身在纸幕后）
+	_prewarm_local_services()                  # 封面 / 设置面板期间先把本地语音（按记住的音色）起起来
 	await _maybe_show_title()                  # 首次启动：等「开始对局」
 	if _cover_only and _shot_requested:
 		_handle_cli()                          # 只拍封面：不起服务 / 不叠问候，避免聊天面板透在纸幕后
 		return
 	await _maybe_show_setup()                  # 启动设置面板：思考模式 + 各 API 配置（默认=当前配置）；确认后按新配置起服务
 	if not _shot_requested:
+		var cosy := await _maybe_ask_cosyvoice()
+		var quality: bool = bool(cosy.get("quality", false))
+		var wait_tts: bool = bool(cosy.get("wait", false))
+		var spawned := _maybe_start_local_services(quality, wait_tts)
+		_local_tts_loading = quality and (spawned or _services_prewarmed)
+		if wait_tts and spawned:
+			await _wait_local_tts_ready(true)
+	if not _shot_requested:
 		_begin_new_game_on_entry()             # 先立「等 reset」闸：hello 里上一局的迟到 state 不许闪出来
 	if agent == null:
 		_build_services()                      # 从主界面直接进过棋谱库时已经起过：不重复装配
+	if tts != null:
+		tts.set_suppress_system(_local_tts_loading)   # 装配时质量引擎还在加载：连第一句系统语音也压掉
+	if _local_tts_loading:
+		_watch_local_tts_ready()               # 不阻塞进对局：后台等就绪后解除「只显示文字」
 	_start_launch_game()                       # 首次进对局也保证空局（后端可能还留着上次运行的棋局）
 	_greet()
 	_handle_cli()
+
+## 自用版启动便利：游戏启动时自动拉起本地模型链路（LLM / TTS / KataGo / 后端）。
+## 由 `dev_local.ps1` 拉起游戏时环境里有 AZURE_SERVICES_MANAGED=1，不再重复拉起。
+## `quality_tts` 为真时要求 CosyVoice 质量引擎；`wait_tts` 为假时带 -NoWaitTts，先让后端起来。
+## `tts_only` 为真时带 -TtsOnly：只起本地语音（启动预热用，不写配置 / 不起其他服务）。
+## wscript 的参数顺序：**VBS 自身 → dev_local.ps1 → 可选开关**。顺序错了 wscript 会把 .ps1
+## 当成脚本文件直接执行，Windows 报「没有 .ps1 的脚本引擎」。纯函数，门卫直接测。
+static func hidden_launcher_args(vbs: String, script: String, quality: bool, wait: bool,
+		tts_only := false) -> PackedStringArray:
+	var out := PackedStringArray([vbs, script])
+	if tts_only:
+		out.append("-TtsOnly")
+	if quality:
+		out.append("-QualityTts")
+		if not wait:
+			out.append("-NoWaitTts")
+	return out
+
+func _maybe_start_local_services(quality_tts := false, wait_tts := false, tts_only := false) -> bool:
+	if DisplayServer.get_name() == "headless":
+		return false                              # 无头测试 / 自检：不拉起服务
+	if not cfg.auto_start_services:
+		return false
+	if not _is_local_url(cfg.backend_url):
+		return false
+	if OS.get_environment("AZURE_SERVICES_MANAGED") == "1" and not quality_tts:
+		return false                              # dev_local 已托管基础服务；只有切 CosyVoice 才再拉起一次
+	var script := _dev_local_script()
+	if not FileAccess.file_exists(script):
+		return false                              # 导出包 / 非源码运行：没有启动器，静默跳过
+	# 优先走 VBS 隐藏启动：OS.create_process 直接拉 powershell.exe 时，Windows 仍可能给
+	# 控制台应用分配一个可见窗口（选「等待 CosyVoice」时该进程会存活 1–3 分钟，看起来像
+	# 「又开了一个窗口」）。VBS 里 sh.Run(cmd, 0, False) 把 PowerShell 连同子进程彻底隐藏。
+	var vbs := _repo_root().path_join("tools/run_hidden_dev_local.vbs")
+	var pid := -1
+	if FileAccess.file_exists(vbs):
+		var vargs := hidden_launcher_args(vbs, script, quality_tts, wait_tts, tts_only)
+		var wscript := OS.get_environment("SystemRoot").path_join("System32/wscript.exe")
+		if wscript == "" or not FileAccess.file_exists(wscript):
+			wscript = "wscript.exe"
+		pid = OS.create_process(wscript, vargs)
+	if pid <= 0:                                  # VBS 缺失 / 拉起失败：回落到直接 PowerShell（仍带 -NoGame）
+		var ps := OS.get_environment("SystemRoot").path_join("System32/WindowsPowerShell/v1.0/powershell.exe")
+		if ps == "" or not FileAccess.file_exists(ps):
+			ps = "powershell.exe"
+		var args := ["-NoProfile", "-ExecutionPolicy", "Bypass",
+			"-WindowStyle", "Hidden", "-File", script, "-NoGame"]
+		if tts_only:
+			args.append("-TtsOnly")
+		if quality_tts:
+			args.append("-QualityTts")
+			if not wait_tts:
+				args.append("-NoWaitTts")
+		pid = OS.create_process(ps, args)
+	if pid > 0:
+		if tts_only:
+			_set_status("正在后台预加载 CosyVoice（主界面 / 设置面板期间）…" if quality_tts
+					else "正在后台预加载本地语音（主界面 / 设置面板期间）…")
+		elif quality_tts:
+			_set_status("正在启动 CosyVoice（约 1–3 分钟）…" if wait_tts else "正在启动本地模型服务（CosyVoice 后台加载）…")
+		else:
+			_set_status("正在启动本地模型服务（LLM / TTS / KataGo / 后端）…")
+		print("[Services] 本地服务启动器已拉起 pid=%d quality=%s wait=%s tts_only=%s"
+				% [pid, quality_tts, wait_tts, tts_only])
+		return true
+	if tts_only:
+		print("[Services] 语音预加载没有拉起；稍后完整启动流程会再试一次")
+		return false
+	_set_status("本地模型服务启动失败：请手动运行 dev_local.ps1 -NoGame", true)
+	return false
+
+## 启动预热（和经典版一样「先起服务、后进对局」）：主界面 / 设置面板期间先把本地语音拉起来，
+## 让 CosyVoice 的模型加载与玩家看封面、填设置的时间重叠。只起语音（-TtsOnly），
+## 不写配置（设置面板还没确认），也不启动 LLM / KataGo / 后端——那些由后面的完整流程补齐。
+func _prewarm_local_services() -> void:
+	if DisplayServer.get_name() == "headless":
+		return
+	if not cfg.auto_start_services or not _is_local_url(cfg.backend_url):
+		return
+	if not FileAccess.file_exists(_dev_local_script()):
+		return                                      # 导出包 / 非源码运行：没有启动器
+	if OS.get_environment("AZURE_SERVICES_MANAGED") == "1":
+		return                                      # dev_local 已把语音连同其他服务起好：不重复
+	if _cli_visual_only():
+		return                                      # 截图 / 演示：不启动任何服务
+	if not _can_ask_cosyvoice():
+		return                                      # 不走本地质量引擎（系统 / 云端语音）：按原流程
+	if not local_voice_wants_quality(cfg.tts_local_voice):
+		return                                      # 记住的是轻量音色：几秒就绪，不提前起质量引擎
+	# wait=true：隐藏的启动器等 /health 就绪并预热首句后再退出；游戏这边**不等**。
+	_services_prewarmed = _maybe_start_local_services(true, true, true)
+
+## 这个本地音色要不要 CosyVoice 质量引擎（azure 克隆 / SFT 预设女声）。
+## 轻量音色（melo / xiaoya / shaonv / ...）走 sherpa，不预热、也不弹「等不等」。
+static func local_voice_wants_quality(voice: String) -> bool:
+	return voice.strip_edges() in LOCAL_QUALITY_VOICES
+
+## 只画界面 / 截图的命令行（--title / --shot= / --demo / --setup）：不预拉任何本地服务。
+func _cli_visual_only() -> bool:
+	for a in OS.get_cmdline_user_args():
+		if a == "--title" or a == "--setup" or a == "--demo" or a.begins_with("--shot="):
+			return true
+	return false
+
+## 开游戏询问：CosyVoice 未就绪时问是否等它；已就绪则直接沿用。
+## 返回 {"quality": 是否起/保留 CosyVoice, "wait": 是否等它就绪}。
+func _maybe_ask_cosyvoice() -> Dictionary:
+	var out := {"quality": false, "wait": false}
+	if not _can_ask_cosyvoice():
+		return out
+	if not local_voice_wants_quality(cfg.tts_local_voice):
+		return out                                  # 用户明确选了轻量音色：按轻量起，不再追问
+	var h := await _tts_health_once()
+	if _cosyvoice_ready(h):
+		out["quality"] = true                     # 已经是质量引擎：保留它，不再询问
+		return out
+	out["quality"] = true
+	if _services_prewarmed:
+		# 预热已经在后台加载 CosyVoice：不再弹「等不等」，也不挡住进对局——
+		# 先只显示文字（客户端此时会压掉系统语音），质量引擎起好后自动接上。
+		_set_status("CosyVoice 正在后台加载，先只显示文字；起好后自动用 Azure 音色。")
+		return out
+	out["wait"] = await _show_cosyvoice_dialog()
+	return out
+
+## 只有「本机后端 + 本机本地语音 + 自动拉起」才提问/接管。
+## 即使由 dev_local 拉起，当前是轻量引擎也会询问是否切到 CosyVoice；已就绪则直接沿用。
+func _can_ask_cosyvoice() -> bool:
+	if DisplayServer.get_name() == "headless":
+		return false
+	if not cfg.auto_start_services:
+		return false
+	if not _local_tts_managed():
+		return false
+	return FileAccess.file_exists(_dev_local_script())
+
+func _local_tts_managed() -> bool:
+	if not cfg.tts_enabled:
+		return false
+	if cfg.tts_mode != "local":
+		return false
+	if not _is_local_url(cfg.backend_url):
+		return false
+	if not _is_local_url(cfg.tts_local_base_url):
+		return false
+	return true
+
+## 等待 CosyVoice 就绪：只读 /health，不改配置。
+func _wait_local_tts_ready(wait_for_cosy := false) -> void:
+	if not wait_for_cosy or DisplayServer.get_name() == "headless":
+		return
+	var started := Time.get_ticks_msec()
+	var limit_ms := 300000
+	_set_status("正在等待 CosyVoice 就绪（约 1–3 分钟）…")
+	var ready := false
+	var note_ten := -1
+	while Time.get_ticks_msec() - started < limit_ms:
+		var h := await _tts_health_once()
+		if _cosyvoice_ready(h):
+			ready = true
+			break
+		var sec := int((Time.get_ticks_msec() - started) / 1000.0)
+		if sec / 10 != note_ten:
+			note_ten = sec / 10
+			_set_status("正在等待 CosyVoice 就绪… %ds（模型比轻量引擎大，首次约 1–3 分钟；就绪后再开始对局）" % sec)
+			print("[TTS] 等待 CosyVoice 就绪… %ds" % sec)
+		await get_tree().create_timer(2.0).timeout
+	_local_tts_loading = false                    # 就绪 / 超时都解除：超时后真连不上再按原逻辑降级
+	if ready:
+		_set_status("CosyVoice 已就绪（Azure 克隆音色），开始对局。")
+		print("[TTS] CosyVoice 已就绪")
+	else:
+		_set_status("CosyVoice 启动超时，先用当前语音。", true)
+		print("[TTS] CosyVoice 等待超时（300s）")
+
+## 后台等质量引擎就绪（不阻塞进对局）：加载期压掉系统语音，就绪后解除并提示；
+## 超时同样解除——与经典版 `notify_service_ready()` 同口径（之后真连不上再降级）。
+func _watch_local_tts_ready() -> void:
+	if DisplayServer.get_name() == "headless":
+		return
+	var started := Time.get_ticks_msec()
+	var limit_ms := 300000
+	while _local_tts_loading and Time.get_ticks_msec() - started < limit_ms:
+		await get_tree().create_timer(2.0).timeout
+		var h := await _tts_health_once()
+		if _cosyvoice_ready(h):
+			_local_tts_loading = false
+			if tts != null:
+				tts.set_suppress_system(false)
+			_set_status("CosyVoice 已就绪（Azure 克隆音色），接下来用 Azure 音色。")
+			return
+	if _local_tts_loading:
+		_local_tts_loading = false
+		if tts != null:
+			tts.set_suppress_system(false)
+		_set_status("CosyVoice 仍在加载，先用当前语音。", true)
+
+func _show_cosyvoice_dialog() -> bool:
+	var dlg := ConfirmationDialog.new()
+	dlg.title = "本地语音"
+	dlg.dialog_text = "CosyVoice 质量引擎还没起好。\n\n等待：约 1–3 分钟，音色更接近 Azure。\n不等：先只显示文字（不退回系统语音），CosyVoice 起好后自动接上。"
+	dlg.ok_button_text = "等待 CosyVoice"
+	dlg.cancel_button_text = "先不等"
+	dlg.exclusive = true
+	add_child(dlg)
+	var state := {"closed": false, "wait": false}
+	dlg.confirmed.connect(func():
+		state["wait"] = true
+		state["closed"] = true
+	)
+	dlg.canceled.connect(func():
+		state["closed"] = true
+	)
+	dlg.popup_centered()
+	while not bool(state["closed"]):
+		await get_tree().process_frame
+	dlg.queue_free()
+	return bool(state["wait"])
+
+## 读一次本地 TTS 的 /health；失败 / 超时返回空字典。
+func _tts_health_once() -> Dictionary:
+	var base := _tts_base_url()
+	if base == "":
+		return {}
+	var req := HTTPRequest.new()
+	req.timeout = 2.0
+	add_child(req)
+	var box := {"done": false, "data": {}}
+	req.request_completed.connect(func(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray):
+		box["done"] = true
+		if result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300:
+			var d = JSON.parse_string(body.get_string_from_utf8())
+			if typeof(d) == TYPE_DICTIONARY:
+				box["data"] = d
+	)
+	var err := req.request(base + "/health")
+	if err != OK:
+		req.queue_free()
+		return {}
+	var deadline := Time.get_ticks_msec() + 2500
+	while not bool(box["done"]) and Time.get_ticks_msec() < deadline:
+		await get_tree().process_frame
+	req.queue_free()
+	return box["data"] as Dictionary
+
+func _cosyvoice_ready(h: Dictionary) -> bool:
+	if h.is_empty():
+		return false
+	return str(h.get("model_dir", "")) != "" or str(h.get("model_dir_sft", "")) != ""
+
+## 启动面板里的本地语音状态：预热在封面 / 设置期间已经启动，这里每秒刷新一次进度。
+func _poll_setup_tts_state(label: Label) -> void:
+	if DisplayServer.get_name() == "headless":
+		return
+	var started := Time.get_ticks_msec()
+	while is_instance_valid(label):
+		if not _local_tts_managed():
+			label.text = "本地语音：当前不使用（朗读方式 = %s）" % cfg.tts_mode
+			return
+		var quality := local_voice_wants_quality(cfg.tts_local_voice)
+		var h := await _tts_health_once()
+		if not is_instance_valid(label):
+			return
+		if _cosyvoice_ready(h):
+			label.text = "本地语音：CosyVoice 已就绪（Azure 克隆音色）"
+			label.add_theme_color_override("font_color", GufengTheme.INK)
+			return
+		if not h.is_empty():
+			label.text = ("本地语音：轻量引擎已就绪（CosyVoice 仍在后台加载）" if quality
+					else "本地语音：轻量引擎已就绪")
+		else:
+			var sec := int((Time.get_ticks_msec() - started) / 1000.0)
+			label.text = (("本地语音：CosyVoice 后台加载中… %ds（约 1–3 分钟）" % sec) if quality
+					else "本地语音：等待本地服务… %ds" % sec)
+		await get_tree().create_timer(1.0).timeout
+
+## 本地 TTS 基地址：去掉尾部 /v1，拼 /health 用。
+func _tts_base_url() -> String:
+	var base := cfg.tts_local_base_url.strip_edges()
+	while base.ends_with("/"):
+		base = base.substr(0, base.length() - 1)
+	if base.ends_with("/v1"):
+		base = base.substr(0, base.length() - 3)
+	return base
+
+func _repo_root() -> String:
+	return ProjectSettings.globalize_path("res://").simplify_path().path_join("..").simplify_path()
+
+func _dev_local_script() -> String:
+	return _repo_root().path_join("dev_local.ps1")
+
+## 本机后端判断：只有 127.0.0.1 / localhost / ::1 才允许自动拉起本地服务。
+static func _is_local_url(url: String) -> bool:
+	var u := url.strip_edges().to_lower()
+	if u.begins_with("http://"):
+		u = u.substr(7)
+	elif u.begins_with("https://"):
+		u = u.substr(8)
+	u = u.get_slice("/", 0)
+	if u.begins_with("["):
+		var close := u.find("]")
+		u = u.substr(1, close - 1) if close > 1 else u
+	else:
+		u = u.get_slice(":", 0)
+	return u in ["127.0.0.1", "localhost", "::1", "0.0.0.0"]
 
 ## 命令行覆盖：--llm=http://host:port/v1  --model=模型名  --key=云端API Key（均不写回配置）
 ## 另有 --backend-url=http://host:port 指定后端服务地址
@@ -347,46 +716,160 @@ func _build_joseki_card(root: Control) -> void:
 	root.add_child(_joseki_card)
 	get_viewport().size_changed.connect(_on_viewport_resized)
 
-## 形势面板（v3.12.0 采纳）：浮在棋盘左上方的小纸签，内容全部来自后端 `estimate` 事件。
-## 它是**临时注记**（玩家下一手 / 局面变了就收起），所以不进侧栏、不新增常驻控件。
+## 全局形势卡（左上角常驻纸签）：胜率条 / 目差每手更新；点目来自「局面分析」；
+## 最后一栏是她落子后那句全局判断（与第三句共用同一份文本）。
+## 可折叠；玩家下一手只收棋盘上的点目小方块，卡片本身保留上次点目（标注第 N 手）。
 func _build_estimate_box(root: Control) -> void:
 	_estimate_box = PanelContainer.new()
-	_estimate_box.visible = false
-	_estimate_box.custom_minimum_size = Vector2(200, 0)
+	_estimate_box.visible = false                 # 第一份 info / estimate 到了再出现
+	_estimate_box.custom_minimum_size = Vector2(272, 0)
 	_estimate_box.mouse_filter = Control.MOUSE_FILTER_STOP
-	_estimate_box.tooltip_text = "只统计归属明确的点（|归属| ≥ 50%）：空地算目，被点死的对手子也算；\n" \
-		+ "中间大片还没定下来的地方不计入——所以双方点数加起来通常小于棋盘总点数。"
+	_estimate_box.tooltip_text = "全局形势：胜率 / 目差每手更新；点目来自「局面分析」（只统计归属明确的点）；\n" \
+		+ "下面的「她的全局判断」来自她落子后那句，和聊天里第三句是同一份文本。"
 	_estimate_box.add_theme_stylebox_override("panel", GufengTheme.slip(GufengTheme.PAPER, 10))
 	root.add_child(_estimate_box)
 	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", 2)
+	vb.add_theme_constant_override("separation", 4)
 	_estimate_box.add_child(vb)
 	var head := HBoxContainer.new()
 	vb.add_child(head)
 	var title := Label.new()
-	title.text = "形势"
+	title.text = "全局形势"
 	title.add_theme_font_size_override("font_size", 15)
 	title.add_theme_color_override("font_color", GufengTheme.DAI)
 	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	head.add_child(title)
-	var close := Button.new()
-	close.text = "关闭形势"
-	GufengTheme.apply_bare_button(close)
-	close.pressed.connect(_hide_estimate)
-	head.add_child(close)
+	_card_toggle = Button.new()
+	_card_toggle.text = "展开"
+	GufengTheme.apply_bare_button(_card_toggle)
+	_card_toggle.pressed.connect(_toggle_estimate_body)
+	head.add_child(_card_toggle)
+
+	# —— 常驻摘要：胜率条（黑方占比；剩余就是白方） ——
+	var wrow := HBoxContainer.new()
+	wrow.add_theme_constant_override("separation", 6)
+	vb.add_child(wrow)
+	_card_wr_black = Label.new()
+	_card_wr_black.text = "黑 --"
+	_card_wr_black.add_theme_font_size_override("font_size", 12)
+	_card_wr_black.add_theme_color_override("font_color", GufengTheme.INK)
+	_card_wr_black.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	wrow.add_child(_card_wr_black)
+	_card_wr_white = Label.new()
+	_card_wr_white.text = "白 --"
+	_card_wr_white.add_theme_font_size_override("font_size", 12)
+	_card_wr_white.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
+	_card_wr_white.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	wrow.add_child(_card_wr_white)
+	_card_wr_bar = ProgressBar.new()
+	_card_wr_bar.min_value = 0.0
+	_card_wr_bar.max_value = 100.0
+	_card_wr_bar.value = 50.0
+	_card_wr_bar.show_percentage = false
+	_card_wr_bar.custom_minimum_size = Vector2(0, 10)
+	_card_wr_bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var bar_bg := StyleBoxFlat.new()
+	var bgc := GufengTheme.INK_SOFT
+	bgc.a = 0.18                                  # 浅灰底：能看出白方剩余份额，又不抢墨色填充
+	bar_bg.bg_color = bgc
+	bar_bg.set_corner_radius_all(3)
+	bar_bg.border_width_left = 1
+	bar_bg.border_width_top = 1
+	bar_bg.border_width_right = 1
+	bar_bg.border_width_bottom = 1
+	var border := GufengTheme.INK
+	border.a = 0.22
+	bar_bg.border_color = border
+	var bar_fill := StyleBoxFlat.new()
+	bar_fill.bg_color = GufengTheme.INK
+	bar_fill.set_corner_radius_all(3)
+	_card_wr_bar.add_theme_stylebox_override("background", bar_bg)
+	_card_wr_bar.add_theme_stylebox_override("fill", bar_fill)
+	vb.add_child(_card_wr_bar)
+
+	# 目差留在摘要区：折叠后仍能一眼看到胜率 + 目差
+	_card_score = Label.new()
+	_card_score.text = "目差: --"
+	_card_score.add_theme_font_size_override("font_size", 13)
+	_card_score.add_theme_color_override("font_color", GufengTheme.INK)
+	vb.add_child(_card_score)
+	_card_score_hint = Label.new()
+	_card_score_hint.add_theme_font_size_override("font_size", 11)
+	_card_score_hint.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
+	_card_score_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	vb.add_child(_card_score_hint)
+
+	# —— 可折叠部分：点目 / 她的全局判断 ——
+	_card_body = VBoxContainer.new()
+	_card_body.add_theme_constant_override("separation", 2)
+	_card_body.visible = false                     # 默认收起：只留标题 + 胜率 + 目差，不挡棋盘视野
+	vb.add_child(_card_body)
 	_estimate_count = Label.new()
+	_estimate_count.text = "点目：点「局面分析」后显示"
+	_estimate_count.add_theme_font_size_override("font_size", 12)
 	_estimate_count.add_theme_color_override("font_color", GufengTheme.INK)
-	vb.add_child(_estimate_count)
+	_estimate_count.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_card_body.add_child(_estimate_count)
 	_estimate_lead = Label.new()
 	_estimate_lead.add_theme_font_size_override("font_size", 12)
 	_estimate_lead.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
-	vb.add_child(_estimate_lead)
+	_estimate_lead.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_card_body.add_child(_estimate_lead)
+	var gtitle := Label.new()
+	gtitle.text = "她的全局判断"
+	gtitle.add_theme_font_size_override("font_size", 11)
+	gtitle.add_theme_color_override("font_color", GufengTheme.DAI)
+	_card_body.add_child(gtitle)
+	_card_global = Label.new()
+	_card_global.text = "她落子后会说一句全局判断。"
+	_card_global.add_theme_font_size_override("font_size", 12)
+	_card_global.add_theme_color_override("font_color", GufengTheme.INK)
+	_card_global.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_card_global.max_lines_visible = 8
+	_card_body.add_child(_card_global)
 	var hint := Label.new()
-	hint.text = "她此刻的判断，仅供参考"
+	hint.text = "胜率 / 目差每手更新；点目来自「局面分析」，仅供参考。"
 	hint.add_theme_font_size_override("font_size", 11)
 	hint.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
-	vb.add_child(hint)
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_card_body.add_child(hint)
 	_place_estimate_box()
+
+## 折叠 / 展开卡片正文；标题与胜率条始终可见。
+func _toggle_estimate_body() -> void:
+	if _card_body == null:
+		return
+	_card_body.visible = not _card_body.visible
+	_card_toggle.text = "收起" if _card_body.visible else "展开"
+
+## 只收棋盘上的点目方块（卡片常驻保留上次点目）；标题 / 复盘 / 新局才整卡收起。
+func _clear_estimate_marks() -> void:
+	if board != null:
+		board.clear_estimate()
+
+## 新局 / 从封面回来：把卡片内容恢复成「等待第一份形势」。
+func _reset_global_card() -> void:
+	if _card_wr_bar == null:
+		return
+	_card_wr_bar.value = 50.0
+	_card_wr_black.text = "黑 --"
+	_card_wr_white.text = "白 --"
+	_card_score.text = "目差: --"
+	_card_score_hint.text = ""
+	_estimate_count.text = "点目：点「局面分析」后显示"
+	_estimate_lead.text = ""
+	_card_global.text = "她落子后会说一句全局判断。"
+	if _card_body != null:                     # 新局默认收起：只留胜率 / 目差，不挡棋盘视野
+		_card_body.visible = false
+		_card_toggle.text = "展开"
+	_estimate_move_count = -1
+	_last_ai_kind = ""
+
+## 第一份形势 / 从封面回来：把卡片摆出来（折叠状态由玩家自己保持）。
+func _show_global_card() -> void:
+	if _estimate_box != null and not _estimate_box.visible:
+		_estimate_box.visible = true
+		_place_estimate_box()
 
 ## 形势面板落位：左上角；左栏展开时向右让开，别压在侧栏上（棋盘投影在它下方，不会挡棋子）。
 func _place_estimate_box() -> void:
@@ -668,6 +1151,24 @@ func _build_right_panel(root: Control) -> void:
 	# 对局音效（v3.11.5）：纯前端；落子 / 提子 / 虚着 / 终局，音量与开关写回 config.json
 	_acc_check(drawer, "音效", cfg.sfx_enabled, "sfx",
 		"落子、提子、虚着、终局的轻音效；关闭后完全静音（不影响语音朗读）→ 立即生效")
+	_acc_check(drawer, "棋盘坐标", true, "coords",
+		"显示 / 隐藏棋盘四边的 A–T、19–1 坐标（本局内生效，不改 config.json）")
+	var chat_font_opt := OptionButton.new()
+	chat_font_opt.add_item("聊天字号：小 13", 0)
+	chat_font_opt.add_item("聊天字号：标准 15", 1)
+	chat_font_opt.add_item("聊天字号：大 17", 2)
+	chat_font_opt.selected = 1
+	chat_font_opt.tooltip_text = "只改聊天正文，本局内生效（不改 config.json）"
+	chat_font_opt.item_selected.connect(_on_chat_font_selected)
+	drawer.add_child(chat_font_opt)
+	var chat_gap_opt := OptionButton.new()
+	chat_gap_opt.add_item("聊天行距：紧", 0)
+	chat_gap_opt.add_item("聊天行距：标准", 1)
+	chat_gap_opt.add_item("聊天行距：宽", 2)
+	chat_gap_opt.selected = 1
+	chat_gap_opt.tooltip_text = "气泡内行距，本局内生效（不改 config.json）"
+	chat_gap_opt.item_selected.connect(_on_chat_gap_selected)
+	drawer.add_child(chat_gap_opt)
 	var sfx_vol_lbl := _field_label("音效音量")
 	sfx_vol_lbl.tooltip_text = "只控制落子/提子/虚着/终局音效；语音朗读音量在左侧栏单独调"
 	drawer.add_child(sfx_vol_lbl)
@@ -712,6 +1213,27 @@ func _build_right_panel(root: Control) -> void:
 	_acc_check(drawer, "时间感知", cfg.time_aware_enabled, "time_aware",
 		"默认关。开启后她知道现在几点、这一局下了多久、你多久没来、连续第几天——只在相关时提，"
 		+ "不会把数字当口头禅 → 立即生效")
+	# 人格化（自用版）：关系阶段 / 情绪余温 / 今天的小心思 / 夜間节奏 / 难度与偏航的半句提示。
+	_acc_check(drawer, "人格化", cfg.persona_enabled, "persona",
+		"默认开。她会记得你们一起下过多少盘、上一局的情绪余温、偶尔有点自己的小心思；"
+		+ "深夜放慢搭话，你长考时少打扰。关掉＝提示词逐字符不变、不写跨局状态 → 立即生效")
+	# 关系阶段与称呼变化：默认关；开启后可填高阶段称呼名（留空=仍叫 prompt_user_name）。
+	var rel_row := HBoxContainer.new()
+	rel_row.add_theme_constant_override("separation", 6)
+	drawer.add_child(rel_row)
+	_acc_check(rel_row, "关系称呼", cfg.persona_relationship_enabled, "persona_relationship",
+		"默认关。开启后按一起下完的局数推进称呼（初识 → 熟悉 → 熟络 → 老搭档）。"
+		+ "右侧填高阶段称呼名；留空则始终用 config.json 的 prompt_user_name（默认 Estarth）。")
+	var le_addr := LineEdit.new()
+	le_addr.placeholder_text = "称呼名（留空=%s）" % cfg.prompt_user_name
+	le_addr.text = cfg.persona_address_name
+	le_addr.max_length = 16
+	le_addr.custom_minimum_size = Vector2(120, 0)
+	le_addr.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	le_addr.tooltip_text = "关系到了「熟络 / 老搭档」后才偶尔使用；最多 16 字。留空=始终用 prompt_user_name。"
+	le_addr.text_submitted.connect(func(t): _on_persona_address_changed(t))
+	le_addr.focus_exited.connect(func(): _on_persona_address_changed(le_addr.text))
+	rel_row.add_child(le_addr)
 	# 只读面板：一个按钮 + 一块文本（**不新增右栏常驻控件位**，与 joseki / drift / digest 同风格）。
 	# 不并进 `_buttons`：它是只读 GET，复盘期间也允许看（冻结清单只锁「会改动局面 / 会让她开口」的控件）。
 	var prof_row := HBoxContainer.new()
@@ -732,8 +1254,19 @@ func _build_right_panel(root: Control) -> void:
 	vb.add_child(_chat_scroll)
 	_chat_box = VBoxContainer.new()
 	_chat_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_chat_box.add_theme_constant_override("separation", 6)
+	_chat_box.add_theme_constant_override("separation", _chat_line_px)
 	_chat_scroll.add_child(_chat_box)
+	_chat_scroll.get_v_scroll_bar().value_changed.connect(_on_chat_scrolled)
+
+	# 新消息提示（只在玩家翻上去看旧消息时出现）
+	_btn_new_msg = Button.new()
+	_btn_new_msg.text = "↓ 新消息"
+	_btn_new_msg.visible = false
+	_btn_new_msg.size_flags_horizontal = Control.SIZE_SHRINK_END
+	_btn_new_msg.tooltip_text = "回到最新消息"
+	GufengTheme.apply_bare_button(_btn_new_msg)
+	_btn_new_msg.pressed.connect(_scroll_to_bottom.bind(true))
+	vb.add_child(_btn_new_msg)
 
 	# 输入行
 	var inp_row := HBoxContainer.new()
@@ -1151,6 +1684,7 @@ func _on_tts_mode(i: int) -> void:
 		tts.voice = (cfg.tts_local_voice if m == "local" and cfg.tts_local_voice != "" else cfg.tts_voice)
 		tts.stop()
 	cfg.save()
+	_fill_voice_items()               # 本地 / 云端两套音色候选不同：切换朗读方式后重填
 	_tts_status.text = "朗读方式：%s（合成在后端，重启后端后生效）" % m
 	if _tts_aliyun_box != null:
 		_tts_aliyun_box.visible = m == "aliyun"
@@ -1186,6 +1720,9 @@ func _apply_tts_fields() -> void:
 func _fill_voice_items() -> void:
 	if _tts_voice_opt == null:
 		return
+	if cfg.tts_mode == "local":                         # 本地模式：显示经典版 Azure 克隆等本机音色
+		_fill_local_voice_items()
+		return
 	if _is_removed_voice(cfg.tts_voice):                # 旧配置里的男声/克隆音色 → 迁到中文女
 		cfg.tts_voice = "中文女"
 		if _tts_voice_edit != null:
@@ -1202,13 +1739,38 @@ func _fill_voice_items() -> void:
 			_tts_voice_opt.select(i)
 			break
 
+## 本地音色下拉：把经典版的 Azure 克隆音色加回来；当前值是未知 id 时也保留一行。
+func _fill_local_voice_items() -> void:
+	var cur := cfg.tts_local_voice.strip_edges()
+	if cur == "":
+		cur = "azure"
+	_tts_voice_opt.clear()
+	var found := false
+	for pair in LOCAL_VOICE_PRESETS:
+		_tts_voice_opt.add_item(str(pair[1]))
+		_tts_voice_opt.set_item_metadata(_tts_voice_opt.item_count - 1, str(pair[0]))
+		if str(pair[0]) == cur:
+			found = true
+	if not found:
+		_tts_voice_opt.add_item("当前：%s" % cur)
+		_tts_voice_opt.set_item_metadata(_tts_voice_opt.item_count - 1, cur)
+	for i in _tts_voice_opt.item_count:
+		if str(_tts_voice_opt.get_item_metadata(i)) == cur:
+			_tts_voice_opt.select(i)
+			break
+
 ## 已移除的音色（男声 / 韩语女 / 旧克隆音色）：清单以 AzureConfig.LEGACY_TTS_VOICES 为准，不再各存一份
 static func _is_removed_voice(v: String) -> bool:
 	return v in AzureConfig.LEGACY_TTS_VOICES
 
 func _on_voice_selected(i: int) -> void:
 	var vid := str(_tts_voice_opt.get_item_metadata(i))
-	if vid == "" or vid == cfg.tts_voice:
+	if vid == "":
+		return
+	if cfg.tts_mode == "local":
+		await _apply_local_voice(vid)
+		return
+	if vid == cfg.tts_voice:
 		return
 	cfg.tts_voice = vid
 	_tts_voice_edit.text = vid
@@ -1218,10 +1780,73 @@ func _on_voice_selected(i: int) -> void:
 	cfg.save()
 	_tts_status.text = "音色已切换：%s" % vid
 
+## 本地音色：写 config + 通知后端内存立即生效（不重启后端、不丢棋局）；
+## 需要质量引擎而当前不是时，用 `-TtsOnly` 在后台换引擎，加载期只显示文字（不退回系统语音）。
+func _apply_local_voice(vid: String) -> void:
+	if vid == cfg.tts_local_voice:
+		return
+	cfg.tts_local_voice = vid
+	cfg.save()
+	if tts != null:
+		tts.voice = vid
+		tts.stop()
+	if agent != null:
+		agent.set_tts_local_voice(vid)              # 后端 /api/config：下一句就用新音色
+	_refresh_tts_route()
+	if local_voice_wants_quality(vid):
+		var h := await _tts_health_once()
+		if _cosyvoice_ready(h):
+			_local_tts_loading = false
+			if tts != null:
+				tts.set_suppress_system(false)
+			_tts_status.text = "本地音色已切换：%s（立即生效）" % vid
+			return
+		_local_tts_loading = true
+		if tts != null:
+			tts.set_suppress_system(true)
+		_maybe_start_local_services(true, false, true)   # 只起语音、换质量引擎；不写配置、不动后端
+		_watch_local_tts_ready()
+		_tts_status.text = "已切到 %s：CosyVoice 后台加载中，先只显示文字" % vid
+		return
+	# 轻量音色：质量引擎也能念它，当前有服务就不必停掉重起；没服务才拉一个轻量。
+	var h2 := await _tts_health_once()
+	_local_tts_loading = false
+	if tts != null:
+		tts.set_suppress_system(false)
+	if h2.is_empty():
+		_maybe_start_local_services(false, false, true)
+	_tts_status.text = "本地音色已切换：%s（轻量引擎）" % vid
+
 ## 「重填音色候选」按钮：音色不再由服务端提供，这里只按静态候选重填一次下拉框
 func _refresh_voices() -> void:
 	_fill_voice_items()
-	_tts_status.text = "音色候选已重填（%d 项，也可手填服务商音色）" % _tts_voice_opt.item_count
+	if cfg.tts_mode == "local":
+		_tts_status.text = "本地音色候选已重填（%d 项）" % _tts_voice_opt.item_count
+	else:
+		_tts_status.text = "音色候选已重填（%d 项，也可手填服务商音色）" % _tts_voice_opt.item_count
+
+## ⚙ 抽屉里这些开关只进状态栏（不是语音项）。集中成一张表，新增开关不会再漏写状态文案。
+const ACC_STATUS_NAMES := {
+	"digest": "聊天摘要用 LLM",
+	"profile": "玩家棋风画像",
+	"time_aware": "时间感知",
+	"persona": "人格化",
+	"persona_relationship": "关系称呼",
+	"sfx": "音效",
+	"ownership": "领地热力图",
+	"adaptive": "自适应难度",
+}
+
+## 关系称呼名（⚙ 抽屉）：失焦 / 回车时写盘并推给后端；留空=仍叫 prompt_user_name。
+func _on_persona_address_changed(text: String) -> void:
+	var s := str(text).strip_edges().substr(0, 16)
+	if s == cfg.persona_address_name:
+		return
+	cfg.persona_address_name = s
+	cfg.save()
+	if agent != null:
+		agent.set_persona_relationship(cfg.persona_relationship_enabled, s)
+	_set_status("关系称呼：%s" % (s if s != "" else "仍叫 %s" % cfg.prompt_user_name))
 
 ## 右侧栏语音开关：立即存盘并即时生效（都不需要重启任何服务）
 func _on_acc_toggled(on: bool, which: String) -> void:
@@ -1243,6 +1868,11 @@ func _on_acc_toggled(on: bool, which: String) -> void:
 			cfg.sfx_enabled = on
 			if sfx != null:
 				sfx.enabled = on
+		"coords":
+			if board != null:
+				board.set_coords_visible(on)
+			_set_status("棋盘坐标已%s（本局内生效）" % ("显示" if on else "隐藏"))
+			return
 		"ownership":
 			cfg.ownership_enabled = on
 			if board != null:
@@ -1266,11 +1896,17 @@ func _on_acc_toggled(on: bool, which: String) -> void:
 			cfg.time_aware_enabled = on
 			if agent != null:
 				agent.set_profile(cfg.profile_enabled, cfg.time_aware_enabled)
+		"persona":
+			cfg.persona_enabled = on
+			if agent != null:
+				agent.set_persona(on)
+		"persona_relationship":
+			cfg.persona_relationship_enabled = on
+			if agent != null:
+				agent.set_persona_relationship(on, cfg.persona_address_name)
 	cfg.save()
-	if which in ["digest", "profile", "time_aware", "sfx", "ownership", "adaptive"]:
-		# 它们不是语音项：只进底部状态栏——`_tts_status` 是左栏「语音朗读」的状态行，别写串
-		var nm2 := "聊天摘要用 LLM" if which == "digest" else ("玩家棋风画像" if which == "profile" else ("时间感知" if which == "time_aware" else ("音效" if which == "sfx" else ("领地热力图" if which == "ownership" else "自适应难度"))))
-		_set_status("%s 已%s（立即生效）" % [nm2, "开启" if on else "关闭"])
+	if ACC_STATUS_NAMES.has(which):
+		_set_status("%s 已%s（立即生效）" % [ACC_STATUS_NAMES[which], "开启" if on else "关闭"])
 		return
 	var nm := "同步说话" if which == "sync" else ("整段合成" if which == "batch" else "长句合并")
 	var scope := "（重启后端后生效）" if which == "chunk" else "（立即生效）"
@@ -1331,9 +1967,9 @@ func _add_msg(kind: String, text: String) -> void:
 		return                               # 玩家已经回来继续下棋：这句走神搭话作废（不出声也不显示）
 	var tone := ""
 	if is_ai:
-		var parsed := _strip_tone(text)      # 剥离 [[tone:xxx]] 语气标记（玩家不可见、TTS 不朗读）
-		tone = str(parsed[0])
-		text = str(parsed[1])
+		var tone_parsed := _strip_tone(text)  # 剥离 [[tone:xxx]] 语气标记（玩家不可见、TTS 不朗读）
+		tone = str(tone_parsed[0])
+		text = str(tone_parsed[1])
 		if text.strip_edges() == "":
 			return
 		# 防复读按「去掉 {行为} 后的正文」判断：只换动作、正文一样的两条也算复读
@@ -1510,13 +2146,16 @@ func _director_hesitation(kind: String, waiting_behind: int, seq: int) -> float:
 		return randf_range(HESITATE_SLOW_MIN, HESITATE_SLOW_MAX)
 	return randf_range(HESITATE_FAST_MIN, HESITATE_FAST_MAX)
 
-## 轮到这条消息投递时真正执行（原 _add_msg 主体）：先轻声补个语气词，文字/语音仍按既有管线走。
+## 轮到这条消息投递时真正执行（原 _add_msg 主体）：文字/语音仍按既有管线走。
 ## `rec` 是这条台词在 `_add_msg` 里登记的语音配对记录（{} = 这条不由后端朗读/语音关着）
 func _deliver_msg(kind: String, text: String, tone: String, rec: Dictionary) -> void:
 	var is_ai := kind.begins_with("ai")
 	var reveal := kind == "ai_move"          # 这条是「Azure 落子宣告」：轮到她这段语音时再落子
-	if tone != "":
-		_mood_sound(tone)                    # 语气标记 → 预制语气词（同一情绪延续时不重复出声）
+	if is_ai:
+		# 只记「上一句」的语义，真正插语气词在下一个思考节点（`_show_thinking`）做
+		_last_ai_tone = tone
+		_last_ai_acts = _strip_actions(text)[0]
+		_last_ai_semantic_ms = Time.get_ticks_msec()
 	if is_ai and tts != null and tts.enabled and not rec.is_empty():
 		var tts_kind := "idle" if kind == "ai_idle" else ""      # 走神搭话可被整类取消（cancel_kind("idle")）
 		if cfg.tts_batch_speak:
@@ -1584,6 +2223,13 @@ func _release_batch(force_show: bool) -> void:
 	_flush_pending_ai()                 # 已经在响了 / 需要保序：先显示文字
 
 func _add_msg_now(kind: String, text: String) -> void:
+	# 全局形势卡：把「落子宣告」之后那句（第三句）同步到卡片；与聊天共用同一份文本。
+	if kind.begins_with("ai"):
+		if kind == "ai" and _last_ai_kind == "ai_move" and _card_global != null:
+			var clean := str(_strip_actions(text)[1]).strip_edges()
+			if clean != "":
+				_card_global.text = clean
+		_last_ai_kind = kind
 	# {行为} 标签只在**文字真正出现**的这一刻演（有语音时这里正是语音开播 / 配对的显示点）
 	if kind.begins_with("ai"):
 		var parsed := _strip_actions(text)
@@ -1625,18 +2271,22 @@ func _add_msg_now(kind: String, text: String) -> void:
 	row.add_child(bubble)
 
 	var inner := VBoxContainer.new()
-	inner.add_theme_constant_override("separation", 2)
+	inner.name = "ChatInner"
+	inner.add_theme_constant_override("separation", _chat_line_px)
 	bubble.add_child(inner)
 	if kind == "ai":
 		var who := Label.new()
+		who.name = "ChatWho"
 		who.text = "Azure"
 		who.add_theme_font_size_override("font_size", 11)
 		who.add_theme_color_override("font_color", GufengTheme.CINNABAR)
 		inner.add_child(who)
 	var lbl := Label.new()
+	lbl.name = "ChatText"
 	lbl.text = text if kind != "ai" else ""      # AI 消息先空着：交给 _start_typing 按节奏逐字显示
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	lbl.custom_minimum_size = Vector2(292, 0)
+	lbl.add_theme_font_size_override("font_size", _chat_font_px)
 	lbl.add_theme_color_override("font_color", GufengTheme.INK)   # 三种气泡都是纸底：一律墨字
 	inner.add_child(lbl)
 
@@ -1732,8 +2382,7 @@ func _show_thinking() -> void:
 	who.add_theme_color_override("font_color", GufengTheme.CINNABAR)
 	inner.add_child(who)
 	var lbl := Label.new()
-	_thinking_idx = -1                                 # 新的一次等待：从短句表里重新挑一句
-	lbl.text = _next_thinking_text()
+	lbl.text = THINKING_FALLBACK
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	lbl.custom_minimum_size = Vector2(292, 0)
 	lbl.add_theme_color_override("font_color", GufengTheme.INK)
@@ -1741,10 +2390,10 @@ func _show_thinking() -> void:
 	_chat_box.add_child(row)
 	_thinking_row = row
 	_thinking_label = lbl
-	_think_last_ms = Time.get_ticks_msec()              # 换句计时从这一句开始
+	_think_last_ms = Time.get_ticks_msec()              # 省略号计时从这一句开始
 	_scroll_to_bottom()
-	if tts != null:
-		tts.play_filler("think")         # 思考时先「嗯……」一声，别让等待无声（冷却由 TTS 内部管）
+	_filler_nodes += 1
+	_maybe_semantic_filler()
 
 func _clear_thinking() -> void:
 	if _thinking_row != null and is_instance_valid(_thinking_row):
@@ -1753,22 +2402,16 @@ func _clear_thinking() -> void:
 	_thinking_label = null
 
 ## 句间合成空隙也要有「思考中…」：下一句正在合成、还没开始播时显示占位。
-## v3.11.2：占位里的短句**每秒换一句**（随机且不连复，句子表见 `game/data/thinking_lines.json`）；
-## 句子表读不到时退回旧行为——每 450ms 让省略号动一下。
+## 当前只做省略号动效，不轮播任何短句。
 func _update_thinking(now: int) -> void:
 	if _thinking_label == null and pairing.has_pending() and not _tts_playing:
 		_show_thinking()                                 # 文字还没轮到显示、也没在播：她在憋下一句
 	if _thinking_label == null:
 		return
-	if _thinking_lines.is_empty():
-		if now - _think_last_ms >= 450:
-			_think_last_ms = now
-			_think_dots = _think_dots % 3 + 1
-			_thinking_label.text = THINKING_FALLBACK + "…".repeat(_think_dots)
-		return
-	if now - _think_last_ms >= THINKING_SWITCH_MS:
+	if now - _think_last_ms >= 450:
 		_think_last_ms = now
-		_thinking_label.text = _next_thinking_text()
+		_think_dots = _think_dots % 3 + 1
+		_thinking_label.text = THINKING_FALLBACK + "…".repeat(_think_dots)
 
 ## 占位气泡只在「还等着、也没在说话」时清掉，避免把马上要被替换的占位提前删掉
 func _clear_thinking_if_idle() -> void:
@@ -1784,10 +2427,10 @@ func _clear_thinking_if_idle() -> void:
 ## 这里只把它**逐项应用**到控件上——退出复盘时同样走这里，所以「逐项恢复」不需要另一套逻辑（V20/V21）。
 func _refresh_lock() -> void:
 	var s := review_lock_state(_reviewing, agent != null and agent.busy, _speech_hold, _move_pending,
-			pairing.pending_reveal(), _title_open, _fr_active, _game_ended)
+			pairing.pending_reveal(), _title_open, _fr_active, _game_ended, agent == null)
 	if board != null:
 		board.locked = bool(s["locked"])
-		board.set_readonly(bool(s["readonly"]))   # 复盘只读（落子与摸头同源）
+		board.set_readonly(bool(s["readonly"]))   # 复盘只读（落子与摸头都禁；她思考中只禁落子）
 	for b in _buttons:
 		b.disabled = bool(s["buttons_disabled"])
 	if _btn_reset != null:
@@ -1824,19 +2467,22 @@ func _refresh_lock() -> void:
 ## （局面已经定案，不该再要提示、再点一次结束）；**重来不灰**——那是玩家开新局的出口。
 static func review_lock_state(reviewing: bool, busy: bool, speech_hold: bool,
 		move_pending := false, reveal_pending := false, menu_open := false,
-		full_review := false, game_ended := false) -> Dictionary:
-	var locked := busy or move_pending or reveal_pending or menu_open or full_review
+		full_review := false, game_ended := false, client_missing := false) -> Dictionary:
+	# `client_missing`＝NetClient 还没装配（例如选「等待 CosyVoice」的启动等待期）：
+	# 棋盘 / 按钮 / 聊天一起锁住，避免点进 `agent.player_move` 打到 Nil。
+	var locked := busy or move_pending or reveal_pending or menu_open or full_review or client_missing
 	var base_disabled := locked or speech_hold or reviewing or full_review
 	return {
 		"readonly": reviewing or full_review,          # 棋盘只读：复盘 / 全盘复盘
 		"locked": locked,                       # 她思考中 / 点下就锁 / 她的落子还没揭示 / 主界面开着
 		"buttons_disabled": base_disabled or game_ended,   # 提示 / 局面分析 / 结束（重来见下一项）
 		"reset_disabled": base_disabled,        # 复盘 / 全盘复盘 / 忙碌 / 语音未完：重来也冻
-		"chat_editable": not reviewing and not menu_open and not full_review,    # 聊天禁用
+		"chat_editable": not reviewing and not menu_open and not full_review and not client_missing,    # 聊天禁用
 		# 别的会改动**真实棋局**的入口（I1）：`⏪ 俗手回档` 按钮（`_bad_box`，每次 state 事件都会重建）
 		# 与两个开关（允许虚着 → POST /api/config、定式导学）。后端刻意不门禁 /api/undo 与 /api/config，
 		# 所以只能靠前端冻住——但**只有复盘**冻它们：她忙碌时回档 / 改配置是既有且被支持的玩法，不许回退。
-		"extra_disabled": reviewing or menu_open or full_review,
+		# `client_missing` 时同样冻：这些入口都会调 `agent`，不能让它打到 Nil。
+		"extra_disabled": reviewing or menu_open or full_review or client_missing,
 	}
 
 ## 能不能进复盘（I2）：正在跑回合（如「结束」的总结还在途中）或她还有语音没播完时**先别进**。
@@ -1876,10 +2522,48 @@ func _reveal_move() -> void:
 	if agent != null:
 		agent.reveal_move()
 
-func _scroll_to_bottom() -> void:
+func _scroll_to_bottom(force := false) -> void:
 	await get_tree().process_frame
-	if _chat_scroll != null:
+	if _chat_scroll == null:
+		return
+	if force or _chat_follow:
 		_chat_scroll.scroll_vertical = 1 << 20
+		_chat_follow = true
+		if _btn_new_msg != null:
+			_btn_new_msg.visible = false
+	elif _btn_new_msg != null:
+		_btn_new_msg.visible = true
+
+## 聊天滚动：在底部就跟随新消息；翻上去后新消息只亮提示，不把玩家拽回底部。
+func _on_chat_scrolled(_v: float) -> void:
+	if _chat_scroll == null:
+		return
+	var bar := _chat_scroll.get_v_scroll_bar()
+	_chat_follow = bar.value >= bar.max_value - bar.page - 8.0
+	if _chat_follow and _btn_new_msg != null:
+		_btn_new_msg.visible = false
+
+func _on_chat_font_selected(i: int) -> void:
+	_chat_font_px = [13, 15, 17][clampi(i, 0, 2)]
+	_apply_chat_style()
+
+func _on_chat_gap_selected(i: int) -> void:
+	_chat_line_px = [2, 6, 10][clampi(i, 0, 2)]
+	_apply_chat_style()
+
+## 把字号 / 行距应用到已经显示的气泡（新气泡在建的时候直接取当前值）。
+func _apply_chat_style() -> void:
+	if _chat_box == null:
+		return
+	_chat_box.add_theme_constant_override("separation", maxi(4, _chat_line_px))
+	for row in _chat_box.get_children():
+		for bubble in row.get_children():
+			for inner in bubble.get_children():
+				if inner is VBoxContainer:
+					inner.add_theme_constant_override("separation", _chat_line_px)
+					var lbl := inner.get_node_or_null("ChatText") as Label
+					if lbl != null:
+						lbl.add_theme_font_size_override("font_size", _chat_font_px)
 
 func _render_bad_moves(list: Array) -> void:
 	for c in _bad_box.get_children():
@@ -2043,6 +2727,7 @@ func _close_title_screen() -> void:
 	if title_screen != null:
 		title_screen.close()
 	_refresh_lock()
+	_show_global_card()                           # 从封面回来：形势卡带着上一局的最后数据回来
 	_bump_activity()                              # 从菜单回来不算「闲置」
 
 ## 主界面首帧：两侧栏与贴边开关都收起来，相机直接摆到「远看 + 正对棋盘」取景
@@ -2182,6 +2867,8 @@ static func fresh_game_labels() -> Dictionary:
 ## v3.12.2：复盘计数与「回看中」标志也在这里归零——从主界面进来时，上一局的复盘态不许漏进新局。
 func _reset_game_view() -> void:
 	_hide_estimate()
+	_reset_global_card()
+	_show_global_card()                           # 新局：卡片带着占位文案回来，第一份 info 再填数
 	_release_move_pending()
 	_last_move_count = 0
 	_last_stone_count = 0
@@ -2274,8 +2961,8 @@ func _games_refresh(select_id := 0) -> void:
 	var lib := game_library
 	agent.fetch_bytes("/api/games", HTTPClient.METHOD_GET, {},
 		func(ok: bool, code: int, body: PackedByteArray):
-			if game_library != lib or seq != _games_list_seq:
-				return                              # 旧回包 / 已经换过一个库实例：直接丢弃
+			if not is_instance_valid(lib) or game_library != lib or seq != _games_list_seq:
+				return                              # 库实例已被释放 / 旧回包 / 已经换过一个库实例：直接丢弃
 			if not ok:
 				game_library.set_status("棋谱库读取失败：" + _games_error_text(code, body), true)
 				return
@@ -2303,8 +2990,8 @@ func _games_open(game_id: int) -> void:
 	var lib := game_library
 	agent.fetch_bytes("/api/games/%d" % game_id, HTTPClient.METHOD_GET, {},
 		func(ok: bool, code: int, body: PackedByteArray):
-			if game_library != lib or seq != _games_open_seq:
-				return                              # 又点了别的棋谱 / 库已换实例：旧回包作废
+			if not is_instance_valid(lib) or game_library != lib or seq != _games_open_seq:
+				return                              # 库实例已释放 / 又点了别的棋谱 / 库已换实例：旧回包作废
 			if not ok:
 				game_library.set_status("读到第 %d 盘失败：%s" % [game_id, _games_error_text(code, body)], true)
 				return
@@ -2314,7 +3001,16 @@ func _games_open(game_id: int) -> void:
 				game_library.set_status("这盘棋谱是空的", true)
 				return
 			game_library.set_selected(rec)
-			game_library.set_status("已载入第 %d 盘" % game_id))
+			game_library.set_status("已载入第 %d 盘" % game_id)
+			# 她的回忆（纯本地短文案，零 LLM）：旧回包 / 已换库实例直接丢弃。
+			agent.fetch_bytes("/api/games/%d/remark" % game_id, HTTPClient.METHOD_GET, {},
+				func(ok2: bool, code2: int, body2: PackedByteArray):
+					if not is_instance_valid(lib) or game_library != lib or seq != _games_open_seq:
+						return
+					if not ok2:
+						return
+					var d2 := _json_dict(body2)
+					game_library.set_remark(str(d2.get("text", "")))))
 
 func _games_import() -> void:
 	if game_library == null or agent == null:
@@ -2661,17 +3357,7 @@ func _modal_open() -> bool:
 			return true
 	return false
 
-# ================= 思考中的短句（v3.11.2） =================
-
-func _load_thinking_lines() -> void:
-	var f := FileAccess.open(THINKING_LINES_PATH, FileAccess.READ)
-	if f == null:
-		return
-	var text := f.get_as_text()
-	f.close()
-	_thinking_lines = parse_thinking_lines(text)
-	if _thinking_lines.is_empty():
-		print("[UI] %s 没有可用短句，思考中改用旧的省略号动效" % THINKING_LINES_PATH)
+# ================= 思考短句解析工具（当前运行路径不轮播） =================
 
 ## JSON → 短句表（**纯函数**，门卫直接调它）：接受 `{"lines": [...]}` 或裸数组；
 ## 非字符串 / 空串 / 重复句一律丢掉（重复句轮换时看起来就像卡住了）。
@@ -2715,12 +3401,6 @@ static func next_thinking_index(prev: int, count: int, rng_value: float) -> int:
 	if n >= prev:
 		n += 1                                    # 再补回去 ⇒ 一定绕开上一句
 	return n
-
-func _next_thinking_text() -> String:
-	if _thinking_lines.is_empty():
-		return THINKING_FALLBACK
-	_thinking_idx = next_thinking_index(_thinking_idx, _thinking_lines.size(), randf())
-	return _thinking_lines[_thinking_idx]
 
 # ================= 启动设置面板 =================
 
@@ -2790,6 +3470,22 @@ func _build_setup_panel(primary_text := "开始对局",
 	vb.add_theme_constant_override("separation", 8)
 	scroll.add_child(vb)
 
+	# 品牌图（用户提供）：放在「出发前的准备」上方；图片缺失时静默跳过，不影响设置面板。
+	var brand_tex = load("res://assets/AzureGo2.0.png")
+	if brand_tex != null:
+		var brand_card := PanelContainer.new()
+		brand_card.add_theme_stylebox_override("panel", GufengTheme.panel(12))
+		brand_card.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+		brand_card.custom_minimum_size = Vector2(148, 148)
+		var brand_img := TextureRect.new()
+		brand_img.texture = brand_tex
+		brand_img.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		brand_img.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		brand_img.custom_minimum_size = Vector2(124, 124)
+		brand_img.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		brand_card.add_child(brand_img)
+		vb.add_child(brand_card)
+
 	var title := Label.new()
 	title.text = "出发前的准备"
 	title.add_theme_font_size_override("font_size", 20)
@@ -2801,6 +3497,15 @@ func _build_setup_panel(primary_text := "开始对局",
 	sub.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(sub)
+
+	# 本地语音预加载进度：预热在封面 / 设置期间就已经在跑，这里给玩家一个确定的进度。
+	var tts_live := Label.new()
+	tts_live.text = "本地语音：检查中…"
+	tts_live.add_theme_font_size_override("font_size", 11)
+	tts_live.add_theme_color_override("font_color", GufengTheme.DAI)
+	tts_live.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	vb.add_child(tts_live)
+	_poll_setup_tts_state(tts_live)
 
 	vb.add_child(_field_label("界面主题（重启游戏后生效）"))
 	var theme_opt := OptionButton.new()
@@ -2861,6 +3566,22 @@ func _build_setup_panel(primary_text := "开始对局",
 	tts_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	aliyun_body.add_child(tts_hint)
 
+	var vlm_body := _setup_section(vb, "窥屏 VLM（长时间闲置、切去别的窗口时看她一眼）", false)
+	var chk_vlm := CheckBox.new()
+	chk_vlm.button_pressed = cfg.vlm_enabled
+	_style_check(chk_vlm, "启用长时间闲置窥屏")
+	vlm_body.add_child(chk_vlm)
+	var le_vlm_url := _setup_field(vlm_body, "服务地址（留空=本机自动拉起）", cfg.vlm_base_url,
+		"填了就走这个外部/自管 OpenAI 兼容 VLM 服务；留空则由游戏在本机端口拉起 llama-server")
+	var le_vlm_port := _setup_field(vlm_body, "本机服务端口", str(cfg.vlm_port),
+		"留空服务地址时，游戏在 127.0.0.1 的这个端口自动拉起 VLM 服务；默认 8090")
+	var vlm_hint := Label.new()
+	vlm_hint.text = "只在游戏窗口失去焦点、且你约 12 秒没操作时触发；截图、OCR 与画面描述都留在本机，不联网。看到密码、聊天、支付、账号等私密内容时不会提，只当你在忙。"
+	vlm_hint.add_theme_font_size_override("font_size", 11)
+	vlm_hint.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
+	vlm_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	vlm_body.add_child(vlm_hint)
+
 	var sep := ColorRect.new()
 	sep.color = Color(GufengTheme.INK, 0.22)
 	sep.custom_minimum_size = Vector2(0, 1)
@@ -2877,6 +3598,27 @@ func _build_setup_panel(primary_text := "开始对局",
 			_setup_showing = false
 			back.queue_free())
 		hb.add_child(cancel)
+	# 「本地全套」：把本机服务地址与本机音色一次填好（不碰 API Key / 云端音色）。
+	var rec := Button.new()
+	rec.text = "本地全套"
+	rec.tooltip_text = "填入本机 LLM 8080 / TTS 9880 / 后端 8000 与 Azure 克隆音色；不清空 API Key 与 config 里已有的 KataGo 地址"
+	GufengTheme.apply_button(rec)
+	rec.pressed.connect(func():
+		cfg.backend_url = "http://127.0.0.1:8000"
+		cfg.llm_base_url = "http://localhost:8080/v1"
+		cfg.tts_enabled = true
+		cfg.tts_mode = "local"
+		cfg.tts_local_base_url = "http://127.0.0.1:9880/v1"
+		cfg.tts_local_voice = "azure"
+		cfg.auto_start_services = true
+		le_llm_url.text = cfg.llm_base_url
+		le_tts_url.text = ""
+		tts_route.text = "实际朗读：" + cfg.tts_route_label()
+		_fill_voice_items()                       # 左侧栏音色下拉同步成本地列表（Azure 克隆）
+		_refresh_tts_route()
+		cfg.save()
+		_set_status("已填入并保存本地全套：LLM 8080 / TTS 9880 / 后端 8000 + Azure 克隆（KataGo 沿用 config）"))
+	hb.add_child(rec)
 	var start := Button.new()
 	start.text = primary_text
 	start.add_theme_font_size_override("font_size", 16)
@@ -2886,7 +3628,8 @@ func _build_setup_panel(primary_text := "开始对局",
 		_setup_showing = false
 		_setup_done = true                    # 本次运行已经配过：开局不再弹第二遍
 		_apply_setup(think_opt, le_llm_url, le_llm_model, le_llm_key,
-			le_tts_url, le_tts_voice, le_tts_key, le_tts_voice_id, theme_opt)
+			le_tts_url, le_tts_voice, le_tts_key, le_tts_voice_id,
+			chk_vlm, le_vlm_url, le_vlm_port, theme_opt)
 		back.queue_free()
 		setup_confirmed.emit())
 	start.grab_focus()
@@ -2927,6 +3670,7 @@ func _setup_field(parent: Control, label_text: String, value: String, tip := "")
 ## **不改 `tts_mode`**：朗读方式是玩家在左侧栏选的，启动面板不该每次开局都把它悄悄改回去。
 func _apply_setup(think_opt: OptionButton, llm_url: LineEdit, llm_model: LineEdit, llm_key: LineEdit,
 		tts_url: LineEdit, tts_voice: LineEdit, tts_key: LineEdit, tts_voice_id: LineEdit,
+		vlm_on: CheckBox, vlm_url: LineEdit, vlm_port: LineEdit,
 		theme_opt: OptionButton) -> void:
 	cfg.llm_think_mode = clampi(think_opt.selected, 0, 2)
 	if theme_opt != null:
@@ -2943,6 +3687,13 @@ func _apply_setup(think_opt: OptionButton, llm_url: LineEdit, llm_model: LineEdi
 	cfg.tts_aliyun_api_key = tts_key.text.strip_edges()      # Key 可以清空（→ 回落系统语音）
 	if tts_voice_id.text.strip_edges() != "":                # 音色 ID 不允许被清成空：空则保留原值
 		cfg.tts_aliyun_voice = tts_voice_id.text.strip_edges()
+	cfg.vlm_enabled = vlm_on.button_pressed
+	cfg.vlm_base_url = vlm_url.text.strip_edges()             # 地址可留空：空=本机自动拉起
+	var vport := vlm_port.text.strip_edges()
+	if vport.is_valid_int():
+		cfg.vlm_port = clampi(vport.to_int(), 1024, 65535)
+	_vlm_url = ""                                             # 设置变了：下次重新解析 VLM 地址
+	_vlm_starter = ""
 	cfg.save()
 	if agent != null:
 		agent.think_mode = cfg.llm_think_mode       # 主界面「设置」改完即时生效（v3.11.2：不用重启后端）
@@ -2955,10 +3706,12 @@ func _apply_setup(think_opt: OptionButton, llm_url: LineEdit, llm_model: LineEdi
 		if _tts_aliyun_voice_edit != null:
 			_tts_aliyun_voice_edit.text = cfg.tts_aliyun_voice
 		_refresh_tts_route()
-	print("[Setup] 启动设置已保存：思考模式=%d · LLM=%s (%s) · 朗读方式=%s · 云端=%s/%s · 阿里云音色=%s%s"
+	print("[Setup] 启动设置已保存：思考模式=%d · LLM=%s (%s) · 朗读方式=%s · 云端=%s/%s · 阿里云音色=%s%s · 窥屏=%s/%s"
 			% [cfg.llm_think_mode, cfg.llm_base_url, cfg.llm_model, cfg.tts_mode,
 			   cfg.tts_base_url, cfg.tts_voice, cfg.tts_aliyun_voice,
-			   "" if cfg.tts_aliyun_api_key != "" else "（未填 Key）"])
+			   "" if cfg.tts_aliyun_api_key != "" else "（未填 Key）",
+			   "开" if cfg.vlm_enabled else "关",
+			   cfg.vlm_base_url if cfg.vlm_base_url != "" else "127.0.0.1:%d" % cfg.vlm_port])
 
 # ================= 服务与接线 =================
 
@@ -2975,6 +3728,7 @@ func _build_services() -> void:
 	agent.net_status.connect(_on_net_status)
 	add_child(agent)                              # _ready 里发起 WS 连接（连上先收 hello 同步棋盘与情绪）
 	agent.setup()                                 # 占位：引擎/LLM 由后端持有
+	agent.set_tts_local_voice(cfg.tts_local_voice)  # 本地音色：后端内存立即对齐（不重启、不丢棋局）
 	agent.reply_style = cfg.reply_style           # 说话详略三档（连上后自动补发；旧版后端读 limit_len）
 	agent.think_mode = cfg.llm_think_mode         # 思考强度：运行期可改，不用重启后端
 	agent.joseki_teach = cfg.joseki_teach
@@ -2984,9 +3738,11 @@ func _build_services() -> void:
 	agent.set_drift(cfg.emotion_drift, cfg.drift_base)
 	agent.set_digest(cfg.chat_digest_llm)
 	agent.set_profile(cfg.profile_enabled, cfg.time_aware_enabled)   # v3.9.0：画像 / 时间感知两个开关
+	agent.set_persona_all(cfg.persona_enabled, cfg.persona_relationship_enabled, cfg.persona_address_name)
 	agent.adaptive_difficulty = cfg.adaptive_difficulty              # v3.11.5：自适应难度（默认关）
 	agent.adaptive_difficulty_base = cfg.adaptive_difficulty_base
 	_wire_agent()
+	_refresh_lock()                               # 装配完成：解开启动等待期对棋盘的冻结
 	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
 
 ## 客户端侧语音：只负责播放（后端按 speech 事件送来的音频 / 系统语音指令），不合成、不起服务
@@ -2998,12 +3754,15 @@ func _build_client_tts() -> void:
 	tts.speed = cfg.tts_speed
 	tts.pitch = cfg.tts_pitch
 	tts.volume = cfg.tts_volume
+	tts.set_suppress_system(_local_tts_loading)    # 质量引擎加载期：系统语音降级不出声（只显示文字）
 	add_child(tts)
 	tts.allow_fillers = false                     # 开场问候/闲置搭话等非玩家触发的语音不插语气词，等真正对局互动再放行
 	tts.status.connect(_on_tts_status)
 	tts.speaking_changed.connect(_on_tts_speaking)
 	tts.utterance_started.connect(_on_utterance_started)
 	tts.speech_skipped.connect(_on_speech_skipped)   # 这条语音不会再响（被停/队列溢出）：文字兜底立即显示
+	if cfg.vlm_enabled:
+		_ensure_vlm_url()                         # 后台预热窥屏 VLM（GPU 常驻；本机没有环境则静默跳过）
 
 ## agent 的信号接线 + 情绪心跳（NetClient 的信号面）
 func _wire_agent() -> void:
@@ -3033,19 +3792,6 @@ func _on_net_status(text: String, bad: bool) -> void:
 	_set_status(text, bad)
 	if bad:
 		pairing.release_stale(_pair_facts(), true)
-
-## 语气词统一出口：同一情绪在 MOOD_KEEP_MS 内延续时只刷新计时、不再出声（治「一惊一乍、语气太多」）；
-## 情绪变化或隔了很久才再次出现，才真正响一声。"" 是 no-op（平淡发言不代表情绪结束）。
-func _mood_sound(kind: String) -> void:
-	if tts == null or kind == "":
-		return
-	var now := Time.get_ticks_msec()
-	if kind == _mood and now - _mood_ms < MOOD_KEEP_MS:
-		_mood_ms = now                             # 情绪还在延续：保持基调，不再出声
-		return
-	_mood = kind
-	_mood_ms = now
-	tts.play_filler(kind, true)
 
 ## {行为} 标签 → 化身动作：只在文字/语音出现的时刻调用（见 `_add_msg_now`）。
 ## 一个段里最多两个：表情按顺序播放，后一个覆盖前一个；脸红单独走定时器。
@@ -3083,7 +3829,7 @@ func _play_actions(acts: Array) -> void:
 		if played >= 2:
 			break
 
-## 三维情绪区域变化：持续表情 / 一次性强调表情 / 语气词 / TTS 音高微调
+## 三维情绪区域变化：持续表情 / 一次性强调表情 / TTS 音高微调；语气词只在思考节点决定。
 func _on_mood_changed(p: Dictionary) -> void:
 	if tts != null:
 		tts.set_mood_pitch(float(p.get("pitch", 0.0)))
@@ -3092,9 +3838,80 @@ func _on_mood_changed(p: Dictionary) -> void:
 		var burst := str(p.get("burst", ""))
 		if burst != "":
 			avatar.play_expression(burst)          # 一次性强调（叠加在持续层上，几秒后回落到区域表情）
-	var f := str(p.get("filler", ""))
-	if f != "":
-		_mood_sound(f)                             # 区域对应的预制语气词（同情绪延续时不出声）
+	_mood_v = clampf(float(p.get("v", _mood_v)), 0.0, 1.0)
+	_mood_c = clampf(float(p.get("c", _mood_c)), 0.0, 1.0)
+	_mood_a = clampf(float(p.get("a", _mood_a)), 0.0, 1.0)
+	_last_mood_filler = str(p.get("filler", ""))
+
+## 思考节点插语气词：预制音必须匹配上一句的语气 / 行为标签；频率由当前情绪强度决定。
+## 节点 = 新的「Azure 思考中…」占位（语音段之间的真实空隙），不再按墙上时钟定时。
+func _maybe_semantic_filler() -> void:
+	if tts == null or not tts.enabled:
+		return
+	if _filler_nodes < FILLER_MIN_NODES:
+		return
+	var now := Time.get_ticks_msec()
+	if now - _last_filler_ms < FILLER_MIN_GAP_MS:
+		return
+	if tts.is_speaking():
+		return                                  # 有语音在播：本节点不插，等下一个空隙
+	var kind := ""
+	var semantic := false
+	if now - _last_ai_semantic_ms <= FILLER_SEMANTIC_MAX_AGE_MS:
+		if _last_ai_tone != "":
+			kind = _last_ai_tone               # 台词自带的 [[tone]] 优先，语义最准
+			semantic = true
+		else:
+			kind = _filler_for_acts(_last_ai_acts)
+			semantic = kind != ""
+	var strength := _mood_intensity()
+	if kind == "" and _last_mood_filler != "" and strength >= 0.35:
+		kind = _last_mood_filler               # 没有台词语义时才退回情绪区域，且只在情绪明显时
+	if kind == "" or kind == "think":
+		return                                  # 思考声不再插；只保留有语义 / 情绪方向的反应
+	if semantic and not _filler_mood_ok(kind):
+		return                                  # 台词语义与当前情绪方向冲突：宁可不插
+	var prob := (0.08 + 0.42 * strength) if semantic else (0.02 + 0.20 * strength)
+	if randf() >= prob:
+		return
+	_last_filler_ms = now
+	_filler_nodes = 0
+	tts.play_filler(kind, true)
+	print("[TTS] 情绪语气词（节点）：%s · 语义=%s · 强度=%.2f" % [kind, semantic, strength])
+
+## 行为标签 → 可匹配的预制语气词；不匹配的标签（blush / think）不出声。
+static func _filler_for_acts(acts: Array) -> String:
+	for a in acts:
+		match action_key(str(a)):
+			"smile", "laugh":
+				return "happy"
+			"proud":
+				return "proud"
+			"surprise":
+				return "surprise"
+			"worried", "sad":
+				return "sigh"
+	return ""
+
+## 情绪强度：三维偏离 0.5 的最大值（0 平静，1 极端）。
+func _mood_intensity() -> float:
+	return clampf(maxf(absf(_mood_v - 0.5),
+		maxf(absf(_mood_c - 0.5), absf(_mood_a - 0.5))) * 2.0, 0.0, 1.0)
+
+## 台词语义与情绪方向不能打架：叹气别在明显开心时响，笑/得意别在明显难过时响。
+func _filler_mood_ok(kind: String) -> bool:
+	match kind:
+		"sigh":
+			return _mood_v <= 0.60
+		"happy", "cheer", "proud":
+			return _mood_v >= 0.40
+		"surprise":
+			return _mood_a >= 0.50
+		"puzzle":
+			return _mood_c >= 0.45
+		"hmph":
+			return _mood_a >= 0.45
+	return true
 
 ## 定式识别成功：角部手顺高亮轨迹（几秒后自动淡出；纯显示，不影响棋局状态）
 ## + 浮层参考图卡片（只渲染后端给的字段：name / line / k / candidates / mistake）
@@ -3177,7 +3994,8 @@ func _on_head_patted() -> void:
 	var seq := _blush_seq
 	get_tree().create_timer(3.5).timeout.connect(func():
 		if seq == _blush_seq and avatar != null:
-			avatar.set_blush(false))
+			avatar.set_blush(false)
+			avatar.clear_expression())      # 脸红退去时一并收起摸头引发的笑，避免一直闭眼笑
 
 func _on_tts_status(text: String) -> void:
 	if _tts_status != null:
@@ -3198,8 +4016,14 @@ func _greet() -> void:
 	_add_msg("system", "你执黑先行。左键落子，右键拖拽可旋转棋盘视角；Home 回正视角，C 依次看四个角。")
 
 func _on_intersection_clicked(x: int, y: int) -> void:
+	# 选「等待 CosyVoice」时 `_ready` 会在装配 NetClient 之前一直等语音就绪；棋盘已经画好、
+	# 玩家这时点进来会打到 `agent`（Nil）。这里先挡住并说明原因，绝不把棋盘锁在半路。
+	if agent == null:
+		_set_status("本地服务还在启动（等待语音就绪），稍后再落子。", true)
+		return
 	_allow_tts_fillers()
-	_hide_estimate()                            # 一手落下，刚才那张点目就过期了：先收起
+	_clear_estimate_marks()                     # 一手落下：棋盘方块过期，形势卡保留（等本手分析刷新）
+	_last_ai_kind = ""                          # 新回合：下一句点评 / 落子 / 全局判断重新计数
 	_interrupt_speech_for_move()                # v3.11.1：你一落子，她上一轮没说完的话就让位
 	if sfx != null:
 		sfx.play("stone")                       # 玩家落子：乐观棋子出现的那一刻就响
@@ -3266,7 +4090,7 @@ func _on_state_changed(p: Dictionary) -> void:
 			board.look_at_board_point(board.stone_world(int(stone["x"]), int(stone["y"])), 2.0)
 	_last_move_count = mc
 	if _estimate_move_count >= 0 and mc != _estimate_move_count:
-		_hide_estimate()                               # 局面已经变了（落子 / 悔棋 / 重来）：旧点目收起
+		_clear_estimate_marks()                        # 局面变了：只收棋盘方块，形势卡保留上次点目
 	if _reviewing:
 		_review_cur = mc                                # 复盘翻页的进度以后端推来的只读快照为准
 	_lbl_moves.text = "手数: %d" % mc
@@ -3304,6 +4128,14 @@ func _on_info_changed(wr: float, sc: float) -> void:
 	_lbl_score.text = score_line(sc)                       # 原始数字照旧保留
 	if _lbl_score_hint != null:
 		_lbl_score_hint.text = score_hint(sc, wr)          # 下面那行量级人话
+	# 全局形势卡：胜率条 + 目差每手更新（黑方视角，与右栏同源）
+	if _card_wr_bar != null:
+		_card_wr_bar.value = clampf(wr * 100.0, 0.0, 100.0)
+		_card_wr_black.text = "黑 %.1f%%" % (wr * 100.0)
+		_card_wr_white.text = "白 %.1f%%" % ((1.0 - wr) * 100.0)
+		_card_score.text = score_line(sc)
+		_card_score_hint.text = score_hint(sc, wr)
+		_show_global_card()
 
 ## 领地热力图：后端每次落子后的既有分析会推 361 个归属值（+黑/-白）。
 ## 复盘快照没有 ownership：进入复盘时已清掉旧图，避免把终局领地盖在回放上。
@@ -3322,16 +4154,17 @@ func _on_estimate(payload: Dictionary) -> void:
 	if mc >= 0 and mc != _last_move_count:
 		return                                    # 迟到的旧判断：对应的是上一手，别贴到现在的盘面
 	_estimate_move_count = mc
-	_estimate_count.text = estimate_count_line(payload.get("black", 0), payload.get("white", 0))
+	var count := estimate_count_line(payload.get("black", 0), payload.get("white", 0))
+	_estimate_count.text = ("点目（第 %d 手）：%s" % [mc, count]) if mc >= 0 else count
 	_estimate_lead.text = estimate_lead_line(payload.get("lead"), payload.get("komi"))
 	if board != null:
 		var cells = payload.get("cells", [])
 		board.set_estimate(cells if typeof(cells) == TYPE_ARRAY else [])
-	_place_estimate_box()
-	_estimate_box.visible = true
+	_show_global_card()
 	_follow_joseki_card()                       # 定式卡片若正好在左上角，立刻让开形势纸签
 
-## 收起形势面板（连同棋盘上的点目小方块）：幂等，任何出口都可直接调用。
+## 收起整张形势卡（连同棋盘上的点目小方块）：标题 / 复盘 / 新局这些出口用。
+## 玩家下一手不走这里——那只收方块，卡片常驻保留「上次点目（第 N 手）」。
 func _hide_estimate() -> void:
 	_estimate_move_count = -1
 	if _estimate_box != null:
@@ -3713,20 +4546,17 @@ func _tick_chat_queue(hold: bool) -> void:
 		return
 	agent.flush_queued_chat({"busy": agent.busy, "speaking": tts != null and tts.is_speaking()})
 
-## 玩家主动发起对局互动：允许 TTS 在合成等待时插「嗯…」这类语气词。
-## 同时把还在合成/排队/播放的走神搭话全部作废——人已经回来下棋了，别再追着问「在忙什么呀」
+## 玩家主动发起对局互动：作废还在合成/排队/播放的走神搭话。
+## 自动语气词已停用（只保留摸头时的预制反应），这里不再开启 TTS 插话。
 func _allow_tts_fillers() -> void:
 	_cancel_idle_speech()
-	if tts != null:
-		tts.allow_fillers = true
-		tts.begin_filler_turn()          # 本回合语气词限次（think 至多两次，且不连着播同一句）
 
 ## 玩家落子时打断她上一轮还没播完的语音（v3.11.1）。
 ## 棋盘在「她这一轮结束 + 落子揭示」后就放开了，但她的旧话可能还在念——玩家一动，旧话让位，
 ## 新回合的回应不必排在它后面。两条路径都要收账，否则会留下 `got && !played` 的悬空记录
 ## （那种记录会让 `audio_in_flight()` 恒真，是本项目最怕的「棋盘锁死」形态）：
 ##   · 正在播 / 排队中的：`TTSClient.interrupt_for_move()` 先把文字收账（立即显示），当前句 0.25s
-##     淡出，然后接一句预制短句（嗯？ / 这么着急？…），新合成语音等短句说完再开播；
+##     淡出；不再补预制短句，新回合的回应直接接上；
 ##   · 还在取音频（HTTP 在途 / 排队）的：`TTSClient` 根本不知道它们，这里自己 finish + display，
 ##     在途那条回来时 `resolve_fetch` 见到 `played` 会直接判 `done`，不会补播。
 func _interrupt_speech_for_move() -> void:
@@ -3734,7 +4564,7 @@ func _interrupt_speech_for_move() -> void:
 		return
 	if not tts.is_speaking() and _speech_fetch.is_empty() and _speech_fetch_current.is_empty():
 		return
-	var cut := tts.interrupt_for_move(0.25)
+	tts.interrupt_for_move(0.25)
 	var jobs: Array[Dictionary] = _speech_fetch.duplicate()
 	_speech_fetch.clear()
 	if not _speech_fetch_current.is_empty():
@@ -3746,17 +4576,13 @@ func _interrupt_speech_for_move() -> void:
 			continue
 		pairing.finish(rec)
 		pairing.display(rec)           # 先显示再收账：打断的只是声音，台词不能丢
-	if not cut and not jobs.is_empty():
-		# 旧句还没开播（只在取音频）：也要给一句「被打断」的预制反应，再等新合成语音
-		var dur := tts.play_interrupt_line()
-		if dur > 0.0:
-			tts.hold_for(dur + 0.12)
 	_speech_hold = _speech_busy()
 	_refresh_lock()
 
 ## 作废走神搭话：文字与语音（在途取音频、播放中、排队中）一起清掉，让新的内容立刻顶上
 func _cancel_idle_speech() -> void:
 	_idle_muted = true
+	_cancel_peek()                   # 玩家回来了：正在跑的窥屏直接收掉
 	if _pending_batch_kind == "idle":
 		_batch_pending = false
 		_pending_batch_kind = ""
@@ -3794,7 +4620,7 @@ func _ask_end() -> void:
 
 # ================= 局后只读复盘（v3.7.0 任务 D） =================
 # 反目标：回看全程她**不出声**（后端已冻结，前端也绝不为此发 chat/idle/hint/analyze）、界面不更挤
-# （入口只在局后出现）。只读范围：棋盘（落子与摸头同源，Board3D.placement_allowed）+ 四个功能按钮
+# （入口只在局后出现）。只读范围：棋盘（落子与摸头都禁，Board3D.placement_allowed / pat_allowed）+ 四个功能按钮
 # + 聊天输入。冻结与恢复都经由既有的 `_refresh_lock()`（V20/V21），不另起一套互斥逻辑。
 
 ## 复盘入口 / 退出（📖 复盘 ↔ ✅ 退出复盘）。三个端点都走 `Main.gd` 的 `fetch_bytes`（V18：
@@ -3915,7 +4741,7 @@ func _enter_review() -> void:
 			_refresh_lock()                             # 冻结（只读 / 置灰 / 禁聊天 / 俗手回档与开关）在这里一处收口
 			_set_status("复盘：只读回看中 · 第 %d / %d 手（← → 或按钮翻页）"
 					% [_review_cur, _review_total])
-			_load_review_notes()
+			_load_review_intro()
 			# 总手数取**新鲜**的 `GET /api/state`：本地 `_last_move_count` 可能因 WS 断线而落后（Minor #6）。
 			# 复用的 `_on_state_changed` 顺便把棋盘 / 手数 / 俗手回档也对齐一次（它内部会同步 `_review_cur`）。
 			agent.fetch_bytes("/api/state", HTTPClient.METHOD_GET, {},
@@ -4011,6 +4837,23 @@ func _review_keys(event: InputEvent) -> void:
 		_review_step(1)
 		get_viewport().set_input_as_handled()
 
+## 复盘开场白（POST /api/review/intro）：后端按真实手数 / 亏损手账给一句短话，
+## 前端**只显示不发声**（mark_text_only），保持复盘期间静音的既有约定；随后再拉逐手存档。
+## 失败 / 空文案 ⇒ 直接去拉存档，不挡复盘。
+func _load_review_intro() -> void:
+	if agent == null:
+		_load_review_notes()
+		return
+	agent.fetch_bytes("/api/review/intro", HTTPClient.METHOD_POST, {},
+		func(ok: bool, code: int, body: PackedByteArray):
+			if ok:
+				var d := _json_dict(body)
+				var text := str(d.get("text", "")).strip_edges()
+				if text != "" and _reviewing:
+					pairing.mark_text_only()
+					_add_msg("ai", text)
+			_load_review_notes())
+
 ## 拉本局逐手存档（GET /api/review/notes）并**只渲染**到聊天区：**一条** system 气泡（不刷屏）、
 ## 不登记语音配对、不触发任何 LLM/TTS ⇒ 复盘期间她一个字都不说。
 ## 拉不到就静默跳过（存档是锦上添花，不影响回看）。
@@ -4073,9 +4916,30 @@ func _input(event: InputEvent) -> void:
 
 func _bump_activity() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
+	_last_player_activity_ms = _last_activity_ms  # 只有真实玩家操作才推进这个时钟
+	_cancel_peek()                                # 人已经回来：正在跑的窥屏没有意义，别浪费 OCR/VLM
 	if _idle:
 		_idle = false
 		_set_idle_state(false)
+
+## 闲置搭话的等待秒数（纯函数，门卫可测）：
+## - 深夜 / 清晨整体放慢，别在困的时候还频繁搭话；
+## - 对局中轮到玩家（黑）且游戏窗口在前台：至少 30 秒，给他长考的空间。
+static func idle_talk_delay(hour: int, player_turn: bool, first: bool, roll: float) -> float:
+	var base := IDLE_TALK_FIRST if first else lerpf(IDLE_TALK_MIN, IDLE_TALK_MAX,
+		clampf(0.5 if not is_finite(roll) else roll, 0.0, 1.0))
+	if hour >= 23 or hour < 6:
+		base *= 1.5
+	if player_turn:
+		base = maxf(base, 30.0)
+	return base
+
+func _hour_now() -> int:
+	return int(Time.get_datetime_dict_from_system().get("hour", 12))
+
+## 是否「对局中轮到玩家、且他就在游戏窗口里」：用于把闲置搭话放慢，不误伤挂机窥屏。
+func _player_turn_now() -> bool:
+	return _last_move_count > 0 and _last_move_count % 2 == 0 and DisplayServer.window_is_focused()
 
 func _process(delta: float) -> void:
 	var now := Time.get_ticks_msec()
@@ -4094,13 +4958,15 @@ func _process(delta: float) -> void:
 	if not _idle and now - _last_activity_ms >= int(IDLE_SEC * 1000.0):
 		_idle = true                                    # 长时间没操作：看向玩家、准备歪头
 		_set_idle_state(true)
-		_next_talk_ms = now + int(IDLE_TALK_FIRST * 1000.0)
+		_next_talk_ms = now + int(idle_talk_delay(_hour_now(), _player_turn_now(), true, 0.0) * 1000.0)
 	# 复盘期间绝不出声（V20/M3）：走神搭话本来该由后端门禁挡住，前端也不许发——不依赖 Task C。
 	if _idle and now >= _next_talk_ms and not _reviewing and not _title_open and not _fr_active \
 			and agent != null and not agent.busy:
-		_next_talk_ms = now + randi_range(int(IDLE_TALK_MIN * 1000.0), int(IDLE_TALK_MAX * 1000.0))
+		_next_talk_ms = now + int(idle_talk_delay(_hour_now(), _player_turn_now(), false, randf()) * 1000.0)
 		_idle_muted = false                             # 新的一轮搭话：先解除「玩家已回来」的作废标记
-		agent.idle_remark()                             # 长时间没动静：主动问一句（后端 POST /api/idle）
+		_request_idle_talk(now)
+	if _peek_busy:
+		_tick_peek(now)                                 # 窥屏结果就绪后由她主动开口
 	for text in pairing.prune_expired():                 # 等不到语音的配对位清出，别让它吃掉后面那条
 		print("[TTS] 等不到语音的台词已从配对表清出：%s" % text.substr(0, 20))
 	pairing.release_stale(_pair_facts())                # 回合结束后还等不到语音的文字别一直等
@@ -4201,6 +5067,170 @@ func _sync_speech_hold() -> void:
 func _azure_hold_active() -> bool:
 	return pairing.hold_active(_pair_facts(), _speech_hold)
 
+# ================= 长时间闲置窥屏（本地 RapidOCR + Qwen2.5-VL，独立 python 进程一跑一停） =================
+
+## 这一轮闲置到底说什么：玩家切去了别的窗口就先窥屏，否则普通走神搭话。
+## 游戏窗口在前台 = 玩家就在游戏里（窥屏只会看到游戏本身）：不白起 python 进程。
+func _request_idle_talk(now: int) -> void:
+	if agent == null or _peek_busy:
+		return
+	var idle_ms := now - _last_player_activity_ms
+	var peekable := cfg.vlm_enabled and not DisplayServer.window_is_focused()
+	if peekable and idle_ms >= int(IDLE_SEC * 1000.0) \
+			and now - _peek_last_ms >= PEEK_COOLDOWN_MS and _peek_available():
+		_start_peek(now)
+	else:
+		agent.idle_remark()
+
+## 窥屏环境是否可用：需要 azure_peek.py 与一个装好 rapidocr / PIL 的 python。
+## 探测一次后缓存；缺任何一样就永远退回普通走神搭话（优雅降级）。
+func _peek_available() -> bool:
+	if _peek_probed:
+		return _peek_ok
+	_peek_probed = true
+	var dirs: Array[String] = [
+		_repo_root().path_join("peek"),
+		OS.get_executable_path().get_base_dir().path_join("peek"),
+		"D:/KataGo/peek",
+	]
+	for d in dirs:
+		var script := d.path_join("azure_peek.py")
+		if not FileAccess.file_exists(script):
+			continue
+		var pys: Array[String] = [
+			d.path_join(".venv/Scripts/pythonw.exe"),     # 无控制台：不会给窥屏 / VLM 弹出窗口
+			d.path_join(".venv/Scripts/python.exe"),
+			"D:/KataGo/peek/.venv/Scripts/pythonw.exe",   # 原开发机环境（RapidOCR 已装好）
+			"D:/KataGo/peek/.venv/Scripts/python.exe",
+			"E:/AI_Omni/Python/pythonw.exe",
+			"E:/AI_Omni/Python/python.exe",
+		]
+		for py in pys:
+			if FileAccess.file_exists(py):
+				_peek_script = script
+				_peek_exe = py
+				_peek_ok = true
+				print("[Peek] 窥屏可用：%s + %s" % [py, script])
+				return true
+	print("[Peek] 未找到窥屏环境（azure_peek.py / python），长时间闲置只走普通搭话")
+	return false
+
+## 确保窥屏 VLM 服务可用，返回传给窥屏脚本的 --vlm-url（空字符串=不可用，脚本回退 CPU 推理）。
+## - cfg.vlm_base_url 填了：视为外部/自管服务，直接用，不碰本地进程
+## - 留空且 vlm_auto_start：本机 python 拉起 start_vlm_server.py（内部有 lock + 健康检查防重复）
+func _ensure_vlm_url() -> String:
+	if _vlm_url != "":
+		return _vlm_url
+	var manual := cfg.vlm_base_url.strip_edges()
+	if manual != "":
+		_vlm_url = manual
+		return _vlm_url
+	if not cfg.vlm_auto_start:
+		return ""
+	if not _peek_available():                     # 窥屏环境本身不可用：不值得起服务
+		return ""
+	if _vlm_starter == "":
+		var dirs: Array[String] = [
+			_repo_root().path_join("peek"),
+			OS.get_executable_path().get_base_dir().path_join("peek"),
+			"D:/KataGo/peek",
+		]
+		for d in dirs:
+			var st := d.path_join("start_vlm_server.py")
+			if FileAccess.file_exists(st):
+				_vlm_starter = st
+				break
+	if _vlm_starter == "":
+		return ""                                 # 本机没有 VLM 启动器：窥屏走 CPU/降级
+	var args := PackedStringArray([_vlm_starter, "--port", str(cfg.vlm_port)])
+	if cfg.vlm_exe != "":
+		args.append_array(["--exe", cfg.vlm_exe])
+	if cfg.vlm_model != "":
+		args.append_array(["--model", cfg.vlm_model])
+	if cfg.vlm_mmproj != "":
+		args.append_array(["--mmproj", cfg.vlm_mmproj])
+	var pid := OS.create_process(_peek_exe, args)
+	if pid <= 0:
+		print("[Peek] VLM 服务启动器拉起失败，窥屏将回退 CPU 推理")
+		return ""
+	_vlm_url = "http://127.0.0.1:%d/v1" % cfg.vlm_port
+	print("[Peek] 已后台拉起 VLM 服务（端口 %d，加载需要一点时间）" % cfg.vlm_port)
+	return _vlm_url
+
+## 后台拉起一次窥屏：独立 python 进程截图 → OCR → VLM，把结果写成 json（不阻塞游戏）
+func _start_peek(now: int) -> void:
+	_peek_busy = true
+	_peek_started_ms = now
+	_peek_ctx_activity = _last_player_activity_ms
+	# 结果文件按次命名：超时被杀掉的旧进程即使晚写结果，也不会串到下一轮窥屏里
+	_peek_out = OS.get_user_data_dir().path_join("peek_result_%d.json" % now)
+	var pargs := PackedStringArray([
+		_peek_script, "--out", _peek_out, "--game-pid", str(OS.get_process_id())])
+	var vlm_url := _ensure_vlm_url()             # 顺手确保 VLM 服务在跑（幂等）
+	if vlm_url != "":
+		pargs.append_array(["--vlm-url", vlm_url])
+	var pid := OS.create_process(_peek_exe, pargs)
+	if pid <= 0:
+		_peek_busy = false
+		if agent != null:
+			agent.idle_remark()
+		return
+	_peek_pid = pid
+	_peek_last_ms = now                          # 真的拉起来了才吃冷却
+	print("[Peek] 已发起窥屏（pid=%d），等结果…" % pid)
+
+## 玩家回来 / 进入复盘：正在跑的窥屏直接收掉（结果文件也清掉，别在下次误读）
+func _cancel_peek() -> void:
+	if not _peek_busy:
+		return
+	if _peek_pid > 0:
+		OS.kill(_peek_pid)
+	_peek_pid = -1
+	_peek_busy = false
+	if _peek_out != "" and FileAccess.file_exists(_peek_out):
+		DirAccess.remove_absolute(_peek_out)
+
+## 每帧看窥屏结果好了没；等不到就超时放弃
+func _tick_peek(now: int) -> void:
+	if FileAccess.file_exists(_peek_out):
+		_peek_pid = -1
+		var data: Dictionary = {}
+		var f := FileAccess.open(_peek_out, FileAccess.READ)
+		if f != null:
+			var parsed = JSON.parse_string(f.get_as_text())
+			if typeof(parsed) == TYPE_DICTIONARY:
+				data = parsed
+			f.close()
+		DirAccess.remove_absolute(_peek_out)
+		_peek_busy = false
+		if data.is_empty():
+			print("[Peek] 结果文件为空/损坏，放弃本次窥屏")
+			return
+		# 结果回来时玩家已经动过（或已不闲置）：这条窥屏内容过期了，不说
+		if _last_player_activity_ms != _peek_ctx_activity or not _idle or agent == null or agent.busy:
+			print("[Peek] 结果到达时玩家已回来/不再闲置/Azure 正忙，本次窥屏作废")
+			return
+		if not bool(data.get("ok", true)):
+			print("[Peek] 窥屏失败（ok=false），退回普通搭话")
+			agent.idle_remark()
+			return
+		if bool(data.get("is_game", true)):
+			print("[Peek] 前台仍是游戏本身，退回普通搭话")
+			agent.idle_remark()
+		else:
+			print("[Peek] 结合窥屏内容搭话：前台=%s" % str(data.get("fg_title", "")))
+			agent.peer_remark(data)
+		return
+	if now - _peek_started_ms > PEEK_TIMEOUT_MS:
+		if _peek_pid > 0:
+			OS.kill(_peek_pid)                       # 超时进程多半还在跑：杀掉，别留孤儿占资源
+		_peek_pid = -1
+		_peek_busy = false
+		if _idle and agent != null and not agent.busy \
+				and _last_player_activity_ms == _peek_ctx_activity:
+			print("[Peek] 超时仍未出结果，退回普通搭话")
+			agent.idle_remark()
+
 func _set_idle_state(v: bool) -> void:
 	if board != null:
 		board.idle_attention = v
@@ -4220,6 +5250,8 @@ func _on_tts_speaking(v: bool) -> void:
 		# 注意：这里只代表「这一句播完了」。后面常有排队/还在取的语音，
 		# 所以要看整队是否真的空了才算说完；否则句间空隙里棋盘会被提前解锁。
 		_speech_hold = _speech_busy()
+		if not _speech_hold and avatar != null:
+			avatar.clear_expression()   # 整段说完：收起一次性表情（笑/惊讶），别让笑脸一直挂着
 	_refresh_lock()
 	_clear_thinking_if_idle()
 

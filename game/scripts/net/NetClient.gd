@@ -116,6 +116,24 @@ var time_aware_enabled := false:
 		time_aware_enabled = v
 		if not _profile_batch:
 			_push_settings()
+## 人格化（自用版）：总开关 + 关系称呼（默认关）+ 高阶段称呼名。
+## 走 `_push_settings` 统一推送，WS 重连时会和其余设置一起重新对齐（不会因为掉线丢一次改动）。
+var _persona_batch := false
+var persona_enabled := true:
+	set(v):
+		persona_enabled = v
+		if not _persona_batch:
+			_push_settings()
+var persona_relationship_enabled := false:
+	set(v):
+		persona_relationship_enabled = v
+		if not _persona_batch:
+			_push_settings()
+var persona_address_name := "":
+	set(v):
+		persona_address_name = str(v).strip_edges().substr(0, 16)
+		if not _persona_batch:
+			_push_settings()
 ## 自适应难度（v3.11.5）：开关 + 基线（1..5）一次推一次；与 profile 同一套原子入口做法。
 var _adaptive_batch := false
 var adaptive_difficulty := false:
@@ -393,6 +411,10 @@ func reset_game(silent := false) -> bool:
 func set_allow_pass(v: bool) -> void:
 	_post("/api/config", {"allow_pass": v})
 
+## 本地音色运行期切换：只更新后端内存里的 TTS 配置（不重启后端、不丢棋局），下一句立即生效。
+func set_tts_local_voice(v: String) -> void:
+	_post("/api/config", {"tts_local_voice": v})
+
 ## 由界面在她「落子宣告」的语音开始播放时调用：让后端把这一手推给棋盘显示
 func reveal_move() -> void:
 	_post("/api/reveal")
@@ -402,6 +424,12 @@ func player_interaction(what: String) -> void:
 
 func idle_remark() -> void:
 	_post("/api/idle")
+
+## 窥屏搭话：客户端截图 + OCR + VLM 后，把看到的内容交给后端组织台词。
+func peer_remark(info: Dictionary) -> void:
+	_post("/api/peer", {"fg_title": str(info.get("fg_title", "")),
+		"ocr": str(info.get("ocr", "")),
+		"vlm": str(info.get("vlm", ""))})
 
 func tick_mood() -> void:
 	_post("/api/mood/tick")
@@ -454,6 +482,32 @@ func set_profile(profile_on: bool, time_on: bool) -> void:
 	_profile_batch = false
 	_push_settings()
 
+## 人格化总开关 + 关系称呼**一次落定、只推一次**（启动装配用）：
+## 分两次调 `set_persona` / `set_persona_relationship` 会各发一条 POST，到达顺序无保证，
+## 可能出现「关系刚开又被上一条旧载荷关掉」。启动时用这个原子入口。
+func set_persona_all(enabled: bool, relationship_on: bool, address_name: String) -> void:
+	_persona_batch = true
+	persona_enabled = enabled
+	persona_relationship_enabled = relationship_on
+	persona_address_name = address_name
+	_persona_batch = false
+	_push_settings()
+
+## 人格化开关（自用版）：单字段，与其余设置一起推 `/api/config`；关掉后后端提示词逐字符不变。
+func set_persona(on: bool) -> void:
+	_persona_batch = true
+	persona_enabled = on
+	_persona_batch = false
+	_push_settings()
+
+## 关系阶段与称呼变化（默认关）：开关 + 高阶段称呼名一次推一次；留空＝仍叫 prompt_user_name。
+func set_persona_relationship(on: bool, address_name: String) -> void:
+	_persona_batch = true
+	persona_relationship_enabled = on
+	persona_address_name = address_name
+	_persona_batch = false
+	_push_settings()
+
 ## 自适应难度「开关 + 基线」原子入口（v3.11.5）：两个字段一次落定、只推一次 `/api/config`。
 func set_adaptive(on: bool, base: int) -> void:
 	_adaptive_batch = true
@@ -475,6 +529,9 @@ func _flush_settings() -> void:
 		"think_mode": think_mode, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate,
 		"emotion_drift": emotion_drift, "drift_base": drift_base, "chat_digest_llm": chat_digest_llm,
 		"profile_enabled": profile_enabled, "time_aware_enabled": time_aware_enabled,
+		"persona_enabled": persona_enabled,
+		"persona_relationship_enabled": persona_relationship_enabled,
+		"persona_address_name": persona_address_name,
 		"adaptive_difficulty": adaptive_difficulty,
 		"adaptive_difficulty_base": adaptive_difficulty_base})
 

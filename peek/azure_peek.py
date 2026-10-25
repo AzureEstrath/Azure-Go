@@ -20,13 +20,41 @@ import time
 import traceback
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent          # 开发机 = D:\KataGo
+def _find_root(start: Path) -> Path:
+    """从本脚本所在目录向上找含 models/ 的根（仓库内 models 通常在外层 D:\\KataGo，而非 AzureGo-Creative）。"""
+    for p in [start, *start.parents]:
+        if (p / "models").is_dir():
+            return p
+    return start.parent
+
+
+ROOT = _find_root(Path(__file__).resolve().parent)     # 开发机 = D:\KataGo
 OCR_DIR = ROOT / "models" / "OCR"
 VLM_GGUF = ROOT / "models" / "Qwen2.5-VL-3B-Instruct-IQ4_NL.gguf"
 MMPROJ_CANDIDATES = [
     ROOT / "models" / "mmproj-BF16.gguf",
     Path(r"E:\AI_Omni\models\mmproj-BF16.gguf"),
 ]
+
+
+def _hide_console() -> None:
+    """由游戏用 python.exe 拉起时，Windows 会给控制台程序分配一个可见窗口；
+    第一行就把它藏掉（用 pythonw 时本来就没有窗口，这里是兜底）。
+    """
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)      # SW_HIDE
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+def _log(*args, **kwargs) -> None:
+    """pythonw 下 sys.stdout 是 None，print 会抛；日志可有可无，绝不能因此崩。"""
+    try:
+        print(*args, **kwargs)
+    except Exception:                                      # noqa: BLE001
+        pass
 
 
 def parse_args():
@@ -89,10 +117,10 @@ def load_ocr():
 
         t0 = time.time()
         engine = RapidOCR()
-        print("[peek] OCR 引擎：RapidOCR（初始化 %.2fs）" % (time.time() - t0), flush=True)
+        _log("[peek] OCR 引擎：RapidOCR（初始化 %.2fs）" % (time.time() - t0), flush=True)
         return ("rapid", engine)
     except Exception as e:                         # noqa: BLE001
-        print("[peek] RapidOCR 不可用（%r），回退 PaddleOCR" % e, flush=True)
+        _log("[peek] RapidOCR 不可用（%r），回退 PaddleOCR" % e, flush=True)
     return ("paddle", load_paddle_ocr())
 
 
@@ -153,7 +181,9 @@ def run_ocr(engine, img):
 
 
 VLM_PROMPT = ("这是一张电脑屏幕截图。用一两句简短的中文描述屏幕上正在做什么"
-              "（什么软件、显示的是什么内容），别猜人物身份，不超过50字。")
+              "（什么软件、显示的是什么内容）。不要描述聊天内容、账号、密码、金额、姓名等隐私信息；"
+              "如果画面以聊天 / 支付 / 账号为主，只说「他在处理私人的事情」。"
+              "别猜人物身份，不超过50字。")
 
 
 def _img_to_b64(img, max_side):
@@ -220,13 +250,14 @@ def run_vlm_cpu(img, max_side):
 
 
 def main() -> int:
+    _hide_console()
     args = parse_args()
     t0 = time.time()
     logf = open(str(args.out) + ".log", "w", encoding="utf-8")
 
     def log(msg):
         line = "[%.1fs] %s" % (time.time() - t0, msg)
-        print(line, flush=True)
+        _log(line, flush=True)
         logf.write(line + "\n")
         logf.flush()
 

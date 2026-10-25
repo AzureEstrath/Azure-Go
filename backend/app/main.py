@@ -17,6 +17,7 @@
     POST /api/reveal                        落子宣告语音开始（需要 round-trip 的客户端）
     POST /api/interaction {what}            玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话
+    POST /api/peer        {fg_title,ocr,vlm} 窥屏搭话（客户端截屏/OCR/VLM 后交后端组织台词）
     POST /api/mood/tick                     情绪心跳（向基线回落）
     POST /api/review      {on}              进入 / 退出复盘模式（只读回看；期间落子/聊天/闲置/提示/分析被拒）
     POST /api/review/goto {n}               复盘：把第 n 手（含）之后的**只读**快照推一份 state 事件
@@ -60,7 +61,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
 from . import config as config_mod
-from . import coords, events, prompts, sgf
+from . import coords, events, persona, prompts, sgf
 from . import full_review
 from .agent import AzureAgent
 from .engine import KataGoEngine
@@ -186,6 +187,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                          chat_digest_llm=cfg.chat_digest_llm,
                                          profile_enabled=cfg.profile_enabled,
                                          time_aware_enabled=cfg.time_aware_enabled,
+                                         persona_enabled=(cfg.persona_enabled and autostart),
+                                         persona_relationship_enabled=cfg.persona_relationship_enabled,
+                                         persona_address_name=cfg.persona_address_name,
                                          reply_style=cfg.reply_style,
                                          memory=mem, tts=tts_client,
                                          joseki_progress=joseki_progress)
@@ -206,7 +210,11 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent.tts = tts_client     # 注入的 agent 同样接上（显式 tts= 优先）
             app.state.agent.joseki_progress = joseki_progress   # T5：注入的 agent 也接上同一个实例
             app.state.agent.profile_store = profile_store       # v3.9.0：画像库同样无条件接上
-            app.state.agent.game_store = gstore                 # v3.11.5：棋谱库同样无条件接上
+            # 人格化：测试装配（autostart=False）不读真实 profile.db，也不改提示词；
+            # 生产在下面统一 load_persona() 读一次跨局状态。
+            app.state.agent.persona_enabled = bool(cfg.persona_enabled and autostart)
+            app.state.agent.persona_relationship_enabled = bool(cfg.persona_relationship_enabled)
+            app.state.agent.persona_address_name = str(cfg.persona_address_name or "").strip()[:16]
             app.state.agent.player_name = cfg.prompt_user_name
             # v3.9.0：画像 / 时间感知两个开关同样以 cfg 为准（关着＝现状）
             app.state.agent.profile_enabled = bool(cfg.profile_enabled)
@@ -215,6 +223,12 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             if callable(_adaptive):                     # v3.11.5：注入 agent 也按配置接通
                 _adaptive(cfg.adaptive_difficulty, cfg.adaptive_difficulty_base,
                           cfg.adaptive_difficulty_spread)
+        # 人格化：生产装配读一次跨局状态（关系 / 情绪余温 / 互动数）。
+        # 测试装配（autostart=False）刻意不读真实 profile.db，保持门卫与提示词逐字符不变。
+        if autostart:
+            _load_persona = getattr(app.state.agent, "load_persona", None)
+            if callable(_load_persona):
+                await _load_persona()
         yield
         mem.close()                              # 退出时收尾（可重复调用）
         await tts_client.close()                 # 语音客户端**无条件**关闭（autostart 为假时也要关）
@@ -436,6 +450,13 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                 s.chat_digest_llm = v
         if "tools_enabled" in body:             # 发言侧工具开关：开启后她才会在提示/落子宣告里查资料
             s.tools_enabled = bool(body["tools_enabled"])
+        if "tts_local_voice" in body:           # 本地音色：只改后端内存里的 TTS 配置，不重启、不丢棋局
+            v = body.get("tts_local_voice")
+            if isinstance(v, str):              # 非字符串是脏值：保留原值
+                tts_client = getattr(app.state, "tts", None)
+                tts_cfg = getattr(tts_client, "cfg", None)
+                if tts_cfg is not None:
+                    tts_cfg.tts_local_voice = v.strip()
         if "profile_enabled" in body:           # 「玩家棋风画像」开关（默认关）：关着＝不注入画像块
             v = body["profile_enabled"]         # 只认 JSON 的 true / false；字符串 "false" 是脏值
             if isinstance(v, bool):
@@ -444,6 +465,22 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             v = body["time_aware_enabled"]      # 与 `emotion_drift` / `chat_digest_llm` 同一口径
             if isinstance(v, bool):
                 s.time_aware_enabled = v
+        if "persona_enabled" in body:           # 「人格化」开关（默认开）：关着＝提示词逐字符不变
+            v = body["persona_enabled"]
+            if isinstance(v, bool):
+                s.persona_enabled = v
+                if v:                            # 运行时重新打开：补读一次跨局状态（失败按初识）
+                    _loader = getattr(s, "load_persona", None)
+                    if callable(_loader):
+                        await _loader()
+        if "persona_relationship_enabled" in body:   # 关系阶段与称呼变化（默认关）
+            v = body["persona_relationship_enabled"]
+            if isinstance(v, bool):
+                s.persona_relationship_enabled = v
+        if "persona_address_name" in body:      # 高阶段称呼名（留空＝仍叫 prompt_user_name）
+            v = body.get("persona_address_name")
+            if isinstance(v, str):              # null / 数字 / 对象是脏值：保留原值
+                s.persona_address_name = v.strip()[:16]
         if ("adaptive_difficulty" in body or "adaptive_difficulty_base" in body) \
                 and hasattr(s, "adaptive"):
             on = s.adaptive.enabled
@@ -484,6 +521,21 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
         await s.idle_remark()
+        return ok()
+
+    @app.post("/api/peer")
+    async def peer(body: dict):
+        s = a()
+        denied = review_gate()                  # 复盘先于 busy（V6）
+        if denied is not None:
+            return denied
+        if s.busy:
+            return {"ok": False, "busy": True, "state": s.st.payload()}
+        await s.peer_remark({
+            "fg_title": body.get("fg_title", ""),
+            "ocr": body.get("ocr", ""),
+            "vlm": body.get("vlm", ""),
+        })
         return ok()
 
     @app.post("/api/mood/tick")
@@ -539,6 +591,22 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         return {"ok": True,
                 "notes": [dict(n) for n in s.st.move_notes if isinstance(n, dict)],
                 "losses": [dict(l) for l in s.st.losses if isinstance(l, dict)]}
+
+    @app.post("/api/review/intro")
+    async def review_intro():
+        """普通复盘的开场白（**纯本地、零 LLM / 零 TTS**）。
+
+        前端在 ``POST /api/review {"on": true}`` **之前**调用，拿到文字后在聊天区显示
+        （只显示、不发声，保持「复盘期间静音」的既有约定）。文案只依据本局真实手数与
+        亏损手账，不编造棋形。
+        """
+        s = a()
+        if s.busy:
+            return {"ok": False, "busy": True, "state": s.st.payload()}
+        if bool(getattr(s, "review", False)):
+            return {"ok": False, "error": "复盘模式中"}
+        text = persona.review_intro(len(s.st.moves), list(s.st.losses or []))
+        return {"ok": True, "text": text}
 
     # ================= 全盘 AI 复盘（v3.11.5，分段拉取） =================
     @app.post("/api/review/full/segment")
@@ -636,6 +704,19 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         if not rec:
             return JSONResponse(status_code=404, content={"ok": False, "error": "棋谱不存在"})
         return {"ok": True, "game": _with_date(rec)}
+
+    @app.get("/api/games/{game_id}/remark")
+    async def games_remark(game_id: int):
+        """棋谱库某局的「她的回忆」：纯本地短文案（零 LLM、零引擎）。
+
+        只用记录里真实存在的日期 / 手数 / 黑方胜率 / 总结 / 来源，不编造对局内容；
+        前端在载入某局后展示在详情页，不打断翻手与全盘复盘。
+        """
+        store = game_store_of()
+        rec = await asyncio.to_thread(store.get_game, game_id) if store is not None else None
+        if not rec:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "棋谱不存在"})
+        return {"ok": True, "text": persona.library_remark(_with_date(rec), time.time())}
 
     @app.get("/api/games/{game_id}/sgf")
     async def games_sgf(game_id: int):

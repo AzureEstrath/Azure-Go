@@ -11,10 +11,9 @@ const TMP := "user://test_config_tmp.json"
 const KATAGO_BIN := "D:/KataGo/bin/katago/katago.exe"
 const KATAGO_MODEL := "D:/KataGo/models/model-b18c384nbt.bin.gz"
 const KATAGO_CONFIG := "D:/KataGo/bin/katago/default_gtp.cfg"
-## save() 应清掉的旧键（v2.x 遗留：本地编排 / 窥屏 VLM / 本地语音拉起）
+## save() 应清掉的旧键（v2.x 遗留：本地编排 / 本地语音拉起）
 const DEAD_KEYS := [
 	"backend_mode", "llm_auto_start", "llm_exe", "llm_model_path", "llm_port",
-	"vlm_base_url", "vlm_auto_start", "vlm_exe", "vlm_model", "vlm_mmproj", "vlm_port",
 	"tts_auto_start", "tts_bf16", "tts_short_prompt",
 ]
 
@@ -103,6 +102,42 @@ func _run() -> void:
 	_write_raw({"adaptive_difficulty": "false"})
 	_check("自适应难度脏值（字符串）⇒ 保持默认关", AzureConfig.load_config(TMP).adaptive_difficulty == false)
 
+	# —— 1e) 窥屏 VLM：开关 / 地址 / 自动拉起 / 端口 / 高级路径（缺省与脏值都不能炸）——
+	_write_raw({"vlm_enabled": false, "vlm_base_url": " http://127.0.0.1:8090/v1 ",
+		"vlm_auto_start": false, "vlm_port": 8091,
+		"vlm_exe": " E:/llama/llama-server.exe ", "vlm_model": "D:/m.gguf", "vlm_mmproj": "D:/mmproj.gguf"})
+	var cv := AzureConfig.load_config(TMP)
+	_check("窥屏开关读入", cv.vlm_enabled == false)
+	_check("VLM 地址去空白", cv.vlm_base_url == "http://127.0.0.1:8090/v1")
+	_check("VLM 自动拉起开关读入", cv.vlm_auto_start == false)
+	_check("VLM 端口读入", cv.vlm_port == 8091)
+	_check("VLM 高级路径去空白",
+		cv.vlm_exe == "E:/llama/llama-server.exe" and cv.vlm_model == "D:/m.gguf" and cv.vlm_mmproj == "D:/mmproj.gguf")
+	for pair in [[0, 1024], [70000, 65535], ["abc", 8090], ["8092", 8092]]:
+		_write_raw({"vlm_port": pair[0]})
+		_check("vlm_port=%s ⇒ %d" % [str(pair[0]), int(pair[1])],
+			AzureConfig.load_config(TMP).vlm_port == int(pair[1]))
+	_write_raw({})
+	var cvd := AzureConfig.load_config(TMP)
+	_check("VLM 键缺失 ⇒ 默认启用 / 空地址 / 自动拉起 / 8090",
+		cvd.vlm_enabled and cvd.vlm_base_url == "" and cvd.vlm_auto_start and cvd.vlm_port == 8090)
+	_write_raw({"persona_enabled": false})
+	_check("人格化开关读入 false", AzureConfig.load_config(TMP).persona_enabled == false)
+	_write_raw({"persona_relationship_enabled": true, "persona_address_name": " 搭档 "})
+	var c_rel := AzureConfig.load_config(TMP)
+	_check("关系称呼开关读入 true", c_rel.persona_relationship_enabled == true)
+	_check("关系称呼名去空白", c_rel.persona_address_name == "搭档")
+	_write_raw({})
+	var c_rel_default := AzureConfig.load_config(TMP)
+	_check("关系称呼默认关 / 称呼名为空",
+		c_rel_default.persona_relationship_enabled == false and c_rel_default.persona_address_name == "")
+	_write_raw({"persona_address_name": "12345678901234567890"})
+	_check("关系称呼名最多 16 字", AzureConfig.load_config(TMP).persona_address_name.length() == 16)
+	for bad in [null, 42, ["x"]]:
+		_write_raw({"persona_address_name": bad})
+		_check("关系称呼名脏值 %s ⇒ 空串" % str(bad),
+			AzureConfig.load_config(TMP).persona_address_name == "")
+
 	# —— 2) 已废弃音色 id → 模板默认音色 ——
 	for dead in ["中文男", "azure-soft"]:
 		_write_raw({"tts_voice": dead})
@@ -126,6 +161,12 @@ func _run() -> void:
 	c3.tts_api_key = "sk-changed"
 	c3.adaptive_difficulty = true
 	c3.adaptive_difficulty_base = 4
+	c3.vlm_enabled = false
+	c3.vlm_base_url = "http://127.0.0.1:8091/v1"
+	c3.vlm_port = 8091
+	c3.persona_enabled = false
+	c3.persona_relationship_enabled = true
+	c3.persona_address_name = "搭档"
 	_check("save() 返回成功", c3.save())
 	var out := _read_raw()
 	for k in DEAD_KEYS:
@@ -140,6 +181,12 @@ func _run() -> void:
 	_check("save() 写回领地热力图开关", out.get("ownership_enabled", true) == false)
 	_check("save() 写回自适应难度开关", out.get("adaptive_difficulty", false) == true)
 	_check("save() 写回自适应难度基线", int(out.get("adaptive_difficulty_base", 0)) == 4)
+	_check("save() 写回窥屏开关", out.get("vlm_enabled", true) == false)
+	_check("save() 写回 VLM 地址", out.get("vlm_base_url", "") == "http://127.0.0.1:8091/v1")
+	_check("save() 写回 VLM 端口", int(out.get("vlm_port", 0)) == 8091)
+	_check("save() 写回人格化开关", out.get("persona_enabled", true) == false)
+	_check("save() 写回关系称呼开关", out.get("persona_relationship_enabled", false) == true)
+	_check("save() 写回关系称呼名", out.get("persona_address_name", "") == "搭档")
 
 	# —— 4) 定式导学＝开关 + 频率（joseki_teach / joseki_rate）——
 	# 口径与后端 `config._apply` 一致：键缺失 ⇒ 默认（teach=true / rate=0.5）；

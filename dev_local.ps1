@@ -5,6 +5,14 @@
 #       启动本地 LLM(8080) / TTS(9880) / KataGo 服务(8100) / 后端(8000)，然后运行游戏
 #   powershell ... -File dev_local.ps1 -NoGame
 #       只起服务，不启动游戏（用于确认各模型是否接上）
+#   powershell ... -File dev_local.ps1 -QualityTts
+#       用 CosyVoice 质量引擎起本地语音（默认用轻量 MeloTTS，启动快）
+#   powershell ... -File dev_local.ps1 -FastTts
+#       强制轻量引擎（覆盖 config 里已经记住的 CosyVoice 选择）
+#   powershell ... -File dev_local.ps1 -QualityTts -NoWaitTts
+#       起 CosyVoice 但不等它加载完，先继续启动后端（首句可能先用系统语音，起好后自动接上）
+#   powershell ... -File dev_local.ps1 -TtsOnly [-QualityTts] [-NoWaitTts]
+#       只起本地语音（游戏在主界面 / 设置面板期间预热用）：不写 config、不启动其他服务
 #   powershell ... -File dev_local.ps1 -Tests
 #       打开一个控制台跑 run_test_env.bat tests（后端 + KataGo + 前端 headless）
 #   powershell ... -File dev_local.ps1 -Stop
@@ -12,12 +20,20 @@
 #
 # 说明：本脚本属于开发便利工具，不进入游戏运行时（游戏本身仍然只连后端）。
 
-param(
-    [switch]$NoGame,
-    [switch]$Tests,
-    [switch]$Stop,
-    [switch]$QualityTts
-)
+# 参数：**不用 param 块**——这个文件会被编辑器反复保存成「多重 BOM」，param 会因此
+# 解析失败（`param` 变成未知命令），`-NoGame` 等开关全部落到 $args 里被忽略，
+# 结果就是「只起服务」却递归开出第二个游戏窗口。直接从 $args 解析，BOM 再多也不影响。
+$NoGame     = $args -contains "-NoGame"
+$Tests      = $args -contains "-Tests"
+$Stop       = $args -contains "-Stop"
+$QualityTts = $args -contains "-QualityTts"
+$FastTts    = $args -contains "-FastTts"
+$NoWaitTts  = $args -contains "-NoWaitTts"
+$TtsOnly    = $args -contains "-TtsOnly"
+
+# 由游戏自己拉起时（环境里已有 AZURE_SERVICES_MANAGED=1）强制不启动游戏：
+# 即使 -NoGame 因为任何参数转发问题丢失，也绝不再递归开出第二个游戏窗口。
+if ($env:AZURE_SERVICES_MANAGED -eq "1") { $NoGame = $true }
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -60,6 +76,21 @@ foreach ($d in $TtsCandidates) {
 }
 
 function Say([string]$s) { Write-Host $s }
+
+# 配置里已经记住「质量音色 azure」时，直接起 CosyVoice：
+# 否则每次启动都先起轻量引擎、再由游戏问一次「要不要切 CosyVoice」，白等一次完整的模型加载。
+# 想用轻量引擎：-FastTts（本次会写回 tts_local_voice=xiaoya；下次仍按 config 起）。
+$cfgPath = Join-Path $Root "game\config.json"
+if (-not $QualityTts -and -not $FastTts -and (Test-Path $cfgPath)) {
+    try {
+        $cfgText = [IO.File]::ReadAllText($cfgPath, [Text.Encoding]::UTF8)
+        if ($cfgText -match '"tts_mode"\s*:\s*"local"' -and
+            $cfgText -match '"tts_local_voice"\s*:\s*"azure"') {
+            $QualityTts = $true
+            Say "[2/4] 配置已记住质量音色（azure）：本次直接起 CosyVoice，省去从轻量引擎切换的一次加载"
+        }
+    } catch { }
+}
 
 function Test-Url([string]$url, [string]$pattern = "", [int]$timeout = 2) {
     try {
@@ -121,6 +152,22 @@ function Test-TtsStarting {
     } catch { return $false }
 }
 
+## 正在启动的语音服务是不是质量引擎（命令行里带 --cosyvoice 1）；读不到就按轻量处理。
+function Test-TtsStartingQuality {
+    $lock = Join-Path $TtsDir ".tts_server.lock"
+    if (-not (Test-Path $lock)) { return $false }
+    try {
+        $procId = 0
+        if (-not [int]::TryParse((Get-Content $lock -Raw).Trim(), [ref]$procId)) { return $false }
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue
+        if (-not $proc) { return $false }
+        # VBS 拉起时每个参数都被引号包住（"--cosyvoice" "1"），只按 \s+ 会误判成轻量，
+        # 进而把「正在加载的质量引擎」停掉重起——预热白等一次、还会双实例抢 CPU。
+        $cmd = ([string]$proc.CommandLine).Replace('"', '')
+        return ($cmd -match '--cosyvoice(?:=|\s+)1')
+    } catch { return $false }
+}
+
 function Stop-TtsServer {
     $c = Get-NetTCPConnection -LocalPort $TtsPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($c) { try { Stop-Process -Id $c.OwningProcess -Force } catch { } }
@@ -135,17 +182,26 @@ function Start-TtsServer {
     $py = Join-Path $TtsDir ".venv\Scripts\python.exe"
     $script = Join-Path $TtsDir "azure_tts_server.py"
     $vbs = Join-Path $TtsDir "run_hidden.vbs"
-    $bat = if ($QualityTts) { "start_tts_server.bat" } else { "start_tts_server_fast.bat" }
-    $batPath = Join-Path $TtsDir $bat
-    if (-not (Test-Path $py) -or -not (Test-Path $script) -or -not (Test-Path $vbs) -or
-        -not (Test-Path $batPath)) {
+    if (-not (Test-Path $py) -or -not (Test-Path $script) -or
+        -not (Test-Path $vbs)) {
         Say ("      [跳过] 本地语音环境不完整：" + $TtsDir)
         return $false
     }
-    # 走经典版同一套 VBS（start_tts_server*.bat 内部 start "" wscript run_hidden.vbs）。
-    # 不在 PowerShell 里直接拼 wscript 参数：start 的「空标题」引号在 PS 5.1 下很容易被
-    # Start-Process 的 ArgumentList 重写；批处理已经把这层处理好了。
-    Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$batPath`"") `
+    # 直接 wscript 拉 run_hidden.vbs（不再经过 cmd /c 批处理 + start）：
+    # 少一层控制台宿主，Python 进程由 VBS 的 sh.Run(...,0,False) 彻底隐藏。
+    # 注意：这里**不能**给参数加引号——Start-Process 会把数组拼成命令行，VBS 自己会给
+    # 每个参数补引号；再加一层会变成 ""D:\...""，wscript 解析不出路径，TTS 直接不启动。
+    $threads = if ($QualityTts) { 12 } else { 6 }
+    $ttsArgs = @($vbs, $py, $script,
+        "--port", "$TtsPort", "--threads", "$threads",
+        "--cosyvoice", $(if ($QualityTts) { "1" } else { "0" }))
+    if ($QualityTts) {
+        $ttsArgs += @("--model_dir", "pretrained_models\Fun-CosyVoice3-0.5B",
+                      "--sft_dir", "pretrained_models\CosyVoice-300M-SFT")
+    }
+    $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
+    if (-not (Test-Path $wscript)) { $wscript = "wscript.exe" }
+    Start-Process -FilePath $wscript -ArgumentList $ttsArgs `
         -WorkingDirectory $TtsDir -WindowStyle Hidden | Out-Null
     return $true
 }
@@ -239,7 +295,17 @@ if ($ttsHealth -ne "") {
 if (-not $TtsReady) {
     $ttsCanWait = $true
     if (Test-TtsStarting) {
-        Say "[2/4] 已有语音服务在启动（模型加载中），等待它就绪，不重复拉起…"
+        $startingQuality = Test-TtsStartingQuality
+        if ($QualityTts -and -not $startingQuality) {
+            Say "[2/4] 现有语音服务正在用轻量引擎启动：停止后改起 CosyVoice…"
+            Stop-TtsServer
+            if (-not (Start-TtsServer)) {
+                $ttsCanWait = $false
+                Say "      （本地语音环境不完整，跳过；游戏仍可用系统语音）"
+            }
+        } else {
+            Say "[2/4] 已有语音服务在启动（模型加载中），等待它就绪，不重复拉起…"
+        }
     } else {
         Say ("[2/4] 启动本地语音（" + $(if ($QualityTts) { "质量引擎 CosyVoice" } else { "快引擎 MeloTTS" }) + "，后台隐藏窗口）…")
         if (-not (Start-TtsServer)) {
@@ -247,25 +313,39 @@ if (-not $TtsReady) {
             Say "      （本地语音环境不完整，跳过；游戏仍可用系统语音）"
         }
     }
-    if ($ttsCanWait) {
+    if ($ttsCanWait -and -not $NoWaitTts) {
         # 经典版等 160 次 × 1.5 秒 ≈ 240 秒；质量引擎给到 300 秒。
         $ttsWait = 240
         if ($QualityTts) { $ttsWait = 300 }
         $TtsReady = Wait-Url "http://127.0.0.1:$TtsPort/health" "" $ttsWait "本地语音服务"
+    } elseif ($NoWaitTts) {
+        Say "      （-NoWaitTts：先继续启动后端，语音起好后自动接上）"
     }
     if (-not $TtsReady) {
         Say "      （本地语音未就绪：保持原朗读方式，不把配置伪装成已切到本地）"
     }
 }
 
-# 只在语音服务真就绪时写配置，避免「脚本说切了本地、后端却连不上」的假成功。
-$cfgPath = Join-Path $Root "game\config.json"
+# —— 预热入口（游戏在主界面 / 设置面板期间提前调用）：只起本地语音 ——
+# 不写 config（玩家还没确认设置面板，写了会覆盖他正在改的值），也不启动 LLM / KataGo /
+# 后端 / 游戏；后面完整流程还会再跑一遍，届时这里起好的语音会被直接复用。
+if ($TtsOnly) {
+    if ($TtsReady) { Warm-Tts $TtsVoice }
+    Say ("-TtsOnly：本地语音" + $(if ($TtsReady) { "已就绪" } else { "后台加载中" }) +
+         "（不改配置、不启动其他服务）。")
+    exit 0
+}
+
+# 正常只在语音服务真就绪时写配置，避免「脚本说切了本地、后端却连不上」的假成功。
+# 例外：-QualityTts -NoWaitTts（用户选择不等）先把 tts_mode=local、voice=azure 写进去，
+# 让后端立刻以质量音色启动；CosyVoice 没加载完时首句先回落系统，起好后自动用上。
 $ttsConfigChanged = $false
 $oldMode = ""
 if (Test-Path $cfgPath) {
     $cfgText = [IO.File]::ReadAllText($cfgPath, [Text.Encoding]::UTF8)
     if ($cfgText -match '"tts_mode"\s*:\s*"([^"]*)"') { $oldMode = $Matches[1] }
-    if ($TtsReady) {
+    $writeTts = $TtsReady -or ($QualityTts -and $NoWaitTts)
+    if ($writeTts) {
         $localUrl = "http://127.0.0.1:$TtsPort/v1"
         $oldUrl = ""
         $oldVoice = ""
@@ -279,7 +359,11 @@ if (Test-Path $cfgPath) {
                                     '"tts_mode": "local"')
         $ttsConfigChanged = ($oldMode -ne "local") -or ($oldUrl -ne $localUrl) -or ($oldVoice -ne $TtsVoice)
         [IO.File]::WriteAllText($cfgPath, $cfgText, (New-Object Text.UTF8Encoding($false)))
-        Say "[2/4] 已写入本地语音配置（tts_mode=local、voice=$TtsVoice）"
+        if ($TtsReady) {
+            Say "[2/4] 已写入本地语音配置（tts_mode=local、voice=$TtsVoice）"
+        } else {
+            Say "[2/4] 已写入质量语音配置（tts_mode=local、voice=$TtsVoice；CosyVoice 后台加载中）"
+        }
         if ($ttsConfigChanged) {
             Say "      （后端在运行时会重启以生效）"
         } else {
@@ -354,6 +438,7 @@ if (-not (Test-Path $GodotExe)) {
 }
 
 Say "启动游戏（Godot 4.6.3）…"
+$env:AZURE_SERVICES_MANAGED = "1"                # 告诉客户端：服务已由本脚本拉起，启动时不要再拉一遍
 $g = Start-Process -FilePath $GodotExe -ArgumentList @("--path", (Join-Path $Root "game")) -PassThru
 $started += $g.Id
 $started | ConvertTo-Json -Compress | Out-File -Encoding utf8 $PidFile

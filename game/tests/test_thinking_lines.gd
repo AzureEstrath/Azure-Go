@@ -1,5 +1,6 @@
 extends SceneTree
-## 思考中短句自检（v3.11.2）——纯逻辑：JSON 解析 / 20 句 / 脏值过滤 / 轮换不连复 / 缺表回退。
+## 思考短句解析工具自检——纯逻辑：JSON 解析 / 20 句 / 脏值过滤 / 轮换纯函数 / 固定占位文案。
+## 注意：当前运行路径**不轮播**短句；这里只测保留下来的纯函数工具。
 ## 运行：godot --headless --path game --script res://tests/test_thinking_lines.gd
 
 var _total := 0
@@ -17,7 +18,7 @@ func _check(name: String, ok: bool) -> void:
 		print("  FAIL  ", name)
 
 func _run() -> void:
-	print("[think] 思考中短句自检（JSON 预存 20 句 / 每秒轮换 / 缺文件回退）")
+	print("[think] 思考短句解析工具自检（JSON 预存 20 句 / 轮换纯函数 / 固定占位）")
 	var main_script := preload("res://scripts/ui/Main.gd")
 
 	# —— ① 出货的那份 JSON：恰好 20 句、无空句、无重复、长度可控 ——
@@ -78,7 +79,7 @@ func _run() -> void:
 	_check("③ 首句下标钉在 0.0 → 第一句", main_script.next_thinking_index(-1, 20, 0.0) == 0)
 	_check("③ 脏 prev（越界）按「没有上一句」处理",
 		main_script.next_thinking_index(99, 20, 0.0) == 0)
-	_check("③ 换句间隔就是 1 秒（用户口径：每秒一句）", int(main_script.THINKING_SWITCH_MS) == 1000)
+	_check("③ 固定占位文案是「Azure 思考中」", str(main_script.THINKING_FALLBACK) == "Azure 思考中")
 
 	if _fail == 0:
 		print("[think] PASS：", _total, " 项断言全部通过")

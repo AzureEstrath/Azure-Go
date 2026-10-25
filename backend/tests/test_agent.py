@@ -125,12 +125,86 @@ class FlowTest(unittest.TestCase):
             "第二手不应重算已缓存的「落子前局面」",
         )
 
-    def test_peek_removed(self):
+    def test_peer_remark_uses_screen_context(self):
+        """窥屏搭话：台词仍走 AI_IDLE，且 prompt 里真的带上了看到的窗口与画面描述。"""
+        async def run():
+            agent, _eng, llm, bus = _mk()
+            await agent.peer_remark({"fg_title": "Bilibili", "ocr": "围棋教学视频",
+                                     "vlm": "他正在看一个围棋教学视频"})
+            return llm, bus
+
+        llm, bus = asyncio.run(run())
+        self.assertEqual(len(bus.messages(events.AI_IDLE)), 1)
+        joined = "\n".join(str(m.get("content", "")) for m in llm.calls[-1][0])
+        self.assertIn("Bilibili", joined)
+        self.assertIn("围棋教学视频", joined)
+        self.assertIn("Estarth", joined)
+
+    def test_peer_remark_filters_private_screen(self):
+        """窥屏隐私：密码 / 聊天 / 手机号等一律不进口型提示词，只留「私人的东西」。"""
+        async def run():
+            agent, _eng, llm, _bus = _mk()
+            await agent.peer_remark({"fg_title": "微信 - 张三", "ocr": "密码 13800138000",
+                                     "vlm": "聊天记录和银行卡余额"})
+            return llm
+
+        llm = asyncio.run(run())
+        joined = "\n".join(str(m.get("content", "")) for m in llm.calls[-1][0])
+        for secret in ("微信", "密码", "13800138000", "聊天记录", "银行卡", "余额"):
+            self.assertNotIn(secret, joined)
+        self.assertIn("私人的东西", joined)
+
+    def test_persona_note_disabled_by_default(self):
         agent, _eng, _llm, _bus = _mk()
-        self.assertFalse(hasattr(agent, "peer_remark"))
+        self.assertEqual(agent.persona_note(), "")
+
+    def test_persona_note_relationship_off_by_default(self):
+        """默认不开关系：即便已经下过很多局，提示词里也不出现关系阶段 / 称呼变化。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent.persona_enabled = True
+        agent._persona = {"games_total": 12, "streak": -2}
+        note = agent.persona_note()
+        self.assertNotIn("熟络", note)
+        self.assertNotIn("关系", note)
+        self.assertIn("输", note, "情绪记忆与关系开关无关，仍应保留")
+
+    def test_persona_note_stage_and_streak(self):
+        agent, _eng, _llm, _bus = _mk()
+        agent.persona_enabled = True
+        agent.persona_relationship_enabled = True
+        agent.persona_address_name = "搭档"
+        agent._persona = {"games_total": 12, "streak": -2}
+        note = agent.persona_note()
+        self.assertIn("熟络", note)
+        self.assertIn("搭档", note)
+        self.assertIn("输", note)
+        self.assertIn("不要逐条念出来", note)
+
+    def test_reset_game_carries_mood(self):
+        """情绪余温：上一局结束时的情绪按 keep=0.45 带进新局，而不是直接清零。"""
+        agent, _eng, _llm, _bus = _mk()
+        agent.persona_enabled = True
+        agent._lingering_mood = {"v": 0.9, "c": 0.3, "a": 0.8}
+        agent.reset_game(silent=True)
+        self.assertAlmostEqual(agent.mood.v, 0.58 + (0.9 - 0.58) * 0.45, delta=0.01)
+        self.assertAlmostEqual(agent.mood.c, 0.55 + (0.3 - 0.55) * 0.45, delta=0.01)
+        self.assertIsNone(agent._lingering_mood, "余温只带一次，随后清掉")
+
+    def test_persist_persona_writes_store(self):
+        with tempfile.TemporaryDirectory() as d:
+            agent, _eng, _llm, _bus = _mk()
+            agent.persona_enabled = True
+            agent.profile_store = ProfileStore(os.path.join(d, "profile.db"))
+            agent.mood.v, agent.mood.c, agent.mood.a = 0.4, 0.7, 0.6
+            asyncio.run(agent._persist_persona({"data": {"wr": 0.3}}))
+            got = agent.profile_store.get_persona()
+            self.assertEqual(got["games_total"], 1)
+            self.assertEqual(got["last_result"], "win")
+            self.assertEqual(got["streak"], 1)
+            self.assertEqual(got["mood"], {"v": 0.4, "c": 0.7, "a": 0.6})
 
     def test_idle_remark_still_works(self):
-        """删掉窥屏后，闲置主动搭话必须照常（Review Focus 第四条）。"""
+        """窥屏恢复后，普通闲置主动搭话仍然照常。"""
 
         async def run():
             agent, _eng, _llm, bus = _mk()

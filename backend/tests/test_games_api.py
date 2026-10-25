@@ -86,6 +86,24 @@ class GamesApiTest(unittest.TestCase):
             self.assertEqual(r2.status_code, 400)
             self.assertEqual(self.store.count(), 0)
 
+    def test_remark_uses_record(self):
+        """棋谱库「她的回忆」：纯本地文案，引用真实手数 / 胜率 / 总结；缺失 404。"""
+        gid = self.store.add_game({
+            "moves": [["black", "Q16"], ["white", "D4"], ["black", "R4"]],
+            "move_count": 3, "final_black_wr": 0.71,
+            "summary": "这局你在右下角下得很漂亮。", "meta": {"source": "game"},
+        })
+        self.assertGreater(gid, 0)
+        with self._client() as client:
+            r = client.get("/api/games/%d/remark" % gid)
+            self.assertEqual(r.status_code, 200)
+            text = r.json()["text"]
+            self.assertTrue(r.json()["ok"])
+            self.assertIn("3 手", text)
+            self.assertIn("右下角下得很漂亮", text)
+            self.assertIn("今天", text)
+            self.assertEqual(client.get("/api/games/9999/remark").status_code, 404)
+
     def test_missing_game_404(self):
         with self._client() as client:
             self.assertEqual(client.get("/api/games/9999").status_code, 404)

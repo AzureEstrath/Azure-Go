@@ -42,12 +42,31 @@ var chat_digest_llm := false
 ## 玩家棋风画像（v3.9.0）：跨局攒「她眼中的你」，手动结束对局时写进后端的 profile.db。
 ## 默认关；关掉=行为零变化（不注入画像块、不写记录、不攒画像）。开关与只读面板同在 ⚙ 设置抽屉的一格里。
 var profile_enabled := false
+## 人格化（自用版）：关系阶段 / 情绪余温 / 今天的小心思 / 夜間节奏 / 难度与偏航的半句提示。
+## 默认开；关掉＝后端提示词逐字符不变。由 ⚙ 设置抽屉读写。
+var persona_enabled := true
+## 关系阶段与称呼变化：**默认关**——称呼保持 `prompt_user_name`（默认 Estarth）不变。
+## 开启后才按局数推进称呼；`persona_address_name` 为空 ⇒ 即便开启也仍用原名。
+var persona_relationship_enabled := false
+var persona_address_name := ""    # 高阶段称呼名（最多 16 字；留空=仍叫 prompt_user_name）
 ## 时间感知（v3.9.0）：让她知道现在几点、这一局下了多久、你多久没来、连续第几天。
 ## 默认关；关掉=行为零变化（不注入时间块）。与画像开关同一格、**一次推一次** `/api/config`。
 var time_aware_enabled := false
 # —— 前后端架构 ——
 # 编排（KataGo / LLM / 定式 / 情绪）全部在后端服务进程，游戏只做渲染与语音，经 REST + WebSocket 通信
 var backend_url := "http://127.0.0.1:8000"   # 后端服务地址（WS 地址由其推导）
+## 自用版启动便利：游戏启动时自动拉起本地 LLM / TTS / KataGo / 后端（只在 backend_url 为本机时）。
+## 由 `dev_local.ps1` 拉起游戏时它已置 `AZURE_SERVICES_MANAGED=1`，不会重复拉起。
+var auto_start_services := true
+## 窥屏：玩家长时间无操作且切去别的窗口时，看一眼前台画面再搭话。
+## 本机默认自动拉起 VLM（GPU 常驻）；填了 vlm_base_url 则视为外部/自管服务，游戏不再碰本地进程。
+var vlm_enabled := true
+var vlm_base_url := ""
+var vlm_auto_start := true
+var vlm_port := 8090
+var vlm_exe := ""                 # 高级：llama-server.exe 路径（留空自动找）
+var vlm_model := ""               # 高级：VLM gguf 路径（留空自动找）
+var vlm_mmproj := ""              # 高级：视觉编码器 mmproj 路径（留空自动找）
 ## 自用版主视觉：warm / classic / mist / dark；默认雾蓝清透。只给客户端 `GufengTheme` 用。
 var ui_theme := "mist"
 var llm_base_url := "https://api.deepseek.com/v1"   # 云端 LLM（OpenAI 兼容）地址；示例见 README 第四节
@@ -131,8 +150,22 @@ static func load_config(path := "") -> AzureConfig:
 			c.drift_base = _normalize_drift_base(d.get("drift_base", c.drift_base), c.drift_max)
 			c.chat_digest_llm = _normalize_flag(d.get("chat_digest_llm"), c.chat_digest_llm)
 			c.profile_enabled = _normalize_flag(d.get("profile_enabled"), c.profile_enabled)
+			c.persona_enabled = _normalize_flag(d.get("persona_enabled"), c.persona_enabled)
+			c.persona_relationship_enabled = _normalize_flag(d.get("persona_relationship_enabled"),
+				c.persona_relationship_enabled)
+			var addr_name = d.get("persona_address_name", c.persona_address_name)
+			if typeof(addr_name) == TYPE_STRING:   # null / 数字 / 对象是脏值：保留默认空串
+				c.persona_address_name = (addr_name as String).strip_edges().substr(0, 16)
 			c.time_aware_enabled = _normalize_flag(d.get("time_aware_enabled"), c.time_aware_enabled)
 			c.backend_url = str(d.get("backend_url", c.backend_url))
+			c.auto_start_services = _normalize_flag(d.get("auto_start_services"), c.auto_start_services)
+			c.vlm_enabled = _normalize_flag(d.get("vlm_enabled"), c.vlm_enabled)
+			c.vlm_base_url = str(d.get("vlm_base_url", c.vlm_base_url)).strip_edges()
+			c.vlm_auto_start = _normalize_flag(d.get("vlm_auto_start"), c.vlm_auto_start)
+			c.vlm_port = _normalize_port(d.get("vlm_port"), c.vlm_port)
+			c.vlm_exe = str(d.get("vlm_exe", c.vlm_exe)).strip_edges()
+			c.vlm_model = str(d.get("vlm_model", c.vlm_model)).strip_edges()
+			c.vlm_mmproj = str(d.get("vlm_mmproj", c.vlm_mmproj)).strip_edges()
 			c.ui_theme = _normalize_ui_theme(str(d.get("ui_theme", c.ui_theme)))
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
@@ -213,8 +246,15 @@ static func _normalize_tts_mode(v: String) -> String:
 
 ## 主题归一化：未知值回落雾蓝（默认），避免旧配置 / 手写值让启动落进空主题。
 static func _normalize_ui_theme(v: String) -> String:
-	var m := v.strip_edges().to_lower()
-	return m if m in UI_THEMES else "mist"
+	var s := v.strip_edges().to_lower()
+	return s if s in UI_THEMES else "mist"
+
+static func _normalize_port(v, fallback: int) -> int:
+	if typeof(v) == TYPE_INT or typeof(v) == TYPE_FLOAT:
+		return clampi(int(v), 1024, 65535)
+	if typeof(v) == TYPE_STRING and (v as String).strip_edges().is_valid_int():
+		return clampi((v as String).strip_edges().to_int(), 1024, 65535)
+	return clampi(fallback, 1024, 65535)
 
 ## 旧配置归一化：UI 视为「已移除」的旧音色（男声 / 韩语女 / 旧克隆音色）→ 回落模板默认音色；
 ## 自建服务仍在用的活音色（azure / azure-fast / melo）与手填 id 一律原样保留
@@ -340,9 +380,20 @@ func save() -> bool:
 	# `drift_max` 是**只读镜像**（v3.9.0）：前端不写它、也不推它——手改过的值随 `_raw` 原样保留。
 	d["chat_digest_llm"] = chat_digest_llm        # 聊天摘要用 LLM（默认关）：单字段开关，写回即生效
 	d["profile_enabled"] = profile_enabled        # 玩家棋风画像（默认关）：与下面的时间感知同一格
+	d["persona_enabled"] = persona_enabled        # 人格化（默认开）：关系 / 情绪余温 / 小目标 / 夜間节奏
+	d["persona_relationship_enabled"] = persona_relationship_enabled   # 关系称呼变化（默认关）
+	d["persona_address_name"] = persona_address_name                   # 高阶段称呼名；空=仍叫原名
 	d["time_aware_enabled"] = time_aware_enabled  # 时间感知（默认关）：两个字段一起原子推一次 `/api/config`
 	d.erase("backend_mode")                       # 只剩「连后端」一条路径：旧配置里的 backend_mode 不再写回
 	d["backend_url"] = backend_url
+	d["auto_start_services"] = auto_start_services
+	d["vlm_enabled"] = vlm_enabled
+	d["vlm_base_url"] = vlm_base_url
+	d["vlm_auto_start"] = vlm_auto_start
+	d["vlm_port"] = vlm_port
+	d["vlm_exe"] = vlm_exe
+	d["vlm_model"] = vlm_model
+	d["vlm_mmproj"] = vlm_mmproj
 	d["ui_theme"] = ui_theme
 	d["llm_base_url"] = llm_base_url
 	d["llm_model"] = llm_model
@@ -354,12 +405,6 @@ func save() -> bool:
 	d.erase("llm_exe")
 	d.erase("llm_model_path")
 	d["vrm_path"] = d.get("vrm_path", vrm_path)
-	d.erase("vlm_base_url")                       # 窥屏 VLM 已删除：旧键不再写回
-	d.erase("vlm_auto_start")
-	d.erase("vlm_exe")
-	d.erase("vlm_model")
-	d.erase("vlm_mmproj")
-	d.erase("vlm_port")
 	d.merge({
 		"tts_enabled": tts_enabled,
 		"tts_mode": tts_mode,

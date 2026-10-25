@@ -15,10 +15,10 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import adaptive, coords, events, joseki_gate, profile, prompt_chains, prompts, pv_lines, time_ctx
+from . import adaptive, coords, events, joseki_gate, persona, profile, prompt_chains, prompts, pv_lines, time_ctx
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
-    PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, build_graph, is_joseki_mistake, _emit_line,
+    PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, PHASE_PEER, build_graph, is_joseki_mistake, _emit_line,
 )
 from .board import GoBoard, SIZE as BOARD_SIZE
 from .config import DRIFT_MAX_LIMIT
@@ -195,7 +195,7 @@ def chat_topics(history, window=CHAT_TOPIC_WINDOW):
     - **关键词 / 相似度**：玩家发言命中 ``CHAT_TOPIC_RULES`` 里最靠前的一类即为该段的主题，
       核不上归「闲聊」；主题相同的连续玩家发言并成一段（相似度＝同类关键词）；
     - **两侧都用**（设计 §6.6：输入＝这轮玩家消息 **+ 她的回复**）：主题由玩家发言定，
-      但段的摘要同时收两侧命中的关键词 ——「他说到 X」用玩家那侧、「我聊到 Y」用她那侧；
+      但段的摘要同时收两侧命中的关键词 ——「Estarth 说到 X」用玩家那侧、「我聊到 Y」用她那侧；
       她没回关键词时写成「我回应了」（**与有没有她的回复无关地稳定**，故去重不会被回合数打散）；
     - **纯函数、零 LLM**：不碰 ``self``，可直接在事件写入路径上调用。
     """
@@ -204,7 +204,7 @@ def chat_topics(history, window=CHAT_TOPIC_WINDOW):
     uidx = [i for i, m in enumerate(msgs) if str(m.get("role", "")) == "user"]
     if window and window > 0 and len(uidx) > window:
         msgs = msgs[uidx[-int(window)]:]          # 窗口从「第 window 近的玩家发言」起，带上其后回复
-    segs = []                                     # [主题, [他那侧的关键词], [她那侧的关键词]]
+    segs = []                                     # [主题, [Estarth 那侧的关键词], [她那侧的关键词]]
     for m in msgs:
         role = str(m.get("role", ""))
         topic, kw = _chat_topic_of(str(m.get("content", "")))
@@ -221,7 +221,7 @@ def chat_topics(history, window=CHAT_TOPIC_WINDOW):
                 segs[-1][2].append(kw)
     out = []
     for topic, his, mine in segs:
-        his_s = ("他说到%s" % "、".join(his)) if his else "他随口聊了几句"
+        his_s = ("Estarth 说到%s" % "、".join(his)) if his else "Estarth 随口聊了几句"
         mine_s = ("我聊到%s" % "、".join(mine)) if mine else "我回应了"
         out.append((topic, prompts._one_line("%s，%s" % (his_s, mine_s), CHAT_TOPIC_SUMMARY_CHARS)))
     return out
@@ -363,6 +363,8 @@ class AzureAgent:
                  drift_base=DRIFT_BASE_DEFAULT, drift_max=DRIFT_MAX_DEFAULT,
                  pv_max_drop=PV_MAX_DROP_DEFAULT, drift_rng=None, chat_digest_llm=False,
                  profile_enabled=False, time_aware_enabled=False, reply_style=None,
+                 persona_enabled=False, persona_rng=None,
+                 persona_relationship_enabled=False, persona_address_name="",
                  adaptive_enabled=False, adaptive_base=adaptive.BASE_DEFAULT,
                  adaptive_spread=adaptive.SPREAD_DEFAULT, adaptive_rng=None):
         self.st = GameState()
@@ -489,6 +491,22 @@ class AzureAgent:
         self.profile_enabled = bool(profile_enabled)
         self.time_aware_enabled = bool(time_aware_enabled)
         self.profile_store = None
+        # —— 人格化（关系阶段 / 情绪余温 / 今天的小心思）：默认关；关着＝提示词逐字符不变 ——
+        #    与画像开关**解耦**：画像记棋风，人格化记「你们一起下过多少盘、她心里还留着什么」。
+        #    ``load_persona()`` 在 lifespan 里读一次 profile.db 的 persona 表（测试不调用 ⇒ 零变化）。
+        self.persona_enabled = bool(persona_enabled)
+        self.persona_rng = persona_rng if persona_rng is not None else random.Random()
+        # 关系阶段 / 称呼变化：**默认关**，称呼保持 `prompts.user_name`（默认 Estarth）不变。
+        # 开启后才按局数推进称呼；`persona_address_name` 为空 ⇒ 即便开启也仍用原名。
+        self.persona_relationship_enabled = bool(persona_relationship_enabled)
+        self.persona_address_name = (str(persona_address_name).strip()[:16]
+                                     if isinstance(persona_address_name, str) else "")
+        self._persona = {}
+        self._lingering_mood = None
+        self._interactions = 0
+        self._intent = None
+        self._soft_note = ""
+        self._soft_note_turns = 0
         # —— 棋谱库（v3.11.5）：默认不接线（None）⇒ 局末不写库；由 main.py lifespan 注入 GameStore。
         #    ``player_name`` 只用于棋谱的 PB（黑方名），``_library_sig`` 防同一次结束重复归档。
         self.game_store = None
@@ -652,6 +670,10 @@ class AzureAgent:
         """开启一次公开编排调用：生成新的 ``turn_id``（同一回合的多个阶段一路沿用，S33）。"""
         self.turn_id = uuid.uuid4().hex
         self._speech_seq = 0                        # T15：seq 是**同一** turn_id 内从 1 起的单调序号
+        if self._soft_note_turns > 0:               # 难度半句只顺延一个公开回合，之后自然消失
+            self._soft_note_turns -= 1
+            if self._soft_note_turns <= 0:
+                self._soft_note = ""
         return self.turn_id
 
     def _next_speech_seq(self) -> int:
@@ -791,6 +813,7 @@ class AzureAgent:
         return prompt_chains.build_messages(
             prompt_chains.PHASES[0], len_note=len_note,
             mood_name=self.mood.region_name(), think_hint=self._think_hint(),
+            persona_extra=self.persona_note(),
         )[0]["content"]
 
     def _sys_msg(self):
@@ -825,6 +848,7 @@ class AzureAgent:
         return prompt_chains.build_messages(
             phase, context=context, len_note=len_note,
             mood_name=self.mood.region_name(), think_hint=self._think_hint(),
+            persona_extra=self.persona_note(),
         )
 
     @staticmethod
@@ -1187,6 +1211,7 @@ class AzureAgent:
         """
         if self.review:
             return
+        self._persona_bump_interaction()
         self.mood.apply_event(what)
         self._mood_desc = EmotionModel.event_desc(what)
         self.sync_mood(False, True)
@@ -1606,6 +1631,122 @@ class AzureAgent:
             print("[Agent] 画像读取异常（按「无画像」降级）：%s" % e)
             return {}
 
+    # ================= 人格化：关系 / 情绪余温 / 今天的小心思 =================
+
+    async def load_persona(self):
+        """从 ``profile.db`` 的 persona 表读一次跨局状态（lifespan 调用；失败按空处理）。
+
+        只读一次、缓存在实例上，**回合内零 IO**。情绪余温按「距上一局结束多久」向基线回落：
+        刚结束几乎原样，隔一天剩约四成，隔三天基本平静（见 ``persona.mood_after_break``）。
+        """
+        if not self.persona_enabled:
+            return
+        store = self.profile_store
+        if store is None:
+            return
+        try:
+            data = await asyncio.to_thread(store.get_persona)
+        except Exception as e:                      # noqa: BLE001 —— 读不到就当没有历史
+            print("[Agent] 人格化状态读取异常（按初识降级）：%s" % e)
+            data = {}
+        self._persona = data if isinstance(data, dict) else {}
+        try:
+            self._interactions = int(self._persona.get("interactions_total") or 0)
+        except (TypeError, ValueError):
+            self._interactions = 0
+        restored = persona.mood_after_break(self._persona.get("mood"),
+                                             self._persona.get("last_game_ts"))
+        if restored:
+            self._lingering_mood = restored
+
+    def persona_note(self) -> str:
+        """人格化提示词附加段（关系 / 最近胜负 / 夜間语气 / 小目标 / 难度半句）。
+
+        关着人格化 / 没有任何可说的内容 ⇒ ``""``（系统提示词逐字符不变）。全部是**语气指令**，
+        明确要求模型不要逐条念出来；数据不足时宁可不写，不硬编。
+        """
+        if not self.persona_enabled:
+            return ""
+        parts = []
+        if self.persona_relationship_enabled:
+            stage = persona.relationship_stage(self._persona.get("games_total", 0),
+                                               self._interactions)
+            rel = persona.relationship_note(stage, prompts.user_name, self.persona_address_name)
+            if rel:
+                parts.append(rel)
+        mem = persona.memory_note(self._persona.get("streak", 0))
+        if mem:
+            parts.append(mem)
+        night = persona.night_note(time.localtime().tm_hour)
+        if night:
+            parts.append(night)
+        intent = persona.intent_note(self._intent)
+        if intent:
+            parts.append(intent)
+        if self._soft_note:
+            parts.append(self._soft_note)
+        if not parts:
+            return ""
+        return ("【此刻的你 · 只影响语气与分寸，不要逐条念出来】\n"
+                + "\n".join("· " + p for p in parts))
+
+    def _persona_bump_interaction(self):
+        """互动计数（摸头等）：只进内存，局末随人格化状态一起落盘；复盘期间不计。"""
+        if self.persona_enabled and not self.review:
+            self._interactions += 1
+
+    async def _persist_persona(self, state):
+        """局末写人格化状态（关系局数 / 连续胜负 / 情绪快照）；任何故障只打日志。"""
+        if not self.persona_enabled or self.profile_store is None:
+            return
+        data = dict(state.get("data") or {}) if isinstance(state, dict) else {}
+        if not data:
+            return
+        try:
+            wr = float(data.get("wr", 0.5))
+        except (TypeError, ValueError):
+            wr = 0.5
+        result = "win" if wr < 0.5 else ("loss" if wr > 0.5 else "draw")   # Azure 视角
+        prev = self._persona if isinstance(self._persona, dict) else {}
+        try:
+            games = int(prev.get("games_total") or 0) + 1
+        except (TypeError, ValueError):
+            games = 1
+        old_streak = 0
+        try:
+            old_streak = int(prev.get("streak") or 0)
+        except (TypeError, ValueError):
+            old_streak = 0
+        if result == prev.get("last_result"):
+            if result == "win":
+                streak = old_streak + 1 if old_streak > 0 else 1
+            elif result == "loss":
+                streak = old_streak - 1 if old_streak < 0 else -1
+            else:
+                streak = 0
+        else:
+            streak = 1 if result == "win" else (-1 if result == "loss" else 0)
+        mood = {"v": round(float(self.mood.v), 4),
+                "c": round(float(self.mood.c), 4),
+                "a": round(float(self.mood.a), 4)}
+        items = {
+            "games_total": games,
+            "first_game_ts": prev.get("first_game_ts") or time.time(),
+            "last_game_ts": time.time(),
+            "last_result": result,
+            "streak": streak,
+            "mood": mood,
+            "interactions_total": int(self._interactions),
+        }
+        try:
+            await asyncio.to_thread(self.profile_store.set_persona, items)
+        except Exception as e:                      # noqa: BLE001 —— 写不进去只丢这一次
+            print("[Agent] 人格化状态写入异常（已忽略）：%s" % e)
+        self._persona.update(items)
+        self._lingering_mood = mood                 # 下一局开头带一点余温
+        self._soft_note = ""
+        self._soft_note_turns = 0
+
     # ================= 对局记录与画像写入（v3.9.0，设计 §6.1 / §五 G） =================
     #
     # **写入点只有一处**：``summarize()``（手动结束对局）成功跑完那一回合之后。素材由
@@ -1841,8 +1982,12 @@ class AzureAgent:
         """玩家这一手的表现进自适应窗口（零额外调用）；真的调档才推一条 difficulty 事件。"""
         if not self.adaptive.enabled:
             return
+        old_level = self.adaptive.level
         try:
             if self.adaptive.note_move(move_no, black_wr, rank, drop):
+                if self.persona_enabled and self.adaptive.level < old_level:
+                    self._soft_note = persona.adaptive_soft_note(old_level, self.adaptive.level)
+                    self._soft_note_turns = 1
                 self._emit_difficulty("")
         except Exception as e:                  # noqa: BLE001 —— 难度调节失败不影响对局
             print("[Adaptive] 表现记录失败（已忽略）：%s" % e)
@@ -2196,7 +2341,7 @@ class AzureAgent:
         for m in list(self.st.chat_history)[-CHAT_DIGEST_MAX_MSGS:]:
             if not isinstance(m, dict):
                 continue
-            who = "他" if str(m.get("role", "")) == "user" else "我"
+            who = "Estarth" if str(m.get("role", "")) == "user" else "我"
             t = " ".join(str(m.get("content", "")).split())
             if t != "":
                 lines.append("%s：%s" % (who, t))
@@ -2304,7 +2449,7 @@ class AzureAgent:
         if self.adaptive.enabled and self.adaptive.note_chat(text, len(self.st.moves)):
             self._emit_difficulty("")
         # 按聊天内容即时结算情绪（本地关键词分类）
-        self._mood_event(self._chat_event(self.chat_emotion(text)), "，他说：「%s」" % text[:40].strip())
+        self._mood_event(self._chat_event(self.chat_emotion(text)), "，对面说：「%s」" % text[:40].strip())
         owner = self._set_busy(True)
         self._new_turn()
         token = self.begin_epoch()
@@ -2336,6 +2481,19 @@ class AzureAgent:
         if self.epoch_ok(token):
             await self._digest_chat_llm(token)
 
+    async def peer_remark(self, info):
+        """窥屏搭话：玩家切去别的窗口时，结合前台窗口 / OCR / VLM 描述主动说一句。
+
+        与 ``idle_remark`` 同一条「不进 busy」的通道（空闲搭话不锁棋盘），但 prompt 里带上看到的内容。
+        玩家一回来就会 ``begin_epoch()``，这一代随即作废——与前端丢弃迟到的窥屏结果一致。
+        """
+        if self.busy:
+            return
+        self._new_turn()
+        token = self.begin_epoch()
+        await self._turn_guard(
+            self._turn(PHASE_PEER, {"info": info if isinstance(info, dict) else {}}), token)
+
     async def summarize(self, note=""):
         """对局总结（顺序见 ``agent_graph.py`` 的 summary 阶段）。
 
@@ -2366,6 +2524,9 @@ class AzureAgent:
         # 棋谱库（v3.11.5）：与画像开关解耦，每局「结束」归档一次（重复点结束由 _library_sig 挡住）
         if self.epoch_ok(token):
             await self._persist_library(state)
+        # 人格化（关系 / 连续胜负 / 情绪余温）：同样与画像开关解耦；关着人格化 ⇒ 一条都不写。
+        if self.epoch_ok(token):
+            await self._persist_persona(state)
         # 局末：`chat_digest_llm=true` 时在这里补做一次 LLM 分段总结（默认关，零额外调用）。
         # 代数一并带进去：那一趟 LLM ``await`` 里若玩家起了新回合，摘要不再写表（修复波 / Minor #2）。
         if self.epoch_ok(token):
@@ -2441,7 +2602,16 @@ class AzureAgent:
         # v3.9.0：时间感知的采集同样是**局内内存**——新一局从零开始（本局时长 / 单手用时重新计）
         self.session_start = None
         self.move_ts_list = []
-        self.mood.reset()                        # 新一局：情绪回到基线（平静）
+        # 人格化（v3.x 自用版）：上一局的情绪余温带一半进新局；没有余温 / 关着 ⇒ 回到平静基线。
+        # 「今天的小心思」每局重抽（小概率才有），难度半句类的一次性提示一并清掉。
+        if self.persona_enabled and self._lingering_mood:
+            self.mood.carry(self._lingering_mood, keep=0.45)
+            self._lingering_mood = None
+        else:
+            self.mood.reset()
+        self._soft_note = ""
+        self._soft_note_turns = 0
+        self._intent = persona.pick_intent(self.persona_rng) if self.persona_enabled else None
         self.sync_mood(True)
         self._emit(events.state(self.st.payload()))
         # v3.12.1：从主界面进对局用 ``silent=True``——开场不该每次都多一句「重新来吧」；
