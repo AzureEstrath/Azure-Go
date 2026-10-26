@@ -279,6 +279,15 @@ DRIFT_MOOD_BASELINE = EmotionModel.BASELINE
 DRIFT_MOOD_WEIGHTS = (0.45, 0.20, 0.35)
 DRIFT_SCORE_FULL = 0.5
 
+# —— 情绪棋风（v3.13.0）：与「情绪波动」不同，这是**她自愿**的风格选择，不是走偏 ——
+# 只在 B 线与最优线胜率差 ≤ 1.5% 时考虑；心情好/兴奋时才可能选更锐的一手；
+# 一次选完冷却 6 手，避免每手都「想试试」。低落 / 平静时一律走最优（更稳）。
+STYLE_MAX_DROP = 0.015
+STYLE_MAX_P = 0.16
+STYLE_COOLDOWN_MOVES = 6
+STYLE_MIN_V = 0.62
+STYLE_MIN_A = 0.50
+
 
 def _clamp_unit(v, default):
     """``[0, 1]`` 的安全取值：键缺失 / 脏值 → ``default``（不抛，不把 agent 构造搞崩）。"""
@@ -362,6 +371,7 @@ class AzureAgent:
                  pv_max_visits=PV_MAX_VISITS_DEFAULT, emotion_drift=False,
                  drift_base=DRIFT_BASE_DEFAULT, drift_max=DRIFT_MAX_DEFAULT,
                  pv_max_drop=PV_MAX_DROP_DEFAULT, drift_rng=None, chat_digest_llm=False,
+                 emotion_style=False,
                  profile_enabled=False, time_aware_enabled=False, reply_style=None,
                  persona_enabled=False, persona_rng=None,
                  persona_relationship_enabled=False, persona_address_name="",
@@ -459,6 +469,9 @@ class AzureAgent:
         self.drift_base = min(_clamp_unit(drift_base, DRIFT_BASE_DEFAULT), self.drift_max)
         self.pv_max_drop = _clamp_unit(pv_max_drop, PV_MAX_DROP_DEFAULT)
         self.drift_rng = drift_rng if drift_rng is not None else random.Random()
+        # 情绪棋风（v3.13.0）：默认关（测试 / 旧调用与现状一致）；运行时由 config.json 打开。
+        self.emotion_style = bool(emotion_style)
+        self._style_until_move = 0
         # 本轮偏航的**待记账**信息（修复轮 1 / Important #1）：``_drift_pick`` 只填它、不写表；
         # 落点定案并提交之后由 ``_record_drift`` 消费（一次性，绝不跨回合残留）。
         self._drift_pending = None
@@ -526,6 +539,10 @@ class AzureAgent:
         self._mood_region = -1
         self._mood_ms = 0
         self._mood_desc = ""
+        self._mood_reason = ""             # 最近一次情绪事件的「为什么」：给提示词带一两回合
+        self._mood_reason_until = -1       # 手数上界；超过就自动不提
+        self._undo_ts = []                 # 最近悔棋时刻：短时间连悔 → 无奈
+        self._pat_ts = []                  # 最近摸头时刻：连续摸头收益递减
         self._busy_seq = 0            # busy 的所有者编号（每次置真 +1）：见 `_clear_busy`
         self._busy_owner = 0
         self._reveal_pending = False
@@ -812,7 +829,8 @@ class AzureAgent:
         """
         return prompt_chains.build_messages(
             prompt_chains.PHASES[0], len_note=len_note,
-            mood_name=self.mood.region_name(), think_hint=self._think_hint(),
+            mood_name=self.mood.region_name(), mood_reason=self._mood_reason_text(),
+            think_hint=self._think_hint(),
             persona_extra=self.persona_note(),
         )[0]["content"]
 
@@ -847,7 +865,8 @@ class AzureAgent:
             len_note = self._len_note()
         return prompt_chains.build_messages(
             phase, context=context, len_note=len_note,
-            mood_name=self.mood.region_name(), think_hint=self._think_hint(),
+            mood_name=self.mood.region_name(), mood_reason=self._mood_reason_text(),
+            think_hint=self._think_hint(),
             persona_extra=self.persona_note(),
         )
 
@@ -1171,14 +1190,28 @@ class AzureAgent:
 
     # ================= 三维情绪 =================
 
-    def _mood_event(self, ev, desc_extra=""):
-        """事件结算入口：本地增量立即生效，区域变化才推给界面。"""
-        self.mood.apply_event(ev)
-        self._mood_desc = EmotionModel.event_desc(ev) + desc_extra
-        self.sync_mood(False)
+    def _mood_event(self, ev, desc_extra="", scale=1.0, burst=""):
+        """事件结算入口：本地增量立即生效，区域变化才推给界面。
 
-    def sync_mood(self, force=False, quiet=False):
-        """把当前情绪区域推给界面；区域没变时不产生任何事件。"""
+        ``scale`` 供「哄与惯性」使用；``burst`` 非空时即使区域没变也推一次一次性表情
+        （自己下好/下坏这种小情绪不该因为区域没跨带就完全看不见）。
+        """
+        self.mood.apply_event(ev, scale)
+        self._mood_desc = EmotionModel.event_desc(ev) + desc_extra
+        self._mood_reason = self._mood_desc
+        self._mood_reason_until = len(self.st.moves) + 2
+        self.sync_mood(bool(burst), False, burst)
+
+    def _mood_reason_text(self) -> str:
+        """最近一次情绪事件的来由；超过两回合 / 复盘 / 空 ⇒ 空串（提示词逐字符不变）。"""
+        if self.review or self._mood_reason == "":
+            return ""
+        if len(self.st.moves) > self._mood_reason_until:
+            return ""
+        return self._mood_reason
+
+    def sync_mood(self, force=False, quiet=False, burst=""):
+        """把当前情绪区域推给界面；区域没变时不产生任何事件（``burst`` 非空则强制推一次）。"""
         r = self.mood.region()
         if not force and r == self._mood_region:
             return
@@ -1190,9 +1223,28 @@ class AzureAgent:
             "name": str(info.get("name", "")),
             "morphs": info.get("morphs", {}),
             "filler": "" if quiet else str(info.get("filler", "")),
-            "burst": "" if quiet else str(info.get("burst", "")),
+            "burst": "" if quiet else (str(burst) or str(info.get("burst", ""))),
             "pitch": float(info.get("pitch", 0.0)),
         }))
+
+    def _pat_scale(self) -> float:
+        """摸头的效果系数：难过时更有效；烦躁/委屈时更难哄；连续摸头收益递减。"""
+        info = self.mood.info(self.mood.region())
+        name = str(info.get("name", ""))
+        if name in ("难过", "失落", "落寞", "忧心", "不安"):
+            scale = 1.25
+        elif name in ("烦躁", "烦闷", "委屈"):
+            scale = 0.35
+        else:
+            scale = 1.0
+        now = time.time()
+        self._pat_ts = [t for t in self._pat_ts if now - t <= 45.0]
+        n = len(self._pat_ts)
+        self._pat_ts.append(now)
+        self._pat_ts = self._pat_ts[-4:]
+        if n > 0:
+            scale *= (0.65 ** min(n, 3))              # 第二次 65%，第三次 42%，之后约 27%
+        return max(0.2, min(1.3, scale))
 
     def tick_mood(self):
         """客户端每 2 秒的心跳：只结算「向基线回落」。
@@ -1212,8 +1264,11 @@ class AzureAgent:
         if self.review:
             return
         self._persona_bump_interaction()
-        self.mood.apply_event(what)
+        scale = self._pat_scale() if str(what) == "patted" else 1.0
+        self.mood.apply_event(what, scale)
         self._mood_desc = EmotionModel.event_desc(what)
+        self._mood_reason = self._mood_desc
+        self._mood_reason_until = len(self.st.moves) + 2
         self.sync_mood(False, True)
 
     async def _mood_delta(self, cur, desc):
@@ -1281,6 +1336,12 @@ class AzureAgent:
             "sad": "chat_sad",
             "puzzled": "chat_question",
         }.get(kind, "chat_normal")
+
+    @staticmethod
+    def is_casual_chat(text) -> bool:
+        """玩家是不是在说「随便下下 / 放松点」：只影响情绪事件，不改回复内容。"""
+        t = str(text or "").lower()
+        return any(kw in t for kw in ["随便", "轻松", "不用认真", "玩玩", "放松", "随便聊"])
 
     @staticmethod
     def chat_emotion(text) -> str:
@@ -2041,6 +2102,7 @@ class AzureAgent:
             # 前端据此**不登记语音配对记录**——否则它会占掉配对位，把连接后第一回合的三条真语音
             # 整体错位（点评等到落子宣告的音频才显示、揭示被推后、最后一条没声音）。
             self._emit(events.message(events.AI_NOTICE, text))
+            self._mood_event("reunion", burst="pleased")   # 隔了几天又见：心里是真的高兴
             return text
         finally:
             self._greet_busy = False
@@ -2071,6 +2133,10 @@ class AzureAgent:
         # 时间感知的采集点（v3.9.0，设计 §5-H；修复轮 1 / I-1 起**放在合法性判定之后**）：
         # 只有真的一手（``is_legal`` 通过）才算「到达」，被拒的落子不打点——否则 ``session_start``
         # 会被一次失败尝试置位、``move_ts_list`` 多一个幽灵时刻、``avg_move_sec`` 的间隔被算歪。
+        if self.move_ts_list:
+            gap = time.time() - float(self.move_ts_list[-1])
+            if 45.0 <= gap <= 900.0:
+                self._mood_event("patient_wait")     # 你想了好一会儿：她安静地等，不催
         self.mark_move_time()
         owner = self._set_busy(True)
         self._new_turn()                            # 三阶段共用同一轮标识（S33）
@@ -2145,11 +2211,17 @@ class AzureAgent:
         三种情形都不会留下与实际落点不符的事件。
         """
         self._drift_pending = None
-        if not self.emotion_drift:
+        if not self.emotion_drift and not self.emotion_style:
             return pick
-        lines = pv_lines.extract_lines(list(move_infos or []), max_drop=self.pv_max_drop)
+        lines = pv_lines.extract_lines(list(move_infos or []), max_drop=max(self.pv_max_drop, STYLE_MAX_DROP))
         mood = self.mood_payload()
-        letter = self._maybe_drift(lines, mood, self.drift_rng)
+        letter = "a"
+        mode = "drift"
+        if self.emotion_drift:
+            letter = self._maybe_drift(lines, mood, self.drift_rng)
+        if letter == "a" and self.emotion_style:
+            letter = self._style_letter(lines, mood, self.drift_rng)
+            mode = "style"
         if letter == "a":
             return pick
         line = lines.get(letter) or {}
@@ -2166,7 +2238,10 @@ class AzureAgent:
             "best": str(a_moves[0]) if a_moves else "",
             "drop": _as_float(lines.get("drop"), 0.0),
             "mood": str(mood.get("name") or "") if isinstance(mood, dict) else "",
+            "mode": mode,
         }
+        if mode == "style":
+            self._style_until_move = len(self.st.moves) + STYLE_COOLDOWN_MOVES
         return [gtp, xy[0], xy[1]]
 
     def _take_drift_pending(self):
@@ -2212,6 +2287,36 @@ class AzureAgent:
                 return letter
         return "a"
 
+    def _style_letter(self, lines, mood, rng) -> str:
+        """情绪棋风：心情好 / 兴奋时，在胜率差 ≤ ``STYLE_MAX_DROP`` 的 B 线里选一手更锐的。
+
+        与「情绪波动」分开：这里不是低落时的走偏，而是**她自愿**的风格选择；低落 / 平静
+        一律走 A（更稳）。冷却 ``STYLE_COOLDOWN_MOVES`` 手，避免每手都想试。
+        任何线缺失 / 胜率差超限 / 非法手 → 安全回落 ``"a"``。
+        """
+        if not self.emotion_style:
+            return "a"
+        if len(self.st.moves) < self._style_until_move:
+            return "a"
+        if not isinstance(lines, dict):
+            return "a"
+        if not self._line_usable(lines.get("a")) or not self._line_usable(lines.get("b")):
+            return "a"
+        drop = _as_float(lines.get("drop"), 1.0)
+        if drop > STYLE_MAX_DROP:
+            return "a"                      # 只在她自己也觉得「差不多」的手上试
+        v = _mood_dim(mood, "v")
+        a = _mood_dim(mood, "a")
+        if v is None or a is None:
+            return "a"
+        if v < STYLE_MIN_V or a < STYLE_MIN_A:
+            return "a"                      # 低落 / 平静：更稳
+        p = 0.04 + 0.20 * max(0.0, v - 0.58) + 0.12 * max(0.0, a - 0.30)
+        p = min(STYLE_MAX_P, p)
+        if _rng_random(rng) >= p:
+            return "a"
+        return "b"
+
     def _drift_probability(self, mood) -> float:
         """``p_drift = clamp(drift_base + emotion_bias(mood), 0, drift_max)``（设计 §6.2）。
 
@@ -2251,15 +2356,24 @@ class AzureAgent:
         if not isinstance(drift, dict) or str(drift.get("gtp") or "") != str(gtp or ""):
             return False
         move_no = len(self.st.moves)
-        text = "我在第%d手自主偏航：没走最优的%s，选了%s（与最优的胜率差约%d%%）" % (
-            move_no, drift.get("best") or "（未知）", drift.get("gtp"),
-            int(round(_as_float(drift.get("drop"), 0.0) * 100.0)))
-        self.event_log.add("ai_bad", move_no, text, {
+        mode = str(drift.get("mode") or "drift")
+        if mode == "style":
+            text = ("我在第%d手按自己的棋感选了一手：没走最稳的%s，选了%s（两者胜率只差约%d%%）"
+                    % (move_no, drift.get("best") or "（未知）", drift.get("gtp"),
+                       int(round(_as_float(drift.get("drop"), 0.0) * 100.0))))
+            kind = "ai_style"
+        else:
+            text = "我在第%d手自主偏航：没走最优的%s，选了%s（与最优的胜率差约%d%%）" % (
+                move_no, drift.get("best") or "（未知）", drift.get("gtp"),
+                int(round(_as_float(drift.get("drop"), 0.0) * 100.0)))
+            kind = "ai_bad"
+        self.event_log.add(kind, move_no, text, {
             "line": str(drift.get("line") or ""),
             "gtp": str(drift.get("gtp") or ""),
             "best": str(drift.get("best") or ""),
             "drop": _as_float(drift.get("drop"), 0.0),
             "mood": str(drift.get("mood") or ""),
+            "mode": mode,
         })
         return True
 
@@ -2449,7 +2563,11 @@ class AzureAgent:
         if self.adaptive.enabled and self.adaptive.note_chat(text, len(self.st.moves)):
             self._emit_difficulty("")
         # 按聊天内容即时结算情绪（本地关键词分类）
-        self._mood_event(self._chat_event(self.chat_emotion(text)), "，对面说：「%s」" % text[:40].strip())
+        kind = self.chat_emotion(text)
+        ev = self._chat_event(kind)
+        if ev == "chat_normal" and self.is_casual_chat(text):
+            ev = "casual_play"                     # 「随便下下」：一起松下来，不是普通闲聊
+        self._mood_event(ev, "，对面说：「%s」" % text[:40].strip())
         owner = self._set_busy(True)
         self._new_turn()
         token = self.begin_epoch()
@@ -2546,7 +2664,12 @@ class AzureAgent:
         if turn_index < 0 or turn_index >= len(self.st.snapshots):
             self._emit(events.message(events.AI, "这个回档点已经不存在了哦"))
             return
-        self._mood_event("undo")
+        now = time.time()
+        self._undo_ts = [t for t in self._undo_ts if now - t <= 90.0]
+        repeated = len(self._undo_ts) > 0
+        self._undo_ts.append(now)
+        self._undo_ts = self._undo_ts[-3:]
+        self._mood_event("undo_repeat" if repeated else "undo")
         # 族计数要在**覆盖 st 之前**先记下「回档前已计过数的族」——覆盖之后就再也看不到它们了
         old_counted = list(self.st.joseki_counted)
         s = self.st.snapshots[turn_index]
@@ -2612,6 +2735,11 @@ class AzureAgent:
         self._soft_note = ""
         self._soft_note_turns = 0
         self._intent = persona.pick_intent(self.persona_rng) if self.persona_enabled else None
+        self._undo_ts = []                       # 新局：连悔计数 / 摸头惯性 / 情绪来由都重新开始
+        self._pat_ts = []
+        self._mood_reason = ""
+        self._mood_reason_until = -1
+        self._style_until_move = 0
         self.sync_mood(True)
         self._emit(events.state(self.st.payload()))
         # v3.12.1：从主界面进对局用 ``silent=True``——开场不该每次都多一句「重新来吧」；

@@ -35,6 +35,7 @@ func _run() -> void:
 	_test_estimate_helpers()
 	_test_idle_talk_delay()
 	_test_hidden_launcher_args()
+	_test_praise_keywords()
 
 	if _fail == 0:
 		print("[view] PASS：", _total, " 项断言全部通过")
@@ -284,3 +285,14 @@ func _test_estimate_helpers() -> void:
 			and not Board3D.estimate_cell_ok([3, 3, "red"])
 			and not Board3D.estimate_cell_ok([3, 3])
 			and not Board3D.estimate_cell_ok("oops"))
+
+func _test_praise_keywords() -> void:
+	var m := preload("res://scripts/ui/Main.gd")
+	_check("⑧ 被夸关键词：喜欢 / 厉害 / 谢谢 命中",
+		m.looks_like_praise("我喜欢你下棋的样子")
+		and m.looks_like_praise("这手真厉害")
+		and m.looks_like_praise("谢谢 Azure"))
+	_check("⑧ 普通聊天 / 空串不误判",
+		not m.looks_like_praise("这手该怎么下")
+		and not m.looks_like_praise("")
+		and not m.looks_like_praise("   "))

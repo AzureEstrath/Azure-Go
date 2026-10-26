@@ -11,6 +11,7 @@
   "embed_model": "",
   "embed_timeout": 10.0,
   "emotion_drift": false,
+  "emotion_style": true,
   "joseki_rate": 0.5,
   "joseki_teach": true,
   "katago_timeout_ms": 30000.0,

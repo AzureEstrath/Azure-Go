@@ -1725,4 +1725,22 @@ class CtxExtrasGateTest(unittest.TestCase):
         self.assertEqual(asyncio.run(_ctx_extras(agent, {})), ({}, None), "读画像炸了 ⇒ 按「不注入」降级")
 
 
+class SelfMoveEmotionTest(unittest.TestCase):
+    """她自己的好手 / 坏手 → 自我感受事件（v3.13.0，纯函数）。"""
+
+    def test_thresholds(self):
+        from app.agent_graph import self_move_event
+        self.assertEqual(self_move_event(0.50, 0.44), "self_good", "黑方胜率掉 6% ⇒ 她这手很好")
+        self.assertEqual(self_move_event(0.50, 0.55), "self_bad", "黑方胜率涨 5% ⇒ 没达到预期")
+        self.assertEqual(self_move_event(0.50, 0.59), "self_blunder", "涨 9% ⇒ 明显亏了")
+        self.assertEqual(self_move_event(0.50, 0.51), "", "差距太小：不每手都情绪起伏")
+        self.assertEqual(self_move_event(0.50, 0.47), "", "小幅变好也不到得意阈值")
+
+    def test_dirty_values_never_raise(self):
+        from app.agent_graph import self_move_event
+        for before, after in ((None, 0.5), ("x", 0.5), (0.5, None), (float("nan"), 0.5),
+                              (0.5, float("inf")), (0.5, -3.0), (2.0, 0.5)):
+            self.assertIsInstance(self_move_event(before, after), str)
+
+
 

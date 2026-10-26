@@ -136,6 +136,29 @@ def is_joseki_mistake(jk: dict, player_on_line: bool, drop: float, rank_ok: bool
     return (not rank_ok) or (drop > 0.10)
 
 
+def self_move_event(before_black_wr, after_black_wr) -> str:
+    """她这一手前后的黑方胜率差 → 自我感受事件（纯函数；脏值 / 差距太小 ⇒ 空串）。
+
+    黑方胜率下降（``delta < 0``）＝她这一手让白方更好：小得意；上升＝这手没达到预期：
+    懊恼；上升很多（≥8%）＝明显亏了。阈值刻意保守，避免引擎深度噪声让她每手都情绪起伏。
+    """
+    try:
+        before = float(before_black_wr)
+        after = float(after_black_wr)
+    except (TypeError, ValueError):
+        return ""
+    if before != before or after != after:          # NaN
+        return ""
+    d = after - before
+    if d <= -0.06:
+        return "self_good"
+    if d >= 0.08:
+        return "self_blunder"
+    if d >= 0.04:
+        return "self_bad"
+    return ""
+
+
 def _record_player_event(agent, ev, *, move_no, gtp, rank, drop, jk, jk_teach) -> bool:
     """玩家侧的好手 / 坏手入事件表（P3 的四个写入点之二；返回是否真的写了）。
 
@@ -306,6 +329,7 @@ async def _prepare_after_player(agent, data):
         conv = prompts.to_black_perspective(after, n + 1)
         after_black_wr = float(conv[0])
         after_black_score = float(conv[1])
+        data["after_black_ok"] = True
         if _alive(agent, data):                     # 看门狗守卫：超时后旧一代不再写形势摘要
             agent._update_katago_brief(after, n + 1)       # 当前棋面的引擎形势，供 Azure 上下文
 
@@ -417,6 +441,10 @@ async def _prepare_after_player(agent, data):
     elif player_rank >= 3:
         ev = "player_off"
     agent._mood_event(ev)
+    # 她教过的定式被真的用上了：这一点比「好手」更让她得意（同一次事件，只多一条情绪）。
+    if (jk and jk_kind in ("entered", "branch", "formed")
+            and str(jk.get("family") or "") in agent.st.joseki_counted):
+        agent._mood_event("lesson_followed", burst="pleased")
 
     # ④″″ 玩家侧事件（v3.8.0 / P3 的四个写入点之二）：好手 / 坏手各写一条 —— spec §一 的动机
     #      「这盘棋我先亏了一手、你后来又送我一块」这种**跨手脉络**正是靠它们才有载体。
@@ -564,6 +592,14 @@ async def _prepare_just_moved(agent, data):
         own2 = post.get("ownership") or []
         if own2:                                    # 复用她落子后的这次分析：零额外引擎调用
             agent._emit(events.ownership(own2, len(agent.st.moves)))
+        # 自我感受（v3.13.0）：她也会因为自己这手好不好而得意 / 懊恼——只在分析成功、
+        # 差距超过阈值时结算一次；区域没变也给一次性表情，别让情绪只停留在内部数值。
+        if (not data.get("self_mood_done") and data.get("after_black_ok")
+                and "error" not in post and not getattr(agent, "review", False)):
+            ev = self_move_event(data.get("after_black_wr", 0.5), wr)
+            if ev:
+                agent._mood_event(ev, burst=("pleased" if ev == "self_good" else "worried"))
+            data["self_mood_done"] = True
 
     # 三个节点分工（用户反馈）：after_player＝只评玩家那手；own_turn＝只宣告自己的落点与用意；
     # just_moved＝**全局局面分析**——不评任何单独一手、不复述坐标与上一句的夸奖词。
@@ -922,8 +958,12 @@ async def _decide_own_turn(agent, data):
     drift = data.get("drift") if isinstance(data.get("drift"), dict) else {}
     if bool(getattr(agent, "persona_enabled", False)) and drift \
             and str(drift.get("gtp") or "") == ai_gtp:
-        think_prompt += (" 这一手是你自己有点想试试的选择；如果上下文合适，用半句带出这种心情，"
-                         "不要解释机制、别说「胜率」或「偏航」，也别每手都提。")
+        if str(drift.get("mode") or "drift") == "style":
+            think_prompt += (" 这一手不是最稳的，但你有点想按自己的棋感走；如果上下文合适，"
+                             "用半句带出这种犹豫和期待，不要解释机制、别说「胜率」或「偏航」，也别每手都提。")
+        else:
+            think_prompt += (" 这一手是你自己有点想试试的选择；如果上下文合适，用半句带出这种心情，"
+                             "不要解释机制、别说「胜率」或「偏航」，也别每手都提。")
     await asyncio.sleep(THINK_BEAT_SEC)         # 落子宣告前的犹豫节拍（位置与旧 _ai_turn 一致）
     profile, time_facts = await _ctx_extras(agent, data)
     return agent._phase_messages(

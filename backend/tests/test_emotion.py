@@ -140,7 +140,20 @@ class TestParsersAndTables(unittest.TestCase):
 
     def test_event_desc(self):
         self.assertEqual(EmotionModel.event_desc("player_good"), "对面下出了一手好棋")
+        self.assertEqual(EmotionModel.event_desc("self_good"), "你刚下的这手让局面更好了，心里有点小得意")
+        self.assertEqual(EmotionModel.event_desc("undo_repeat"), "对面又悔棋了，你有点无奈")
         self.assertEqual(EmotionModel.event_desc("__unknown__"), "")
+
+    def test_apply_event_scale(self):
+        """scale 供「哄与惯性」使用：0.5 ⇒ 增量减半；脏值按 1.0（不抛）。"""
+        m = EmotionModel()
+        m.reset()
+        v0 = m.v
+        m.apply_event("patted", 0.5)
+        self.assertAlmostEqual(m.v - v0, 0.06, places=3)
+        m.reset()
+        m.apply_event("patted", "oops")
+        self.assertAlmostEqual(m.v - v0, 0.12, places=3)
 
 
 if __name__ == "__main__":

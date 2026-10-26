@@ -25,10 +25,10 @@ class EventLogTest(unittest.TestCase):
         self.assertGreater(ev["ts"], 0.0)
         self.assertEqual(log.all(), [ev])
 
-    def test_kinds_are_the_five_known_ones(self):
+    def test_kinds_are_the_known_ones(self):
         from app.event_log import EVENT_KINDS, EventLog
         self.assertEqual(set(EVENT_KINDS),
-                         {"ai_bad", "player_bad", "player_good", "chat", "joseki"})
+                         {"ai_bad", "ai_style", "player_bad", "player_good", "chat", "joseki"})
         log = EventLog()
         for k in EVENT_KINDS:
             self.assertIsNotNone(log.add(k, 1, "第 %s 类事件" % k, {}))

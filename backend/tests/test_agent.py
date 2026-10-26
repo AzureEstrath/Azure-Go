@@ -2515,3 +2515,62 @@ class BusyOwnershipTest(unittest.TestCase):
         a._set_busy(True)
         a._clear_busy()
         self.assertFalse(a.busy)
+
+class PersonaStyleTest(unittest.TestCase):
+    """情绪棋风 / 随便聊天 / 摸头惯性（v3.13.0）。"""
+
+    def test_casual_chat_keywords(self):
+        self.assertTrue(AzureAgent.is_casual_chat("今天随便下下"))
+        self.assertTrue(AzureAgent.is_casual_chat("放松点，不用认真"))
+        self.assertFalse(AzureAgent.is_casual_chat("这手该怎么下"))
+        self.assertFalse(AzureAgent.is_casual_chat(None))
+
+    def test_style_only_when_happy_and_close(self):
+        agent, _eng, _llm, _bus = _mk()
+        agent.emotion_style = True
+        happy = {"v": 0.85, "c": 0.55, "a": 0.65}
+        sad = {"v": 0.35, "c": 0.55, "a": 0.65}
+        close = _drift_lines(drop=0.01)
+        self.assertEqual(agent._style_letter(close, sad, FixedRng(0.0)), "a",
+                         "低落时更稳：哪怕掷中也不试 B")
+        self.assertEqual(agent._style_letter(_drift_lines(drop=0.03), happy, FixedRng(0.0)), "a",
+                         "胜率差超过 1.5%：不拿这一手试风格")
+        self.assertEqual(agent._style_letter(close, happy, FixedRng(0.0)), "b",
+                         "心情好 + 两手接近：可以按自己的棋感走 B")
+        self.assertEqual(agent._style_letter(close, happy, FixedRng(0.99)), "a",
+                         "风格选择仍是小概率，不是必偏")
+        agent._style_until_move = 10
+        self.assertEqual(agent._style_letter(close, happy, FixedRng(0.0)), "a",
+                         "冷却期内不再连续「想试试」")
+
+    def test_style_pick_end_to_end_writes_ai_style(self):
+        """心情好 + 两手接近 ⇒ 真落 B，并记 ``ai_style``（不是 ``ai_bad``）。"""
+        async def run():
+            a = AzureAgent(DriftEngine(), StubLLM(), events.RecordingBus(),
+                           joseki_rate=0.0, emotion_style=True, drift_rng=FixedRng(0.0))
+            a.mood.v, a.mood.c, a.mood.a = 0.85, 0.55, 0.65
+            await a.player_move(3, 3)                 # 玩家 D16，不挡 B 的 D4
+            return a
+
+        a = asyncio.run(run())
+        self.assertEqual(a.st.moves[-1][1], "D4", "掷中风格时走 B 的首手")
+        kinds = [e["kind"] for e in a.event_log.all()]
+        self.assertIn("ai_style", kinds)
+        self.assertNotIn("ai_bad", kinds, "风格选择不是「下坏了」")
+
+    def test_pat_scale_diminishes_and_depends_on_mood(self):
+        agent, _eng, _llm, _bus = _mk()
+        first = agent._pat_scale()
+        second = agent._pat_scale()
+        third = agent._pat_scale()
+        self.assertAlmostEqual(first, 1.0)
+        self.assertGreater(first, second)
+        self.assertGreater(second, third)
+        self.assertLess(third, 0.5, "连续摸头收益必须明显递减")
+
+        sad, _e1, _l1, _b1 = _mk()
+        sad.mood.v, sad.mood.c, sad.mood.a = 0.2, 0.5, 0.2
+        self.assertGreater(sad._pat_scale(), 1.0, "难过时安慰更有效")
+        angry, _e2, _l2, _b2 = _mk()
+        angry.mood.v, angry.mood.c, angry.mood.a = 0.1, 0.1, 0.9
+        self.assertLess(angry._pat_scale(), 0.5, "烦躁时摸头没那么容易哄好")

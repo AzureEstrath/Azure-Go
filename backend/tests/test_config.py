@@ -375,5 +375,18 @@ class MainTtsRoutingTest(unittest.TestCase):
         self.assertIsInstance(_build_tts(c), TTSClient)
 
 
+class EmotionStyleConfigTest(unittest.TestCase):
+    """情绪棋风（v3.13.0）：默认关；只认 JSON 的 true / false。"""
+
+    def test_default_off_and_round_trip(self):
+        import tempfile, json
+        self.assertFalse(AzureConfig().emotion_style)
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"emotion_style": True}, f)
+            self.assertTrue(AzureConfig.load(p).emotion_style)
+
+
 if __name__ == "__main__":
     unittest.main()

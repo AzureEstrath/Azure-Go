@@ -167,6 +167,15 @@ class TestSmallHelpers(_Base):
         for c in self.data["mood_note"]:
             self.eq(prompts.mood_note(c["name"]), c["result"], "name=%r" % c["name"])
 
+    def test_mood_note_reason_is_optional_and_causal(self):
+        """默认（无来由）与 golden 逐字符一致；带来由时追加「为什么」，并禁止原样念出来。"""
+        base = prompts.mood_note("开心")
+        self.assertEqual(prompts.mood_note("开心", ""), base)
+        got = prompts.mood_note("开心", "你刚下的这手让局面更好了")
+        self.assertIn("这份心情来自刚才的事", got)
+        self.assertIn("别把原因原样念出来", got)
+        self.assertTrue(got.startswith(base))
+
     def test_mood_delta_prompt(self):
         for c in self.data["mood_delta_prompt"]:
             self.eq(prompts.mood_delta_prompt(c["cur"], c["region"], c["event"]),

@@ -36,13 +36,13 @@ _WITH_CONTEXT = ChatPromptTemplate.from_messages([
 _ROLE_OF = {"system": "system", "human": "user", "ai": "assistant"}
 
 
-def _persona_block(mood_name, think_hint, persona_extra="") -> str:
+def _persona_block(mood_name, think_hint, persona_extra="", mood_reason="") -> str:
     """人设 + 心情 +（人格化附加段）+（思考档开启时）思考风格。
 
     系统提示词同样要过玩家称呼替换（``prompts._t``，旧实现也在这里调它）。
-    ``persona_extra`` 为空时输出与旧 ``_sys_content()`` **逐字符一致**（golden 锁定）。
+    ``persona_extra`` / ``mood_reason`` 为空时输出与旧 ``_sys_content()`` **逐字符一致**（golden 锁定）。
     """
-    s = prompts._t(prompts.system_prompt()) + prompts.mood_note(mood_name)
+    s = prompts._t(prompts.system_prompt()) + prompts.mood_note(mood_name, mood_reason)
     if persona_extra:
         s += "\n\n" + str(persona_extra)
     if think_hint != "":
@@ -72,15 +72,15 @@ def phase_chain(phase):
     return RunnableBranch((_is_fallback, _fallback_template(phase)), _WITH_CONTEXT)
 
 
-def build_messages(phase, *, context="", prompt="", len_note="", mood_name="", think_hint="",
-                   history=None, persona_extra="") -> list[dict]:
+def build_messages(phase, *, context="", prompt="", len_note="", mood_name="", mood_reason="",
+                   think_hint="", history=None, persona_extra="") -> list[dict]:
     """按阶段拼消息，与旧 ``_sys_msg() + _user_msg(with_context(...))`` 逐字符一致。
 
     逐字符一致是硬要求：模型要看到的字必须与本次重构前完全相同，一个标点都不能变（测试锁定）。
     ``persona_extra`` 为空（默认 / 人格化关闭）时同样逐字符一致；非空时只追加在心情段之后。
     """
     msgs = phase_chain(phase).invoke({
-        "persona": _persona_block(mood_name, think_hint, persona_extra),
+        "persona": _persona_block(mood_name, think_hint, persona_extra, mood_reason),
         "len_note": len_note,
         "history": list(history or []),
         "context": context,

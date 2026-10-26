@@ -75,6 +75,13 @@ var _expr_cur: Dictionary = {}
 var _expr_baseline: Dictionary = {}    # 常态表情：形状 -> 值
 var _expr_thinking := false
 var _mood_targets: Dictionary = {}     # 三维情绪区域的持续表情层（形状 -> 值；非空时取代常态微笑）
+var _mood_ghost: Dictionary = {}       # 情绪切换的「余温」：上一段情绪短暂留一点，不瞬间换脸
+var _ghost_until := -1.0
+var _serious := false                  # 复盘 / 讲解等严肃场合：收住大表情
+var _arousal := 0.30                   # 唤醒度：眨眼、呼吸、歪头的幅度与频率跟着它走
+var _gaze_avoid_until := -1.0          # 被夸 / 摸头后短暂移开视线
+var _night := false                    # 深夜：整体放慢（眨眼更稀、呼吸更沉）
+var _night_check := 0.0
 
 # 歪头小动作：闲置 / 说话时偶尔轻轻歪一下（绕世界 Z 轴横滚），随机起止
 var _idle := false
@@ -100,6 +107,8 @@ func _ready() -> void:
 	_build_chains()
 	_update_gaze_pivot()
 	_update_baseline()          # 常态微微笑
+	_update_night()
+	_night_check = _t
 
 # ================= 加载 =================
 
@@ -545,6 +554,9 @@ func _process(delta: float) -> void:
 		return
 	var dt := minf(delta, 0.05)
 	_t += delta
+	if _t - _night_check > 300.0:            # 五分钟对一次表：跨过 23:00 / 05:00 就切深夜节奏
+		_night_check = _t
+		_update_night()
 	_animate_tilt(dt)
 	_animate_face(dt)
 	_animate_sway(dt)
@@ -563,6 +575,10 @@ func _animate_face(dt: float) -> void:
 			target = gaze_source.call("player_eye")
 	elif gaze_source != null and gaze_source.has_method("gaze_target"):
 		target = gaze_source.call("gaze_target")
+	if _t < _gaze_avoid_until:
+		target += Vector3(4.6, -1.2, -2.0)      # 被夸 / 摸头：视线往旁边让一下，再慢慢回来
+	elif _expr_thinking:
+		target += Vector3(-2.8, 2.0, 0.0)        # 思考：目光离开棋盘，往上方飘一点
 	var raw := target - _gaze_pivot
 	if raw.length_squared() < 1e-6:
 		raw = Vector3(0, 0, 1)
@@ -589,18 +605,20 @@ func _animate_face(dt: float) -> void:
 	var y_e := clampf(yaw - (y_s + y_c + y_n + y_h), -YAW_EYE, YAW_EYE)
 	var p_e := clampf(look_down - (p_h + p_n + p_c), -PITCH_EYE, PITCH_EYE)
 	_dbg_gaze = Vector3(yaw, look_down, 0.0)      # 调试用：期望的视线偏航/低头量
-	# —— 呼吸 ——
-	var br := sin(_t * 1.15)
-	var br2 := sin(_t * 1.15 - 0.45)
+	# —— 呼吸：唤醒度高时略快略深；深夜整体放慢 ——
+	var br_speed := 1.15 * (0.82 if _night else 1.0) * (0.92 + 0.22 * _arousal)
+	var br_amp := 0.78 + 0.50 * _arousal
+	var br := sin(_t * br_speed)
+	var br2 := sin(_t * br_speed - 0.45)
 	_anim_pose("J_Bip_C_Spine", 0.0, y_s, 0.0)
-	_anim_pose("J_Bip_C_Chest", 0.020 * br, y_c, p_c)
-	_anim_pose("J_Bip_C_UpperChest", -0.012 * br, 0.0, 0.0)
-	_anim_pose("J_Bip_C_Neck", -0.010 * br, y_n, p_n, _tilt_cur * 0.25)
-	_anim_pose("J_Bip_C_Head", 0.008 * br, y_h, p_h, _tilt_cur)
+	_anim_pose("J_Bip_C_Chest", 0.020 * br * br_amp, y_c, p_c)
+	_anim_pose("J_Bip_C_UpperChest", -0.012 * br * br_amp, 0.0, 0.0)
+	_anim_pose("J_Bip_C_Neck", -0.010 * br * br_amp, y_n, p_n, _tilt_cur * 0.25)
+	_anim_pose("J_Bip_C_Head", 0.008 * br * br_amp, y_h, p_h, _tilt_cur)
 	_anim_pose("J_Adj_L_FaceEye", 0.0, y_e, p_e)
 	_anim_pose("J_Adj_R_FaceEye", 0.0, y_e, p_e)
-	_breath_pose("J_Bip_L_Shoulder", Vector3(0, 0, 1), 0.022 * br2)
-	_breath_pose("J_Bip_R_Shoulder", Vector3(0, 0, 1), -0.022 * br2)
+	_breath_pose("J_Bip_L_Shoulder", Vector3(0, 0, 1), 0.022 * br2 * br_amp)
+	_breath_pose("J_Bip_R_Shoulder", Vector3(0, 0, 1), -0.022 * br2 * br_amp)
 
 ## 在基底 pose 上叠加：呼吸（局部 X）+ 视线偏航（世界 Y）+ 俯仰（世界 X）+ 歪头横滚（世界 Z）
 func _anim_pose(bone_name: String, breath_ang: float, yaw: float, pitch: float, roll := 0.0) -> void:
@@ -675,8 +693,13 @@ func _animate_blink(delta: float) -> void:
 		v = 1.0 - (_blink_t - 0.10) / 0.12
 	else:
 		_blink_t = -1.0
-		_blink_wait = randf_range(2.2, 4.8)
-		if randf() < 0.3:
+		var lo := lerpf(3.4, 1.7, _arousal)      # 唤醒度高：眨眼更勤
+		var hi := lerpf(6.0, 3.2, _arousal)
+		if _night:
+			lo *= 1.3
+			hi *= 1.35
+		_blink_wait = randf_range(lo, hi)
+		if randf() < 0.26 + 0.18 * _arousal:
 			_blink_wait = 0.16          # 偶尔连眨两下
 		v = 0.0
 	_face.set_blend_shape_value(_blink_shape, clampf(v, 0.0, 1.0))
@@ -710,6 +733,7 @@ func _animate_tilt(dt: float) -> void:
 		elif _t > _tilt_next:
 			_tilt_active = true
 			var amp := 0.14 if _idle else 0.065     # 闲置时歪得明显些，说话时轻轻歪
+			amp *= (0.72 + 0.55 * _arousal) * (0.6 if _serious else 1.0)
 			_tilt_target = randf_range(amp * 0.6, amp) * (1.0 if randf() < 0.5 else -1.0)
 			_tilt_phase_until = _t + randf_range(1.1, 2.2)
 	else:
@@ -757,13 +781,44 @@ func _animate_blush(dt: float) -> void:
 		m.albedo_color = base.lerp(Color(1.0, 0.62, 0.66, base.a), _blush_cur * 0.1)   # 微微泛红（0.1：用户再调淡）
 
 ## 三维情绪区域的持续表情层（由 Main 在 mood_changed 时下发）：morph 名 → 权重（≤3 个）
-## 非空时取代常态微笑成为表情底；一次性表情（play_expression）叠加其上、优先显示
+## 非空时取代常态微笑成为表情底；一次性表情（play_expression）叠加其上、优先显示。
+## 切换时把即将退场的形状留一点「余温」，一两秒内再退干净——不瞬间换脸。
 func set_mood(morphs: Dictionary) -> void:
-	_mood_targets.clear()
+	var next := {}
 	for nm in morphs.keys():
 		var idx := int(_expr_shapes.get(str(nm), -1))
 		if idx >= 0:
-			_mood_targets[idx] = float(morphs[nm])
+			next[idx] = float(morphs[nm])
+	_mood_ghost.clear()
+	if not _mood_targets.is_empty() and not next.is_empty() and not _expr_thinking and not _serious:
+		for k in _mood_targets.keys():
+			var old := float(_mood_targets[k])
+			var newv := float(next.get(k, 0.0))
+			if old > 0.05 and newv < old * 0.7:
+				_mood_ghost[k] = old * 0.28
+		if not _mood_ghost.is_empty():
+			_ghost_until = _t + 1.4
+	_mood_targets = next
+
+## 唤醒度（0~1）：眨眼、呼吸、歪头的频率与幅度跟着走；由 Main 在 mood_changed 时下发。
+func set_arousal(a: float) -> void:
+	_arousal = clampf(a, 0.0, 1.0)
+
+## 严肃场合（全盘复盘等）：收住持续表情与歪头，别在讲解时挂着大笑脸。
+func set_serious(v: bool) -> void:
+	_serious = v
+	if v:
+		_mood_ghost.clear()
+		clear_expression()
+
+## 被夸 / 摸头后短暂把视线移开，再自然回到玩家身上。
+func avoid_gaze(sec: float) -> void:
+	_gaze_avoid_until = _t + maxf(0.2, sec)
+
+## 深夜（23:00–05:00）：整体放慢，像一个真的有点困的人。
+func _update_night() -> void:
+	var h := int(Time.get_time_dict_from_system().get("hour", 12))
+	_night = h >= 23 or h < 5
 
 ## kind: delight（好手）/ pleased（不错）/ puzzled（略意外）/ worried（俗手、明显失着）
 ##       sad（难过）/ laugh（被逗笑）
@@ -818,6 +873,16 @@ func _animate_expression(dt: float) -> void:
 	var targets: Dictionary = {}
 	if not _expr_thinking and not _mood_targets.is_empty():
 		targets = _mood_targets.duplicate()
+		if _serious:
+			for k in targets.keys():
+				targets[k] = float(targets[k]) * 0.55     # 复盘 / 讲解：收住大表情
+		if not _serious and _t < _ghost_until:
+			for k in _mood_ghost.keys():                 # 上一段情绪的余温：短暂保留一点
+				var g := float(_mood_ghost[k])
+				if not targets.has(k) or float(targets[k]) < g:
+					targets[k] = g
+		else:
+			_mood_ghost.clear()
 	else:
 		targets = _expr_baseline.duplicate()
 	for k in _expr_targets.keys():

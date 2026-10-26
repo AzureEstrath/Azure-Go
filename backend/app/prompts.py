@@ -124,11 +124,21 @@ def _t(s):
     return s.replace("Estarth", user_name) if user_name != "Estarth" else s
 
 
-def mood_note(name):
-    """当前心情注入：接在系统提示词末尾（reply_style 的动态部分）。"""
+def mood_note(name, reason=""):
+    """当前心情注入：接在系统提示词末尾（reply_style 的动态部分）。
+
+    ``reason`` 是最近一次情绪事件的来由（可空）；非空时补一句「为什么」，让语气与表情
+    有因果，同时明确要求**不要原样念出来**。空串时输出与旧版逐字符一致。
+    """
     if name == "":
         return ""
-    return "\n\n【当前心情 · 内部状态勿外露】\n你此刻的心情是「%s」：语气、用词、话多话少都自然顺着它来；这个词本身和任何心情数值都不要出现在回复里，也不要拿它当话题或敷衍。" % name
+    s = ("\n\n【当前心情 · 内部状态勿外露】\n你此刻的心情是「%s」：语气、用词、话多话少都自然顺着它来；"
+         "这个词本身和任何心情数值都不要出现在回复里，也不要拿它当话题或敷衍。" % name)
+    r = str(reason or "").strip()
+    if r != "":
+        s += ("\n（这份心情来自刚才的事：%s。自然带着这个余韵说话——别把原因原样念出来，"
+              "也别把它当成新话题；如果眼前的事更重要，就先把眼前的事说好。）" % r)
+    return s
 
 
 def mood_delta_prompt(cur, region_name, event_desc):
@@ -366,6 +376,7 @@ def long_term_note(text):
 # 多一处要改的地方。
 _KIND_WORD = {
     "ai_bad": "我走过一手偏",
+    "ai_style": "我按自己的棋感选过一手",
     "player_bad": "Estarth 下过一手不太好的棋",
     "player_good": "Estarth 下过一手好棋",
     "chat": "Estarth 和我聊过天",

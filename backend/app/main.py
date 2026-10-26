@@ -184,6 +184,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                          emotion_drift=cfg.emotion_drift,
                                          drift_base=cfg.drift_base, drift_max=cfg.drift_max,
                                          pv_max_drop=cfg.pv_max_drop,
+                                         emotion_style=cfg.emotion_style,
                                          chat_digest_llm=cfg.chat_digest_llm,
                                          profile_enabled=cfg.profile_enabled,
                                          time_aware_enabled=cfg.time_aware_enabled,

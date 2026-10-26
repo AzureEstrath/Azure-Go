@@ -84,6 +84,13 @@ var _batch_token := 0                      # 去抖令牌：又来新消息就�
 var _tts_playing := false                  # 当前是否真有音频在播（区别于「排队中/合成中」）
 var _think_dots := 0                       # 「思考中…」省略号动效点数（1~3 循环）
 var _think_last_ms := 0                    # 上次刷新省略号的时刻
+var _think_lines := PackedStringArray()    # 思考短句池（data/thinking_lines.json）
+var _think_groups: Dictionary = {}         # 心情/局面分组 → 下标数组
+var _think_prev := -1                      # 上一句下标：跨气泡也不连复
+var _think_line_ms := 0                    # 上一句轮换时刻
+var _think_dynamic := false                # 当前占位是否用短句轮播（数据缺失时退回固定文案）
+var _mood_name := "平静"                    # 最近一次三维情绪区域名（选思考短句 / 身体语言用）
+var _last_azure_wr := -1.0                 # 最近一次形势里的白方胜率（-1 ＝还没有数据）
 var _blush_seq := 0                        # 摸头脸红的序号（新的一次摸头会让旧的褪红计时失效）
 
 ## 导演层（拟人化）：重要点评前的犹豫节拍 + 聊天面板打字节奏；均为确定性本地规则，零额外 LLM 调用
@@ -862,6 +869,8 @@ func _reset_global_card() -> void:
 	if _card_body != null:                     # 新局默认收起：只留胜率 / 目差，不挡棋盘视野
 		_card_body.visible = false
 		_card_toggle.text = "展开"
+	_last_azure_wr = -1.0                      # 新局：思考短句回到「平静 / 等第一份形势」
+	_mood_name = "平静"
 	_estimate_move_count = -1
 	_last_ai_kind = ""
 
@@ -2364,6 +2373,43 @@ func _tick_typing(delta: float) -> void:
 func _flush_pending_ai() -> void:
 	pairing.flush_pending()
 
+## 思考短句池：只在第一次显示占位时读一次；文件缺失 ⇒ 空表，走固定占位回退。
+func _ensure_thinking_lines() -> void:
+	if not _think_lines.is_empty():
+		return
+	var f := FileAccess.open("res://data/thinking_lines.json", FileAccess.READ)
+	if f == null:
+		return
+	var text := f.get_as_text()
+	f.close()
+	_think_lines = parse_thinking_lines(text)
+	_think_groups = parse_thinking_moods(text, _think_lines.size())
+
+## 当前该用哪组短句：情绪区域优先；情绪中立时看白方胜率（局面）。
+func _thinking_pool() -> PackedInt32Array:
+	var key := thinking_group_for_mood(_mood_name)
+	if key == "" and _last_azure_wr >= 0.0:
+		key = "negative" if _last_azure_wr < 0.42 else ("confident" if _last_azure_wr > 0.58 else "calm")
+	if key == "":
+		key = "calm"
+	var pool := PackedInt32Array()
+	var raw = _think_groups.get(key, null)
+	if typeof(raw) == TYPE_ARRAY:
+		for v in raw:
+			var i := int(v)
+			if i >= 0 and i < _think_lines.size() and not pool.has(i):
+				pool.append(i)
+	if pool.is_empty():                              # 分组缺失：退回全表
+		for i in _think_lines.size():
+			pool.append(i)
+	return pool
+
+func _pick_thinking_index() -> int:
+	var idx := pick_thinking_index(_thinking_pool(), _think_prev, randf())
+	if idx >= 0:
+		_think_prev = idx
+	return idx
+
 ## 显示「Azure 思考中……」占位气泡（等第一条真实 Azure 文字到来时原地替换）
 func _show_thinking() -> void:
 	if _thinking_label != null or _chat_box == null:
@@ -2382,7 +2428,10 @@ func _show_thinking() -> void:
 	who.add_theme_color_override("font_color", GufengTheme.CINNABAR)
 	inner.add_child(who)
 	var lbl := Label.new()
-	lbl.text = THINKING_FALLBACK
+	_ensure_thinking_lines()
+	_think_dynamic = not _think_lines.is_empty()
+	var think_idx := _pick_thinking_index() if _think_dynamic else -1
+	lbl.text = _think_lines[think_idx] if think_idx >= 0 else THINKING_FALLBACK
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	lbl.custom_minimum_size = Vector2(292, 0)
 	lbl.add_theme_color_override("font_color", GufengTheme.INK)
@@ -2391,6 +2440,7 @@ func _show_thinking() -> void:
 	_thinking_row = row
 	_thinking_label = lbl
 	_think_last_ms = Time.get_ticks_msec()              # 省略号计时从这一句开始
+	_think_line_ms = _think_last_ms
 	_scroll_to_bottom()
 	_filler_nodes += 1
 	_maybe_semantic_filler()
@@ -2402,11 +2452,18 @@ func _clear_thinking() -> void:
 	_thinking_label = null
 
 ## 句间合成空隙也要有「思考中…」：下一句正在合成、还没开始播时显示占位。
-## 当前只做省略号动效，不轮播任何短句。
+## 有短句池时按心情/局面轮播（约 2.6 秒一句，连续不重复）；数据缺失才退回固定省略号动效。
 func _update_thinking(now: int) -> void:
 	if _thinking_label == null and pairing.has_pending() and not _tts_playing:
 		_show_thinking()                                 # 文字还没轮到显示、也没在播：她在憋下一句
 	if _thinking_label == null:
+		return
+	if _think_dynamic:
+		if now - _think_line_ms >= 2600:
+			var idx := _pick_thinking_index()
+			if idx >= 0:
+				_thinking_label.text = _think_lines[idx]
+				_think_line_ms = now
 		return
 	if now - _think_last_ms >= 450:
 		_think_last_ms = now
@@ -3125,6 +3182,8 @@ func _on_game_review(record: Dictionary) -> void:
 	_fr_last_text = ""
 	# 先置模式再放 title_started：`_ready` 可能同步恢复并 `_greet()`，别让开场白插进复盘
 	_fr_active = true
+	if avatar != null:
+		avatar.set_serious(true)                    # 复盘是讲解场合：收住大表情
 	_hide_estimate()
 	if _joseki_card != null:
 		_joseki_card.clear()                        # 上一局残留的定式卡片不许压在这盘复盘上
@@ -3281,6 +3340,8 @@ func _exit_full_review() -> void:
 	if not _fr_active:
 		return
 	_fr_active = false
+	if avatar != null:
+		avatar.set_serious(false)                   # 退出复盘：恢复平时的表情幅度
 	_fr_token += 1
 	_fr_paused = false
 	_fr_requesting = false
@@ -3401,6 +3462,60 @@ static func next_thinking_index(prev: int, count: int, rng_value: float) -> int:
 	if n >= prev:
 		n += 1                                    # 再补回去 ⇒ 一定绕开上一句
 	return n
+
+## `moods` 分组 → 下标数组（纯函数）：只收合法下标、去重；坏 JSON / 缺键 / 脏值 → 空字典。
+static func parse_thinking_moods(text: String, count: int) -> Dictionary:
+	var out := {}
+	var j := JSON.new()
+	if j.parse(text) != OK:
+		return out
+	var d = j.data
+	if typeof(d) != TYPE_DICTIONARY:
+		return out
+	var moods = (d as Dictionary).get("moods", null)
+	if typeof(moods) != TYPE_DICTIONARY:
+		return out
+	for key in (moods as Dictionary).keys():
+		var arr = moods[key]
+		if typeof(arr) != TYPE_ARRAY:
+			continue
+		var idxs: Array[int] = []
+		var seen := {}
+		for v in arr:
+			if typeof(v) != TYPE_INT and typeof(v) != TYPE_FLOAT:
+				continue
+			var i := int(v)
+			if i < 0 or i >= count or seen.has(i):
+				continue
+			seen[i] = true
+			idxs.append(i)
+		if not idxs.is_empty():
+			out[str(key)] = idxs
+	return out
+
+## 情绪区域 → 短句分组；中立 / 未知名返回空串（由调用方用局面兜底）。
+static func thinking_group_for_mood(mood_name: String) -> String:
+	var n := mood_name.strip_edges()
+	if n in ["落寞", "烦闷", "烦躁", "失落", "难过", "委屈", "忧心", "不安", "惊慌"]:
+		return "negative"
+	if n in ["惬意", "愉悦", "兴奋", "开心", "欢喜", "欢腾", "期待", "跃跃欲试", "惊喜"]:
+		return "confident"
+	if n in ["好奇", "兴致", "激动", "跳脱", "专注", "振奋"]:
+		return "alert"
+	return ""
+
+## 从分组池里挑一句（纯函数）：**一定绕开上一句**；池只有一句时就只能复用它。
+static func pick_thinking_index(pool: PackedInt32Array, prev: int, rng_value: float) -> int:
+	if pool.is_empty():
+		return -1
+	var candidates: Array[int] = []
+	for i in pool:
+		if i != prev:
+			candidates.append(i)
+	if candidates.is_empty():
+		return pool[0]
+	var r := clampf(rng_value, 0.0, 0.999999)
+	return candidates[int(floor(r * float(candidates.size())))]
 
 # ================= 启动设置面板 =================
 
@@ -3835,9 +3950,11 @@ func _on_mood_changed(p: Dictionary) -> void:
 		tts.set_mood_pitch(float(p.get("pitch", 0.0)))
 	if avatar != null:
 		avatar.set_mood(p.get("morphs", {}))
+		avatar.set_arousal(float(p.get("a", _mood_a)))
 		var burst := str(p.get("burst", ""))
 		if burst != "":
 			avatar.play_expression(burst)          # 一次性强调（叠加在持续层上，几秒后回落到区域表情）
+	_mood_name = str(p.get("name", _mood_name))
 	_mood_v = clampf(float(p.get("v", _mood_v)), 0.0, 1.0)
 	_mood_c = clampf(float(p.get("c", _mood_c)), 0.0, 1.0)
 	_mood_a = clampf(float(p.get("a", _mood_a)), 0.0, 1.0)
@@ -3986,6 +4103,7 @@ func _on_head_patted() -> void:
 	if avatar != null:
 		avatar.play_expression("laugh")
 		avatar.set_blush(true)
+		avatar.avoid_gaze(2.0)                 # 被摸头：先害羞地把视线移开一点
 	if tts != null:
 		tts.play_filler("pat", true)
 	_bump_activity()
@@ -4123,6 +4241,7 @@ static func _last_stone(stones: Array) -> Dictionary:
 func _on_info_changed(wr: float, sc: float) -> void:
 	_last_wr = wr
 	_last_score = sc
+	_last_azure_wr = 1.0 - clampf(wr, 0.0, 1.0)
 	_info_ready = true
 	_lbl_wr.text = "黑胜率: %.1f%%" % (wr * 100.0)
 	_lbl_score.text = score_line(sc)                       # 原始数字照旧保留
@@ -4518,6 +4637,17 @@ func _on_drift_level_selected(i: int) -> void:
 	var names := ["关闭", "低 3%", "中 5%", "高 6%"]
 	_set_status("情绪波动：%s" % names[lvl])
 
+## 玩家这句话是不是在夸她（本地关键词，零 LLM）：只用来决定「被夸时短暂移开视线」。
+## 误判成本很低：最坏只是害羞一下，不影响回复内容。
+static func looks_like_praise(text: String) -> bool:
+	var t := text.strip_edges().to_lower()
+	if t == "":
+		return false
+	for kw in ["喜欢", "爱你", "可爱", "厉害", "真棒", "漂亮", "好看", "温柔", "谢谢", "辛苦了", "帅"]:
+		if t.contains(kw):
+			return true
+	return false
+
 func _send_chat() -> void:
 	var t := _chat_input.text
 	if t.strip_edges() == "":
@@ -4528,6 +4658,8 @@ func _send_chat() -> void:
 		return
 	_allow_tts_fillers()
 	_add_msg("user", t)
+	if avatar != null and looks_like_praise(t):
+		avatar.avoid_gaze(1.6)                 # 被夸：不直勾勾盯着，先让开一下视线
 	_chat_input.text = ""
 
 ## 右下角那行排队提示：`排队中 N 条 · 队头前几个字`（队列空 ⇒ 隐藏）

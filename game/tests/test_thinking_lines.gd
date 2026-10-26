@@ -1,6 +1,5 @@
 extends SceneTree
-## 思考短句解析工具自检——纯逻辑：JSON 解析 / 20 句 / 脏值过滤 / 轮换纯函数 / 固定占位文案。
-## 注意：当前运行路径**不轮播**短句；这里只测保留下来的纯函数工具。
+## 思考短句解析工具自检——纯逻辑：JSON 解析 / 20 句 / 脏值过滤 / 轮换纯函数 / 心情分组。
 ## 运行：godot --headless --path game --script res://tests/test_thinking_lines.gd
 
 var _total := 0
@@ -80,6 +79,35 @@ func _run() -> void:
 	_check("③ 脏 prev（越界）按「没有上一句」处理",
 		main_script.next_thinking_index(99, 20, 0.0) == 0)
 	_check("③ 固定占位文案是「Azure 思考中」", str(main_script.THINKING_FALLBACK) == "Azure 思考中")
+
+	# —— ④ 心情/局面分组：解析 / 覆盖 / 抽句不连复 ——
+	var moods: Dictionary = main_script.parse_thinking_moods(text, lines.size())
+	_check("④ 解析出四组", moods.size() >= 4)
+	var covered := {}
+	for key in moods.keys():
+		for i in moods[key]:
+			covered[int(i)] = true
+	_check("④ 分组覆盖全部 20 句", covered.size() == lines.size())
+	_check("④ 坏 JSON → 空字典", main_script.parse_thinking_moods("not json", 20).is_empty())
+	var dirty_moods: Dictionary = main_script.parse_thinking_moods(
+		"{\"moods\": {\"negative\": [1, 1, 99, -1, \"x\"]}}", 20)
+	_check("④ 越界 / 重复 / 非数字下标被丢掉",
+		dirty_moods.has("negative") and dirty_moods["negative"].size() == 1
+		and int(dirty_moods["negative"][0]) == 1)
+	_check("④ 情绪映射：难过→negative",
+		main_script.thinking_group_for_mood("难过") == "negative")
+	_check("④ 情绪映射：开心→confident",
+		main_script.thinking_group_for_mood("开心") == "confident")
+	_check("④ 情绪映射：好奇→alert",
+		main_script.thinking_group_for_mood("好奇") == "alert")
+	_check("④ 平静 / 未知情绪交给局面兜底",
+		main_script.thinking_group_for_mood("平静") == ""
+		and main_script.thinking_group_for_mood("??") == "")
+	var pool := PackedInt32Array([1, 3, 13, 18])
+	var picked: int = main_script.pick_thinking_index(pool, 1, 0.0)
+	_check("④ 分组抽句绕开上一句", picked != 1 and pool.has(picked))
+	_check("④ 空池 → -1", main_script.pick_thinking_index(PackedInt32Array(), -1, 0.5) == -1)
+	_check("④ 单句池只能复用", main_script.pick_thinking_index(PackedInt32Array([5]), 5, 0.5) == 5)
 
 	if _fail == 0:
 		print("[think] PASS：", _total, " 项断言全部通过")

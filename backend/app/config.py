@@ -39,6 +39,8 @@ class AzureConfig:
         self.drift_base = 0.03                      # 基础偏航概率（平静时的 p_drift）
         self.drift_max = 0.08                       # p_drift 上限
         self.pv_max_drop = 0.05                     # 偏航线与最优线的胜率差上限（超了整条不用）
+        # 情绪棋风（v3.13.0）：心情好时在「差不多」的两手里选更锐的一手；默认关，随包配置打开。
+        self.emotion_style = False
         # —— 聊天事件摘要（v3.8.0）：默认规则式（零 LLM）；开启后只在局末 / 空闲补做 LLM 分段 ——
         self.chat_digest_llm = False
         # —— 玩家棋风画像 + 时间感知（v3.9.0，设计 §6.4）：两个开关**默认都关**（关掉＝现状）——
@@ -175,6 +177,8 @@ class AzureConfig:
         self.drift_max = min(_clamp01(d.get("drift_max"), 0.08), DRIFT_MAX_LIMIT)
         self.drift_base = min(_clamp01(d.get("drift_base"), 0.03), self.drift_max)
         self.pv_max_drop = _clamp01(d.get("pv_max_drop"), 0.05)
+        v = d.get("emotion_style")
+        self.emotion_style = v if isinstance(v, bool) else self.emotion_style
         # 聊天事件摘要（v3.8.0）：开关**只认 JSON 的 true / false**（与 `emotion_drift` 同一口径，
         # 字符串 `"false"` 是脏值 → 保留默认关）。
         v = d.get("chat_digest_llm")
