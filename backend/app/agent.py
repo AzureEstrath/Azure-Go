@@ -10,6 +10,7 @@
 import asyncio
 import random
 import re
+import threading
 import time
 import uuid
 
@@ -32,6 +33,10 @@ from .tools import TOOLS, failed as tool_failed
 # LLM「情绪变化」小调用：限频 + 忙时跳过，保护主对话的响应速度与 KV 前缀缓存
 MOOD_LLM_GAP_MS = 15000
 MOOD_LLM_MAX_TOKENS = 32
+
+# 主动回忆：同一条旧事 30 分钟内不再提；提示词里只放一小段，避免把记忆库倒出来
+IDLE_RECALL_AVOID_SEC = 1800.0
+IDLE_RECALL_MAX_CHARS = 110
 
 # 限制回复长度时追加的约束（在不动原人设的前提下，单独附在末尾）
 LEN_NOTE = ("\n\n【本次额外要求 · 优先遵守】\n"
@@ -376,7 +381,8 @@ class AzureAgent:
                  persona_enabled=False, persona_rng=None,
                  persona_relationship_enabled=False, persona_address_name="",
                  adaptive_enabled=False, adaptive_base=adaptive.BASE_DEFAULT,
-                 adaptive_spread=adaptive.SPREAD_DEFAULT, adaptive_rng=None):
+                 adaptive_spread=adaptive.SPREAD_DEFAULT, adaptive_rng=None,
+                 life=None, recall_rng=None):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -431,6 +437,16 @@ class AzureAgent:
 
         # —— 跨局长期记忆：默认不接线（None），由 main.py 的 lifespan 注入 MemoryService ——
         self.memory = memory
+
+        # —— 生命时间线（拟人化 P0）：默认不接线（None）⇒ 行为与旧版逐字符一致；
+        #    由 main.py lifespan 注入 LifeStore。它只记录**时间事实**，不参与出话。
+        self.life = life
+        self._life_tick_ms = 0
+        self._life_mood_ms = 0
+        # 主动回忆：概率门 + 最近提过的旧事（同一条 30 分钟内不重复）；线程锁保护 to_thread 并发。
+        self.recall_rng = recall_rng if recall_rng is not None else random.Random()
+        self._recall_recent: list = []
+        self._recall_lock = threading.Lock()
 
         # —— 跨局的定式族计数（T5）：默认不接线（None）⇒ 一律当作「第 1 次」、每次都上卡片；
         #    由 main.py 的 lifespan 无条件注入 JosekiProgress（没有开关，设计 §8.4）——
@@ -831,7 +847,7 @@ class AzureAgent:
             prompt_chains.PHASES[0], len_note=len_note,
             mood_name=self.mood.region_name(), mood_reason=self._mood_reason_text(),
             think_hint=self._think_hint(),
-            persona_extra=self.persona_note(),
+            persona_extra=self._extra_note(),
         )[0]["content"]
 
     def _sys_msg(self):
@@ -867,7 +883,7 @@ class AzureAgent:
             phase, context=context, len_note=len_note,
             mood_name=self.mood.region_name(), mood_reason=self._mood_reason_text(),
             think_hint=self._think_hint(),
-            persona_extra=self.persona_note(),
+            persona_extra=self._extra_note(),
         )
 
     @staticmethod
@@ -936,15 +952,26 @@ class AzureAgent:
             out = out.replace("\n\n\n", "\n\n")
         return out if out != "" else text
 
-    async def _reply(self, messages, max_tokens=300) -> str:
+    async def _reply(self, messages, max_tokens=300, think_mode=None) -> str:
         """所有对外展示的 LLM 回复统一过一遍清洗。
+
+        ``think_mode`` 可按调用覆盖（桌宠走神/窥屏用快速档，别为一句 20 字的话
+        等强思考）；``None`` 沿用客户端全局档位。
 
         云端失败时 ``LLMClient.chat`` 返回「调用出错：…」文案（不抛异常）；这里再兜住
         「真抛出来」的情况（返回空串），由调用方的兜底台词顶上——她该下的棋、该念的
         落子宣告都不会因此丢掉。
         """
         try:
-            return self.clean_reply(await self.llm.chat(messages, max_tokens))
+            if think_mode is None:
+                text = await self.llm.chat(messages, max_tokens)
+            else:
+                try:
+                    text = await self.llm.chat(messages, max_tokens, think_mode=think_mode)
+                except TypeError:
+                    # 鸭子类型替身只实现旧三参 chat()：快速档退化为普通调用，绝不打挂这一回合。
+                    text = await self.llm.chat(messages, max_tokens)
+            return self.clean_reply(text)
         except Exception as e:                  # noqa: BLE001
             print("[Agent] LLM 调用异常：%s" % e)
             return ""
@@ -1174,6 +1201,280 @@ class AzureAgent:
             print("[Agent] 长期记忆召回异常（已忽略）：%s" % e)
             return ""
 
+    # —— 主动回忆：不是每句都提，按情绪/无聊/亲密与随机门决定 ——
+
+    def idle_recall_chance(self) -> float:
+        """一次走神里主动想起旧事的概率（0.03–0.30）。
+
+        依据情绪系统设计：无聊高、亲密/信任高时更愿意回忆；精力低时少一点。
+        这是**规则**，不调用 LLM；没有记忆库时为 0。
+        """
+        mem = self.memory
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return 0.0
+        f = self._life_fields() or {}
+        boredom = float(f.get("boredom", 0.16))
+        affinity = float(f.get("affinity", 0.35))
+        trust = float(f.get("trust", 0.50))
+        energy = float(f.get("energy", 0.72))
+        p = 0.10 + 0.14 * boredom + 0.07 * affinity + 0.03 * trust
+        if self.mood.v >= 0.62:
+            p += 0.03                         # 心情好时更愿意分享旧事
+        if energy <= 0.32:
+            p -= 0.04                         # 累了就少翻旧账
+        return max(0.03, min(0.30, p))
+
+    def idle_memory_query(self) -> str:
+        """按当前情绪挑选联想方向；向量/关键词召回都用它。
+
+        不是把情绪数值扔给模型，而是用情绪**选一个回忆主题**：开心时想温暖的事，
+        低落时想被陪伴的事，好奇时想知道你最近在忙什么。
+        """
+        f = self._life_fields() or {}
+        affinity = float(f.get("affinity", 0.35))
+        if self.mood.v >= 0.66 or affinity >= 0.65:
+            return "Estarth 开心 喜欢 温暖 约定 一起做过的事"
+        if self.mood.v <= 0.40:
+            return "Estarth 难过 安慰 陪伴 低落 最近聊天"
+        if self.mood.c >= 0.62:
+            return "Estarth 最近在忙 好奇 新鲜事 计划"
+        if self.mood.a >= 0.68:
+            return "上次聊到 有趣 期待 一起做的事"
+        return "Estarth 最近聊过 喜欢 习惯 事情"
+
+    def idle_memory_hint(self) -> dict:
+        """走神时偶尔挑一条旧事（向量/关键词召回），返回 ``{id,text,score}`` 或 ``{}``。
+
+        - 概率由 ``idle_recall_chance`` 决定；同一条 30 分钟内不重复；
+        - **只返回一句短文本**，旧事原文由 ``agent_graph`` 放进提示词；
+        - 记忆关闭 / 召回为空 / 任何故障 ⇒ ``{}``（提示词逐字符不变）。
+        同步实现（召回可能含 embedding），调用点走 ``asyncio.to_thread``。
+        """
+        mem = self.memory
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return {}
+        chance = self.idle_recall_chance()
+        if chance <= 0.0:
+            return {}
+        try:
+            with self._recall_lock:
+                roll = float(self.recall_rng.random())
+            if roll >= chance:
+                return {}
+            query = self.idle_memory_query()
+            fn = getattr(mem, "recall_items_for", None)
+            if callable(fn):
+                items = fn(query, k=5)
+            else:
+                text = str(mem.recall_for(query) or "").strip()
+                items = [{"id": None, "text": text, "score": 0.0}] if text else []
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 主动回忆失败（已忽略）：%s" % e)
+            return {}
+        if not isinstance(items, list):
+            return {}
+        now = time.time()
+        with self._recall_lock:
+            self._recall_recent = [
+                (key, ts) for key, ts in self._recall_recent
+                if now - float(ts) <= IDLE_RECALL_AVOID_SEC
+            ]
+            used = {key for key, _ in self._recall_recent}
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                text = " ".join(str(item.get("text", "") or "").split())
+                if text == "":
+                    continue
+                key = str(item.get("id")) if item.get("id") is not None else text
+                if key in used:
+                    continue
+                if len(text) > IDLE_RECALL_MAX_CHARS:
+                    text = text[:IDLE_RECALL_MAX_CHARS - 1] + "…"
+                self._recall_recent.append((key, now))
+                return {"id": item.get("id"), "text": text, "score": item.get("score", 0.0)}
+        return {}
+
+    def _remember_chat_turn(self, user_text, reply_text, mode=""):
+        """把一轮聊天写进共享记忆（原文流水 + 可召回摘要）。同步实现，调用方走 to_thread。"""
+        mem = self.memory
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return
+        try:
+            remember = getattr(mem, "remember_chat", None)
+            if callable(remember):
+                remember(str(user_text or ""), str(reply_text or ""), str(mode or ""), self.mood_payload())
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 聊天记忆写入异常（已忽略）：%s" % e)
+
+    def _remember_pet_line(self, kind, text, mode=""):
+        """把桌宠的走神 / 窥屏搭话写成轻量事件记忆；失败不影响出话。"""
+        mem = self.memory
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return
+        try:
+            remember = getattr(mem, "remember_event", None)
+            if callable(remember):
+                remember(str(kind or "pet"), str(text or ""), str(mode or ""), self.mood_payload())
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 桌宠事件记忆写入异常（已忽略）：%s" % e)
+
+    def load_recent_chat_history(self, limit=8):
+        """启动时把最近的共享聊天流水灌回 ``st.chat_history``。
+
+        这是「围棋 ↔ 桌宠 ↔ 下次启动」的连续性来源：桌宠聊过的事、上一盘棋后说过的话，
+        在围棋的聊天/落子提示词里仍能看到最近窗口；长期细节仍由 memories 召回。
+        关闭记忆 / 库不可用时什么都不做（提示词逐字符不变）。同步实现，调用方走 to_thread。
+        """
+        mem = self.memory
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return
+        try:
+            recent = getattr(mem, "recent_chats", None)
+            rows = list(recent(int(limit or 8)) or []) if callable(recent) else []
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 最近聊天恢复失败（已忽略）：%s" % e)
+            rows = []
+        hist = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            u = str(r.get("user_text", "") or "").strip()
+            a = str(r.get("reply_text", "") or "").strip()
+            if u:
+                hist.append({"role": "user", "content": u[:240]})
+            if a:
+                hist.append({"role": "assistant", "content": a[:360]})
+        if hist:
+            # 与局内窗口同量级：最多保留最近 2*limit 条，别把提示词撑爆
+            self.st.chat_history = hist[-max(2, int(limit or 8) * 2):]
+
+    # ================= 生命时间线（拟人化 P0） =================
+
+    def load_life(self, now=None):
+        """启动时接上持久化时间线：恢复跨重启的情绪余温（失败静默）。
+
+        时间线库在 lifespan 构造时已经读过一次；这里只做**内存状态 → 情绪模型**的恢复，
+        不额外读盘。没有装配 / 没有落盘情绪 / 脏值 ⇒ 不改情绪，保持旧版行为。
+        ``now`` 可注入（测试用），生产留空走系统时钟。
+        """
+        life = self.life
+        if life is None:
+            return
+        try:
+            restored = life.mood_after_break(now=time.time() if now is None else now)
+        except Exception as e:                  # noqa: BLE001
+            print("[Life] 情绪恢复失败（已忽略）：%s" % e)
+            return
+        if not isinstance(restored, dict) or not restored:
+            return
+        try:
+            self.mood.carry(restored, keep=1.0)
+        except Exception as e:                  # noqa: BLE001
+            print("[Life] 情绪恢复应用失败（已忽略）：%s" % e)
+
+    def save_life(self):
+        """进程退出 / 需要显式落盘时保存情绪与活跃时间（失败静默）。"""
+        self._life_tick(force=True)
+        self._life_save_mood(force=True)
+
+    def _life_touch(self, kind, source="", summary="", meta=None, event=True, now=None):
+        """写一条生命事件；没有装配时间线时零动作。任何故障只打日志。"""
+        life = self.life
+        if life is None:
+            return
+        try:
+            life.touch(kind, source=source, summary=summary, meta=meta,
+                       now=time.time() if now is None else now, event=event)
+        except Exception as e:                  # noqa: BLE001
+            print("[Life] 事件写入失败（已忽略）：%s" % e)
+
+    def _life_fields(self) -> dict:
+        """慢变量快照（精力 / 无聊 / 亲密 / 信任）；未装配 ⇒ ``{}``（旧载荷形状不变）。"""
+        life = self.life
+        if life is None:
+            return {}
+        try:
+            s = life.state
+        except Exception as e:                  # noqa: BLE001
+            print("[Life] 慢变量读取失败（已忽略）：%s" % e)
+            return {}
+        out = {}
+        for key, default in (("energy", 0.72), ("boredom", 0.16),
+                             ("affinity", 0.35), ("trust", 0.50),
+                             ("dominance", 0.50)):
+            try:
+                out[key] = max(0.0, min(1.0, float(s.get(key, default))))
+            except (TypeError, ValueError):
+                out[key] = default
+        return out
+
+    def life_note(self) -> str:
+        """把慢变量翻译成**语气约束**（不报数字、不念状态名）。
+
+        没有装配生命时间线 ⇒ 空串（提示词逐字符不变）。触发阈值刻意偏极端：
+        只有真的累了 / 真的无聊了才说，避免每句都“演状态”。
+        """
+        f = self._life_fields()
+        if not f:
+            return ""
+        parts = []
+        energy = f.get("energy", 0.72)
+        boredom = f.get("boredom", 0.16)
+        affinity = f.get("affinity", 0.35)
+        trust = f.get("trust", 0.50)
+        dominance = f.get("dominance", 0.50)
+        if energy <= 0.32:
+            parts.append("你现在有点累：反应慢半拍、句子短一些，别硬撑热情。")
+        elif energy >= 0.80:
+            parts.append("你现在精神不错：可以主动一点，但别喧宾夺主。")
+        if boredom >= 0.62:
+            parts.append("你已经有一阵子没和 Estarth 互动：心里有点想说话，但先读空气，别催促。")
+        if affinity >= 0.70:
+            parts.append("你们已经很熟了：语气可以放松、亲近一点，但别腻。")
+        elif affinity <= 0.25:
+            parts.append("你还在观察 Estarth：保持一点分寸，别一下子掏心。")
+        if trust <= 0.30:
+            parts.append("信任还没有完全建立：不要替 Estarth 做决定，也别过度自证。")
+        if dominance <= 0.30:
+            parts.append("你此刻有点没底气：允许自己说不确定，别逞强。")
+        elif dominance >= 0.70:
+            parts.append("你现在比较笃定：可以给出自己的判断，但别压人。")
+        if not parts:
+            return ""
+        return ("【此刻的身体与心绪 · 内部状态勿外露】\n"
+                + "\n".join("· " + p for p in parts)
+                + "\n（这些只影响语气、长度与主动性；不要提数值、状态名，也不要逐条念出来。）")
+
+    def _life_save_mood(self, force=False):
+        """落盘情绪快照（节流 10 秒；事件点可 force）。"""
+        life = self.life
+        if life is None:
+            return
+        now = time.time()
+        if not force and now - self._life_mood_ms < 10.0:
+            return
+        self._life_mood_ms = now
+        try:
+            life.save_mood(self.mood_payload(), now=now)
+        except Exception as e:                  # noqa: BLE001
+            print("[Life] 情绪落盘失败（已忽略）：%s" % e)
+
+    def _life_tick(self, force=False):
+        """时间线心跳（节流 15 秒）：推进 last_tick_ts 并顺便保留情绪。"""
+        life = self.life
+        if life is None:
+            return
+        now = time.time()
+        if not force and now - self._life_tick_ms < 15.0:
+            return
+        self._life_tick_ms = now
+        self._life_mood_ms = now
+        try:
+            life.tick(now=now, mood=self.mood_payload())
+        except Exception as e:                  # noqa: BLE001
+            print("[Life] 心跳落盘失败（已忽略）：%s" % e)
+
     def _remember_game(self, summary, black_wr, score):
         """把这一局的总结写进长期记忆（``result`` 渲染成一行）；失败只打日志，不影响对局。
 
@@ -1201,6 +1502,7 @@ class AzureAgent:
         self._mood_reason = self._mood_desc
         self._mood_reason_until = len(self.st.moves) + 2
         self.sync_mood(bool(burst), False, burst)
+        self._life_save_mood(True)
 
     def _mood_reason_text(self) -> str:
         """最近一次情绪事件的来由；超过两回合 / 复盘 / 空 ⇒ 空串（提示词逐字符不变）。"""
@@ -1217,7 +1519,7 @@ class AzureAgent:
             return
         self._mood_region = r
         info = self.mood.info(r)
-        self._emit(events.mood({
+        payload = {
             "region": r,
             "v": self.mood.v, "c": self.mood.c, "a": self.mood.a,
             "name": str(info.get("name", "")),
@@ -1225,7 +1527,10 @@ class AzureAgent:
             "filler": "" if quiet else str(info.get("filler", "")),
             "burst": "" if quiet else (str(burst) or str(info.get("burst", ""))),
             "pitch": float(info.get("pitch", 0.0)),
-        }))
+        }
+        payload.update(self._life_fields())      # 未装配生命时间线 ⇒ 形状与旧版完全一致
+        self._emit(events.mood(payload))
+        self._life_save_mood(False)
 
     def _pat_scale(self) -> float:
         """摸头的效果系数：难过时更有效；烦躁/委屈时更难哄；连续摸头收益递减。"""
@@ -1254,6 +1559,7 @@ class AzureAgent:
         """
         if self.review:
             return
+        self._life_tick()
         self.sync_mood(False)
 
     def player_interaction(self, what):
@@ -1264,12 +1570,14 @@ class AzureAgent:
         if self.review:
             return
         self._persona_bump_interaction()
+        self._life_touch("interaction", summary=what)
         scale = self._pat_scale() if str(what) == "patted" else 1.0
         self.mood.apply_event(what, scale)
         self._mood_desc = EmotionModel.event_desc(what)
         self._mood_reason = self._mood_desc
         self._mood_reason_until = len(self.st.moves) + 2
         self.sync_mood(False, True)
+        self._life_save_mood(True)
 
     async def _mood_delta(self, cur, desc):
         """情绪增量：优先结构化输出，拿不到才回落到正则解析（``None`` = 两条路都没拿到）。
@@ -1657,6 +1965,8 @@ class AzureAgent:
         if self.session_start is None:
             self.session_start = t
         self.move_ts_list.append(t)
+        # 落子也是“她还活着、和 Estarth 在同一张桌上”的时间事实；只推进时间戳，不逐手写事件行。
+        self._life_touch("game_move", event=False, now=t)
 
     def time_facts(self, *, now=None, last_game_ts=None, game_ts_list=None):
         """**时间块**的素材（纯计算、零 IO、零调用）：``time_aware_enabled`` 关着 ⇒ ``{}``。
@@ -1665,14 +1975,25 @@ class AzureAgent:
         生产调用方补上）；``last_game_ts`` / ``game_ts_list`` 由调用方从 ``ProfileStore`` 读出来
         传进来（**那两次读是同步阻塞的，要 ``await asyncio.to_thread``**；本方法只做纯计算）。
         关着开关 ⇒ 空 dict ⇒ ``prompts.time_note`` 返回空串 ⇒ 提示词**逐字符不变**。
+
+        装配了生命时间线时，再把 ``LifeStore.temporal_facts`` 的**相对时间**合并进来：
+        距上次互动 / 主动开口 / 聊天 / 对局，以及昼夜相位。没有时间线 ⇒ 与旧版逐字符一致。
         """
         if not self.time_aware_enabled:
             return {}
-        return time_ctx.facts(now=time.time() if now is None else now,
-                              session_start=self.session_start,
-                              last_game_ts=last_game_ts,
-                              move_ts_list=list(self.move_ts_list),
-                              game_ts_list=game_ts_list)
+        ref = time.time() if now is None else now
+        facts = time_ctx.facts(now=ref,
+                               session_start=self.session_start,
+                               last_game_ts=last_game_ts,
+                               move_ts_list=list(self.move_ts_list),
+                               game_ts_list=game_ts_list)
+        if not facts or self.life is None:
+            return facts
+        try:
+            facts.update(self.life.temporal_facts(now=ref))
+        except Exception as e:                  # noqa: BLE001
+            print("[Life] 时间上下文计算失败（已忽略）：%s" % e)
+        return facts
 
     def profile_facts(self):
         """**画像块**的素材：``profile_enabled`` 关着 / 未装配画像库 ⇒ ``{}``（＝不注入）。
@@ -1719,6 +2040,11 @@ class AzureAgent:
                                              self._persona.get("last_game_ts"))
         if restored:
             self._lingering_mood = restored
+
+    def _extra_note(self) -> str:
+        """系统提示词附加段：人格化 + 生命状态；两者都空 ⇒ 空串（提示词逐字符不变）。"""
+        parts = [self.persona_note(), self.life_note()]
+        return "\n\n".join(p for p in parts if p)
 
     def persona_note(self) -> str:
         """人格化提示词附加段（关系 / 最近胜负 / 夜間语气 / 小目标 / 难度半句）。
@@ -2102,6 +2428,7 @@ class AzureAgent:
             # 前端据此**不登记语音配对记录**——否则它会占掉配对位，把连接后第一回合的三条真语音
             # 整体错位（点评等到落子宣告的音频才显示、揭示被推后、最后一条没声音）。
             self._emit(events.message(events.AI_NOTICE, text))
+            self._life_touch("greet", source="startup")
             self._mood_event("reunion", burst="pleased")   # 隔了几天又见：心里是真的高兴
             return text
         finally:
@@ -2552,12 +2879,16 @@ class AzureAgent:
         finally:
             self._clear_busy(owner)
 
-    async def chat(self, text):
-        """自由聊天（顺序见 ``agent_graph.py`` 的 chat 阶段）。"""
+    async def chat(self, text, mode="game"):
+        """自由聊天（顺序见 ``agent_graph.py`` 的 chat 阶段）。
+
+        ``mode`` 只用于共享记忆：``pet``（桌宠聊天面板）或 ``game``（围棋内聊天）。
+        """
         if self.busy:
             return
         if text is None or text.strip() == "":
             return
+        self._life_touch("chat", source=mode, summary=text)
         self.st.chat_history.append({"role": "user", "content": text})
         # 自适应难度：玩家明确说「太难 / 认真点」时立刻调一档（受 4 手冷却与基线 ±1 约束）
         if self.adaptive.enabled and self.adaptive.note_chat(text, len(self.st.moves)):
@@ -2572,7 +2903,7 @@ class AzureAgent:
         self._new_turn()
         token = self.begin_epoch()
         try:
-            await self._turn_guard(self._turn(PHASE_CHAT, {"text": text}), token)
+            await self._turn_guard(self._turn(PHASE_CHAT, {"text": text, "mode": str(mode or "game")}), token)
         except Exception as e:                      # 意外抛出：按失败处理，别让棋盘锁死
             print("[Agent] 聊天异常：%s" % e)
         finally:
@@ -2582,7 +2913,7 @@ class AzureAgent:
         if self.epoch_ok(token):
             self._record_chat_events()
 
-    async def idle_remark(self):
+    async def idle_remark(self, mode="game"):
         """闲置搭话：Estarth 一段时间没动静时，Azure 主动说一句短话。
 
         同样走看门狗（超时也解锁 + 前推一代），只是它**不进 busy**：与今天一致（空闲搭话不锁棋盘）。
@@ -2591,15 +2922,16 @@ class AzureAgent:
         """
         if self.busy:
             return
+        self._life_touch("idle", source=mode)
         self._new_turn()
         token = self.begin_epoch()
-        await self._turn_guard(self._turn(PHASE_IDLE), token)
+        await self._turn_guard(self._turn(PHASE_IDLE, {"mode": str(mode or "game")}), token)
         # 空闲：`chat_digest_llm=true` 时在这里补做一次 LLM 分段总结（默认关，零额外调用）。
         # 代数一并带进去：那一趟 LLM ``await`` 里若玩家起了新回合，摘要不再写表（修复波 / Minor #2）。
         if self.epoch_ok(token):
             await self._digest_chat_llm(token)
 
-    async def peer_remark(self, info):
+    async def peer_remark(self, info, mode="game"):
         """窥屏搭话：玩家切去别的窗口时，结合前台窗口 / OCR / VLM 描述主动说一句。
 
         与 ``idle_remark`` 同一条「不进 busy」的通道（空闲搭话不锁棋盘），但 prompt 里带上看到的内容。
@@ -2607,10 +2939,13 @@ class AzureAgent:
         """
         if self.busy:
             return
+        title = str(info.get("fg_title", "")) if isinstance(info, dict) else ""
+        self._life_touch("peer", source=mode, summary=title)
         self._new_turn()
         token = self.begin_epoch()
         await self._turn_guard(
-            self._turn(PHASE_PEER, {"info": info if isinstance(info, dict) else {}}), token)
+            self._turn(PHASE_PEER, {"info": info if isinstance(info, dict) else {},
+                                    "mode": str(mode or "game")}), token)
 
     async def summarize(self, note=""):
         """对局总结（顺序见 ``agent_graph.py`` 的 summary 阶段）。
@@ -2625,6 +2960,7 @@ class AzureAgent:
             self._new_turn()                        # 空盘提示也是对外台词（T20①）
             await _emit_line(self, events.AI, "还没下过棋呢~")
             return
+        self._life_touch("game_end", source="game", summary=note)
         owner = self._set_busy(True)
         self._new_turn()
         token = self.begin_epoch()
@@ -2708,6 +3044,7 @@ class AzureAgent:
     def reset_game(self, silent=False):
         # v3.7.0：开新一代——新一局开始，上一代（可能还在后台收尾）的迟到写入一律作废
         self.begin_epoch()
+        self._life_touch("game_start", source="game")
         keep_pass = self.st.allow_pass
         self.st.reset()
         self._library_sig = None                 # 新一局：同长度同末手也不再算「已归档」
@@ -2727,7 +3064,11 @@ class AzureAgent:
         self.move_ts_list = []
         # 人格化（v3.x 自用版）：上一局的情绪余温带一半进新局；没有余温 / 关着 ⇒ 回到平静基线。
         # 「今天的小心思」每局重抽（小概率才有），难度半句类的一次性提示一并清掉。
-        if self.persona_enabled and self._lingering_mood:
+        if self.life is not None:
+            # 装配了生命时间线（桌宠 ↔ 围棋共享）：当前情绪已经是“最新事实”，
+            # 新局保留它；旧的局末余温不再覆盖（life 快照比 game 结束快照更新）。
+            self._lingering_mood = None
+        elif self.persona_enabled and self._lingering_mood:
             self.mood.carry(self._lingering_mood, keep=0.45)
             self._lingering_mood = None
         else:
@@ -2818,7 +3159,7 @@ class AzureAgent:
     def mood_payload(self) -> dict:
         """当前情绪快照（WS 连接建立时随 hello 一起下发）。"""
         info = self.mood.info(self.mood.region())
-        return {
+        payload = {
             "region": self.mood.region(),
             "v": self.mood.v, "c": self.mood.c, "a": self.mood.a,
             "name": str(info.get("name", "")),
@@ -2827,3 +3168,5 @@ class AzureAgent:
             "burst": str(info.get("burst", "")),
             "pitch": float(info.get("pitch", 0.0)),
         }
+        payload.update(self._life_fields())       # 未装配生命时间线 ⇒ 形状与旧版完全一致
+        return payload

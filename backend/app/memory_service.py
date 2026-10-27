@@ -108,6 +108,24 @@ class MemoryService:
             print("[Memory] 召回失败（已忽略）：%s" % e)
             return ""
 
+    def recall_items_for(self, query: str, k: int | None = None) -> list:
+        """召回原始条目（供主动回忆选具体旧事）；关闭 / 无命中 / 故障返回 ``[]``。
+
+        ``k`` 缺省用 ``memory_top_k``；主动回忆需要看到 ``id`` / ``text`` / ``score``，
+        不能只拿拼好的注入字符串，否则无法去重与判断“这条是否值得提”。
+        """
+        if self.store is None:
+            return []
+        try:
+            kk = self._top_k if k is None else max(0, int(k))
+            if kk == 0:
+                return []
+            rows = self.store.recall(str(query or ""), kk)
+            return list(rows or [])
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 主动回忆召回失败（已忽略）：%s" % e)
+            return []
+
     def remember_game(self, moves: list, result: str, summary: str) -> None:
         """落一条对局归档，并把总结另存为可召回的记忆。
 
@@ -127,6 +145,72 @@ class MemoryService:
         if self.store is None:
             return None
         return self.store.write(text, kind="fact", tag=str(tag or ""))
+
+    # —— 桌宠 / 围棋共用的事件记忆（MaiBot 式「episode + 可召回摘要」的轻量实现） ——
+
+    def recent_chats(self, limit: int = 50) -> list:
+        """最近聊天流水（启动恢复 / 桌宠聊天面板共用）；关闭或失败返回 ``[]``。"""
+        if self.store is None:
+            return []
+        try:
+            return list(self.store.recent_chats(int(limit or 50)) or [])
+        except Exception as e:                  # noqa: BLE001
+            print("[Memory] 最近聊天读取失败（已忽略）：%s" % e)
+            return []
+
+    def remember_chat(self, user_text: str, reply_text: str, mode: str = "", mood=None) -> int | None:
+        """记一轮聊天：写原文流水 + 一条可召回的 ``kind=chat`` 记忆。
+
+        原文流水服务「最近聊了什么」的连续性；可召回记忆服务跨重启 / 跨模式的长期回忆。
+        任何失败只打日志，绝不影响聊天回包。
+        """
+        if self.store is None:
+            return None
+        u = " ".join(str(user_text or "").split())
+        r = " ".join(str(reply_text or "").split())
+        if u == "" and r == "":
+            return None
+        m = str(mode or "")
+        self.store.append_chat(u, r, mode=m, mood=mood if isinstance(mood, dict) else {})
+        try:
+            self.store.append_episode_turn(m, u, r, mood=mood if isinstance(mood, dict) else {})
+        except Exception as e:                  # noqa: BLE001
+            print("[Memory] episode 归并失败（已忽略）：%s" % e)
+        text = "Estarth：%s；Azure：%s" % (u[:100], r[:100])
+        return self.store.write(
+            text, kind="chat", tag="chat:%s" % str(mode or ""),
+            meta={"mode": str(mode or ""), "mood": mood if isinstance(mood, dict) else {}})
+
+    def recent_episodes(self, limit: int = 3) -> list:
+        """最近 episode 摘要（启动 continuity / 调试查看用）；关闭或失败返回 ``[]``。"""
+        if self.store is None:
+            return []
+        try:
+            return list(self.store.recent_episodes(int(limit or 3)) or [])
+        except Exception as e:                  # noqa: BLE001
+            print("[Memory] episode 读取失败（已忽略）：%s" % e)
+            return []
+
+    def close_episode(self, source: str = "") -> None:
+        """模式切换 / 退出前收束当前 episode，把这段相处写成可召回摘要。"""
+        if self.store is None:
+            return
+        try:
+            self.store.close_episode(str(source or ""))
+        except Exception as e:                  # noqa: BLE001
+            print("[Memory] episode 收束失败（已忽略）：%s" % e)
+
+    def remember_event(self, kind: str, text: str, mode: str = "", mood=None, tag: str = "") -> int | None:
+        """记一条桌宠 / 围棋的短事件（摸头、走神、窥屏搭话等）为可召回记忆。"""
+        if self.store is None:
+            return None
+        body = " ".join(str(text or "").split())
+        if body == "":
+            return None
+        tag2 = str(tag or ("%s:%s" % (kind, mode or "")))
+        return self.store.write(
+            body, kind=str(kind or "event"), tag=tag2,
+            meta={"mode": str(mode or ""), "mood": mood if isinstance(mood, dict) else {}})
 
     def close(self) -> None:
         """关闭底层库；可重复调用。"""

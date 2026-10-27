@@ -11,13 +11,16 @@
 结算时机只在事件点与界面心跳，绝不进每帧路径。
 """
 
+import math
 import re
 import time
 
 BAND_LO = 1.0 / 3.0     # 低/中带界
 BAND_HI = 2.0 / 3.0     # 中/高带界
 HYST = 0.035            # 分带滞回：情绪值贴着边界时不来回横跳（防表情闪烁）
-DECAY_TAU = 150.0       # 向基线回落的时间常数（秒）
+DECAY_TAU = 150.0       # 唤醒度向基线回落的时间常数（秒）——快变量
+DECAY_TAU_SLOW = 1800.0  # 愉悦度 / 好奇度向基线回落的时间常数（秒）——慢变量（30 分钟）
+EMOTION_STICKY_SEC = 20.0  # 一次情绪事件后的“粘性”：短时间不立刻往回衰减
 DELTA_MAX = 0.4         # 单次增量上限（事件表与 LLM 都受此约束）
 # 基线（「平静」）：初始值 = 回落目标。**唯一一份数字**——别处（如情绪波动的 `agent.emotion_bias`）
 # 引用它而不是抄一份字面量（修复轮 1 / Minor #2：抄副本会各自静默漂移）。
@@ -80,6 +83,7 @@ EVENT_DELTAS = {
     "chat_normal": (0.02, 0.03, 0.02),      # 普通闲聊
     "patted": (0.12, -0.02, 0.10),          # 摸头
     "idle_bored": (-0.03, 0.06, -0.04),     # 玩家长时间无动静
+    "idle_near": (0.00, 0.015, -0.005),     # 桌宠助手：安静一小会儿，主动陪一句（不是被晾着）
     "peek": (-0.01, 0.10, 0.05),            # 悄悄看到玩家切去了别的窗口：好奇、轻微被晾着
     "undo": (-0.03, 0.04, 0.02),            # 悔棋
     "undo_repeat": (-0.02, 0.02, 0.03),     # 短时间内又悔一次：有点无奈
@@ -107,6 +111,7 @@ EVENT_DESCS = {
     "chat_normal": "对面和你聊了几句",
     "patted": "对面摸了摸你的头",
     "idle_bored": "对面很久没有动静了",
+    "idle_near": "桌面上安静了一小会儿，你想自然地陪 Estarth 说句话",
     "peek": "你悄悄看了一眼屏幕，对面正在忙别的事",
     "undo": "对面悔棋重下了",
     "undo_repeat": "对面又悔棋了，你有点无奈",
@@ -143,6 +148,8 @@ class EmotionModel:
     BAND_HI = BAND_HI
     HYST = HYST
     DECAY_TAU = DECAY_TAU
+    DECAY_TAU_SLOW = DECAY_TAU_SLOW
+    EMOTION_STICKY_SEC = EMOTION_STICKY_SEC
     DELTA_MAX = DELTA_MAX
     # 基线（「平静」）：初始值与回落目标都是它。**类级常量**，供别处（如情绪波动的
     # `agent.emotion_bias`）引用同一份数字，别抄字面量副本（修复轮 1 / Minor #2）。
@@ -157,6 +164,7 @@ class EmotionModel:
         self._bands = [1, 1, 0]        # 当前各维分带（滞回比较用）
         self._region = 12              # 当前区域索引（baseline → 平静）
         self._t_ms = 0                 # 上次结算时刻（懒衰减基准）
+        self._hold_until_ms = 0.0      # 情绪粘性截止（事件后的一小段“余温”）
 
         self._t_ms = time.monotonic() * 1000.0
 
@@ -209,6 +217,8 @@ class EmotionModel:
         self.v = _clampf(self.v + _clampf(dv, -DELTA_MAX, DELTA_MAX), 0.0, 1.0)
         self.c = _clampf(self.c + _clampf(dc, -DELTA_MAX, DELTA_MAX), 0.0, 1.0)
         self.a = _clampf(self.a + _clampf(da, -DELTA_MAX, DELTA_MAX), 0.0, 1.0)
+        # 事件后的短粘性：不让情绪在下一帧就立刻被拉回基线。
+        self._hold_until_ms = time.monotonic() * 1000.0 + EMOTION_STICKY_SEC * 1000.0
         self._region_of(self.v, self.c, self.a)
 
     def reset(self):
@@ -216,6 +226,7 @@ class EmotionModel:
         self.v = self.baseline[0]
         self.c = self.baseline[1]
         self.a = self.baseline[2]
+        self._hold_until_ms = 0.0
         self._bands = [self._raw_band(self.v), self._raw_band(self.c), self._raw_band(self.a)]
         self._region = self._bands[0] * 9 + self._bands[1] * 3 + self._bands[2]
 
@@ -239,6 +250,7 @@ class EmotionModel:
         self.v = _clampf(bv + (v - bv) * k, 0.0, 1.0)
         self.c = _clampf(bc + (c - bc) * k, 0.0, 1.0)
         self.a = _clampf(ba + (a - ba) * k, 0.0, 1.0)
+        self._hold_until_ms = 0.0
         self._bands = [self._raw_band(self.v), self._raw_band(self.c), self._raw_band(self.a)]
         self._region = self._bands[0] * 9 + self._bands[1] * 3 + self._bands[2]
 
@@ -260,16 +272,25 @@ class EmotionModel:
     # ================= 内部 =================
 
     def _decay(self):
-        """懒衰减：把三维朝基线拉回（时间常数 DECAY_TAU），只在结算时按 elapsed 计算。"""
+        """懒衰减：快变量（唤醒度）先回落，慢变量（愉悦度 / 好奇度）留得更久。
+
+        双速是「刚被夸完还有点余温，但已经不太激动了」的物理来源：
+         arousal 用 ``DECAY_TAU``（150 秒），pleasure / curiosity 用
+        ``DECAY_TAU_SLOW``（30 分钟）。两者都是**闭式指数**；情绪事件后的
+        ``EMOTION_STICKY_SEC`` 内不衰减（γ→0 的粘性），让事件真的留下痕迹。
+        """
         now = time.monotonic() * 1000.0
         dt = float(now - self._t_ms) / 1000.0
         self._t_ms = now
         if dt <= 0.0:
             return
-        k = _clampf(dt / DECAY_TAU, 0.0, 1.0)
-        self.v += (self.baseline[0] - self.v) * k
-        self.c += (self.baseline[1] - self.c) * k
-        self.a += (self.baseline[2] - self.a) * k
+        if now < self._hold_until_ms:
+            return
+        k_fast = math.exp(-dt / DECAY_TAU)
+        k_slow = math.exp(-dt / DECAY_TAU_SLOW)
+        self.v += (self.baseline[0] - self.v) * (1.0 - k_slow)
+        self.c += (self.baseline[1] - self.c) * (1.0 - k_slow)
+        self.a += (self.baseline[2] - self.a) * (1.0 - k_fast)
 
     def _region_of(self, nv, nc, na):
         """由三维值算区域并刷新分带（带滞回，防边界抖动）。"""

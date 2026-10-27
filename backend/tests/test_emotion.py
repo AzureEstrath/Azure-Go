@@ -76,6 +76,33 @@ class TestHysteresisSteps(_Base):
             self.assertEqual(list(m._bands), list(st["bands"]), f"{tag} bands 期望={st['bands']} 实际={m._bands}")
 
 
+class TestDualSpeedDecay(_Base):
+    """PAD 双速：唤醒度快回落，愉悦度 / 好奇度留得更久。"""
+
+    def test_arousal_decays_faster_than_pleasure_curiosity(self):
+        m = EmotionModel()
+        m.v, m.c, m.a = 0.90, 0.90, 0.90
+        m._t_ms = (time.monotonic() - 300.0) * 1000.0   # 5 分钟
+        m.region()
+        self.assertLess(abs(m.a - 0.30), 0.10, "唤醒度应在 150 秒尺度上明显回落")
+        self.assertGreater(m.v, 0.80, "愉悦度应还在慢变量尺度上保留余温")
+        self.assertGreater(m.c, 0.80, "好奇度应还在慢变量尺度上保留余温")
+        self.assertLess(m.a, m.v, "快变量必须比慢变量先回到基线")
+
+    def test_event_stickiness_delays_decay(self):
+        m = EmotionModel()
+        m.apply_delta(0.2, 0.2, 0.2)
+        v0 = m.v
+        m._t_ms = (time.monotonic() - 10.0) * 1000.0
+        m._hold_until_ms = time.monotonic() * 1000.0 + 5.0 * 1000.0
+        m.region()
+        self.assertAlmostEqual(m.v, v0, places=6, msg="粘性窗口内不衰减")
+        m._hold_until_ms = time.monotonic() * 1000.0 - 1.0
+        m._t_ms = (time.monotonic() - 300.0) * 1000.0
+        m.region()
+        self.assertLess(m.v, v0, msg="粘性窗口过后应开始回落")
+
+
 class TestParseDelta(_Base):
     """parse_delta：9 组样本（全角、前后缀、超界、无标记、空串、非法小数）。"""
 

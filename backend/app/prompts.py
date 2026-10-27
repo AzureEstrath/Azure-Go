@@ -583,7 +583,7 @@ def _gap_cn(days) -> str:
 
 
 def _time_lines(t) -> list:
-    """时间事实 → 子句列表（**新 → 旧**：当前时间 → 本局时长 → 单手用时 → 间隔 → 连续天数）。
+    """时间事实 → 子句列表（**新 → 旧**：当前时间 → 相对时间 → 本局时长 → 单手用时 → 间隔 → 连续天数）。
 
     超预算时**从最旧的事实开始丢** ＝ 从这张列表的**尾部**往回丢（连续天数最先走、当前时间最后走）。
     """
@@ -592,7 +592,32 @@ def _time_lines(t) -> list:
     clock = str(t.get("clock") or "")
     if date != "" or clock != "":
         wd = str(t.get("weekday") or "")
-        lines.append("现在是 " + " ".join([x for x in (date, wd, clock) if x != ""]))
+        at = " ".join([x for x in (date, wd, clock) if x != ""])
+        phase = str(t.get("day_phase") or "")
+        if phase != "":
+            at += "（%s）" % phase
+        lines.append("现在是 " + at)
+    # 相对时间：只报「真的过了一阵子」的，刚说过话就不复读一个 0 秒。
+    for key, label in (("since_interaction_sec", "距上次和 Estarth 互动"),
+                       ("since_proactive_sec", "距上次你主动开口"),
+                       ("since_chat_sec", "距上次聊天")):
+        sec = _num(t.get(key), -1.0)
+        if sec < 60.0:
+            continue
+        dur = _dur_cn(sec)
+        if dur != "":
+            lines.append("%s %s" % (label, dur))
+    title = str(t.get("next_schedule_title") or "")
+    if title != "":
+        at = str(t.get("next_schedule_at") or "")
+        sec = _num(t.get("next_schedule_in_sec"), -1.0)
+        when = ""
+        if sec >= 0.0:
+            when = "马上" if sec < 60.0 else ("约 %s后" % _dur_cn(sec))
+        line = "日程上最近的是「%s」" % title
+        if at != "" or when != "":
+            line += "（%s）" % "，".join(x for x in (at, when) if x != "")
+        lines.append(line)
     if "session_sec" in t:
         dur = _dur_cn(t.get("session_sec"))
         if dur != "":

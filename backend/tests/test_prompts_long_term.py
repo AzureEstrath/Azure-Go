@@ -67,6 +67,21 @@ class MemoryServiceTest(unittest.TestCase):
             self.assertIn("定式讲解", svc.recall_for("讲讲定式"))
             svc.close()
 
+    def test_remember_chat_shared_by_pet_and_game(self):
+        import tempfile
+        from app.memory_service import MemoryService
+        with tempfile.TemporaryDirectory() as d:
+            svc = MemoryService(self._cfg(memory_db_path=os.path.join(d, "m.db")))
+            svc.remember_chat("我今天有点累", "那就先歇一会儿，我陪你。", mode="pet",
+                              mood={"v": 0.3, "c": 0.5, "a": 0.4})
+            chats = svc.recent_chats(10)
+            self.assertEqual(len(chats), 1)
+            self.assertEqual(chats[0]["mode"], "pet")
+            self.assertIn("有点累", chats[0]["user_text"])
+            self.assertIn("我陪你", chats[0]["reply_text"])
+            self.assertIn("我陪你", svc.recall_for("我今天有点累"))
+            svc.close()
+
     def test_build_embed_fn_requires_full_config(self):
         from app.memory_service import build_embed_fn
         self.assertIsNone(build_embed_fn(self._cfg()))

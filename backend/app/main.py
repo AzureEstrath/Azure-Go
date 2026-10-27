@@ -35,6 +35,8 @@
     GET  /api/memory/stats                  长期记忆体量（行数 / 归档数 / 向量数 / 库路径）
     POST /api/memory/forget {ids?}/{all}    忘掉指定或全部长期记忆
     GET  /api/profile                       玩家棋风画像（只读：各维值 + 置信度 + 最近 N 局记录）
+    GET  /api/mood                          当前情绪快照（桌宠用）
+    GET  /api/life                          生命时间线快照（状态 / 相对时间 / 最近事件）
     GET  /api/state                         当前棋盘权威快照
     GET  /api/health                        引擎/LLM/长期记忆状态
 
@@ -62,11 +64,14 @@ from fastapi.responses import JSONResponse, Response
 
 from . import config as config_mod
 from . import coords, events, persona, prompts, sgf
+from . import file_service
 from . import full_review
+from . import schedule as schedule_mod
 from .agent import AzureAgent
 from .engine import KataGoEngine
 from .game_store import GameStore
 from .joseki_progress import JosekiProgress
+from .life import LifeStore
 from .llm import LLMClient
 from .memory_service import MemoryService
 from .profile_store import ProfileStore
@@ -134,7 +139,7 @@ PROFILE_SOURCE_GAMES = 20
 
 
 def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=True, memory=None,
-               game_store=None):
+               game_store=None, life=None):
     """构造应用；测试可注入 stub 引擎/LLM/agent/memory/tts/game_store（autostart=False 跳过引擎启动）。
 
     ``memory`` 显式传入时优先于 lifespan 构造的 ``MemoryService``（测试 seam）：
@@ -143,6 +148,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     **两个分支**（自建 agent / 注入 agent）都把它挂到 agent 上（T16）。
     定式族计数（T5）没有 seam、也没有开关：lifespan 无条件构造 ``JosekiProgress()``（构造期不碰
     磁盘），**两个分支**都挂同一个实例（有开关就等于能悄悄关掉教学记忆，设计 §8.4 明确不设）。
+    ``life`` 是生命时间线的测试 seam：显式注入优先；``autostart=False`` 且不注入 ⇒ 不碰真实
+    ``data/life.db``。
     """
     cfg = cfg if cfg is not None else config_mod.AzureConfig.load()
 
@@ -152,6 +159,10 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         # 长期记忆：显式注入优先；默认关闭时零开销（不建库、不调接口）
         mem = memory if memory is not None else MemoryService(cfg)
         app.state.memory = mem
+        # 生命时间线（拟人化 P0）：显式注入优先；生产装配**无条件**建库（不受 memory_enabled 影响）。
+        # autostart=False 是测试装配：未显式注入就不碰真实 data/life.db，保持门卫零副作用。
+        life_store = life if life is not None else (LifeStore(cfg.life_db_path) if autostart else None)
+        app.state.life = life_store
         # 云端语音：显式注入优先（测试用假 TTS）；默认关闭时 speak() 零请求
         tts_client = tts if tts is not None else _build_tts(cfg)
         app.state.tts = tts_client
@@ -193,7 +204,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                          persona_address_name=cfg.persona_address_name,
                                          reply_style=cfg.reply_style,
                                          memory=mem, tts=tts_client,
-                                         joseki_progress=joseki_progress)
+                                         joseki_progress=joseki_progress,
+                                         life=life_store)
             app.state.agent.profile_store = profile_store   # v3.9.0：画像库无条件接上（懒建库、零开销）
             app.state.agent.game_store = gstore             # v3.11.5：棋谱库同样无条件接上（懒建库）
             app.state.agent.player_name = cfg.prompt_user_name
@@ -210,6 +222,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent.memory = mem         # 注入的 agent 也接上同一个实例（显式 memory= 优先）
             app.state.agent.tts = tts_client     # 注入的 agent 同样接上（显式 tts= 优先）
             app.state.agent.joseki_progress = joseki_progress   # T5：注入的 agent 也接上同一个实例
+            app.state.agent.life = life_store    # P0：注入的 agent 也接上同一条生命时间线（None ⇒ 不启用）
             app.state.agent.profile_store = profile_store       # v3.9.0：画像库同样无条件接上
             # 人格化：测试装配（autostart=False）不读真实 profile.db，也不改提示词；
             # 生产在下面统一 load_persona() 读一次跨局状态。
@@ -230,7 +243,22 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             _load_persona = getattr(app.state.agent, "load_persona", None)
             if callable(_load_persona):
                 await _load_persona()
+            # P0：跨重启的情绪余温（生命时间线里最后一次落盘的 v/c/a）。
+            _load_life = getattr(app.state.agent, "load_life", None)
+            if callable(_load_life):
+                _load_life()
+            # 共享记忆的连续性：把最近聊天灌回 chat_history（桌宠 ↔ 围棋 ↔ 重启后）。
+            # 记忆关闭 / 库不可用时是空操作（提示词逐字符不变）。
+            _load_chats = getattr(app.state.agent, "load_recent_chat_history", None)
+            if callable(_load_chats):
+                await asyncio.to_thread(_load_chats)
         yield
+        if autostart:
+            _save_life = getattr(app.state.agent, "save_life", None)
+            if callable(_save_life):
+                _save_life()
+        if life_store is not None:
+            life_store.close()
         mem.close()                              # 退出时收尾（可重复调用）
         await tts_client.close()                 # 语音客户端**无条件**关闭（autostart 为假时也要关）
         if autostart:
@@ -238,6 +266,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             await app.state.agent.llm.close()
 
     app = FastAPI(title="Azure 后端", lifespan=lifespan)
+    file_scan_lock = asyncio.Lock()          # 资料扫描是长任务：同一时刻只允许一批
 
     def a():
         return app.state.agent
@@ -362,8 +391,25 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             return denied
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
-        await s.chat(str(body.get("text", "")))
+        await s.chat(str(body.get("text", "")), str(body.get("mode", "game")))
         return ok()
+
+    @app.get("/api/chat/history")
+    async def chat_history(limit: int = 50):
+        """最近聊天流水（桌宠聊天面板 / 连续性恢复共用）。
+
+        返回 `{"ok": True, "items": [{id, ts, mode, user_text, reply_text, mood}]}`；
+        记忆关闭 / 库不可用时返回空列表（不影响聊天面板打开）。
+        """
+        store = mem_store()
+        items = []
+        if store is not None:
+            try:
+                items = list(await asyncio.to_thread(store.recent_chats, max(1, min(int(limit), 200))) or [])
+            except Exception as e:              # noqa: BLE001
+                print("[Memory] 聊天历史读取失败（已忽略）：%s" % e)
+                items = []
+        return {"ok": True, "items": items}
 
     @app.post("/api/summarize")
     async def summarize(body: dict):
@@ -514,14 +560,14 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         return ok()
 
     @app.post("/api/idle")
-    async def idle():
+    async def idle(body: dict | None = None):
         s = a()
         denied = review_gate()                  # 复盘先于 busy（V6）
         if denied is not None:
             return denied
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
-        await s.idle_remark()
+        await s.idle_remark(str((body or {}).get("mode", "game")))
         return ok()
 
     @app.post("/api/peer")
@@ -536,7 +582,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             "fg_title": body.get("fg_title", ""),
             "ocr": body.get("ocr", ""),
             "vlm": body.get("vlm", ""),
-        })
+        }, str(body.get("mode", "game")))
         return ok()
 
     @app.post("/api/mood/tick")
@@ -544,7 +590,134 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         a().tick_mood()
         return ok()
 
-    # ================= 复盘模式（v3.7.0） =================
+    @app.get("/api/mood")
+    async def mood_snapshot():
+        """当前三维情绪快照（桌宠用）：与 WS ``hello.mood`` 同一份字段。
+
+        同一区域内的数值变化不一定发 ``mood`` 事件；桌宠点完 / 打开面板时主动拉一次，
+        保证「情绪数值」在桌宠与对局之间看到的是同一份。
+        """
+        payload = dict(a().mood_payload())
+        payload["ok"] = True
+        return payload
+
+    @app.get("/api/life")
+    async def life_snapshot(limit: int = 20):
+        """生命时间线快照（桌宠 / 调试）：状态 + 相对时间 + 最近事件。
+
+        与围棋共用同一条后端时间线：桌宠启动时据此知道“上一回见到 Estarth 是什么时候”，
+        不必只依赖本地计时器。时间线未装配（测试装配 / 库不可用）时返回可读的空结果。
+        """
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": True, "available": False, "state": {},
+                    "temporal": {}, "events": []}
+        try:
+            payload = dict(store.snapshot(now=time.time(),
+                                          events_limit=max(0, min(int(limit), 200))))
+        except Exception as e:                  # noqa: BLE001 —— 调试面绝不 500
+            return JSONResponse(status_code=200,
+                                content={"ok": False, "available": bool(getattr(store, "available", False)),
+                                         "error": "时间线读取失败：%s" % e,
+                                         "state": {}, "temporal": {}, "events": []})
+        payload["ok"] = True
+        return payload
+
+    # ================= 资料箱 / 日程 =================
+
+    @app.get("/api/files")
+    async def files_list():
+        """列出资料箱中的可处理文件（不读内容；桌宠面板打开时调用）。"""
+        try:
+            info = await asyncio.to_thread(file_service.list_files, cfg)
+        except Exception as e:              # noqa: BLE001
+            return {"ok": False, "folder": "", "files": [], "error": "资料箱读取失败：%s" % e}
+        info["ok"] = bool(info.get("ok"))
+        return info
+
+    @app.post("/api/files/scan")
+    async def files_scan(body: dict | None = None):
+        """扫描资料箱：OCR/VLM 读文件 → LLM 提取日程 → 写共享日程与长期记忆。
+
+        长任务，前端要放宽 HTTP 超时；同一时刻只允许一批。扫描期间不改棋局 / busy。
+        """
+        s = a()
+        if s.busy:
+            return {"ok": False, "busy": True, "error": "Azure 正在对局或聊天，稍后再处理资料"}
+        if file_scan_lock.locked():
+            return {"ok": False, "busy": True, "error": "上一批资料还在处理中"}
+        async with file_scan_lock:
+            scan = await asyncio.to_thread(file_service.scan_files, cfg, 300.0)
+            if not scan.get("ok"):
+                return {"ok": False, "folder": scan.get("folder", ""),
+                        "files": _public_file_list(scan),
+                        "error": scan.get("error", "资料处理失败"),
+                        "schedule": _schedule_payload()}
+            text = schedule_mod.scan_text(scan)
+            raw = await schedule_mod.extract_items(s.llm, text, now=time.time()) if text else []
+            source = ",".join(str(f.get("name", "")) for f in scan.get("files", [])
+                              if isinstance(f, dict))
+            source = source[:200]
+            items = schedule_mod.normalize_items(raw, source=source, now=time.time())
+            life_store = getattr(app.state, "life", None)
+            saved = await asyncio.to_thread(life_store.upsert_schedule, items, source) \
+                if life_store is not None else []
+            if life_store is None:
+                saved = [dict(it, id=0, status="planned") for it in items]
+            mem = getattr(app.state, "memory", None)
+            mem_written = 0
+            if mem is not None and bool(getattr(mem, "available", False)):
+                for it in saved:
+                    try:
+                        await asyncio.to_thread(mem.remember_fact,
+                                                schedule_mod.memory_text(it), "schedule")
+                        mem_written += 1
+                    except Exception:       # noqa: BLE001
+                        pass
+            return {"ok": True, "folder": scan.get("folder", ""),
+                    "files": _public_file_list(scan), "items": saved,
+                    "memory_written": mem_written,
+                    "schedule": _schedule_payload()}
+
+    def _public_file_list(scan):
+        """API 不回传 OCR/VLM 原文（只给面板文件名 / 类型 / 错误）。"""
+        out = []
+        for f in scan.get("files", []) if isinstance(scan, dict) else []:
+            if not isinstance(f, dict):
+                continue
+            out.append({
+                "name": str(f.get("name", "")),
+                "ext": str(f.get("ext", "")),
+                "kind": str(f.get("kind", "")),
+                "error": str(f.get("error", "")),
+            })
+        return out
+
+    def _schedule_payload(limit=50):
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return []
+        try:
+            return store.list_schedule(int(limit))
+        except Exception:                   # noqa: BLE001
+            return []
+
+    @app.get("/api/schedule")
+    async def schedule_list(limit: int = 50):
+        """共享日程：已定日期按时间升序，待定项排后。"""
+        items = await asyncio.to_thread(_schedule_payload, max(0, min(int(limit), 200)))
+        return {"ok": True, "items": items, "folder": file_service.inbox_dir(cfg)}
+
+    @app.post("/api/schedule/status")
+    async def schedule_status(body: dict):
+        """标记日程完成 / 取消（右键面板后续可用；现在先留接口）。"""
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": False, "error": "生命时间线未装配"}
+        changed = await asyncio.to_thread(
+            store.set_schedule_status, body.get("id"), str(body.get("status", "done")))
+        return {"ok": bool(changed), "items": _schedule_payload()}
+
     # 复盘是**后端的模式**（只把前端棋盘设成只读挡不住她出声）：期间她不能开口——落子 / 聊天 /
     # 闲置 / 提示 / 分析一律可读拒绝，情绪心跳与语气词在 agent 侧冻结（V14）；回看只推 `state`
     # 事件（复用既有 payload 形状），不新增事件种类、不新增 LLM 调用。

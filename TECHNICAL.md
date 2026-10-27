@@ -1,8 +1,10 @@
-# Azure · 围棋陪练 — 详细技术文档
+# Azure · 桌宠围棋助手 — 详细技术文档
 
 > 适用分支：`personal`（自用版）；本地工作目录 `AzureGo-Creative`。
 > 本文描述当前代码的真实实现，配置默认值以 `game/config.json` 与 `backend/app/config.py` 为准。
-> 最后更新：2026-10-24。
+> **v4.0.0 起：桌宠是主程序，围棋是它打开的独立窗口。** 本文主体仍侧重围棋后端 / 客户端细节；
+> 桌宠外壳、共享生命时间线、双速情绪与主动回忆见 `README.md`、`game/scripts/app/` 与 `backend/app/life.py`。
+> 最后更新：2026-10-27。
 
 ---
 

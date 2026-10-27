@@ -69,6 +69,7 @@ var _drift_batch := false
 var _digest_batch := false
 ## 说话详略（v3.11.1）：0 精简 / 1 适中 / 2 详细。旧字段 `limit_len` 已并入它，
 ## 推送时仍带上 `limit_len = (reply_style == 0)`，让旧版后端也读得懂「精简」。
+var tts_local_voice := ""                 # 本地音色：入树前 POST 可能失败，连上后随设置一起补发
 var reply_style := 0:
 	set(v):
 		reply_style = v
@@ -312,12 +313,12 @@ func analyze_position() -> void:
 
 ## 自由聊天。她忙（后端 `POST /api/chat` 会挡下）时**先本地排队**，空闲时 `flush_queued_chat()` 续发。
 ## 返回 `false` 表示**队列满了、这条没收** —— 调用方要保留输入框原文并在状态栏提示，绝不吞玩家的话。
-func chat(text: String) -> bool:
+func chat(text: String, mode := "game") -> bool:
 	if text.strip_edges() == "":
 		return true                      # 空话后端也当没发：既不排队也不发（别占住队头）
 	if _can_send_now():
 		_chat_in_flight = true           # 这一条出去了：下一条要等她这一轮结束（busy=false）才放
-		_send_chat_now(text)
+		_send_chat_now(text, mode)
 		return true
 	return _enqueue_chat(text)
 
@@ -348,12 +349,12 @@ func _enqueue_chat(text: String) -> bool:
 ## 真发一条聊天（带回复判定）：**只有明确回 `ok: true` 才算收下**；忙（`busy=false` 事件还没到的竞态）、
 ## 非 2xx、回包读不懂（代理 HTML 错误页一类）⇒ 这条**退回队头**（它本来是最该发的一条，退回也保序），
 ## 并压一个重试闸防每帧重发。宁可极少数情况下重复发一次，也不吞玩家的话。
-func _send_chat_now(text: String) -> void:
-	fetch_bytes("/api/chat", HTTPClient.METHOD_POST, {"text": text},
+func _send_chat_now(text: String, mode := "game") -> void:
+	fetch_bytes("/api/chat", HTTPClient.METHOD_POST, {"text": text, "mode": mode},
 		func(ok: bool, _code: int, body: PackedByteArray):
 			if ok and _chat_reply_ok(body):
 				return                   # 收下了：`_chat_in_flight` 交给随后的 `busy` 事件清（她这一轮开始）
-			_chat_in_flight = false      # 没送出去：立刻放行（重试由节流窗口管）
+			_chat_in_flight = false      # 没送出去：立刻放行（重试由节流窗口限）
 			_chat_retry_ms = Time.get_ticks_msec() + CHAT_RETRY_GAP_MS
 			_chat_queue.push_front(text)
 			chat_queue_changed.emit())
@@ -412,7 +413,10 @@ func set_allow_pass(v: bool) -> void:
 	_post("/api/config", {"allow_pass": v})
 
 ## 本地音色运行期切换：只更新后端内存里的 TTS 配置（不重启后端、不丢棋局），下一句立即生效。
+## 同时记进字段：桌宠启动时后端可能还没起来，这条 POST 会失败——WS 连上后的 `_flush_settings`
+## 会把它和其他运行期设置一起补发。
 func set_tts_local_voice(v: String) -> void:
+	tts_local_voice = v
 	_post("/api/config", {"tts_local_voice": v})
 
 ## 由界面在她「落子宣告」的语音开始播放时调用：让后端把这一手推给棋盘显示
@@ -422,17 +426,57 @@ func reveal_move() -> void:
 func player_interaction(what: String) -> void:
 	_post("/api/interaction", {"what": what})
 
-func idle_remark() -> void:
-	_post("/api/idle")
+func idle_remark(mode := "game") -> void:
+	_post("/api/idle", {"mode": mode})
 
 ## 窥屏搭话：客户端截图 + OCR + VLM 后，把看到的内容交给后端组织台词。
-func peer_remark(info: Dictionary) -> void:
+func peer_remark(info: Dictionary, mode := "game") -> void:
 	_post("/api/peer", {"fg_title": str(info.get("fg_title", "")),
 		"ocr": str(info.get("ocr", "")),
-		"vlm": str(info.get("vlm", ""))})
+		"vlm": str(info.get("vlm", "")), "mode": mode})
 
 func tick_mood() -> void:
 	_post("/api/mood/tick")
+
+## 当前情绪快照（桌宠「心情 · 记忆」用）：`callback(ok, code, {v,c,a,name,...})`。
+## 同一情绪区域内的小幅数值变化不会发 mood 事件，桌宠点完 / 打开面板时主动拉一次。
+func fetch_mood(callback: Callable) -> void:
+	_fetch_json("/api/mood", HTTPClient.METHOD_GET, {}, callback)
+
+## 生命时间线快照（桌宠启动 / 重连）：`callback(ok, code, {state,temporal,events,...})`。
+## 与围棋共用同一条后端时间线；桌宠用 `temporal.since_interaction_sec` 判断“离开多久”。
+func fetch_life(callback: Callable) -> void:
+	_fetch_json("/api/life?limit=12", HTTPClient.METHOD_GET, {}, callback)
+
+## 资料箱文件列表（桌宠右键「资料与日程」）：`callback(ok, code, {folder,files,...})`。
+func fetch_assistant_files(callback: Callable) -> void:
+	_fetch_json("/api/files", HTTPClient.METHOD_GET, {}, callback, 20.0)
+
+## 共享日程列表：`callback(ok, code, {items:[...]})`。
+func fetch_schedule(callback: Callable) -> void:
+	_fetch_json("/api/schedule?limit=30", HTTPClient.METHOD_GET, {}, callback, 20.0)
+
+## 开始处理资料：OCR/VLM + LLM 提取日程是长任务，超时放宽到 5 分钟。
+func scan_assistant_files(callback: Callable) -> void:
+	_fetch_json("/api/files/scan", HTTPClient.METHOD_POST, {}, callback, 300.0)
+
+## 最近聊天流水（桌宠聊天面板 / 启动恢复）：`callback(ok, code, {"items":[...]})`。
+func fetch_chat_history(limit: int, callback: Callable) -> void:
+	_fetch_json("/api/chat/history?limit=%d" % clampi(limit, 1, 200),
+		HTTPClient.METHOD_GET, {}, callback)
+
+## 权威棋盘快照（从桌宠切回正式界面时补一次，防止后台走了几手而前端还停在旧盘面）。
+func fetch_state(callback: Callable) -> void:
+	_fetch_json("/api/state", HTTPClient.METHOD_GET, {}, callback)
+
+func memory_stats(callback: Callable) -> void:
+	_fetch_json("/api/memory/stats", HTTPClient.METHOD_GET, {}, callback)
+
+func memory_query(query: String, k: int, callback: Callable) -> void:
+	_fetch_json("/api/memory/query", HTTPClient.METHOD_POST, {"query": query, "k": k}, callback)
+
+func memory_write(text: String, tag := "") -> void:
+	_post("/api/memory/write", {"text": text, "tag": tag})
 
 ## 初始/重开后的情绪同步：remote 模式下由后端 hello 事件与 reset 事件推送，这里无需动作
 func sync_mood(_force := false, _quiet := false) -> void:
@@ -526,7 +570,8 @@ func _flush_settings() -> void:
 		return
 	_settings_dirty = false
 	_post("/api/config", {"reply_style": reply_style, "limit_len": reply_style == 0,
-		"think_mode": think_mode, "joseki_teach": joseki_teach, "joseki_rate": joseki_rate,
+		"think_mode": think_mode, "tts_local_voice": tts_local_voice,
+		"joseki_teach": joseki_teach, "joseki_rate": joseki_rate,
 		"emotion_drift": emotion_drift, "drift_base": drift_base, "chat_digest_llm": chat_digest_llm,
 		"profile_enabled": profile_enabled, "time_aware_enabled": time_aware_enabled,
 		"persona_enabled": persona_enabled,
@@ -534,6 +579,18 @@ func _flush_settings() -> void:
 		"persona_address_name": persona_address_name,
 		"adaptive_difficulty": adaptive_difficulty,
 		"adaptive_difficulty_base": adaptive_difficulty_base})
+
+## 取一次 JSON：HTTP 2xx 且响应体是对象才算 ok；其余一律 callback(false, code, {})。
+func _fetch_json(path: String, method: int, body: Dictionary, callback: Callable,
+		timeout := POST_TIMEOUT) -> void:
+	var done := func(ok: bool, code: int, data: PackedByteArray):
+		var parsed = JSON.parse_string(data.get_string_from_utf8())
+		var d := {}
+		if typeof(parsed) == TYPE_DICTIONARY:
+			d = parsed
+		if callback.is_valid():
+			callback.call(ok and typeof(parsed) == TYPE_DICTIONARY, code, d)
+	fetch_bytes(path, method, body, done, timeout)
 
 func _post(path: String, body: Dictionary = {}) -> bool:
 	var req := HTTPRequest.new()

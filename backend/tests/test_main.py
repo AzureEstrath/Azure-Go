@@ -72,6 +72,24 @@ class RestTest(unittest.TestCase):
             self.assertEqual(r.status_code, 200)
             self.assertTrue(r.json()["ok"])
 
+    def test_mood_snapshot_endpoint(self):
+        """`GET /api/mood`（桌宠）：返回与 hello.mood 同形的三维情绪快照。"""
+        with _client() as client:
+            r = client.get("/api/mood")
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            self.assertTrue(body["ok"])
+            for key in ("v", "c", "a", "name", "region", "morphs", "pitch"):
+                self.assertIn(key, body)
+            self.assertGreaterEqual(body["v"], 0.0)
+            self.assertLessEqual(body["v"], 1.0)
+
+            # 互动后仍能读到最新值（同一区域内的数值变化不走 mood 事件）
+            self.assertTrue(client.post("/api/interaction", json={"what": "patted"}).json()["ok"])
+            r2 = client.get("/api/mood")
+            self.assertTrue(r2.json()["ok"])
+            self.assertGreaterEqual(r2.json()["v"], body["v"] - 1e-9)
+
     def test_config_forwards_emotion_drift(self):
         """``/api/config`` 透传情绪波动开关与参数（v3.8.0）：脏值不生效、越界按上限夹取、绝不 500。
 
@@ -427,6 +445,22 @@ class MemoryApiEnabledTest(unittest.TestCase):
                 f = client.post("/api/memory/forget", json={"ids": [item["id"]]}).json()
                 self.assertEqual(f, {"ok": True, "removed": 1})
                 self.assertEqual(client.get("/api/memory/stats").json()["rows"], 0)
+
+    def test_chat_history_endpoint_and_shared_memory(self):
+        with tempfile.TemporaryDirectory() as d:
+            with TestClient(self._app(d)) as client:
+                r = client.post("/api/chat", json={"text": "我今天有点累", "mode": "pet"})
+                self.assertTrue(r.json()["ok"])
+                h = client.get("/api/chat/history?limit=10").json()
+                self.assertTrue(h["ok"])
+                self.assertEqual(len(h["items"]), 1)
+                self.assertEqual(h["items"][0]["mode"], "pet")
+                self.assertEqual(h["items"][0]["user_text"], "我今天有点累")
+                self.assertTrue(h["items"][0]["reply_text"].strip())
+                # 同一轮聊天也写进可召回记忆，围棋侧聊天/落子提示词能召回
+                q = client.post("/api/memory/query", json={"query": "今天有点累", "k": 3}).json()
+                self.assertTrue(q["items"])
+                self.assertTrue(any("今天有点累" in i["text"] for i in q["items"]))
 
     def test_duplicate_write_and_query_k(self):
         with tempfile.TemporaryDirectory() as d:

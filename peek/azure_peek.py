@@ -66,6 +66,8 @@ def parse_args():
     ap.add_argument("--vlm-url", default="",
                     help="VLM 服务地址（OpenAI 兼容，形如 http://127.0.0.1:8090/v1）；"
                          "为空或调用失败时回退到本地 llama_cpp（CPU）")
+    ap.add_argument("--peek-behind", action="store_true",
+                    help="前台是桌宠进程时，改为窥探 Z 序后一个非桌宠窗口（桌宠右键手动窥屏用）")
     return ap.parse_args()
 
 
@@ -108,6 +110,54 @@ def grab_window(rect):
     else:
         img = ImageGrab.grab(bbox=(l, t, r, b), all_screens=True)
     return img.convert("RGB")
+
+
+def find_behind_window(game_pid):
+    """从当前前台窗口往后（Z 序）找第一个可见、非本进程、标题非空且有可用矩形的窗口。
+
+    桌宠是小置顶窗：右键时它自己在前台，直接截它只会看到桌宠。只在 `--peek-behind`
+    时使用；找到后把窗口信息当作「前台」交给 OCR / VLM。
+    """
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindow.restype = wintypes.HWND
+    user32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+    user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+    user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.GetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int)
+
+    # 系统级全屏覆盖层 / 控制台不是「正在用的窗口」：按标题与工具窗样式跳过。
+    deny = ("单击以执行", "Windows 输入体验", "Program Manager", "Godot Engine (Console)",
+            "Microsoft Text Input Application", "Realtek Audio Console")
+    hwnd = user32.GetForegroundWindow()
+    cur = user32.GetWindow(hwnd, 2)          # GW_HWNDNEXT = 2：Z 序下一个窗口
+    for _ in range(64):
+        if not cur:
+            break
+        if user32.IsWindowVisible(cur):
+            n = user32.GetWindowTextLengthW(cur)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(cur, buf, n + 1)
+            title = buf.value.strip()
+            exstyle = int(user32.GetWindowLongW(cur, -20))      # GWL_EXSTYLE
+            if (title and not any(d in title for d in deny)
+                    and not (exstyle & 0x00000080)):              # WS_EX_TOOLWINDOW
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(cur, ctypes.byref(pid))
+                rect = wintypes.RECT()
+                user32.GetWindowRect(cur, ctypes.byref(rect))
+                r = (rect.left, rect.top, rect.right, rect.bottom)
+                if (int(pid.value) != int(game_pid)
+                        and r[2] - r[0] >= 200 and r[3] - r[1] >= 120):
+                    return title, int(pid.value), r
+        cur = user32.GetWindow(cur, 2)
+    return None
 
 
 def load_ocr():
@@ -197,21 +247,26 @@ def _img_to_b64(img, max_side):
     return base64.b64encode(buf.getvalue()).decode(), img
 
 
-def run_vlm_api(img, max_side, url, timeout=120.0):
-    """截图 → llama-server（OpenAI 兼容）的中文画面描述（GPU 常驻服务）"""
+def run_vlm_api(img, max_side, url, timeout=120.0, prompt=VLM_PROMPT, max_tokens=80,
+                system="你是一个简短的画面描述助手，始终用简体中文回答。"):
+    """截图 → llama-server（OpenAI 兼容）的中文描述（GPU 常驻服务）。
+
+    ``prompt`` / ``max_tokens`` / ``system`` 可覆盖：资料文件扫描会用更长、更结构化的
+    提取提示词；默认值与窥屏路径完全一致。
+    """
     import urllib.request
 
     b64, _ = _img_to_b64(img, max_side)
     payload = {
         "model": "vlm",
         "messages": [
-            {"role": "system", "content": "你是一个简短的画面描述助手，始终用简体中文回答。"},
+            {"role": "system", "content": system},
             {"role": "user", "content": [
-                {"type": "text", "text": VLM_PROMPT},
+                {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
             ]},
         ],
-        "max_tokens": 80,
+        "max_tokens": max(1, int(max_tokens)),
         "temperature": 0.3,
     }
     req = urllib.request.Request(
@@ -224,8 +279,8 @@ def run_vlm_api(img, max_side, url, timeout=120.0):
     return str(data["choices"][0]["message"]["content"]).strip()
 
 
-def run_vlm_cpu(img, max_side):
-    """截图 → Qwen2.5-VL 的中文画面描述（本地 llama_cpp，CPU，兜底路径）"""
+def run_vlm_cpu(img, max_side, prompt=VLM_PROMPT, max_tokens=100):
+    """截图 → Qwen2.5-VL 的中文描述（本地 llama_cpp，CPU，兜底路径）。"""
     b64, _ = _img_to_b64(img, max_side)
     from llama_cpp import Llama
     from llama_cpp.llama_chat_format import Qwen25VLChatHandler
@@ -239,11 +294,11 @@ def run_vlm_cpu(img, max_side):
         messages=[{
             "role": "user",
             "content": [
-                {"type": "text", "text": VLM_PROMPT},
+                {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
             ],
         }],
-        max_tokens=100,
+        max_tokens=max(1, int(max_tokens)),
         temperature=0.3,
     )
     return out["choices"][0]["message"]["content"].strip()
@@ -267,6 +322,14 @@ def main() -> int:
     try:
         title, pid, rect = foreground_window()
         is_game = (args.game_pid > 0 and pid == args.game_pid) or "azure" in title.lower()
+        if is_game and args.peek_behind:
+            behind = find_behind_window(args.game_pid)
+            if behind is not None:
+                title, pid, rect = behind
+                is_game = False
+                log("前台是桌宠，改为窥探其后窗口：%r pid=%d rect=%s" % (title, pid, rect))
+            else:
+                log("前台是桌宠，且身后没有可用窗口：本次不窥屏")
         result.update(fg_title=title, fg_pid=pid, is_game=is_game, ok=True)
         log("前台窗口：%r pid=%d rect=%s is_game=%s" % (title, pid, rect, is_game))
         if not is_game:

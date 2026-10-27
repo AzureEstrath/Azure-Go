@@ -26,6 +26,34 @@ from helpers import FixedRng, PvStubEngine
 from helpers import mk_agent as _mk
 
 
+class _RecallMemory:
+    """主动回忆的假记忆库：只实现 agent 用到的两个召回入口。"""
+
+    available = True
+
+    def __init__(self, items=None):
+        self.items = list(items or [])
+        self.queries = []
+
+    def recall_for(self, query, k=None):
+        return ""
+
+    def recall_items_for(self, query, k=None):
+        self.queries.append(str(query or ""))
+        return [dict(x) for x in self.items]
+
+
+class _StateLife:
+    """只给 ``_life_fields`` 读的假生命状态（不碰真实 life.db）。"""
+
+    def __init__(self, **kw):
+        self.state = {
+            "energy": 0.72, "boredom": 0.16, "affinity": 0.35,
+            "trust": 0.50, "dominance": 0.50,
+        }
+        self.state.update(kw)
+
+
 class FlowTest(unittest.TestCase):
     def test_full_turn_matches_e2e_expectations(self):
         async def run():
@@ -213,6 +241,128 @@ class FlowTest(unittest.TestCase):
 
         bus = asyncio.run(run())
         self.assertEqual(len(bus.messages(events.AI_IDLE)), 1)
+
+    def test_idle_pet_prompt_is_assistant_like_and_gentle_on_mood(self):
+        """桌宠是助手：开口基线要低，但闲置结算不能反复把她记成“被晾着”。"""
+
+        async def run():
+            agent, _eng, llm, bus = _mk()
+            before = (agent.mood.v, agent.mood.c, agent.mood.a)
+            await agent.idle_remark("pet")
+            return agent, llm, bus, before
+
+        agent, llm, bus, before = asyncio.run(run())
+        self.assertTrue(bus.messages(events.AI_IDLE))
+        joined = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertIn("桌面助手", joined)
+        self.assertNotIn("已经有一段时间没有动静", joined)
+        self.assertEqual(llm.think_modes[0], 0, "桌宠走神应走快速档，不为一句话等强思考")
+        self.assertGreater(agent.mood.v, before[0] - 0.02,
+                           "桌宠频繁开口不应每次都按完整 idle_bored 扣情绪")
+        self.assertGreaterEqual(agent.mood.v, before[0] - 1e-9,
+                                "桌宠 idle_near 不应把愉悦度往下拉")
+
+    def test_idle_recall_chance_uses_mood_and_slow_state(self):
+        agent, _eng, _llm, _bus = _mk()
+        agent.memory = _RecallMemory()
+        agent.life = _StateLife(energy=0.72, boredom=0.16, affinity=0.35, trust=0.50)
+        low = agent.idle_recall_chance()
+        agent.life = _StateLife(energy=0.80, boredom=0.95, affinity=0.85, trust=0.80)
+        agent.mood.v = 0.85
+        high = agent.idle_recall_chance()
+        self.assertGreater(high, low)
+        self.assertLessEqual(high, 0.30)
+        self.assertGreaterEqual(low, 0.03)
+
+    def test_idle_memory_query_is_mood_conditioned(self):
+        agent, _eng, _llm, _bus = _mk()
+        agent.memory = _RecallMemory()
+        agent.mood.v = 0.90
+        agent.mood.c = 0.50
+        agent.mood.a = 0.30
+        self.assertIn("温暖", agent.idle_memory_query())
+        agent.mood.v = 0.20
+        self.assertIn("陪伴", agent.idle_memory_query())
+        agent.mood.v = 0.55
+        agent.mood.c = 0.90
+        self.assertIn("最近在忙", agent.idle_memory_query())
+
+    def test_idle_memory_hint_deduplicates_recent_memories(self):
+        agent, _eng, _llm, _bus = _mk()
+        agent.memory = _RecallMemory([
+            {"id": 11, "text": "Estarth 上次说喜欢雨天摆棋。", "score": 0.9},
+            {"id": 12, "text": "Estarth 提过想去棋院看看。", "score": 0.8},
+        ])
+        agent.recall_rng = FixedRng(0.0)       # 概率门必定通过
+        h1 = agent.idle_memory_hint()
+        h2 = agent.idle_memory_hint()
+        h3 = agent.idle_memory_hint()
+        self.assertEqual(h1["id"], 11)
+        self.assertEqual(h2["id"], 12)
+        self.assertEqual(h3, {}, "同一条旧事 30 分钟内不重复；两条都用过就这次不提")
+        self.assertTrue(agent.memory.queries)
+
+    def test_idle_memory_hint_respects_probability_gate(self):
+        agent, _eng, _llm, _bus = _mk()
+        agent.memory = _RecallMemory([{"id": 1, "text": "旧事", "score": 1.0}])
+        agent.recall_rng = FixedRng(0.99)      # 高于任何合理概率
+        self.assertEqual(agent.idle_memory_hint(), {})
+
+    def test_idle_pet_prompt_can_include_specific_memory(self):
+        async def run():
+            agent, _eng, llm, _bus = _mk()
+            agent.memory = _RecallMemory([
+                {"id": 21, "text": "Estarth 上次说喜欢雨天的棋盘。", "score": 0.9},
+            ])
+            agent.recall_rng = FixedRng(0.0)
+            await agent.idle_remark("pet")
+            return llm
+
+        llm = asyncio.run(run())
+        joined = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertIn("喜欢雨天的棋盘", joined)
+        self.assertIn("不要编造", joined)
+
+    def test_idle_memory_hint_works_with_real_memory_service(self):
+        """真实 MemoryService + 临时库：没有 embedding 时关键词联想也能选中旧事。"""
+        from app.config import AzureConfig
+        from app.memory_service import MemoryService
+
+        with tempfile.TemporaryDirectory() as d:
+            cfg = AzureConfig()
+            cfg.memory_enabled = True
+            cfg.memory_db_path = os.path.join(d, "memory.db")
+            cfg.memory_top_k = 3
+            cfg.memory_max_inject_chars = 240
+            mem = MemoryService(cfg)
+            try:
+                mem.remember_fact("Estarth 上次说雨天摆棋很开心", tag="test")
+                agent, _eng, _llm, _bus = _mk()
+                agent.memory = mem
+                agent.mood.v = 0.90
+                agent.recall_rng = FixedRng(0.0)
+                hint = agent.idle_memory_hint()
+                self.assertTrue(hint)
+                self.assertIn("雨天", hint["text"])
+                self.assertIsInstance(hint["id"], int)
+            finally:
+                mem.close()
+
+    def test_idle_game_prompt_can_include_specific_memory(self):
+        """M2：桌宠与围棋闲聊共用同一份主动回忆。"""
+
+        async def run():
+            agent, _eng, llm, _bus = _mk()
+            agent.memory = _RecallMemory([
+                {"id": 31, "text": "Estarth 上次说喜欢雨天摆棋。", "score": 0.9},
+            ])
+            agent.recall_rng = FixedRng(0.0)
+            await agent.idle_remark("game")
+            return llm
+
+        llm = asyncio.run(run())
+        joined = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertIn("喜欢雨天摆棋", joined)
 
 
 class ControlTest(unittest.TestCase):

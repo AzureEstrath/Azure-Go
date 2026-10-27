@@ -57,6 +57,59 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(store.stats()["rows"], 3)
         store.close()
 
+    def test_chat_history_roundtrip_and_mood(self):
+        self.store.append_chat("你好呀", "我在呢。", mode="pet", mood={"v": 0.7, "c": 0.5, "a": 0.4})
+        self.store.append_chat("再来一句", "嗯哼。", mode="game", mood={"v": 0.6})
+        rows = self.store.recent_chats(10)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["user_text"], "你好呀")
+        self.assertEqual(rows[0]["mode"], "pet")
+        self.assertAlmostEqual(rows[0]["mood"]["v"], 0.7)
+        self.assertEqual(rows[1]["mode"], "game")
+
+    def test_episode_rolls_over_and_writes_summary(self):
+        # 6 轮内是同一段 episode；第 7 轮触发收束，并写一条可召回的 episode 摘要
+        for i in range(6):
+            self.store.append_episode_turn("pet", "第%d句" % i, "回应%d" % i)
+        rows = self.store.recent_episodes(5)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(int(rows[0]["turns"]), 6)
+        self.assertEqual(int(rows[0]["ended_ts"]), 0)
+        self.store.append_episode_turn("pet", "第7句", "回应7")
+        rows = self.store.recent_episodes(5)
+        self.assertEqual(len(rows), 2)
+        self.assertGreater(int(rows[0]["id"]), int(rows[1]["id"]))
+        self.assertTrue(any("最近聊天摘要" in h["text"] for h in self.store.recall("最近聊天", k=3)))
+        self.assertGreaterEqual(self.store.stats()["episodes"], 2)
+
+    def test_episode_splits_on_emotion_valence_jump(self):
+        """事件分割：同一段聊天里情绪效价大起大落时，另起一段而不是混成摘要。"""
+        self.store.append_episode_turn("pet", "今天很开心", "那就好",
+                                       mood={"v": 0.82, "c": 0.5, "a": 0.4})
+        self.store.append_episode_turn("pet", "继续说说", "嗯，我在听",
+                                       mood={"v": 0.80, "c": 0.5, "a": 0.4})
+        self.assertEqual(len(self.store.recent_episodes(5)), 1)
+        self.store.append_episode_turn("pet", "其实我有点难过", "怎么了",
+                                       mood={"v": 0.30, "c": 0.6, "a": 0.3})
+        rows = self.store.recent_episodes(5)
+        self.assertEqual(len(rows), 2)
+        self.assertGreaterEqual(int(rows[1]["ended_ts"]), int(rows[1]["started_ts"]))
+        self.assertTrue(any("最近聊天摘要" in h["text"] for h in self.store.recall("最近聊天", k=3)))
+
+    def test_close_episode_and_forget_all(self):
+        self.store.append_episode_turn("pet", "在吗", "在呢")
+        self.store.close_episode("pet")
+        self.assertTrue(any("最近聊天摘要" in h["text"] for h in self.store.recall("最近聊天", k=3)))
+        self.store.forget(all=True)
+        self.assertEqual(self.store.recent_episodes(5), [])
+        self.assertEqual(self.store.recall("最近聊天", k=3), [])
+
+    def test_forget_all_clears_chat_history(self):
+        self.store.append_chat("你好", "在呢", mode="pet")
+        self.assertEqual(len(self.store.recent_chats(10)), 1)
+        self.store.forget(all=True)
+        self.assertEqual(self.store.recent_chats(10), [])
+
     def test_forget_all(self):
         self.store.write("a", tag="t")
         self.store.write("b", tag="t")

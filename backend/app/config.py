@@ -60,6 +60,11 @@ class AzureConfig:
         self.profile_db_path = ""
         # 棋谱库路径（v3.11.5）：留空＝<backend>/data/games.db；与 profile / memory 一样只存路径。
         self.game_db_path = ""
+        # 生命时间线（拟人化 P0）：留空＝<backend>/data/life.db；与其它库一样只存路径、不在这里碰盘。
+        # 这条时间线始终装配（不受 memory_enabled 影响）——它是跨重启的“时间事实”，不是可选记忆。
+        self.life_db_path = ""
+        # 资料箱：桌宠右键「资料与日程」扫描的文件夹；留空＝<repo>/assistant_files/inbox。
+        self.assistant_inbox = ""
         # —— 自适应难度（v3.11.5）：默认关；基线 1 入门 … 5 严苛，局内最多在基线 ±spread 档内调整 ——
         self.adaptive_difficulty = False
         self.adaptive_difficulty_base = 3
@@ -198,6 +203,8 @@ class AzureConfig:
             self.persona_address_name = v.strip()[:16]
         self.profile_db_path = str(d.get("profile_db_path", self.profile_db_path))
         self.game_db_path = str(d.get("game_db_path", self.game_db_path))
+        self.life_db_path = str(d.get("life_db_path", self.life_db_path))
+        self.assistant_inbox = str(d.get("assistant_inbox", self.assistant_inbox))
         v = d.get("adaptive_difficulty")        # 只认 JSON true / false（与 profile_enabled 同口径）
         self.adaptive_difficulty = v if isinstance(v, bool) else self.adaptive_difficulty
         try:

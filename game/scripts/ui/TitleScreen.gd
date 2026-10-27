@@ -25,6 +25,7 @@ signal quit_pressed
 
 var _primary: Button = null
 var _hint: Label = null
+var _quit_btn: Button = null
 
 func _ready() -> void:
 	# 必须用 `set_anchors_and_offsets_preset`：`set_anchors_preset` 会保留当前尺寸（这里是 0），
@@ -124,13 +125,13 @@ func _build() -> void:
 	settings_btn.pressed.connect(func(): settings_pressed.emit())
 	row.add_child(settings_btn)
 
-	var quit_btn := Button.new()
-	quit_btn.text = "退出"
-	quit_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	quit_btn.custom_minimum_size = Vector2(0, 36)
-	GufengTheme.apply_button(quit_btn)
-	quit_btn.pressed.connect(func(): quit_pressed.emit())
-	row.add_child(quit_btn)
+	_quit_btn = Button.new()
+	_quit_btn.text = "退出"
+	_quit_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_quit_btn.custom_minimum_size = Vector2(0, 36)
+	GufengTheme.apply_button(_quit_btn)
+	_quit_btn.pressed.connect(func(): quit_pressed.emit())
+	row.add_child(_quit_btn)
 
 	_hint = Label.new()
 	_hint.text = "左键落子，右键拖拽旋转视角 · 对局中按 Esc 回主界面"
@@ -164,9 +165,22 @@ func set_restart_mode(on: bool) -> void:
 		_hint.text = ("Esc 开始新对局（上一局不保留） · 左键落子，右键拖拽旋转视角" if on
 			else "左键落子，右键拖拽旋转视角 · 对局中按 Esc 回主界面")
 
+## 从桌宠独立窗口拉起：继续 backend 里的上一局，不提示「上一局不保留」。
+func set_resume_mode() -> void:
+	if _primary != null:
+		_primary.text = "继续对局"
+	if _hint != null:
+		_hint.text = "棋局与记忆都保留着 · 左键落子，右键拖拽旋转视角 · Esc 回主界面"
+
 ## 主按钮文字（门卫用；不暴露内部节点）
 func primary_text() -> String:
 	return _primary.text if _primary != null else ""
+
+## 「退出」按钮的措辞：有桌宠时 Main 会改成「回桌宠」（不退出程序）
+func set_quit_text(text: String) -> void:
+	if _quit_btn != null:
+		_quit_btn.text = text
+		_quit_btn.tooltip_text = "退出正式界面，回到桌面上的 Azure" if text == "回桌宠" else ""
 
 ## 整块封面的不透明度（0..1）：淡入淡出由 `Main` 运镜时调用
 func set_alpha(a: float) -> void:

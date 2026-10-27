@@ -69,6 +69,11 @@ var vlm_model := ""               # 高级：VLM gguf 路径（留空自动找�
 var vlm_mmproj := ""              # 高级：视觉编码器 mmproj 路径（留空自动找）
 ## 自用版主视觉：warm / classic / mist / dark；默认雾蓝清透。只给客户端 `GufengTheme` 用。
 var ui_theme := "mist"
+## 桌面宠物形态（默认开）：启动先显示 2D 桌宠，右键「围棋陪练」才展开正式界面。
+## 关掉 = 回到旧版「启动即主界面」；`--no-pet` / `--pet` 可临时覆盖本次运行。
+var pet_enabled := true
+## 桌宠贴图显示高度（px，宽度按原图比例）；右键菜单可调、自动写回。默认 160。
+var pet_height := 160
 var llm_base_url := "https://api.deepseek.com/v1"   # 云端 LLM（OpenAI 兼容）地址；示例见 README 第四节
 var llm_model := "deepseek-chat"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
@@ -167,6 +172,8 @@ static func load_config(path := "") -> AzureConfig:
 			c.vlm_model = str(d.get("vlm_model", c.vlm_model)).strip_edges()
 			c.vlm_mmproj = str(d.get("vlm_mmproj", c.vlm_mmproj)).strip_edges()
 			c.ui_theme = _normalize_ui_theme(str(d.get("ui_theme", c.ui_theme)))
+			c.pet_enabled = _normalize_flag(d.get("pet_enabled"), c.pet_enabled)
+			c.pet_height = clampi(int(d.get("pet_height", c.pet_height)), 96, 360)
 			c.llm_base_url = str(d.get("llm_base_url", c.llm_base_url))
 			c.llm_model = str(d.get("llm_model", c.llm_model))
 			c.llm_api_key = str(d.get("llm_api_key", c.llm_api_key))
@@ -395,6 +402,8 @@ func save() -> bool:
 	d["vlm_model"] = vlm_model
 	d["vlm_mmproj"] = vlm_mmproj
 	d["ui_theme"] = ui_theme
+	d["pet_enabled"] = pet_enabled
+	d["pet_height"] = pet_height
 	d["llm_base_url"] = llm_base_url
 	d["llm_model"] = llm_model
 	d["llm_api_key"] = llm_api_key

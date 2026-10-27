@@ -10,15 +10,18 @@ config_version=5
 
 [application]
 
-config/name="Azure · 围棋陪练"
-config/description="本地 KataGo + 本地 LLM 的围棋陪练"
-run/main_scene="res://scenes/Main.tscn"
-config/features=PackedStringArray("4.6", "Forward Plus")
+config/name="Azure · 桌宠围棋助手"
+config/description="本地 AI 桌宠助手；围棋陪练是它打开的独立窗口"
+config/version="4.0.0"
+run/main_scene="res://scenes/Launcher.tscn"
+config/features=PackedStringArray("4.6", "GL Compatibility")
 
 [display]
 
-window/size/viewport_width=1280
-window/size/viewport_height=800
+window/size/viewport_width=360
+window/size/viewport_height=540
+window/size/transparent=true
+window/per_pixel_transparency/allowed=true
 
 [editor_plugins]
 
@@ -26,4 +29,7 @@ enabled=PackedStringArray("res://addons/azure_dev/plugin.cfg")
 
 [rendering]
 
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
 anti_aliasing/quality/msaa_3d=2
+viewport/transparent_background=true

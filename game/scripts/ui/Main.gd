@@ -227,6 +227,29 @@ var _buttons: Array[Button] = []
 var _btn_reset: Button = null                   # 🔄 重来：对局结束后仍可用（开新局），复盘时与其余三个一起冻
 var _shot_path := ""
 
+# —— 桌宠形态（启动默认；右键「围棋陪练」切回正式程序，退出再回到这里）——
+var _pet_feature_on := false                 # 本次运行是否启用桌宠（config.pet_enabled + 命令行）
+var _pet_active := false                     # 当前窗口正以桌宠形态存在
+var _pet_ui = null                           # PetMode（Control）
+var _pet_layer: CanvasLayer = null
+var _pet_online := false                     # 后端是否已连上（桌宠名字牌圆点）
+var _pet_memory_on := false                  # /api/memory/stats 的 db 非空 = 长期记忆已开
+var _pet_memory_rows := 0
+var _pet_pat_count := 0                      # 桌宠点击次数：每 5 次尝试写一条长期记忆
+var _pet_last_line := ""                     # 上一句本地反应（同组不连着复读）
+var _pet_audio_busy := false                 # 桌宠侧语音：串行取音频（保证播放顺序）
+var _pet_audio_queue: Array[Dictionary] = []
+var _game_booted := false                    # 3D / 正式 UI 已经建过（从桌宠回来不重复建）
+var _world_env: WorldEnvironment = null      # 回桌宠时要把 environment 摘掉，否则透明窗会被底色填满
+var _ui_layer: CanvasLayer = null
+var _game_saved_env: Environment = null
+var _game_saved_vis: Dictionary = {}
+var _services_started := false               # 本次运行已经拉起过 dev_local（桌宠与对局共用）
+var _mood_timer_started := false
+var _pet_mood_fetching := false
+var _from_pet := false                      # 由 PetShell 拉起的独立围棋窗口
+var _keep_game := false                     # 保留 backend 里的上一局，不在启动/进桌面前 reset
+
 ## —— 局后只读复盘（v3.7.0 任务 D）——
 ## 入口只在**对局结束后**出现（`st.finished` 全仓没人读 ⇒ 前端自己记一个本地标志，V19）；
 ## 复盘期间棋盘只读、四个按钮置灰、聊天禁用，退出时**逐项恢复**（V20/V21）。
@@ -270,16 +293,45 @@ var _btn_next: Button                      # 下一手 ▶（只在复盘模式�
 var _btn_send: Button                      # 聊天发送（复盘期间与输入框一起禁用）
 
 func _ready() -> void:
+	_boot_common()
+	# 围棋窗口永远只是「正式对局」：桌宠由 Launcher / PetShell 负责。
+	# `--from-pet` 表示这个窗口是桌宠拉起的独立进程，关窗即退出，由桌宠恢复自己。
+	_pet_feature_on = false
+	get_tree().auto_accept_quit = true
+	await _boot_game()
+
+## 启动时的公共初始化：配置、主题、字体、语音配对 / 音效。3D 世界与正式 UI 留到 `_boot_game()`。
+func _boot_common() -> void:
 	_last_activity_ms = Time.get_ticks_msec()
 	_last_player_activity_ms = _last_activity_ms  # 窥屏门槛用真实玩家操作时钟
 	_peek_last_ms = -PEEK_COOLDOWN_MS             # 允许开局后第一次长闲置就窥屏
 	_last_filler_ms = _last_activity_ms           # 开局先给一个最短间隔，不因初始 mood 立刻响语气词
 	cfg = AzureConfig.load_config()
 	_apply_cli_overrides()
+	_from_pet = _has_cli_arg("--from-pet")
+	_keep_game = _from_pet or _has_cli_arg("--keep-game")
 	GufengTheme.apply_preset(cfg.ui_theme)     # 建任何 UI 之前先落主题（默认雾蓝）
 	_build_pairing()                           # 语音配对状态机：只做决策，副作用回调回本文件
 	_build_sfx()                               # 对局音效：预加载 6 个音频、4 个播放器轮转
 	_font = _make_cjk_font()
+
+## 启动为 2D 桌宠：透明置顶小窗 + 右键菜单。正式棋盘 / 化身此时不建，首次进对局才建。
+func _boot_pet() -> void:
+	_pet_active = true
+	_build_pet_ui()
+	_enter_pet_window()
+	_build_pet_services()
+	_services_started = _maybe_start_local_services()
+	_pet_greet()
+	# 项目名的窗口标题会在首帧由引擎回填一次；延迟一帧再落桌宠标题（实机验证过）
+	get_tree().create_timer(0.2).timeout.connect(_refresh_pet_title)
+
+## 正式围棋助手：窗口恢复 1280×800，再建 3D 世界 / 棋盘 / 侧栏 / 封面。
+func _boot_game() -> void:
+	if _game_booted:
+		return
+	_game_booted = true
+	_enter_game_window()
 	_build_world()
 	_build_board()
 	_build_ui()
@@ -289,7 +341,8 @@ func _ready() -> void:
 	if _cover_only and _shot_requested:
 		_handle_cli()                          # 只拍封面：不起服务 / 不叠问候，避免聊天面板透在纸幕后
 		return
-	await _maybe_show_setup()                  # 启动设置面板：思考模式 + 各 API 配置（默认=当前配置）；确认后按新配置起服务
+	if not _from_pet:
+		await _maybe_show_setup()              # 桌宠拉起的围棋窗口沿用已有配置，不再弹启动设置
 	if not _shot_requested:
 		var cosy := await _maybe_ask_cosyvoice()
 		var quality: bool = bool(cosy.get("quality", false))
@@ -298,7 +351,7 @@ func _ready() -> void:
 		_local_tts_loading = quality and (spawned or _services_prewarmed)
 		if wait_tts and spawned:
 			await _wait_local_tts_ready(true)
-	if not _shot_requested:
+	if not _shot_requested and not _keep_game:
 		_begin_new_game_on_entry()             # 先立「等 reset」闸：hello 里上一局的迟到 state 不许闪出来
 	if agent == null:
 		_build_services()                      # 从主界面直接进过棋谱库时已经起过：不重复装配
@@ -306,9 +359,468 @@ func _ready() -> void:
 		tts.set_suppress_system(_local_tts_loading)   # 装配时质量引擎还在加载：连第一句系统语音也压掉
 	if _local_tts_loading:
 		_watch_local_tts_ready()               # 不阻塞进对局：后台等就绪后解除「只显示文字」
-	_start_launch_game()                       # 首次进对局也保证空局（后端可能还留着上次运行的棋局）
-	_greet()
+	if not _keep_game:
+		_start_launch_game()                   # 首次进对局也保证空局（后端可能还留着上次运行的棋局）
+		_greet()
+	else:
+		_set_status("继续上次对局：棋局与记忆都保留着。")
+		_keep_game = false                     # 只保留这一次启动；对局中按 Esc 再进仍是「开始新对局」
 	_handle_cli()
+
+## 纯函数（门卫可测）：这次运行要不要以桌宠形态启动。
+## 截图 / 演示 / 无头一律不要（会卡在等点击）；`--no-pet` 显式关闭；`--pet` 强制打开。
+static func should_start_in_pet_mode(enabled: bool, user_args: PackedStringArray,
+		headless := false) -> bool:
+	if headless:
+		return false
+	var force := false
+	for a in user_args:
+		if a == "--no-pet" or a == "--game":
+			return false
+		if a == "--title" or a == "--demo" or a == "--setup" or a.begins_with("--shot="):
+			return false
+		if a == "--pet":
+			force = true
+	return force or enabled
+
+func _has_cli_arg(want: String) -> bool:
+	for a in OS.get_cmdline_user_args():
+		if a == want:
+			return true
+	return false
+
+# ================= 桌宠形态（窗口 / 界面 / 服务） =================
+
+const PetModeScript := preload("res://scripts/ui/PetMode.gd")
+
+func _build_pet_ui() -> void:
+	_pet_layer = CanvasLayer.new()
+	_pet_layer.name = "PetLayer"
+	add_child(_pet_layer)
+	var root := Control.new()
+	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.theme = GufengTheme.build_theme(_font)
+	_pet_layer.add_child(root)
+	_pet_ui = PetModeScript.new()
+	_pet_ui.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_pet_ui.theme = root.theme
+	root.add_child(_pet_ui)
+	_pet_ui.go_requested.connect(_enter_game_from_pet)
+	_pet_ui.peek_requested.connect(_pet_request_peek)
+	_pet_ui.talk_requested.connect(_pet_request_talk)
+	_pet_ui.status_requested.connect(_pet_show_status)
+	_pet_ui.mute_toggled.connect(_pet_on_mute)
+	_pet_ui.quit_requested.connect(_pet_quit)
+	_pet_ui.interacted.connect(_pet_on_interact)
+
+func _enter_pet_window() -> void:
+	if DisplayServer.get_name() == "headless":
+		return
+	DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
+	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
+	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_ALWAYS_ON_TOP, true)
+	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_TRANSPARENT, true)
+	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_RESIZE_DISABLED, true)
+	get_viewport().transparent_bg = true
+	DisplayServer.window_set_title("Azure · 桌宠")
+	DisplayServer.window_set_size(PetMode.WINDOW_SIZE)
+	if _pet_ui != null:
+		_pet_ui.restore_window_position()
+
+func _enter_game_window() -> void:
+	if DisplayServer.get_name() != "headless":
+		# 透明标志保留在 OS 层（运行期重新打开并不可靠）；正式界面的不透明由
+		# `transparent_bg=false` + 3D 环境底色保证，像素本身仍是不透明的。
+		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_TRANSPARENT, true)
+		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_ALWAYS_ON_TOP, false)
+		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, false)
+		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_RESIZE_DISABLED, false)
+		get_viewport().transparent_bg = false
+		DisplayServer.window_set_title("Azure · 围棋陪练")
+		DisplayServer.window_set_size(Vector2i(1280, 800))
+		var scr := DisplayServer.screen_get_usable_rect(DisplayServer.window_get_current_screen())
+		DisplayServer.window_set_position(scr.position + (scr.size - Vector2i(1280, 800)) / 2)
+	if _pet_layer != null:
+		_pet_layer.visible = false
+	if _pet_ui != null:
+		_pet_ui.visible = false
+	if _ui_root != null:
+		_restore_game_for_pet()
+
+## 回桌宠：把 3D 底色 / 棋盘 / 化身 / 正式 UI 暂时收起（透明窗只留 2D 桌宠）
+func _hide_game_for_pet() -> void:
+	if not _game_booted:
+		return
+	_game_saved_vis = {
+		"ui": _ui_root != null and _ui_root.visible,
+		"board": board != null and board.visible,
+		"avatar": avatar != null and avatar.visible,
+	}
+	if _world_env != null:
+		_game_saved_env = _world_env.environment
+		_world_env.environment = null
+	if _ui_layer != null:
+		_ui_layer.visible = false
+	if board != null:
+		board.visible = false
+	if avatar != null:
+		avatar.visible = false
+
+func _restore_game_for_pet() -> void:
+	if _world_env != null and _game_saved_env != null:
+		_world_env.environment = _game_saved_env
+	if _ui_layer != null:
+		_ui_layer.visible = bool(_game_saved_vis.get("ui", true))
+	if board != null:
+		board.visible = bool(_game_saved_vis.get("board", true))
+	if avatar != null:
+		avatar.visible = bool(_game_saved_vis.get("avatar", true))
+
+## 右键「围棋陪练」：隐藏桌宠，恢复 1280×800 正式程序；首次进入才建 3D / 侧栏。
+func _enter_game_from_pet() -> void:
+	if not _pet_active:
+		return
+	if _pet_ui != null:
+		_pet_ui.close_menu()
+		_pet_ui.save_window_position()
+	_pet_active = false
+	_pet_audio_queue.clear()
+	if tts != null:
+		tts.stop()                                # 桌宠的欢迎 / 语气词不要继续跟进正式对局
+	if _pet_layer != null:
+		_pet_layer.visible = false
+	_enter_game_window()
+	if not _game_booted:
+		await _boot_game()
+	else:
+		if agent != null:
+			_on_busy_changed(agent.busy)
+			agent.fetch_state(func(ok: bool, _code: int, d: Dictionary):
+				if ok and not d.is_empty():
+					_on_state_changed(d))
+		_on_mood_changed({
+			"v": _mood_v, "c": _mood_c, "a": _mood_a, "name": _mood_name,
+			"morphs": {}, "burst": "", "pitch": 0.0,
+		})
+		_refresh_lock()
+		_bump_activity()
+
+## 退出正式程序回桌宠（标题「退出」/ 直接关窗都走这里；真正退出只走桌宠菜单）
+func _return_to_pet() -> void:
+	if not _pet_feature_on:
+		get_tree().quit()
+		return
+	if _pet_active:
+		return
+	_pet_active = true
+	_hide_game_for_pet()
+	_enter_pet_window()
+	if _pet_layer != null:
+		_pet_layer.visible = true
+	if _pet_ui != null:
+		_pet_ui.visible = true
+		_refresh_pet_title()
+		_pet_ui.set_online(_pet_online)
+		_pet_ui.set_mood({
+			"v": _mood_v, "c": _mood_c, "a": _mood_a, "name": _mood_name,
+		})
+		_pet_ui.show_bubble("棋局先放这儿，我在这儿等你。", 6.0)
+	if tts != null and tts.enabled and _pet_ui != null and not _pet_ui.is_muted():
+		tts.play_filler("happy", true)
+	_bump_activity()
+
+func _on_title_quit() -> void:
+	if _from_pet:
+		get_tree().quit()                     # 桌宠进程会监测本进程退出并恢复
+	elif _pet_feature_on:
+		_return_to_pet()
+	else:
+		get_tree().quit()
+
+func _pet_quit() -> void:
+	if _pet_ui != null:
+		_pet_ui.save_window_position()
+	get_tree().quit()
+
+func _refresh_pet_title() -> void:
+	if _pet_active and DisplayServer.get_name() != "headless":
+		DisplayServer.window_set_title("Azure · 桌宠")
+
+func _notification(what: int) -> void:
+	if what != NOTIFICATION_WM_CLOSE_REQUEST or not _pet_feature_on:
+		return
+	if _pet_active:
+		if _pet_ui != null:
+			_pet_ui.save_window_position()
+		get_tree().quit()
+	else:
+		_return_to_pet()
+
+## 桌宠启动时的问候：优先用预制欢迎语音（与正式版同一句），没有就退回系统语音 / 纯文字。
+func _pet_greet() -> void:
+	if _pet_ui == null:
+		return
+	_pet_ui.set_online(false, "正在连接后端…")
+	_pet_ui.set_mood({"v": _mood_v, "c": _mood_c, "a": _mood_a, "name": _mood_name})
+	var name := cfg.prompt_user_name
+	var welcome := "嗯~ %s，来下棋吧...我会陪你的 (｡･ω･｡)" % name
+	var spoken := false
+	if tts != null and tts.enabled and not _pet_ui.is_muted():
+		spoken = tts.play_welcome(name)
+		if spoken:
+			_pet_ui.show_bubble(welcome, 8.0)
+		else:
+			var plain := "嗯，%s，我在这里。右键可以找我下棋，也可以让我看看你在忙什么。" % name
+			tts.speak_system(plain, 0, "idle")
+			_pet_ui.show_bubble(plain, 8.0)
+	else:
+		_pet_ui.show_bubble("嗯，%s，我在这里。右键可以找我下棋。" % name, 8.0)
+
+## 左键摸头：视觉反馈 + 本地语气词 + 后端情绪增量；同区域数值变化用 /api/mood 补一次。
+func _pet_on_interact() -> void:
+	if _pet_ui == null:
+		return
+	_bump_activity()
+	_idle_muted = true                         # 玩家已经回来：在途的走神搭话连同气泡一起作废
+	_pet_ui.play_pat_effect()
+	_pet_pat_count += 1
+	var band := PetMode.mood_band(_mood_name, _mood_v)
+	var line := ""
+	for i in 4:
+		var cand := PetMode.pick_reaction(band, randf())
+		if cand != _pet_last_line:
+			line = cand
+			break
+		line = cand
+	_pet_last_line = line
+	_pet_ui.show_bubble(line, 0.0)
+	if tts != null and tts.enabled and not _pet_ui.is_muted():
+		tts.play_filler("pat", true)
+	if agent != null:
+		agent.player_interaction("patted")
+		get_tree().create_timer(0.35).timeout.connect(_pet_fetch_mood)
+		if _pet_memory_on and _pet_pat_count % 5 == 0:
+			agent.memory_write("Estarth 在桌面上摸了摸 Azure 的头。", "桌宠")
+
+func _pet_on_mute(muted: bool) -> void:
+	if _pet_ui != null:
+		_pet_ui.set_muted(muted)
+	if muted and tts != null:
+		tts.stop()
+
+func _pet_request_talk() -> void:
+	if _pet_ui == null:
+		return
+	_bump_activity()
+	_idle_muted = false                         # 手动叫她说话：允许这条走神回复
+	if agent == null or not _pet_online:
+		_pet_say_local(_pet_pick_local_line())
+		return
+	if agent.busy:
+		_pet_ui.show_bubble("你先下着，我这一手还没想完。", 4.0)
+		return
+	_pet_ui.show_thinking("嗯…让我想想。")
+	agent.idle_remark()
+
+## 手动窥屏：桌宠窗口在前台时看不到别的窗口，退化为普通搭话（自动窥屏在 _pet_tick 里）。
+func _pet_request_peek() -> void:
+	if _pet_ui == null:
+		return
+	_bump_activity()
+	if not cfg.vlm_enabled:
+		_pet_ui.show_bubble("窥屏关着。想让我看的话，在设置里打开「窥屏」。", 5.0)
+		return
+	if _peek_busy:
+		_pet_ui.show_bubble("我还在看呢，稍等一下。", 3.0)
+		return
+	if agent == null or not _pet_online:
+		_pet_say_local("还没连上后端，我先陪你聊两句吧。")
+		return
+	if not _peek_available():
+		_pet_ui.show_bubble("窥屏环境还没准备好，先普通聊两句。", 4.0)
+		agent.idle_remark()
+		return
+	_idle = true
+	_idle_muted = false
+	_pet_ui.show_bubble("让我看看你在忙什么…", 8.0)
+	_start_peek(Time.get_ticks_msec())
+
+## 「心情 · 记忆」：三维数值来自后端，记忆体量来自 /api/memory/stats；开着长期记忆时再召回一条。
+func _pet_show_status() -> void:
+	if _pet_ui == null:
+		return
+	_pet_ui.show_bubble("让我看看今天的心情…", 2.0)
+	if agent == null:
+		_pet_ui.show_bubble(_pet_status_text("后端未连接，记忆也读不到。"), 9.0)
+		return
+	_pet_fetch_mood(func():
+		if not _pet_online:
+			_pet_ui.show_bubble(_pet_status_text("后端未连接，先看本地缓存。"), 9.0)
+			return
+		agent.memory_stats(func(ok: bool, _code: int, d: Dictionary):
+			if not ok:
+				_pet_ui.show_bubble(_pet_status_text("记忆库暂时没有回应。"), 9.0)
+				return
+			_pet_memory_on = str(d.get("db", "")) != ""
+			_pet_memory_rows = int(d.get("rows", 0))
+			if not _pet_memory_on:
+				_pet_ui.show_bubble(_pet_status_text("长期记忆还关着（在正式界面的设置里打开）。"), 10.0)
+				return
+			var games := int(d.get("games", 0))
+			agent.memory_query("桌宠 陪伴 摸头", 1, func(ok2: bool, _c2: int, q: Dictionary):
+				var items: Array = q.get("items", []) if ok2 else []
+				if not items.is_empty():
+					var text := str((items[0] as Dictionary).get("text", "")).strip_edges()
+					if text.length() > 52:
+						text = text.substr(0, 52) + "…"
+					_pet_ui.show_bubble(_pet_status_text(
+						"我还记得：%s\n记忆库：%d 条 · %d 局" % [text, _pet_memory_rows, games]), 12.0)
+				else:
+					_pet_ui.show_bubble(_pet_status_text(
+						"记忆库：%d 条 · %d 局" % [_pet_memory_rows, games]), 10.0)
+			)
+		)
+	)
+
+func _pet_status_text(memory_line: String) -> String:
+	var head := "心情：%s\n" % PetMode.mood_summary(_mood_v, _mood_c, _mood_a, _mood_name)
+	if not _pet_online:
+		head = "心情（离线缓存）：%s\n" % PetMode.mood_summary(_mood_v, _mood_c, _mood_a, _mood_name)
+	return head + memory_line
+
+func _pet_fetch_mood(done := Callable()) -> void:
+	if agent == null:
+		if done.is_valid():
+			done.call()
+		return
+	if _pet_mood_fetching:
+		if done.is_valid():
+			done.call()
+		return
+	_pet_mood_fetching = true
+	agent.fetch_mood(func(ok: bool, _code: int, d: Dictionary):
+		_pet_mood_fetching = false
+		if ok and not d.is_empty():
+			_on_mood_changed(d)
+		if done.is_valid():
+			done.call())
+
+func _pet_refresh_memory() -> void:
+	if agent == null:
+		return
+	agent.memory_stats(func(ok: bool, _code: int, d: Dictionary):
+		if ok:
+			_pet_memory_on = str(d.get("db", "")) != ""
+			_pet_memory_rows = int(d.get("rows", 0)))
+
+## 本地短句：显示气泡；后端在线时用 /api/tts/speak 合成，离线 / 失败退回系统语音。
+func _pet_say_local(text: String, speak := true) -> void:
+	if _pet_ui == null:
+		return
+	_pet_ui.show_bubble(text, 0.0)
+	if not speak or tts == null or not tts.enabled or _pet_ui.is_muted():
+		return
+	if agent != null and _pet_online:
+		var done := func(ok: bool, _code: int, body: PackedByteArray):
+			if not _pet_active or (_pet_ui != null and _pet_ui.is_muted()):
+				return
+			if ok and not body.is_empty():
+				tts.play_audio(body, 0, "idle")
+			else:
+				tts.speak_system(text, 0, "idle")
+		agent.fetch_bytes("/api/tts/speak", HTTPClient.METHOD_POST, {"text": text},
+			done, TTS_FETCH_TIMEOUT)
+	else:
+		tts.speak_system(text, 0, "idle")
+
+func _pet_pick_local_line() -> String:
+	var band := PetMode.mood_band(_mood_name, _mood_v)
+	var line := ""
+	for i in 4:
+		var cand := PetMode.pick_reaction(band, randf())
+		if cand != _pet_last_line:
+			line = cand
+			break
+		line = cand
+	_pet_last_line = line
+	return line
+
+## 桌宠收到后端台词：只更新气泡 + 小动作，不走正式界面的聊天队列 / 配对表。
+func _pet_add_msg(kind: String, text: String) -> void:
+	if _pet_ui == null or not kind.begins_with("ai"):
+		return
+	if kind == "ai_review":
+		return
+	if kind == "ai_idle" and _idle_muted:
+		return                                    # 摸头 / 手动互动后，旧的走神搭话不再冒出来
+	var tp := _strip_tone(text)
+	text = str(tp[1])
+	var ap := _strip_actions(text)
+	text = str(ap[1]).strip_edges()
+	var acts: Array = ap[0]
+	if not acts.is_empty():
+		_pet_ui.play_actions(acts)
+	if text == "":
+		return
+	_pet_ui.show_bubble(text, 0.0)
+
+## 后端 speech 指令：桌宠侧独立取音频 / 系统语音，不占正式界面的配对位。
+func _pet_play_speech(payload: Dictionary) -> void:
+	if tts == null or not tts.enabled or _pet_ui == null or _pet_ui.is_muted():
+		return
+	var smode := str(payload.get("mode", ""))
+	if smode != "openai" and smode != "system":
+		return
+	if smode == "system":
+		tts.speak_system(str(payload.get("text", "")), int(payload.get("seq", 0)), "idle")
+		return
+	_pet_audio_queue.append({
+		"id": str(payload.get("id", "")),
+		"seq": int(payload.get("seq", 0)),
+	})
+	_pet_pump_audio()
+
+func _pet_pump_audio() -> void:
+	if _pet_audio_busy or _pet_audio_queue.is_empty() or agent == null:
+		return
+	_pet_audio_busy = true
+	var job: Dictionary = _pet_audio_queue.pop_front()
+	var done := func(ok: bool, code: int, body: PackedByteArray):
+		_pet_audio_busy = false
+		if not _pet_active or (_pet_ui != null and _pet_ui.is_muted()):
+			pass                                    # 已切进正式对局 / 静音：这条晚到的音频丢掉
+		elif ok and not body.is_empty():
+			tts.play_audio(body, int(job.get("seq", 0)), "idle")
+		else:
+			print("[Pet] 语音取回失败：HTTP %d" % code)
+		_pet_pump_audio()
+	agent.fetch_bytes("/api/tts/audio/%s" % str(job.get("id", "")), HTTPClient.METHOD_GET, {},
+		done, TTS_FETCH_TIMEOUT)
+
+## 桌宠模式的每帧：闲置搭话 / 自动窥屏 / 窥屏结果收口。正式对局的 _process 不跑。
+func _pet_tick(delta: float) -> void:
+	var now := Time.get_ticks_msec()
+	var hold: bool = (agent != null and agent.busy) or (tts != null and tts.is_speaking()) \
+		or (_pet_ui != null and bool(_pet_ui.is_menu_open()))
+	if hold:
+		_last_activity_ms = now
+		if _idle:
+			_idle = false
+	if not _idle and now - _last_activity_ms >= int(IDLE_SEC * 1000.0):
+		_idle = true
+		_next_talk_ms = now + int(idle_talk_delay(_hour_now(), false, true, 0.0) * 1000.0)
+	if _idle and now >= _next_talk_ms and agent != null and not agent.busy:
+		_next_talk_ms = now + int(idle_talk_delay(_hour_now(), false, false, randf()) * 1000.0)
+		_idle_muted = false
+		_request_idle_talk(now)
+	if _peek_busy:
+		_tick_peek(now)
+	pairing.release_stale(_pair_facts())
+	if _pet_ui != null:
+		_pet_ui.set_speaking(tts != null and tts.is_speaking())
+		if not (agent != null and agent.busy):
+			_pet_ui.clear_if_thinking()
 
 ## 自用版启动便利：游戏启动时自动拉起本地模型链路（LLM / TTS / KataGo / 后端）。
 ## 由 `dev_local.ps1` 拉起游戏时环境里有 AZURE_SERVICES_MANAGED=1，不再重复拉起。
@@ -330,6 +842,8 @@ static func hidden_launcher_args(vbs: String, script: String, quality: bool, wai
 func _maybe_start_local_services(quality_tts := false, wait_tts := false, tts_only := false) -> bool:
 	if DisplayServer.get_name() == "headless":
 		return false                              # 无头测试 / 自检：不拉起服务
+	if _services_started and not quality_tts and not tts_only:
+		return false                              # 桌宠启动时已拉起过：进对局不重复起一套
 	if not cfg.auto_start_services:
 		return false
 	if not _is_local_url(cfg.backend_url):
@@ -364,6 +878,7 @@ func _maybe_start_local_services(quality_tts := false, wait_tts := false, tts_on
 				args.append("-NoWaitTts")
 		pid = OS.create_process(ps, args)
 	if pid > 0:
+		_services_started = true
 		if tts_only:
 			_set_status("正在后台预加载 CosyVoice（主界面 / 设置面板期间）…" if quality_tts
 					else "正在后台预加载本地语音（主界面 / 设置面板期间）…")
@@ -386,6 +901,8 @@ func _maybe_start_local_services(quality_tts := false, wait_tts := false, tts_on
 func _prewarm_local_services() -> void:
 	if DisplayServer.get_name() == "headless":
 		return
+	if _services_started:
+		return                                      # 桌宠启动时整套服务已经在跑
 	if not cfg.auto_start_services or not _is_local_url(cfg.backend_url):
 		return
 	if not FileAccess.file_exists(_dev_local_script()):
@@ -656,7 +1173,8 @@ func _make_cjk_font() -> Font:
 	return GufengTheme.font()
 
 func _build_world() -> void:
-	var we := WorldEnvironment.new()
+	_world_env = WorldEnvironment.new()
+	var we := _world_env
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
 	env.background_color = GufengTheme.WORLD_BG   # 自用版：无背景板 / 无地板，只留主题底色
@@ -695,7 +1213,8 @@ func _build_board() -> void:
 # ================= 界面 =================
 
 func _build_ui() -> void:
-	var layer := CanvasLayer.new()
+	_ui_layer = CanvasLayer.new()
+	var layer := _ui_layer
 	add_child(layer)
 
 	var root := Control.new()
@@ -1961,6 +2480,11 @@ func _button(parent: Node, text: String, cb: Callable) -> Button:
 	return b
 
 func _add_msg(kind: String, text: String) -> void:
+	if _pet_active:
+		_pet_add_msg(kind, text)
+		return
+	if _chat_box == null:
+		return                                    # 从桌宠切回正式界面、聊天区还没建：先丢弃迟到消息
 	var is_ai := kind.begins_with("ai")
 	var speak_kind := "idle" if kind == "ai_idle" else ""
 	var text_only := pairing.take_text_only_mark(kind) if is_ai else false
@@ -2032,7 +2556,7 @@ static func message_needs_speech(kind: String, text_only := false) -> bool:
 ## 流式增量（后端 `stream_tokens` 开启时才有；默认关闭时这个回调一次都不会被调用到）：
 ## 增量直接追加到本轮的流式气泡；气泡的最终内容一律由随后的 `message` 收口（见 _add_msg_now）
 func _on_token_event(turn_id: String, delta: String) -> void:
-	if delta == "":
+	if _pet_active or delta == "" or _chat_box == null:
 		return
 	if _stream_label == null or not is_instance_valid(_stream_label) or turn_id != _stream_turn:
 		_stream_turn = turn_id                       # 新的一轮发言：另起一个流式气泡
@@ -2232,6 +2756,8 @@ func _release_batch(force_show: bool) -> void:
 	_flush_pending_ai()                 # 已经在响了 / 需要保序：先显示文字
 
 func _add_msg_now(kind: String, text: String) -> void:
+	if _chat_box == null:
+		return                                    # 转场期间 UI 还没建好：不往空面板里塞气泡
 	# 全局形势卡：把「落子宣告」之后那句（第三句）同步到卡片；与聊天共用同一份文本。
 	if kind.begins_with("ai"):
 		if kind == "ai" and _last_ai_kind == "ai_move" and _card_global != null:
@@ -2652,6 +3178,8 @@ func _render_bad_moves(list: Array) -> void:
 	_refresh_lock()
 
 func _set_status(text: String, bad := false) -> void:
+	if _lbl_status == null:
+		return                                    # 桌宠阶段 / 正式 UI 还没建：状态栏不存在
 	_status_bad = bad
 	_lbl_status.text = text
 	_lbl_status.add_theme_color_override("font_color",
@@ -2725,8 +3253,10 @@ func _build_title_screen() -> void:
 	title_screen.primary_pressed.connect(_on_title_primary)
 	title_screen.settings_pressed.connect(_on_title_settings)
 	title_screen.library_pressed.connect(_on_title_library)
-	title_screen.quit_pressed.connect(func(): get_tree().quit())
+	title_screen.quit_pressed.connect(_on_title_quit)
 	_ui_root.add_child(title_screen)
+	if _pet_feature_on or _from_pet:
+		title_screen.set_quit_text("回桌宠")
 
 ## 首次启动时显示封面并等「开始对局」。调试模式：
 ## `--shot=` / `--demo` / `--setup` 默认跳过（截图与自动开局都别被封面挡住）；
@@ -2759,7 +3289,10 @@ func _open_title_screen(animated := false) -> void:
 	_hide_estimate()                              # 封面期间不留对局内的临时注记
 	if board != null:
 		board.input_blocked = true                # 封面期间 Home / C / 拖拽 / 滚轮都不许动视角
-	title_screen.set_restart_mode(_game_started)  # 首次「开始对局」/ 对局中回来「开始新对局」
+	if _keep_game and not _game_started:
+		title_screen.set_resume_mode()             # 从桌宠拉起：继续 backend 里的上一局
+	else:
+		title_screen.set_restart_mode(_game_started)  # 首次「开始对局」/ 对局中回来「开始新对局」
 	_idle = false
 	_set_idle_state(false)
 	_refresh_lock()
@@ -2862,12 +3395,12 @@ func _on_title_primary() -> void:
 	if _transition or _setup_showing:
 		return                                   # 运镜中 / 设置面板已开：不重入
 	var first := not _game_started
-	if first and not _setup_done:
+	if first and not _setup_done and not _from_pet:
 		_transition = true                       # 面板开着也算「切换中」：Esc 与重复点击都不响应
 		_build_setup_panel()
 		await setup_confirmed
 		_setup_done = true
-	if entry_needs_restart(_game_started):
+	if entry_needs_restart(_game_started) and not (_keep_game and first):
 		_begin_new_game_on_entry()
 	await _play_enter_game()
 	_close_title_screen()
@@ -3832,17 +4365,42 @@ func _apply_setup(think_opt: OptionButton, llm_url: LineEdit, llm_model: LineEdi
 
 const NetClientScript := preload("res://scripts/net/NetClient.gd")
 
+## 桌宠启动时的服务：只装配语音 + 后端客户端（不建棋盘 / 化身），
+## 这样桌宠的气泡 TTS、窥屏、情绪数值与正式对局共用同一份后端状态。
+func _build_pet_services() -> void:
+	if tts == null:
+		_build_client_tts()
+	if agent == null:
+		_build_net_client()
+	else:
+		_wire_common_agent()
+
 ## 装配服务：编排与 KataGo/LLM 都在后端服务进程；游戏只做渲染与语音，
 ## 通过 NetClient 以 REST（命令）+ WebSocket（事件）与后端通信。
 func _build_services() -> void:
-	if agent != null:
-		return                                    # 已装配（例如首次从主界面进棋谱库时提前起过）
-	_build_client_tts()                           # 语音朗读归客户端
+	if agent == null:
+		if tts == null:
+			_build_client_tts()                   # 语音朗读归客户端
+		_build_net_client()
+	else:
+		_wire_common_agent()                      # 从桌宠进来：公共信号已接，补一次幂等接线
+	_wire_agent()                                 # 正式界面专属信号（state / info / joseki / tool ...）
+	_refresh_lock()                               # 装配完成：解开启动等待期对棋盘的冻结
+	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
+
+## 唯一的 NetClient 装配点：先接线再入树，避免漏掉连上瞬间的 hello。
+func _build_net_client() -> void:
 	agent = NetClientScript.new()
 	agent.base_url = cfg.backend_url
-	agent.net_status.connect(_on_net_status)
+	_wire_common_agent()                          # 先接线：add_child 会立刻发起 WS，别漏掉首帧 hello
 	add_child(agent)                              # _ready 里发起 WS 连接（连上先收 hello 同步棋盘与情绪）
 	agent.setup()                                 # 占位：引擎/LLM 由后端持有
+	_apply_agent_settings()                       # 必须在入树之后：设置会走 REST，HTTPRequest 要在场景树里
+
+## 后端运行期设置：桌宠启动时也推一次，进入对局不再重复。
+func _apply_agent_settings() -> void:
+	if agent == null:
+		return
 	agent.set_tts_local_voice(cfg.tts_local_voice)  # 本地音色：后端内存立即对齐（不重启、不丢棋局）
 	agent.reply_style = cfg.reply_style           # 说话详略三档（连上后自动补发；旧版后端读 limit_len）
 	agent.think_mode = cfg.llm_think_mode         # 思考强度：运行期可改，不用重启后端
@@ -3856,9 +4414,51 @@ func _build_services() -> void:
 	agent.set_persona_all(cfg.persona_enabled, cfg.persona_relationship_enabled, cfg.persona_address_name)
 	agent.adaptive_difficulty = cfg.adaptive_difficulty              # v3.11.5：自适应难度（默认关）
 	agent.adaptive_difficulty_base = cfg.adaptive_difficulty_base
-	_wire_agent()
-	_refresh_lock()                               # 装配完成：解开启动等待期对棋盘的冻结
-	_set_status("后端模式：编排与引擎在 %s（本地不启动 KataGo/LLM）" % cfg.backend_url)
+
+## 桌宠 / 对局共用的信号（幂等接线）
+func _wire_common_agent() -> void:
+	if agent == null:
+		return
+	_connect_once(agent.message, _add_msg)
+	_connect_once(agent.busy_changed, _on_busy_changed)
+	_connect_once(agent.mood_changed, _on_mood_changed)
+	_connect_once(agent.speech_event, _on_speech_event)
+	_connect_once(agent.net_status, _on_net_status)
+	_start_mood_timer()
+
+func _connect_once(sig: Signal, cb: Callable) -> void:
+	if not sig.is_connected(cb):
+		sig.connect(cb)
+
+func _start_mood_timer() -> void:
+	if _mood_timer_started:
+		return
+	_mood_timer_started = true
+	var mood_timer := Timer.new()                 # 三维情绪向基线回落的心跳：2 秒一次，区域没变时零开销
+	mood_timer.wait_time = 2.0
+	mood_timer.autostart = true
+	mood_timer.timeout.connect(func():
+		if agent != null:
+			agent.tick_mood())
+	add_child(mood_timer)
+
+## 正式界面专属信号：桌宠阶段不接（省掉 state / info / joseki 的 UI 副作用）。
+func _wire_agent() -> void:
+	_wire_common_agent()
+	_connect_once(agent.state_changed, _on_state_changed)
+	_connect_once(agent.info_changed, _on_info_changed)
+	_connect_once(agent.ownership_changed, _on_ownership_changed)
+	_connect_once(agent.estimate_event, _on_estimate)      # 局面点目（只在点「局面分析」时来）
+	_connect_once(agent.difficulty_changed, _on_difficulty_changed)
+	_connect_once(agent.move_rejected, _on_move_rejected)   # 这一手被后端拒绝：撤掉乐观子（v3.9.5）
+	_connect_once(agent.joseki_event, _on_joseki_event)
+	_connect_once(agent.tool_event, _on_tool_event)
+	_connect_once(agent.token_event, _on_token_event)    # 可选（默认关闭）的流式增量：只影响气泡显示过程
+	_connect_once(agent.chat_queue_changed, _on_chat_queue_changed)
+	agent.sync_mood(true)                         # 初始「平静」立即生效（表情/音高一次对齐）
+
+func _on_chat_queue_changed() -> void:
+	_refresh_chat_queue_hint()
 
 ## 客户端侧语音：只负责播放（后端按 speech 事件送来的音频 / 系统语音指令），不合成、不起服务
 func _build_client_tts() -> void:
@@ -3879,34 +4479,19 @@ func _build_client_tts() -> void:
 	if cfg.vlm_enabled:
 		_ensure_vlm_url()                         # 后台预热窥屏 VLM（GPU 常驻；本机没有环境则静默跳过）
 
-## agent 的信号接线 + 情绪心跳（NetClient 的信号面）
-func _wire_agent() -> void:
-	agent.message.connect(_add_msg)
-	agent.state_changed.connect(_on_state_changed)
-	agent.info_changed.connect(_on_info_changed)
-	agent.ownership_changed.connect(_on_ownership_changed)
-	agent.estimate_event.connect(_on_estimate)      # 局面点目（只在点「局面分析」时来）
-	agent.difficulty_changed.connect(_on_difficulty_changed)
-	agent.busy_changed.connect(_on_busy_changed)
-	agent.move_rejected.connect(_on_move_rejected)   # 这一手被后端拒绝：撤掉乐观子（v3.9.5）
-	agent.mood_changed.connect(_on_mood_changed)
-	agent.joseki_event.connect(_on_joseki_event)
-	agent.tool_event.connect(_on_tool_event)
-	agent.token_event.connect(_on_token_event)    # 可选（默认关闭）的流式增量：只影响气泡显示过程
-	agent.speech_event.connect(_on_speech_event)  # 语音指令（合成在后端）：取音频 / 调系统语音 + 与台词配对
-	agent.chat_queue_changed.connect(func(): _refresh_chat_queue_hint())   # 排队内容变了：刷新右下角提示
-	var mood_timer := Timer.new()                 # 三维情绪向基线回落的心跳：2 秒一次，区域没变时零开销
-	mood_timer.wait_time = 2.0
-	mood_timer.autostart = true
-	mood_timer.timeout.connect(func(): agent.tick_mood())
-	add_child(mood_timer)
-	agent.sync_mood(true)                         # 初始「平静」立即生效（表情/音高一次对齐）
-
 ## 后端连接状态：连上/断开提示进状态栏。断开时在途的语音事件已经丢了，别让文字一直等它。
 func _on_net_status(text: String, bad: bool) -> void:
-	_set_status(text, bad)
+	_pet_online = not bad
 	if bad:
 		pairing.release_stale(_pair_facts(), true)
+	if _pet_active:
+		if _pet_ui != null:
+			_pet_ui.set_online(_pet_online, text)
+		if not bad:
+			_pet_fetch_mood()
+			_pet_refresh_memory()
+		return
+	_set_status(text, bad)
 
 ## {行为} 标签 → 化身动作：只在文字/语音出现的时刻调用（见 `_add_msg_now`）。
 ## 一个段里最多两个：表情按顺序播放，后一个覆盖前一个；脸红单独走定时器。
@@ -3959,6 +4544,10 @@ func _on_mood_changed(p: Dictionary) -> void:
 	_mood_c = clampf(float(p.get("c", _mood_c)), 0.0, 1.0)
 	_mood_a = clampf(float(p.get("a", _mood_a)), 0.0, 1.0)
 	_last_mood_filler = str(p.get("filler", ""))
+	if _pet_ui != null:
+		_pet_ui.set_mood({
+			"v": _mood_v, "c": _mood_c, "a": _mood_a, "name": _mood_name,
+		})
 
 ## 思考节点插语气词：预制音必须匹配上一句的语气 / 行为标签；频率由当前情绪强度决定。
 ## 节点 = 新的「Azure 思考中…」占位（语音段之间的真实空隙），不再按墙上时钟定时。
@@ -4033,6 +4622,8 @@ func _filler_mood_ok(kind: String) -> bool:
 ## 定式识别成功：角部手顺高亮轨迹（几秒后自动淡出；纯显示，不影响棋局状态）
 ## + 浮层参考图卡片（只渲染后端给的字段：name / line / k / candidates / mistake）
 func _on_joseki_event(payload: Dictionary) -> void:
+	if _pet_active:
+		return                                    # 桌宠形态：正式棋盘事件不入场，回对局时再拉快照
 	if _joseki_card != null:
 		_joseki_card.apply_event(payload)
 		_follow_joseki_card()                   # 形势纸签正开着时，新出的卡片别压在它上面
@@ -4084,6 +4675,8 @@ static func _int_coord(v) -> int:
 ## 她自己查资料（发言侧工具）：只在状态栏提示一句，end 时恢复原文案（连错误色一起恢复）。
 ## 工具返回的原始盘面/JSON 永远不会显示给玩家——她的台词仍由后端生成的对话事件送达。
 func _on_tool_event(payload: Dictionary) -> void:
+	if _pet_active:
+		return
 	if _lbl_status == null:
 		return
 	if str(payload.get("phase", "")) == "start":
@@ -4116,6 +4709,13 @@ func _on_head_patted() -> void:
 			avatar.clear_expression())      # 脸红退去时一并收起摸头引发的笑，避免一直闭眼笑
 
 func _on_tts_status(text: String) -> void:
+	if _pet_active:
+		if _pet_ui != null and (text.contains("失败") or text.contains("无法")
+				or text.contains("无响应") or text.contains("取回")):
+			_pet_ui.show_bubble("语音：" + text, 5.0)
+		return
+	if _chat_box == null:
+		return                                    # 转场期间：只留下状态，不碰还没建的聊天区
 	if _tts_status != null:
 		_tts_status.text = text
 	_set_status("语音：" + text)          # 底部状态行始终可见，左侧栏收起时也能看到
@@ -4168,6 +4768,8 @@ func _release_move_pending() -> void:
 
 ## 后端明确拒绝了这一手（她还在应手 / 非法）：按权威快照撤掉乐观落下的那颗子。
 func _on_move_rejected(st: Dictionary) -> void:
+	if _pet_active:
+		return                                    # 桌宠形态没有可见棋盘：回对局时 fetch_state
 	_release_move_pending()
 	if board != null:
 		var stones = st.get("stones", [])
@@ -4180,6 +4782,8 @@ func _on_move_rejected(st: Dictionary) -> void:
 	_refresh_lock()
 
 func _on_state_changed(p: Dictionary) -> void:
+	if _pet_active:
+		return                                    # 桌宠形态：隐藏棋盘不接实时 state（回对局时 fetch_state）
 	if _fr_active:
 		return                                  # 全盘复盘：棋盘由本地回放掌控，别被 WS state 盖掉
 	if _restart_when_idle:
@@ -4239,6 +4843,8 @@ static func _last_stone(stones: Array) -> Dictionary:
 	return {}
 
 func _on_info_changed(wr: float, sc: float) -> void:
+	if _pet_active:
+		return
 	_last_wr = wr
 	_last_score = sc
 	_last_azure_wr = 1.0 - clampf(wr, 0.0, 1.0)
@@ -4259,7 +4865,7 @@ func _on_info_changed(wr: float, sc: float) -> void:
 ## 领地热力图：后端每次落子后的既有分析会推 361 个归属值（+黑/-白）。
 ## 复盘快照没有 ownership：进入复盘时已清掉旧图，避免把终局领地盖在回放上。
 func _on_ownership_changed(values: Array, _move_count: int) -> void:
-	if board == null or _reviewing or _fr_active:
+	if _pet_active or board == null or _reviewing or _fr_active:
 		return
 	board.set_ownership(values)
 	board.set_ownership_enabled(cfg.ownership_enabled)
@@ -4267,7 +4873,7 @@ func _on_ownership_changed(values: Array, _move_count: int) -> void:
 ## 形势点目（v3.12.0 采纳）：只在「局面分析」的回包里来一次。棋盘画小方块 + 左上角纸签；
 ## 手数与当前局面不一致（迟到的包）就不显示。它是临时注记：下一手 / 换局面 / 进复盘都会收起。
 func _on_estimate(payload: Dictionary) -> void:
-	if _estimate_box == null or _reviewing or _fr_active or _title_open:
+	if _pet_active or _estimate_box == null or _reviewing or _fr_active or _title_open:
 		return
 	var mc := int(payload.get("move_count", -1))
 	if mc >= 0 and mc != _last_move_count:
@@ -4318,7 +4924,7 @@ static func estimate_lead_line(lead, komi) -> String:
 
 ## 自适应难度档位变化（v3.11.5）：只喂状态栏，不产生台词 / 语音 / 动画。
 func _on_difficulty_changed(level: int, base: int, reason: String) -> void:
-	if not cfg.adaptive_difficulty:
+	if _pet_active or not cfg.adaptive_difficulty:
 		return
 	var lv := clampi(level, 1, 5)
 	var bs := clampi(base, 1, 5)
@@ -4399,6 +5005,13 @@ static func score_hint(score, winrate) -> String:
 	return "" if p == "--" else p
 
 func _on_busy_changed(busy: bool) -> void:
+	if _pet_active:
+		if _pet_ui != null:
+			if busy:
+				_pet_ui.show_thinking()
+			else:
+				_pet_ui.clear_if_thinking()
+		return
 	_release_move_pending()                # 后端已接手（或回合已结束）：本地闩让位给真实状态
 	if not busy:
 		_tool_active = false               # 回合结束：某个 start 的 end 万一没到，别让它卡住下一次 start
@@ -5043,6 +5656,8 @@ func _input(event: InputEvent) -> void:
 		_bump_activity()
 	elif event is InputEventKey and (event as InputEventKey).pressed:
 		_bump_activity()
+	if _pet_active:
+		return                                    # 桌宠形态：键盘 / 视角键留给正式对局，不在宠物窗里响应
 	_menu_keys(event)                           # Esc：对局 ⇄ 主界面（弹窗开着时不抢）
 	_review_keys(event)
 
@@ -5074,6 +5689,9 @@ func _player_turn_now() -> bool:
 	return _last_move_count > 0 and _last_move_count % 2 == 0 and DisplayServer.window_is_focused()
 
 func _process(delta: float) -> void:
+	if _pet_active:
+		_pet_tick(delta)
+		return
 	var now := Time.get_ticks_msec()
 	# 复盘 / 主界面期间也按「她占着棋盘」处理（M3）：闲置计时停摆、聊天队列不续发——否则玩家回看 / 看菜单时会被算成闲置。
 	var hold := _azure_hold_active() or _reviewing or _title_open
@@ -5204,10 +5822,14 @@ func _azure_hold_active() -> bool:
 ## 这一轮闲置到底说什么：玩家切去了别的窗口就先窥屏，否则普通走神搭话。
 ## 游戏窗口在前台 = 玩家就在游戏里（窥屏只会看到游戏本身）：不白起 python 进程。
 func _request_idle_talk(now: int) -> void:
+	if _pet_active and (agent == null or not _pet_online):
+		_pet_say_local(_pet_pick_local_line())     # 后端未连上：桌宠用本地短句 + 系统语音
+		return
 	if agent == null or _peek_busy:
 		return
 	var idle_ms := now - _last_player_activity_ms
-	var peekable := cfg.vlm_enabled and not DisplayServer.window_is_focused()
+	# 桌宠窗口永远在前台/置顶：允许自动窥屏，脚本会看它身后的窗口（--peek-behind）
+	var peekable := cfg.vlm_enabled and (_pet_active or not DisplayServer.window_is_focused())
 	if peekable and idle_ms >= int(IDLE_SEC * 1000.0) \
 			and now - _peek_last_ms >= PEEK_COOLDOWN_MS and _peek_available():
 		_start_peek(now)
@@ -5251,6 +5873,8 @@ func _peek_available() -> bool:
 ## - cfg.vlm_base_url 填了：视为外部/自管服务，直接用，不碰本地进程
 ## - 留空且 vlm_auto_start：本机 python 拉起 start_vlm_server.py（内部有 lock + 健康检查防重复）
 func _ensure_vlm_url() -> String:
+	if DisplayServer.get_name() == "headless":
+		return ""                                 # 无头自检 / 测试：不拉起任何 VLM 子进程
 	if _vlm_url != "":
 		return _vlm_url
 	var manual := cfg.vlm_base_url.strip_edges()
@@ -5298,6 +5922,8 @@ func _start_peek(now: int) -> void:
 	_peek_out = OS.get_user_data_dir().path_join("peek_result_%d.json" % now)
 	var pargs := PackedStringArray([
 		_peek_script, "--out", _peek_out, "--game-pid", str(OS.get_process_id())])
+	if _pet_active:
+		pargs.append("--peek-behind")             # 桌宠自己在前台：看它身后的窗口
 	var vlm_url := _ensure_vlm_url()             # 顺手确保 VLM 服务在跑（幂等）
 	if vlm_url != "":
 		pargs.append_array(["--vlm-url", vlm_url])
@@ -5373,6 +5999,11 @@ func _set_idle_state(v: bool) -> void:
 
 ## 朗读开始/结束 → 化身说话时轻轻歪头
 func _on_tts_speaking(v: bool) -> void:
+	if _pet_active:
+		_tts_playing = v
+		if _pet_ui != null:
+			_pet_ui.set_speaking(v)
+		return
 	if avatar != null:
 		avatar.set_speaking(v)
 	_tts_playing = v
@@ -5390,6 +6021,10 @@ func _on_tts_speaking(v: bool) -> void:
 ## 每段语音开始播放：逐句模式下把与之配对的那条 Azure 文字显示出来（文字与声音成对）。
 ## 分组号就是配对记录里的 group：语音一开播就按它精确回查，一条台词只显示一次、乱序也不会错位。
 func _on_utterance_started(group: int) -> void:
+	if _pet_active:
+		return                                    # 桌宠不登记配对表：文字已即时显示
+	if _chat_box == null:
+		return                                    # 转场期间：配对显示没有落点
 	var rec: Dictionary = pairing.group_of(group)
 	if not rec.is_empty():
 		pairing.finish(rec)          # 这段语音有结果了：退出配对表（不再占着「在途」）
@@ -5403,6 +6038,10 @@ func _on_utterance_started(group: int) -> void:
 
 ## 这条语音不会再响了（音频坏了 / 被 stop / 队列溢出丢弃）：文字/落子照常显示，只是这一句没有声音
 func _on_speech_skipped(group: int) -> void:
+	if _pet_active:
+		return                                    # 桌宠没有待显示文字：跳过不补
+	if _chat_box == null:
+		return                                    # 转场期间：没有聊天区可补文字
 	var rec: Dictionary = pairing.group_of(group)
 	if not rec.is_empty():
 		pairing.finish(rec)
@@ -5474,8 +6113,11 @@ func _register_tomb(kind: String) -> void:
 ## 收到后端一条语音指令（紧随对应 message 之后）：与待播台词配对 → 取音频 / 交系统语音。
 ## 语音关闭时**一条请求都不发**（后端也不会发 speech），文字照常显示的老路子不受影响。
 func _on_speech_event(payload: Dictionary) -> void:
-	if tts == null or not tts.enabled:
+	if _pet_active:
+		_pet_play_speech(payload)
 		return
+	if tts == null or not tts.enabled or _chat_box == null:
+		return                                    # 转场期间：等 UI 建好再接正式配音
 	var smode := str(payload.get("mode", ""))
 	if smode != "openai" and smode != "system":
 		return                                   # none / 脏值：不出声，也不占用配对位

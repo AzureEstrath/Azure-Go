@@ -37,6 +37,10 @@ shots/
 backend/data/
 backend/logs/
 
+# —— 用户资料箱（本地文件不入库，只保留空目录）——
+assistant_files/inbox/*
+!assistant_files/inbox/.gitkeep
+
 # —— KataGo 服务运行产物（引擎日志）——
 katago_service/logs/
 

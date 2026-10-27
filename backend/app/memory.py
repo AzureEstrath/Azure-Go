@@ -27,7 +27,14 @@ import threading
 import time
 
 MEMORY_MAX_ROWS = 2000          # 库内记忆行数上限（超出按时间淘汰最旧）
+CHAT_MAX_ROWS = 1000            # 聊天原文流水上限（超出按时间淘汰最旧；与 memories 解耦）
+EPISODE_GAP_SEC = 900           # 一段 episode 的空档上限：超过 15 分钟就收束成摘要
+EPISODE_MAX_TURNS = 6           # 一段 episode 最多几轮对话（MaiBot 式 episode，不无限长）
+EPISODE_MAX_CHARS = 620         # 一段 episode 的摘要上限（超了先收束，另起一段）
+EPISODE_VALENCE_JUMP = 0.30     # 情绪效价跳变边界：同一段聊天里大起大落时另起一段
 MAX_TEXT_LEN = 200              # 单条记忆写入时的字数上限
+MAX_CHAT_USER_LEN = 240          # 聊天流水：玩家单句上限
+MAX_CHAT_REPLY_LEN = 360         # 聊天流水：Azure 单句上限
 MAX_INJECT_ITEM_CHARS = 120     # 注入提示词时单条记忆的字数上限
 
 # 关键词检索的切分：ASCII 按词、CJK 按二元组（中文没空格，整串匹配对不上自然问句）
@@ -55,6 +62,25 @@ _SCHEMA = (
         moves TEXT NOT NULL DEFAULT '[]',
         meta TEXT NOT NULL DEFAULT '{}'
     )""",
+    """CREATE TABLE IF NOT EXISTS chat_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        mode TEXT NOT NULL DEFAULT '',
+        user_text TEXT NOT NULL DEFAULT '',
+        reply_text TEXT NOT NULL DEFAULT '',
+        mood TEXT NOT NULL DEFAULT '{}'
+    )""",
+    """CREATE TABLE IF NOT EXISTS episodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        source TEXT NOT NULL DEFAULT '',
+        started_ts REAL NOT NULL DEFAULT 0,
+        ended_ts REAL NOT NULL DEFAULT 0,
+        turns INTEGER NOT NULL DEFAULT 0,
+        summary TEXT NOT NULL DEFAULT '',
+        mood TEXT NOT NULL DEFAULT '{}',
+        meta TEXT NOT NULL DEFAULT '{}'
+    )""",
 )
 
 # 旧库缺列时的补列（表 -> 列 -> 建列语句）；主键列不在此列，缺主键的库不认。
@@ -72,6 +98,23 @@ _COLUMNS = {
         "result": "TEXT NOT NULL DEFAULT ''",
         "summary": "TEXT NOT NULL DEFAULT ''",
         "moves": "TEXT NOT NULL DEFAULT '[]'",
+        "meta": "TEXT NOT NULL DEFAULT '{}'",
+    },
+    "chat_history": {
+        "ts": "REAL NOT NULL DEFAULT 0",
+        "mode": "TEXT NOT NULL DEFAULT ''",
+        "user_text": "TEXT NOT NULL DEFAULT ''",
+        "reply_text": "TEXT NOT NULL DEFAULT ''",
+        "mood": "TEXT NOT NULL DEFAULT '{}'",
+    },
+    "episodes": {
+        "ts": "REAL NOT NULL DEFAULT 0",
+        "source": "TEXT NOT NULL DEFAULT ''",
+        "started_ts": "REAL NOT NULL DEFAULT 0",
+        "ended_ts": "REAL NOT NULL DEFAULT 0",
+        "turns": "INTEGER NOT NULL DEFAULT 0",
+        "summary": "TEXT NOT NULL DEFAULT ''",
+        "mood": "TEXT NOT NULL DEFAULT '{}'",
         "meta": "TEXT NOT NULL DEFAULT '{}'",
     },
 }
@@ -153,6 +196,38 @@ def inject_text(items: list, max_chars: int) -> str:
         out.append(piece)
         used += sep + len(piece)
     return "；".join(out)
+
+
+def _valence(mood):
+    """从 episode 的 mood 列 / 当前 mood 里取愉悦度；取不到返回 ``None``（不猜）。"""
+    src = mood
+    if isinstance(src, str):
+        try:
+            src = json.loads(src or "{}")
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(src, dict):
+        return None
+    try:
+        v = float(src.get("v"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(v) or v < 0.0 or v > 1.0:
+        return None
+    return v
+
+
+def _valence_jump(prev_mood, mood) -> bool:
+    """情绪边界：一段 episode 内效价跳变超过阈值 ⇒ 上一段收束。
+
+    这是规则层的**事件分割**信号之一（话题 / 时间 / 情绪三路里先落情绪），
+    不调用 LLM；取不到两边的效价时一律不切（宁可少切，不把普通聊天切碎）。
+    """
+    a = _valence(prev_mood)
+    b = _valence(mood)
+    if a is None or b is None:
+        return False
+    return abs(a - b) >= EPISODE_VALENCE_JUMP
 
 
 class MemoryStore:
@@ -342,18 +417,190 @@ class MemoryStore:
                         break
         return hits
 
+    # —— 聊天流水（共享记忆的「最近发生了什么」；与可召回 memories 分开） ——
+
+    def append_chat(self, user_text: str, reply_text: str, mode: str = "", mood=None) -> int | None:
+        """追加一轮完整聊天（玩家 + Azure），返回行 id；失败返回 ``None``。
+
+        这是**原文流水**：桌宠 / 围棋共用，用于启动时恢复“最近在聊什么”的连续性，
+        同时给 memories 写一条可召回的摘要由 ``MemoryService`` 负责。
+        """
+        u = _clip(" ".join(str(user_text or "").split()), MAX_CHAT_USER_LEN)
+        r = _clip(" ".join(str(reply_text or "").split()), MAX_CHAT_REPLY_LEN)
+        if u == "" and r == "":
+            return None
+        m = str(mode or "")[:16]
+        if self._conn is None:
+            return None
+        with self._lock:
+            if self._conn is None:
+                return None
+            try:
+                cur = self._conn.execute(
+                    "INSERT INTO chat_history(ts, mode, user_text, reply_text, mood) VALUES(?,?,?,?,?)",
+                    (self._now(), m, u, r, _json(mood if isinstance(mood, dict) else {})))
+                row_id = int(cur.lastrowid)
+                excess = self._count("chat_history") - int(CHAT_MAX_ROWS)
+                if excess > 0:
+                    rows = self._conn.execute(
+                        "SELECT id FROM chat_history ORDER BY ts ASC, id ASC LIMIT ?",
+                        (excess,)).fetchall()
+                    ids = [int(x[0]) for x in rows]
+                    if ids:
+                        q = ",".join("?" * len(ids))
+                        self._conn.execute("DELETE FROM chat_history WHERE id IN (%s)" % q, ids)
+                self._conn.commit()
+                return row_id
+            except Exception as e:              # noqa: BLE001
+                print("[Memory] 聊天流水写入失败（已忽略）：%s" % e)
+                try:
+                    self._conn.rollback()
+                except Exception:               # noqa: BLE001
+                    pass
+                return None
+
+    def recent_chats(self, limit: int = 50) -> list:
+        """最近 ``limit`` 轮聊天（按时间正序返回，方便聊天面板直接渲染）。"""
+        n = max(1, min(int(limit or 50), 200))
+        with self._lock:
+            if self._conn is None:
+                return []
+            try:
+                rows = [dict(r) for r in self._conn.execute(
+                    "SELECT id, ts, mode, user_text, reply_text, mood FROM chat_history "
+                    "ORDER BY ts DESC, id DESC LIMIT ?", (n,))]
+            except Exception as e:              # noqa: BLE001
+                print("[Memory] 聊天流水读取失败（已忽略）：%s" % e)
+                return []
+        rows.reverse()
+        for r in rows:
+            try:
+                m = json.loads(str(r.get("mood", "") or "{}"))
+                r["mood"] = m if isinstance(m, dict) else {}
+            except Exception:                   # noqa: BLE001
+                r["mood"] = {}
+        return rows
+
+    # —— Episode：把一段连续聊天收束成可召回摘要（参考 MaiBot 的 episode 思路） ——
+
+    def append_episode_turn(self, source: str, user_text: str, reply_text: str,
+                            mood=None) -> int | None:
+        """把一轮聊天并进当前 episode；满 6 轮 / 超 620 字 / 空档 15 分钟就收束。
+
+        收束时写一条 ``kind=episode`` 的可召回记忆（前缀「最近聊天摘要」），
+        以便围棋与桌宠在之后的提示词里都能召回这段相处的上下文。
+        """
+        src = str(source or "")[:16]
+        u = _clip(" ".join(str(user_text or "").split()), MAX_CHAT_USER_LEN)
+        r = _clip(" ".join(str(reply_text or "").split()), MAX_CHAT_REPLY_LEN)
+        if u == "" and r == "":
+            return None
+        piece = "Estarth：%s；Azure：%s" % (u[:90], r[:110])
+        now = self._now()
+        closed: list = []
+        new_id = None
+        with self._lock:
+            if self._conn is None:
+                return None
+            try:
+                row = self._conn.execute(
+                    "SELECT id, ts, turns, summary, mood FROM episodes "
+                    "WHERE source = ? AND ended_ts = 0 ORDER BY id DESC LIMIT 1", (src,)).fetchone()
+                if row is not None:
+                    summary = str(row["summary"] or "")
+                    full = (now - float(row["ts"])) > EPISODE_GAP_SEC \
+                        or int(row["turns"]) >= EPISODE_MAX_TURNS \
+                        or len(summary) + len(piece) + 1 > EPISODE_MAX_CHARS \
+                        or _valence_jump(row["mood"], mood)
+                    if full:
+                        self._conn.execute(
+                            "UPDATE episodes SET ended_ts = ?, ts = ? WHERE id = ?",
+                            (float(row["ts"]), now, int(row["id"])))
+                        closed.append((src, summary))
+                        row = None
+                if row is None:
+                    cur = self._conn.execute(
+                        "INSERT INTO episodes(ts, source, started_ts, ended_ts, turns, summary, mood) "
+                        "VALUES(?,?,?,0,1,?,?)",
+                        (now, src, now, piece, _json(mood if isinstance(mood, dict) else {})))
+                    new_id = int(cur.lastrowid)
+                else:
+                    summary2 = summary + ("\n" if summary else "") + piece
+                    self._conn.execute(
+                        "UPDATE episodes SET ts = ?, turns = turns + 1, summary = ?, mood = ? WHERE id = ?",
+                        (now, summary2, _json(mood if isinstance(mood, dict) else {}), int(row["id"])))
+                    new_id = int(row["id"])
+                self._conn.commit()
+            except Exception as e:          # noqa: BLE001
+                print("[Memory] episode 写入失败（已忽略）：%s" % e)
+                try:
+                    self._conn.rollback()
+                except Exception:           # noqa: BLE001
+                    pass
+                return None
+        # 收束后的摘要写成可召回记忆（锁外 write，避免嵌套锁 / 慢 embedding）
+        for src2, summary in closed:
+            if summary.strip():
+                self.write("最近聊天摘要（%s）：%s" % (src2 or "共享", summary),
+                           kind="episode", tag="episode:%s" % src2,
+                           meta={"source": src2})
+        return new_id
+
+    def close_episode(self, source: str = "") -> None:
+        """手动收束当前 episode（模式切换 / 退出前）；失败安全。"""
+        src = str(source or "")[:16]
+        closed: list = []
+        with self._lock:
+            if self._conn is None:
+                return
+            try:
+                q = "SELECT id, ts, summary FROM episodes WHERE ended_ts = 0"
+                args = ()
+                if src:
+                    q += " AND source = ?"
+                    args = (src,)
+                rows = self._conn.execute(q + " ORDER BY id DESC LIMIT 8", args).fetchall()
+                for row in rows:
+                    self._conn.execute(
+                        "UPDATE episodes SET ended_ts = ?, ts = ? WHERE id = ?",
+                        (float(row["ts"]), self._now(), int(row["id"])))
+                    if str(row["summary"] or "").strip():
+                        closed.append(str(row["summary"]))
+                self._conn.commit()
+            except Exception as e:          # noqa: BLE001
+                print("[Memory] episode 收束失败（已忽略）：%s" % e)
+        for summary in closed:
+            self.write("最近聊天摘要（%s）：%s" % (src or "共享", summary),
+                       kind="episode", tag="episode:%s" % src, meta={"source": src})
+
+    def recent_episodes(self, limit: int = 3) -> list:
+        """最近收束 / 进行中的 episode 摘要（启动 continuity 用）。"""
+        n = max(1, min(int(limit or 3), 20))
+        with self._lock:
+            if self._conn is None:
+                return []
+            try:
+                return [dict(r) for r in self._conn.execute(
+                    "SELECT id, ts, source, started_ts, ended_ts, turns, summary, mood "
+                    "FROM episodes ORDER BY ts DESC, id DESC LIMIT ?", (n,))]
+            except Exception as e:          # noqa: BLE001
+                print("[Memory] episode 读取失败（已忽略）：%s" % e)
+                return []
+
     def stats(self) -> dict:
-        """库的体量：``{"rows","games","has_vectors","db"}``（库不可用时全 0）。"""
-        rows = games = hasv = 0
+        """库的体量：``{"rows","games","episodes","has_vectors","db"}``（库不可用时全 0）。"""
+        rows = games = hasv = episodes = 0
         with self._lock:
             if self._conn is not None:
                 try:
                     rows = self._count("memories")
                     games = self._count("games")
                     hasv = self._count("vectors")
+                    episodes = self._count("episodes")
                 except Exception as e:      # noqa: BLE001
                     print("[Memory] 统计失败（已忽略）：%s" % e)
-        return {"rows": rows, "games": games, "has_vectors": hasv, "db": self._db_path}
+        return {"rows": rows, "games": games, "episodes": episodes,
+                "has_vectors": hasv, "db": self._db_path}
 
     def forget(self, ids: list | None = None, all: bool = False) -> int:
         """删记忆（含向量），返回删除条数；``ids`` 与 ``all`` 都没给时什么都不做。
@@ -368,6 +615,8 @@ class MemoryStore:
                     n = self._count("memories")
                     self._conn.execute("DELETE FROM memories")
                     self._conn.execute("DELETE FROM vectors")
+                    self._conn.execute("DELETE FROM chat_history")
+                    self._conn.execute("DELETE FROM episodes")
                 elif ids:
                     sel = [int(i) for i in ids]
                     q = ",".join("?" * len(sel))
