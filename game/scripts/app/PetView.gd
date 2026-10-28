@@ -68,6 +68,7 @@ var _chat_status: Label
 var _files: PanelContainer
 var _files_scroll: ScrollContainer
 var _files_folder: Label
+var _files_help: Label
 var _files_rows: VBoxContainer
 var _schedule_rows: VBoxContainer
 var _schedule_table: Control
@@ -80,6 +81,9 @@ var _files_auto_plan: Button
 var _files_archive: Button
 var _files_cleanup: Button
 var _files_review: Button
+var _files_close: Button
+var _files_actions: GridContainer
+var _files_bottom: GridContainer
 var _reminder: PanelContainer
 var _reminder_label: Label
 var _reminder_until := 0
@@ -383,13 +387,14 @@ func _build_files() -> void:
 	GufengTheme.apply_bare_button(close)
 	close.pressed.connect(close_files)
 	head.add_child(close)
+	_files_close = close
 
 	_files_folder = Label.new()
 	_files_folder.text = "资料箱：assistant_files/inbox"
 	_files_folder.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	# 自适应宽度，但保底 180：Label 的 autowrap 在 min 宽为 0 时会按 1px 排版（几百行高），
-	# 反而把面板撑到几千像素、按钮全被挤出窗口。
-	_files_folder.custom_minimum_size = Vector2(180, 0)
+	# 自适应宽度，但保底 140：Label 的 autowrap 在 min 宽为 0 时会按 1px 排版（几百行高），
+	# 反而把面板撑到几千像素、按钮全被挤出窗口；140 又能容纳窄窗口。
+	_files_folder.custom_minimum_size = Vector2(140, 0)
 	_files_folder.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_files_folder.add_theme_font_size_override("font_size", 10)
 	_files_folder.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
@@ -398,11 +403,12 @@ func _build_files() -> void:
 	var hint := Label.new()
 	hint.text = "把图片 / PDF / 文档放进资料箱，点「开始处理」；OCR 会按行列还原课程表，Azure 再整理成日程。"
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	hint.custom_minimum_size = Vector2(180, 0)
+	hint.custom_minimum_size = Vector2(140, 0)
 	hint.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	hint.add_theme_font_size_override("font_size", 10)
 	hint.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.9))
 	vb.add_child(hint)
+	_files_help = hint
 
 	_files_scroll = ScrollContainer.new()
 	_files_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -436,39 +442,47 @@ func _build_files() -> void:
 	_files_status = Label.new()
 	_files_status.text = ""
 	_files_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_files_status.custom_minimum_size = Vector2(180, 0)
+	_files_status.custom_minimum_size = Vector2(140, 0)
 	_files_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_files_status.add_theme_font_size_override("font_size", 10)
 	_files_status.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	vb.add_child(_files_status)
 
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 4)
-	vb.add_child(row)
+	# 操作区用 GridContainer：宽面板一行，窄面板自动折成两列/两排，避免最小宽度把面板撑出视口。
+	_files_bottom = GridContainer.new()
+	_files_bottom.columns = 3
+	_files_bottom.add_theme_constant_override("h_separation", 4)
+	_files_bottom.add_theme_constant_override("v_separation", 4)
+	_files_bottom.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vb.add_child(_files_bottom)
 	_files_refresh = Button.new()
 	_files_refresh.text = "刷新"
-	_files_refresh.custom_minimum_size = Vector2(54, 28)
+	_files_refresh.custom_minimum_size = Vector2(60, 28)
 	GufengTheme.apply_button(_files_refresh)
 	_files_refresh.pressed.connect(func(): files_refresh_requested.emit())
-	row.add_child(_files_refresh)
+	_files_bottom.add_child(_files_refresh)
 	_files_scan = Button.new()
 	_files_scan.text = "开始处理"
 	_files_scan.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_files_scan.custom_minimum_size = Vector2(110, 28)
+	_files_scan.custom_minimum_size = Vector2(84, 28)
 	GufengTheme.apply_seal_button(_files_scan, false)
 	_files_scan.pressed.connect(func(): files_scan_requested.emit())
-	row.add_child(_files_scan)
+	_files_bottom.add_child(_files_scan)
 	# 底部始终可见的「收起」：窗口被限制 / 内嵌在编辑器小视口时，右上角的 × 可能够不到。
 	var collapse := Button.new()
 	collapse.text = "收起"
-	collapse.custom_minimum_size = Vector2(54, 28)
+	collapse.custom_minimum_size = Vector2(60, 28)
 	GufengTheme.apply_button(collapse)
 	collapse.pressed.connect(close_files)
-	row.add_child(collapse)
-	# 第二排：自动排班 / 留档 / 清理（窄面板也能一行放下）。
-	var row2 := HBoxContainer.new()
-	row2.add_theme_constant_override("separation", 4)
-	vb.add_child(row2)
+	_files_bottom.add_child(collapse)
+
+	# 第二排：自动排班 / 留档 / 清理 / 复盘（窄面板折成 2×2）。
+	_files_actions = GridContainer.new()
+	_files_actions.columns = 4
+	_files_actions.add_theme_constant_override("h_separation", 4)
+	_files_actions.add_theme_constant_override("v_separation", 4)
+	_files_actions.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vb.add_child(_files_actions)
 	_files_auto_plan = Button.new()
 	_files_auto_plan.text = "自动排班"
 	_files_auto_plan.tooltip_text = "按优先级、截止时间与空闲区间自动排班；时长 / 优先级用 James-Stein 收缩估计"
@@ -476,21 +490,21 @@ func _build_files() -> void:
 	_files_auto_plan.custom_minimum_size = Vector2(70, 26)
 	GufengTheme.apply_button(_files_auto_plan)
 	_files_auto_plan.pressed.connect(func(): files_auto_plan_requested.emit())
-	row2.add_child(_files_auto_plan)
+	_files_actions.add_child(_files_auto_plan)
 	_files_archive = Button.new()
 	_files_archive.text = "归档过期"
 	_files_archive.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_files_archive.custom_minimum_size = Vector2(70, 26)
 	GufengTheme.apply_button(_files_archive)
 	_files_archive.pressed.connect(func(): files_archive_requested.emit())
-	row2.add_child(_files_archive)
+	_files_actions.add_child(_files_archive)
 	_files_cleanup = Button.new()
 	_files_cleanup.text = "清理留档"
 	_files_cleanup.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_files_cleanup.custom_minimum_size = Vector2(70, 26)
 	GufengTheme.apply_button(_files_cleanup)
 	_files_cleanup.pressed.connect(func(): files_cleanup_requested.emit())
-	row2.add_child(_files_cleanup)
+	_files_actions.add_child(_files_cleanup)
 	_files_review = Button.new()
 	_files_review.text = "复盘"
 	_files_review.tooltip_text = "按类别看计划 / 实际耗时偏差与完成、推迟次数"
@@ -498,7 +512,7 @@ func _build_files() -> void:
 	_files_review.custom_minimum_size = Vector2(70, 26)
 	GufengTheme.apply_button(_files_review)
 	_files_review.pressed.connect(func(): files_review_requested.emit())
-	row2.add_child(_files_review)
+	_files_actions.add_child(_files_review)
 
 func _build_cards() -> void:
 	# 事务提醒卡：到点时由 PetShell 调 show_reminder()；压在聊天 / 资料面板之上，12 秒后自动消失。
@@ -634,8 +648,8 @@ func _chat_size() -> Vector2i:
 	return Vector2i(maxi(450, int(round(pw)) + 280), maxi(470, pet_height + 120))
 
 func _files_size() -> Vector2i:
-	var pw := _pet_width()
-	return Vector2i(maxi(700, int(round(pw)) + int(FILES_W) + 56), maxi(560, pet_height + 170))
+	# 资料 / 日程单独用紧凑窗口（不再为了并排宠物撑到 700 宽）；关闭后宠物回来。
+	return Vector2i(maxi(544, int(FILES_W) + 64), maxi(520, pet_height + 150))
 
 func _pet_rect_for(win: Vector2i) -> Rect2:
 	var pw := _pet_width()
@@ -684,12 +698,22 @@ func _layout() -> void:
 		if _bubble.visible:
 			_relayout_bubble()
 	if _chat != null:
+		# 聊天面板也跟着视口收窄；窄窗口下仍然保留关闭入口。
+		var cw := minf(CHAT_W, maxf(180.0, s.x - MARGIN * 2.0))
 		_chat.position = Vector2(MARGIN, MARGIN)
-		_chat.size = Vector2(CHAT_W, maxf(80.0, s.y - MARGIN * 2.0))
+		_chat.size = Vector2(cw, maxf(80.0, s.y - MARGIN * 2.0))
 		_chat.visible = _chat_open
 	if _files != null:
-		# 面板宽度跟着**实际视口**走：编辑器内嵌小窗口 / 小屏上固定 560 会把关闭按钮挤出屏幕。
-		var fw := minf(FILES_W, maxf(260.0, s.x - MARGIN * 2.0))
+		# 面板宽度跟着**实际视口**走：小屏 / 内嵌窗口也不把关闭按钮挤出屏幕。
+		var fw := minf(FILES_W, maxf(200.0, s.x - MARGIN * 2.0))
+		# 窄面板把操作按钮折成两列，宽面板保持一行；避免按钮的最小宽度把面板撑出视口。
+		if _files_actions != null:
+			_files_actions.columns = 4 if fw >= 360.0 else 2
+		if _files_bottom != null:
+			_files_bottom.columns = 3 if fw >= 260.0 else 2
+		# 极窄 / 矮的窗口里先让位给日程与底部按钮，操作提示不再占高度。
+		if _files_help != null:
+			_files_help.visible = s.y >= 360.0
 		_files.position = Vector2(MARGIN, MARGIN)
 		_files.size = Vector2(fw, maxf(160.0, s.y - MARGIN * 2.0))
 		_files.visible = _files_open
@@ -1065,7 +1089,7 @@ func _build_agenda(items: Array) -> void:
 		elif status == "cancelled":
 			lbl.text += "（已取消）"
 		lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		lbl.custom_minimum_size = Vector2(150, 0)
+		lbl.custom_minimum_size = Vector2(96, 0)
 		lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		lbl.add_theme_font_size_override("font_size", 10)
 		lbl.add_theme_color_override("font_color",
@@ -1088,21 +1112,11 @@ func _build_agenda(items: Array) -> void:
 		row.add_child(lbl)
 		if status == "planned":
 			# 执行反馈：完成 → 后端按「现在 - 开始时间」估实际耗时；推迟 → 明天优先再排。
-			var bd := Button.new()
-			bd.text = "完成"
-			bd.tooltip_text = "记录完成；实际耗时按当前时间与计划开始估算"
-			bd.custom_minimum_size = Vector2(44, 20)
-			bd.add_theme_font_size_override("font_size", 10)
-			GufengTheme.apply_button(bd)
+			var bd := _compact_button("完成", "记录完成；实际耗时按当前时间与计划开始估算")
 			bd.pressed.connect(func(): schedule_feedback_requested.emit(
 				int(d.get("id", 0)), "done", 0))
 			row.add_child(bd)
-			var bp := Button.new()
-			bp.text = "推迟"
-			bp.tooltip_text = "先记下来，优先排到明天；连续推迟会更新类别偏好"
-			bp.custom_minimum_size = Vector2(44, 20)
-			bp.add_theme_font_size_override("font_size", 10)
-			GufengTheme.apply_button(bp)
+			var bp := _compact_button("推迟", "先记下来，优先排到明天；连续推迟会更新类别偏好")
 			bp.pressed.connect(func(): schedule_feedback_requested.emit(
 				int(d.get("id", 0)), "deferred", 0))
 			row.add_child(bp)
@@ -1206,11 +1220,41 @@ func _files_hint(text: String) -> Label:
 	var lbl := Label.new()
 	lbl.text = text
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	lbl.custom_minimum_size = Vector2(180, 0)
+	lbl.custom_minimum_size = Vector2(140, 0)
 	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	lbl.add_theme_font_size_override("font_size", 10)
 	lbl.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.9))
 	return lbl
+
+func _compact_button(text: String, tip := "") -> Button:
+	"""小号文字按钮：紧凑边距，窄面板的日程行里也放得下。"""
+	var b := Button.new()
+	b.text = text
+	b.tooltip_text = tip
+	b.custom_minimum_size = Vector2(34, 20)
+	b.add_theme_font_size_override("font_size", 10)
+	var normal := StyleBoxFlat.new()
+	normal.bg_color = Color(GufengTheme.PANEL_SOFT, 0.92)
+	normal.border_color = GufengTheme.BORDER_SOFT
+	normal.set_border_width_all(1)
+	normal.set_corner_radius_all(6)
+	normal.content_margin_left = 4
+	normal.content_margin_right = 4
+	normal.content_margin_top = 2
+	normal.content_margin_bottom = 2
+	var hover := normal.duplicate()
+	hover.bg_color = GufengTheme.HOVER_BG
+	hover.border_color = Color(GufengTheme.ACCENT, 0.75)
+	var pressed := normal.duplicate()
+	pressed.bg_color = GufengTheme.ACCENT
+	pressed.border_color = GufengTheme.ACCENT
+	b.add_theme_stylebox_override("normal", normal)
+	b.add_theme_stylebox_override("hover", hover)
+	b.add_theme_stylebox_override("pressed", pressed)
+	b.add_theme_color_override("font_color", GufengTheme.INK)
+	b.add_theme_color_override("font_hover_color", GufengTheme.ACCENT)
+	b.add_theme_color_override("font_pressed_color", GufengTheme.ON_ACCENT)
+	return b
 
 # ================= 气泡 =================
 

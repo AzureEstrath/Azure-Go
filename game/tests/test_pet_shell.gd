@@ -99,6 +99,9 @@ func _test_view() -> void:
 	await process_frame
 	await process_frame
 	_check("聊天面板能打开", v.is_chat_open())
+	var chat_rect := Rect2(v._chat.position, v._chat.size)
+	_check("窄窗口聊天面板完整在视口内",
+		chat_rect.end.x <= v.size.x + 0.5 and chat_rect.end.y <= v.size.y + 0.5)
 	var scroll = v.get_node_or_null("ChatPanel").get_child(0).get_child(2)
 	var log = scroll.get_child(0)
 	var rows = log.get_children()
@@ -117,6 +120,21 @@ func _test_view() -> void:
 	_check("资料面板能打开", v.is_files_open())
 	_check("资料面板存在", v.get_node_or_null("FilesPanel") != null)
 	_check("小窗口面板占满时宠物让位（不挡文字）", not v._pet_anchor.visible)
+	var panel_rect := Rect2(v._files.position, v._files.size)
+	_check("窄窗口资料面板完整在视口内",
+		panel_rect.end.x <= v.size.x + 0.5 and panel_rect.end.y <= v.size.y + 0.5)
+	_check("窄窗口关闭按钮可达", v._files_close != null
+		and v._files_close.get_global_rect().end.x <= v.get_global_rect().end.x + 0.5)
+	_check("窄窗口操作按钮折成两列",
+		v._files_actions.columns == 2 and v._files_bottom.columns == 2)
+	var buttons_inside := true
+	for b in v._files_actions.get_children():
+		var br: Rect2 = b.get_global_rect()
+		if br.end.x > v.get_global_rect().end.x + 0.5 \
+				or br.end.y > v.get_global_rect().end.y + 0.5:
+			buttons_inside = false
+	_check("窄窗口操作按钮都在视口内", buttons_inside)
+	_check("资料窗口不再撑到 700 宽", v._files_size().x <= 560)
 	v.set_files_info("C:/inbox", [{"name": "a.png"}, {"name": "b.pdf"}])
 	_check("资料文件列表显示", v._files_rows.get_child_count() == 2)
 	v.set_schedule_items([{"when_text": "2026-10-28 15:30", "title": "评审", "notes": ""}])
@@ -175,6 +193,15 @@ func _test_view() -> void:
 		v._hide_hover_card()
 	else:
 		_check("悬停展开卡显示完整课程信息", false)
+	host.size = Vector2(544, 520)
+	await process_frame
+	await process_frame
+	var wide_rect := Rect2(v._files.position, v._files.size)
+	_check("宽窗口操作按钮恢复一行",
+		v._files_actions.columns == 4 and v._files_bottom.columns == 3)
+	_check("宽窗口资料面板完整在视口内",
+		wide_rect.end.x <= v.size.x + 0.5 and wide_rect.end.y <= v.size.y + 0.5)
+	_check("宽窗口重新显示操作提示", v._files_help.visible)
 	v.close_files()
 	await process_frame
 	_check("资料面板能收起", not v.is_files_open())
