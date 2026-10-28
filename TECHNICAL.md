@@ -6,6 +6,8 @@
 > 桌宠外壳、共享生命时间线、双速情绪与主动回忆见 `README.md`、`game/scripts/app/` 与 `backend/app/life.py`。
 > **v4.1.0：资料箱 OCR 周课表、自动排班（优先级 + 正部 James-Stein 收缩 + best-fit 空闲区间）、
 > 到点事务提醒（LLM 文本 / 离线模板气泡）、归档与清理、课表格子悬停展开。**
+> **v4.1.1：类别 EWMA 时长学习、变更点检测、事件驱动滚动重排（1~3 天 + 15 分钟冷却 + 12 小时锁定窗）、
+> 每日集中缓冲、机会约束 `mean + z·σ`、完成 / 推迟反馈与按类别复盘。**
 > 最后更新：2026-10-28。
 
 ---
@@ -360,6 +362,15 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | POST | `/api/memory/write` | 手动写入记忆 |
 | GET | `/api/memory/stats` | 记忆库体量 |
 | POST | `/api/memory/forget` | 删除记忆 |
+| GET | `/api/schedule` | 共享日程列表 |
+| POST | `/api/schedule/auto_plan` | 自动排班（分层收缩 + 机会约束 + 每日缓冲 + best-fit） |
+| POST | `/api/schedule/feedback` | 完成 / 推迟 / 跳过反馈 → EWMA 学习；推迟后立即重排 |
+| GET | `/api/schedule/review` | 按类别复盘计划 / 实际耗时偏差 |
+| POST | `/api/schedule/archive` | 归档过期 / 指定日程 |
+| POST | `/api/schedule/cleanup` | 清理超过保留期的归档 |
+| POST | `/api/schedule/remind` | 手动触发一次事务提醒 |
+| GET | `/api/files` | 资料箱文件列表 |
+| POST | `/api/files/scan` | OCR / VLM / 文档读取 → 提取日程 → 自动排班 |
 | WS | `/ws` | 服务端事件推送 |
 
 ### 6.3 WebSocket 事件协议
@@ -482,7 +493,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 897 个用例，覆盖：
+`backend/tests` 共 **1016** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -492,9 +503,32 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 - 点目、预测线、全盘复盘、SGF；
 - 棋谱库、记忆、画像、时间感知；
 - TTS 文本、缓存、阿里云协议、语音链路；
+- 动态日程：James-Stein / EWMA / 变更点 / 机会约束 / 缓冲 / 锁定窗口 / 触发闸门 / 反馈与复盘；
 - FastAPI 端点与 WebSocket 事件。
 
 KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
+
+### 6.10 动态日程排程（v4.1.1）
+
+`auto_plan.py`（纯逻辑）+ `schedule_learning.py`（纯学习）+ `life.py`（持久化）分工：
+
+1. **时长估计**：`schedule_stats` 按类别保存 EWMA 均值 / 方差 / 样本数。
+   `update_stats()` 收到完成反馈后更新；连续两次偏差 > 2.5σ 且样本 ≥ 3 ⇒ 变更点，均值重置到本次实际值。
+2. **分层收缩**：`plan()` 先按类别可信度 `n/(n+3)` 把类别均值与全局均值混合，类别无记录时
+   用「类别先验 0.5 + 全局均值 0.5」；同类别 ≥ 3 条走 `shrink_toward()`（向各自目标的正部 JS），
+   1~2 条按 `n/(n+2)` 温和收缩；类别没有完成样本时完全相信本次声明时长。
+3. **机会约束**：`risk_min = mean + z·σ`（上限 1.35 倍），`z` 由 `schedule_risk_z` 配置
+   （0.84 ≈ 80% 完成概率）。每日 `buffer_min` 在窗口末尾集中预留，不逐任务加安全时间。
+4. **放置与排序**：有截止时间走 EDF，其余按综合分 / 时长（优先级密度）降序；
+   best-fit 选「最早一天 + 剩余最小」的空闲段；推迟过的任务优先排到明天。
+5. **滚动重排**：`should_replan()` 只在新增待定 / 关键任务逾期 / 容量不足时返回 `trigger=True`；
+   后台循环每 5 分钟检查、两次重排至少隔 15 分钟，只排未来 1~3 天；
+   `lock_sec`（默认 12 小时）内的自动安排与窗口外的自动安排都视为已承诺，不移动。
+6. **反馈闭环**：`/api/schedule/feedback` 写回状态与实际耗时 → 更新类别统计 →
+   推迟时立即按 1~3 天重排；`/api/schedule/review` 汇总各类别计划 / 实际偏差与完成、推迟、跳过计数。
+   偏好分只做同优先级平局加分，不覆盖用户明确给出的优先级。
+
+未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 
 ---
 
@@ -530,6 +564,7 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
 | `profile.db` | `backend/data/` | 玩家棋风画像、每局记录、人格化状态（关系 / 情绪余温 / 互动数） | `summarize()`；画像总开关关着时不写画像，人格化仍按 `persona_enabled` 写 persona 表 |
 | `games.db` | `backend/data/` | 棋谱库、逐手、总结、注记 | 局末归档 / 导入 |
 | `joseki_progress.db` | `backend/data/` | 定式族出现计数 | 定式命中时 |
+| `life.db` | `backend/data/` | 生命时间线、慢变量、共享日程（`schedule_items`）与类别耗时统计（`schedule_stats`） | 互动 / 日程写入 / 执行反馈 |
 | `thinking_lines.json` | `game/data/` | 思考短句解析工具的数据（当前运行路径不轮播） | 只读 |
 | `assets/voice` | `game/assets/` | 27 条预制语音 | 只读 |
 | `backend/logs` | `backend/logs/` | 服务日志、PID 文件、TTS 探针 | 运行时 |

@@ -20,6 +20,8 @@ signal files_scan_requested
 signal files_auto_plan_requested
 signal files_archive_requested
 signal files_cleanup_requested
+signal files_review_requested
+signal schedule_feedback_requested(id: int, outcome: String, actual_min: int)
 signal go_requested
 signal size_selected(height: int)
 signal quit_requested
@@ -77,6 +79,7 @@ var _files_refresh: Button
 var _files_auto_plan: Button
 var _files_archive: Button
 var _files_cleanup: Button
+var _files_review: Button
 var _reminder: PanelContainer
 var _reminder_label: Label
 var _reminder_until := 0
@@ -488,6 +491,14 @@ func _build_files() -> void:
 	GufengTheme.apply_button(_files_cleanup)
 	_files_cleanup.pressed.connect(func(): files_cleanup_requested.emit())
 	row2.add_child(_files_cleanup)
+	_files_review = Button.new()
+	_files_review.text = "复盘"
+	_files_review.tooltip_text = "按类别看计划 / 实际耗时偏差与完成、推迟次数"
+	_files_review.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_files_review.custom_minimum_size = Vector2(70, 26)
+	GufengTheme.apply_button(_files_review)
+	_files_review.pressed.connect(func(): files_review_requested.emit())
+	row2.add_child(_files_review)
 
 func _build_cards() -> void:
 	# 事务提醒卡：到点时由 PetShell 调 show_reminder()；压在聊天 / 资料面板之上，12 秒后自动消失。
@@ -1036,19 +1047,64 @@ func _build_agenda(items: Array) -> void:
 		var d: Dictionary = it
 		var when := str(d.get("when_text", "")).strip_edges()
 		var title := str(d.get("title", "")).strip_edges()
+		var status := str(d.get("status", "planned")).strip_edges()
+		var tag := _priority_tag(d)
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 3)
 		var lbl := Label.new()
-		lbl.text = "· %s  %s" % [when, title]
+		lbl.text = "· %s  %s%s" % [when, tag, title]
+		if status == "done":
+			lbl.text += "（已完成）"
+		elif status == "cancelled":
+			lbl.text += "（已取消）"
 		lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		lbl.custom_minimum_size = Vector2(180, 0)
+		lbl.custom_minimum_size = Vector2(150, 0)
 		lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		lbl.add_theme_font_size_override("font_size", 10)
-		lbl.add_theme_color_override("font_color", GufengTheme.INK)
+		lbl.add_theme_color_override("font_color",
+			GufengTheme.INK_SOFT if status != "planned" else GufengTheme.INK)
 		var tips: Array[String] = []
-		for x in [str(d.get("notes", "")), str(d.get("teacher", "")), str(d.get("location", ""))]:
+		for x in [str(d.get("notes", "")), str(d.get("teacher", "")),
+				str(d.get("location", ""))]:
 			if str(x).strip_edges() != "":
 				tips.append(str(x).strip_edges())
+		if status == "planned":
+			var pri := int(d.get("priority", 50))
+			var typ := str(d.get("task_type", "general"))
+			var meta := "优先级 %d · 类型 %s · 计划 %d 分钟" % [
+				pri, typ, int(d.get("duration_min", 60))]
+			tips.push_front(meta)
 		lbl.tooltip_text = "\n".join(tips)
-		wrap.add_child(lbl)
+		row.add_child(lbl)
+		if status == "planned":
+			# 执行反馈：完成 → 后端按「现在 - 开始时间」估实际耗时；推迟 → 明天优先再排。
+			var bd := Button.new()
+			bd.text = "完成"
+			bd.tooltip_text = "记录完成；实际耗时按当前时间与计划开始估算"
+			bd.custom_minimum_size = Vector2(44, 20)
+			bd.add_theme_font_size_override("font_size", 10)
+			GufengTheme.apply_button(bd)
+			bd.pressed.connect(func(): schedule_feedback_requested.emit(
+				int(d.get("id", 0)), "done", 0))
+			row.add_child(bd)
+			var bp := Button.new()
+			bp.text = "推迟"
+			bp.tooltip_text = "先记下来，优先排到明天；连续推迟会更新类别偏好"
+			bp.custom_minimum_size = Vector2(44, 20)
+			bp.add_theme_font_size_override("font_size", 10)
+			GufengTheme.apply_button(bp)
+			bp.pressed.connect(func(): schedule_feedback_requested.emit(
+				int(d.get("id", 0)), "deferred", 0))
+			row.add_child(bp)
+		wrap.add_child(row)
+
+func _priority_tag(d: Dictionary) -> String:
+	var pri := int(d.get("priority", 50))
+	if pri >= 85:
+		return "[紧急] "
+	if pri >= 70:
+		return "[高] "
+	return ""
 
 func draw_schedule_table(c: Control, s: Vector2) -> void:
 	if _timetable.is_empty() or s.x < 4.0 or s.y < 4.0:
@@ -1080,7 +1136,8 @@ func set_files_status(text: String) -> void:
 		_files_status.text = str(text)
 
 func set_files_busy(on: bool) -> void:
-	for b in [_files_scan, _files_refresh, _files_auto_plan, _files_archive, _files_cleanup]:
+	for b in [_files_scan, _files_refresh, _files_auto_plan, _files_archive,
+			_files_cleanup, _files_review]:
 		if b != null:
 			b.disabled = on
 	if on:

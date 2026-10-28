@@ -260,6 +260,62 @@ class LifeStoreTest(unittest.TestCase):
         self.assertTrue(row["auto_planned"])
         self.assertIn("自动安排", row["when_text"])
 
+    def test_schedule_stats_and_execution_feedback(self):
+        """类别统计持久化 + 完成 / 推迟 / 跳过三种反馈。"""
+        task = self.store.upsert_schedule([{
+            "start_ts": T0 + 60.0, "when_text": "今天 09:00", "title": "复习第三章",
+            "kind": "task", "source": "plan.txt", "task_type": "study",
+            "duration_min": 60, "priority": 70,
+        }], source="plan.txt", now=T0)[0]
+        self.assertEqual(task["task_type"], "study")
+
+        done = self.store.record_feedback(task["id"], "done", actual_min=45,
+                                          now=T0 + 600.0)
+        self.assertEqual(done["status"], "done")
+        self.assertAlmostEqual(done["actual_min"], 45.0)
+        self.assertAlmostEqual(done["completed_ts"], T0 + 600.0)
+        self.assertEqual(done["outcome"], "done")
+
+        stats = self.store.load_schedule_stats()
+        self.assertEqual(stats, {})
+        self.assertTrue(self.store.save_schedule_stats({
+            "study": {"dur_mean": 50.0, "dur_var": 120.0, "samples": 1,
+                      "done_count": 1, "defer_count": 0, "dev_streak": 0,
+                      "change_point_ts": 0.0, "updated_ts": T0 + 600.0}}))
+        got = self.store.load_schedule_stats()["study"]
+        self.assertAlmostEqual(got["dur_mean"], 50.0)
+        self.assertAlmostEqual(got["dur_var"], 120.0)
+        self.assertEqual(got["samples"], 1)
+
+        defer = self.store.upsert_schedule([{
+            "start_ts": T0 + 3600.0, "when_text": "今天 10:00", "title": "写报告",
+            "kind": "task", "source": "plan.txt", "task_type": "work",
+            "auto_planned": True, "duration_min": 60,
+        }], source="plan.txt", now=T0)[0]
+        self.store.mark_reminded(defer["id"], T0 + 10.0)
+        moved = self.store.record_feedback(defer["id"], "deferred", now=T0 + 120.0)
+        self.assertEqual(moved["status"], "planned")
+        self.assertAlmostEqual(moved["start_ts"], 0.0)
+        self.assertEqual(moved["when_text"], "待定")
+        self.assertFalse(moved["auto_planned"])
+        self.assertAlmostEqual(moved["reminded_ts"], 0.0)
+        self.assertEqual(moved["defer_count"], 1)
+        self.assertEqual(moved["outcome"], "deferred")
+
+        skip = self.store.upsert_schedule([{
+            "start_ts": T0 + 7200.0, "when_text": "今天 11:00", "title": "取消的事",
+            "kind": "task", "source": "plan.txt", "duration_min": 30,
+        }], source="plan.txt", now=T0)[0]
+        cancelled = self.store.record_feedback(skip["id"], "skipped", now=T0 + 180.0)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["outcome"], "skipped")
+
+        history = self.store.list_schedule_history(20)
+        self.assertGreaterEqual(len(history), 3)
+        self.assertEqual(history[0]["id"], task["id"])       # updated_ts 最大的在前
+        self.assertEqual({x["id"] for x in history[:3]},
+                         {task["id"], defer["id"], skip["id"]})
+
     def test_delete_schedule_source_replaces_old_scan(self):
         """重扫同一份资料：按来源清掉旧文本行，新的结构化课程再写入。"""
         self.store.upsert_schedule([{

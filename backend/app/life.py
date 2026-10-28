@@ -84,10 +84,28 @@ _SCHEMA = (
         auto_planned INTEGER NOT NULL DEFAULT 0,
         reminded_ts REAL NOT NULL DEFAULT 0,
         archived INTEGER NOT NULL DEFAULT 0,
-        archived_ts REAL NOT NULL DEFAULT 0
+        archived_ts REAL NOT NULL DEFAULT 0,
+        task_type TEXT NOT NULL DEFAULT 'general',
+        actual_min REAL NOT NULL DEFAULT 0,
+        defer_count INTEGER NOT NULL DEFAULT 0,
+        completed_ts REAL NOT NULL DEFAULT 0,
+        outcome TEXT NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS idx_life_events_ts ON life_events(ts)",
     "CREATE INDEX IF NOT EXISTS idx_schedule_start ON schedule_items(start_ts)",
+    # 类别统计（v4.1.1）：EWMA 真实耗时 / 变更点 / 完成与推迟计数。与 schedule_items 解耦，
+    # 清理旧日程不会丢掉「学习到的个人节奏」。
+    """CREATE TABLE IF NOT EXISTS schedule_stats (
+        task_type TEXT PRIMARY KEY,
+        dur_mean REAL NOT NULL DEFAULT 60,
+        dur_var REAL NOT NULL DEFAULT 900,
+        samples INTEGER NOT NULL DEFAULT 0,
+        dev_streak INTEGER NOT NULL DEFAULT 0,
+        done_count INTEGER NOT NULL DEFAULT 0,
+        defer_count INTEGER NOT NULL DEFAULT 0,
+        change_point_ts REAL NOT NULL DEFAULT 0,
+        updated_ts REAL NOT NULL DEFAULT 0
+    )""",
 )
 
 # 日程表的**完整列**（顺序固定：`_schedule_row` 按这个下标读）。新增字段用于周课表 UI：
@@ -96,7 +114,9 @@ SCHEDULE_COLS = ("id", "start_ts", "when_text", "title", "notes", "source", "sta
                  "date_text", "weekday", "period", "period_start", "period_end",
                  "start_time", "end_time", "teacher", "location",
                  "kind", "priority", "duration_min", "deadline_ts",
-                 "auto_planned", "reminded_ts", "archived", "archived_ts")
+                 "auto_planned", "reminded_ts", "archived", "archived_ts",
+                 "task_type", "actual_min", "defer_count", "completed_ts", "outcome",
+                 "updated_ts")
 _SCHEDULE_SELECT = ", ".join(SCHEDULE_COLS)
 # 旧库升级：v4.0.0 之前的 schedule_items 没有这些列，启动时按需 ALTER TABLE 补上。
 _SCHEDULE_EXTRA_COLS = {
@@ -117,6 +137,11 @@ _SCHEDULE_EXTRA_COLS = {
     "reminded_ts": "REAL NOT NULL DEFAULT 0",
     "archived": "INTEGER NOT NULL DEFAULT 0",
     "archived_ts": "REAL NOT NULL DEFAULT 0",
+    "task_type": "TEXT NOT NULL DEFAULT 'general'",
+    "actual_min": "REAL NOT NULL DEFAULT 0",
+    "defer_count": "INTEGER NOT NULL DEFAULT 0",
+    "completed_ts": "REAL NOT NULL DEFAULT 0",
+    "outcome": "TEXT NOT NULL DEFAULT ''",
 }
 
 # 事件类型 → 需要更新的时间戳字段。所有事件都能写进时间线；
@@ -475,6 +500,12 @@ class LifeStore:
             "reminded_ts": float(r[21] or 0.0) if len(r) > 21 else 0.0,
             "archived": bool(_num(r[22], 0)) if len(r) > 22 else False,
             "archived_ts": float(r[23] or 0.0) if len(r) > 23 else 0.0,
+            "task_type": _text(24) or "general",
+            "actual_min": float(r[25] or 0.0) if len(r) > 25 else 0.0,
+            "defer_count": _num(r[26], 0) if len(r) > 26 else 0,
+            "completed_ts": float(r[27] or 0.0) if len(r) > 27 else 0.0,
+            "outcome": _text(28),
+            "updated_ts": float(r[29] or 0.0) if len(r) > 29 else 0.0,
         }
 
     def upsert_schedule(self, items, source="", now=None):
@@ -527,6 +558,8 @@ class LifeStore:
                     if not math.isfinite(deadline) or deadline < 0.0:
                         deadline = 0.0
                     auto_planned = 1 if bool(it.get("auto_planned", False)) else 0
+                    task_type = _clip(it.get("task_type", ""), 24) or (
+                        "course" if kind == "course" else "general")
                     if period != "" or weekday >= 0:
                         row = self._db.execute(
                             "SELECT id FROM schedule_items WHERE source = ? AND date_text = ? "
@@ -542,11 +575,11 @@ class LifeStore:
                             "INSERT INTO schedule_items(start_ts, when_text, title, notes, source, "
                             "status, created_ts, updated_ts, date_text, weekday, period, period_start, "
                             "period_end, start_time, end_time, teacher, location, kind, priority, "
-                            "duration_min, deadline_ts, auto_planned) "
-                            "VALUES(?,?,?,?,?,'planned',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "duration_min, deadline_ts, auto_planned, task_type) "
+                            "VALUES(?,?,?,?,?,'planned',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (start, when_text, title, notes, src, t, t, date_text, weekday, period,
                              p_start, p_end, start_time, end_time, teacher, location, kind, priority,
-                             duration, deadline, auto_planned))
+                             duration, deadline, auto_planned, task_type))
                         sid = int(cur.lastrowid)
                     else:
                         sid = int(row[0])
@@ -555,10 +588,10 @@ class LifeStore:
                             "date_text = ?, weekday = ?, period = ?, period_start = ?, period_end = ?, "
                             "start_time = ?, end_time = ?, teacher = ?, location = ?, kind = ?, "
                             "priority = ?, duration_min = ?, deadline_ts = ?, auto_planned = ?, "
-                            "updated_ts = ? WHERE id = ?",
+                            "task_type = ?, updated_ts = ? WHERE id = ?",
                             (start, when_text, notes, date_text, weekday, period, p_start, p_end,
                              start_time, end_time, teacher, location, kind, priority, duration,
-                             deadline, auto_planned, t, sid))
+                             deadline, auto_planned, task_type, t, sid))
                     got = self._db.execute(
                         "SELECT %s FROM schedule_items WHERE id = ?" % _SCHEDULE_SELECT,
                         (sid,)).fetchone()
@@ -595,6 +628,126 @@ class LifeStore:
         except Exception as e:              # noqa: BLE001
             print("[Life] 旧日程清理失败（已忽略）：%s" % e)
             return 0
+
+    def load_schedule_stats(self):
+        """读取类别统计（task_type → dict）；库不可用返回空字典。"""
+        if self._db is None:
+            return {}
+        try:
+            with self._lock:
+                rows = self._db.execute(
+                    "SELECT task_type, dur_mean, dur_var, samples, dev_streak, done_count, "
+                    "defer_count, change_point_ts, updated_ts FROM schedule_stats").fetchall()
+            out = {}
+            for r in rows:
+                key = str(r[0] or "general")
+                out[key] = {
+                    "task_type": key, "dur_mean": float(r[1] or 60.0),
+                    "dur_var": float(r[2] or 900.0), "samples": _safe_int(r[3], 0),
+                    "dev_streak": _safe_int(r[4], 0), "done_count": _safe_int(r[5], 0),
+                    "defer_count": _safe_int(r[6], 0),
+                    "change_point_ts": float(r[7] or 0.0), "updated_ts": float(r[8] or 0.0),
+                }
+            return out
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 类别统计读取失败（已忽略）：%s" % e)
+            return {}
+
+    def save_schedule_stats(self, stats):
+        """写入类别统计（整表 upsert）；失败忽略。"""
+        if self._db is None or not isinstance(stats, dict):
+            return False
+        try:
+            with self._lock:
+                for key, raw in stats.items():
+                    if not isinstance(raw, dict):
+                        continue
+                    cat = str(key or raw.get("task_type") or "general")
+                    self._db.execute(
+                        "INSERT INTO schedule_stats(task_type, dur_mean, dur_var, samples, "
+                        "dev_streak, done_count, defer_count, change_point_ts, updated_ts) "
+                        "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(task_type) DO UPDATE SET "
+                        "dur_mean=excluded.dur_mean, dur_var=excluded.dur_var, "
+                        "samples=excluded.samples, dev_streak=excluded.dev_streak, "
+                        "done_count=excluded.done_count, defer_count=excluded.defer_count, "
+                        "change_point_ts=excluded.change_point_ts, updated_ts=excluded.updated_ts",
+                        (cat, float(raw.get("dur_mean", 60.0) or 60.0),
+                         float(raw.get("dur_var", 900.0) or 900.0),
+                         _safe_int(raw.get("samples"), 0), _safe_int(raw.get("dev_streak"), 0),
+                         _safe_int(raw.get("done_count"), 0), _safe_int(raw.get("defer_count"), 0),
+                         float(raw.get("change_point_ts", 0.0) or 0.0),
+                         float(raw.get("updated_ts", 0.0) or 0.0)))
+                self._db.commit()
+            return True
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 类别统计写入失败（已忽略）：%s" % e)
+            return False
+
+    def list_schedule_history(self, limit=500):
+        """学习 / 复盘用：所有状态（完成 / 取消 / 归档）按更新时间倒序。"""
+        try:
+            n = max(1, min(int(limit or 0), 1000))
+        except (TypeError, ValueError):
+            n = 500
+        if self._db is None:
+            return []
+        try:
+            with self._lock:
+                rows = self._db.execute(
+                    "SELECT %s FROM schedule_items ORDER BY updated_ts DESC, id DESC LIMIT ?"
+                    % _SCHEDULE_SELECT, (n,)).fetchall()
+            return [self._schedule_row(r) for r in rows]
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 日程历史读取失败（已忽略）：%s" % e)
+            return []
+
+    def record_feedback(self, item_id, outcome="done", actual_min=0, now=None):
+        """记录一次执行结果：done / deferred / skipped；返回更新后的条目或 ``{}``。
+
+        - ``done``：状态置 done，写入 actual_min / completed_ts；
+        - ``deferred``：推迟计数 +1，清空时间回到待定，提醒标记重置（下次还能提醒）；
+        - ``skipped``：状态置 cancelled。
+        """
+        if self._db is None:
+            return {}
+        try:
+            sid = int(item_id)
+        except (TypeError, ValueError, OverflowError):
+            return {}
+        result = str(outcome or "done").strip().lower()
+        if result not in ("done", "deferred", "skipped"):
+            result = "done"
+        try:
+            actual = max(0.0, float(actual_min or 0))
+        except (TypeError, ValueError, OverflowError):
+            actual = 0.0
+        if not math.isfinite(actual):
+            actual = 0.0
+        t = _as_ts(now) or time.time()
+        try:
+            with self._lock:
+                if result == "done":
+                    self._db.execute(
+                        "UPDATE schedule_items SET status='done', actual_min=?, completed_ts=?, "
+                        "outcome='done', updated_ts=? WHERE id=?",
+                        (actual, t, t, sid))
+                elif result == "deferred":
+                    self._db.execute(
+                        "UPDATE schedule_items SET status='planned', start_ts=0, when_text='待定', "
+                        "auto_planned=0, reminded_ts=0, defer_count=defer_count+1, "
+                        "outcome='deferred', updated_ts=? WHERE id=?", (t, sid))
+                else:
+                    self._db.execute(
+                        "UPDATE schedule_items SET status='cancelled', outcome='skipped', "
+                        "updated_ts=? WHERE id=?", (t, sid))
+                self._db.commit()
+                r = self._db.execute(
+                    "SELECT %s FROM schedule_items WHERE id = ?" % _SCHEDULE_SELECT,
+                    (sid,)).fetchone()
+            return self._schedule_row(r) if r is not None else {}
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 执行结果写入失败（已忽略）：%s" % e)
+            return {}
 
     def list_schedule_plan(self, limit=200):
         """自动排班输入：当前所有未归档的 planned 条目（含待定项）。"""

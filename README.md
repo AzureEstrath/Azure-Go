@@ -3,7 +3,7 @@
 > **桌宠是主程序，围棋是它打开的独立窗口。**
 > 同一套 Azure 人格、情绪、时间线与记忆，在桌宠、围棋窗口和重启后的下一次见面之间保持连续。
 
-**版本：v4.1.0（Release）**
+**版本：v4.1.1（Release）**
 
 Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你说话、看你在忙什么，也可以打开一盘围棋和你下棋。她不是“围棋程序里的桌宠模式”，而是一个有自己的时间、精力、心情与记忆的桌面角色。
 
@@ -64,13 +64,23 @@ Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你�
 - `LifeTimeline`：只追加的生命事件与相对时间事实；桌宠启动时能知道“上一回见到 Estarth 是什么时候”。
 - 共享后端：桌宠、围棋窗口、重启后的 Azure 看到的是同一份情绪与记忆。
 
-### 资料、日程与提醒（v4.1.0）
+### 资料、日程与提醒（v4.1.1）
 
 - **资料箱 → 周课表**：图片 / PDF / 文档经 OCR + VLM 读取；课程表按 OCR 坐标还原成
   7 天 × 12 节的周课表（星期、节次、教师、地点、日期），不再压成一串文字。
 - **自动排班**：待定任务按**优先级 + 截止时间 + 空闲区间**自动落位；时长 / 优先级先做
   **正部 James-Stein 收缩估计**（向历史均值收缩，`m < 3` 不收缩），再用优先级密度排序、
   best-fit 打包空闲段。固定课程与已定时间不被移动。
+- **动态排程学习（v4.1.1）**：
+  - 每类任务用 **EWMA** 维护真实耗时；样本少时向类别先验收缩，样本多时向类别均值收缩，
+    再向全局均值收缩。连续两次偏差超过 2.5σ 视为**变更点**，重置该类别的时长先验。
+  - **事件驱动滚动重排**：新待定 / 关键任务逾期 / 未来容量不足才触发；两次重排至少隔 15 分钟，
+    只动未来 1~3 天；已自动安排且落在 12 小时锁定窗内的任务不动（最小扰动）。
+  - **集中缓冲**：每天工作窗口末尾预留 45 分钟弹性块，而不是给每个任务加安全时间。
+  - **机会约束**：按 `均值 + z·σ`（默认 z=0.84 ≈ 80% 完成概率）预留时长，上限 1.35 倍。
+  - **偏好与推迟**：完成 / 推迟次数形成很轻的类别偏好分；点「推迟」后任务优先排到明天。
+- **执行反馈与复盘**：日程行可直接「完成 / 推迟」；完成后更新类别 EWMA，
+  「复盘」按类别显示计划 / 实际耗时偏差与完成、推迟、跳过计数。
 - **到点事务提醒**：后端每 15 秒检查一次，到点把事务喂给 LLM 生成一句短提醒；
   LLM 不可用时自动退回模板气泡。提醒走 `ai_remind`，**不发语音**；面板开着时显示在面板上方的提醒卡。
 - **留档与清理**：过期日程可归档保留（不删除）；超过保留期（默认 30 天）的归档可一键清理；
@@ -259,6 +269,10 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `schedule_reminder_enabled` | `true` | 到点事务提醒（LLM 生成，失败用模板） |
 | `schedule_archive_days` | `7` | 自动留档 / 手动「归档过期」的天数 |
 | `schedule_retention_days` | `30` | 归档保留天数，超过后自动清理 |
+| `schedule_buffer_min` | `45` | 每天工作窗口末尾预留的弹性时间（分钟） |
+| `schedule_lock_hours` | `12` | 自动安排在未来多少小时内不再移动 |
+| `schedule_risk_z` | `0.84` | 机会约束的 z 值（0.84 ≈ 80% 完成概率） |
+| `schedule_ewma_alpha` | `0.35` | 真实耗时 EWMA 的更新速度 |
 | `vlm_enabled` | `true` | 自动窥屏 / 资料图片读取；缺环境时退化 |
 | `tts_enabled` | `true` | 语音总开关 |
 | `tts_mode` | `local` | `system` / `local` / `openai` / `aliyun` |
@@ -330,7 +344,9 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `GET /api/files` | 资料箱文件列表 |
 | `POST /api/files/scan` | OCR / VLM / 文档读取 → LLM 提取日程 → 写共享日程与记忆 |
 | `GET /api/schedule` | 共享日程列表（`include_archived=1` 看留档） |
-| `POST /api/schedule/auto_plan` | 自动排班（优先级 + James-Stein 收缩 + best-fit） |
+| `POST /api/schedule/auto_plan` | 自动排班（分层收缩 + 机会约束 + 每日缓冲 + best-fit） |
+| `POST /api/schedule/feedback` | 记录完成 / 推迟 / 跳过；更新 EWMA，推迟后立即重排 |
+| `GET /api/schedule/review?days=7` | 按类别复盘计划 / 实际耗时偏差与完成、推迟计数 |
 | `POST /api/schedule/archive` | 归档过期 / 指定日程（不删除） |
 | `POST /api/schedule/cleanup` | 清理超过保留期的归档 |
 | `POST /api/schedule/remind` | 手动触发一次事务提醒（LLM 文本 / 模板） |
@@ -359,7 +375,7 @@ cd backend
 python -m unittest discover -s tests -q
 ```
 
-当前全量：**988 tests OK**。
+当前全量：**1016 tests OK**。
 
 ### 前端门卫
 
@@ -378,7 +394,7 @@ Get-ChildItem game\tests\test_*.gd | ForEach-Object {
 }
 ```
 
-当前 20 个前端脚本全部通过；`test_pet_shell.gd` 61 项断言。
+当前 20 个前端脚本全部通过；`test_pet_shell.gd` 80 项断言。
 
 ### 启动自检
 
@@ -436,7 +452,8 @@ run_test_env.bat tests
 │  ├─ app\memory.py               共享记忆 / episode
 │  ├─ app\file_service.py         资料箱 / 扫描器编排 / VLM 拉起
 │  ├─ app\schedule.py             资料文本 → 日程提取与归一化
-│  ├─ app\auto_plan.py            自动排班（James-Stein 收缩 + 优先级密度 + best-fit）
+│  ├─ app\auto_plan.py            自动排班（分层 James-Stein + 触发闸门 + best-fit）
+│  ├─ app\schedule_learning.py    EWMA 时长 / 变更点 / 偏好 / 复盘
 │  ├─ app\main.py                 REST / WebSocket
 │  ├─ tests\                      后端测试
 │  └─ data\                       运行产物（gitignore）

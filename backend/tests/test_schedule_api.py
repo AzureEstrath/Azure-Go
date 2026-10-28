@@ -66,5 +66,75 @@ class SchedulePlanningApiTest(unittest.TestCase):
                 store.close()
 
 
+class ScheduleFeedbackApiTest(unittest.TestCase):
+    def test_feedback_updates_stats_and_deferred_replans(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = LifeStore(os.path.join(d, "life.db"))
+            done_item = store.upsert_schedule([{
+                "start_ts": 0.0, "when_text": "待定", "title": "复习第三章",
+                "kind": "task", "priority": 80, "duration_min": 60,
+                "task_type": "study", "source": "a.txt",
+            }], source="a.txt")[0]
+            defer_item = store.upsert_schedule([{
+                "start_ts": 0.0, "when_text": "待定", "title": "写项目文档",
+                "kind": "task", "priority": 60, "duration_min": 90,
+                "task_type": "work", "source": "a.txt",
+            }], source="a.txt")[0]
+            skip_item = store.upsert_schedule([{
+                "start_ts": 0.0, "when_text": "待定", "title": "缴费",
+                "kind": "task", "priority": 40, "duration_min": 20,
+                "task_type": "chore", "source": "a.txt",
+            }], source="a.txt")[0]
+            cfg = AzureConfig()
+            app = create_app(cfg=cfg, agent=AzureAgent(
+                StubEngine(), StubLLM(text="好。"), events.RecordingBus()),
+                autostart=False, life=store)
+            try:
+                with TestClient(app) as client:
+                    r = client.post("/api/schedule/feedback", json={
+                        "id": done_item["id"], "outcome": "done", "actual_min": 42})
+                    body = r.json()
+                    self.assertTrue(body["ok"], body)
+                    self.assertEqual(body["item"]["status"], "done")
+                    self.assertAlmostEqual(body["item"]["actual_min"], 42.0)
+                    self.assertAlmostEqual(body["stats"]["dur_mean"], 54.0)  # (60*2+42)/3
+                    self.assertEqual(body["stats"]["samples"], 1)
+
+                    r = client.post("/api/schedule/feedback", json={
+                        "id": defer_item["id"], "outcome": "deferred"})
+                    body = r.json()
+                    self.assertTrue(body["ok"], body)
+                    self.assertAlmostEqual(body["item"]["start_ts"], 0.0)
+                    self.assertEqual(body["item"]["defer_count"], 1)
+                    self.assertEqual(body["stats"]["defer_count"], 1)
+                    self.assertEqual(body["stats"]["samples"], 0)
+                    self.assertIsNotNone(body["replanned"])
+                    self.assertGreaterEqual(body["replanned"]["planned"], 1)
+                    rows = {x["id"]: x for x in body["items"]}
+                    self.assertGreater(rows[defer_item["id"]]["start_ts"], 0.0)
+
+                    r = client.post("/api/schedule/feedback", json={
+                        "id": skip_item["id"], "outcome": "skipped"})
+                    body = r.json()
+                    self.assertTrue(body["ok"], body)
+                    self.assertEqual(body["item"]["status"], "cancelled")
+                    self.assertEqual(body["item"]["outcome"], "skipped")
+
+                    r = client.get("/api/schedule/review?days=7")
+                    rev = r.json()
+                    self.assertTrue(rev["ok"], rev)
+                    self.assertIn("rows", rev)
+                    rows = {x["task_type"]: x for x in rev["rows"]}
+                    self.assertEqual(rows["study"]["done"], 1)
+                    self.assertEqual(rows["work"]["deferred"], 1)
+                    self.assertEqual(rows["chore"]["skipped"], 1)
+                    self.assertIn("days", rev)
+
+                    r = client.post("/api/schedule/feedback", json={"id": 99999})
+                    self.assertFalse(r.json()["ok"])
+            finally:
+                store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

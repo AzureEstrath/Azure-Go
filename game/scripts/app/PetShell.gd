@@ -110,6 +110,8 @@ func _build_ui() -> void:
 	view.files_auto_plan_requested.connect(_auto_plan_files)
 	view.files_archive_requested.connect(_archive_files)
 	view.files_cleanup_requested.connect(_cleanup_files)
+	view.files_review_requested.connect(_review_schedule)
+	view.schedule_feedback_requested.connect(_feedback_schedule)
 	view.go_requested.connect(_launch_game)
 	view.size_selected.connect(_on_size_selected)
 	view.quit_requested.connect(_on_quit)
@@ -556,6 +558,76 @@ func _cleanup_files() -> void:
 			return
 		view.set_schedule_items(d.get("items", []))
 		view.set_files_status("已清理 %d 条超过保留期的旧归档。" % int(d.get("removed", 0)))
+		_bump_activity())
+
+func _feedback_schedule(id: int, outcome: String, actual_min: int) -> void:
+	if view == null or id <= 0:
+		return
+	if agent == null or not _online:
+		view.set_files_status("后端还没连上，稍后再试。")
+		return
+	view.set_files_status("记录执行结果…")
+	agent.feedback_schedule(id, outcome, actual_min, func(ok: bool, _c: int, d: Dictionary):
+		if not ok or not bool(d.get("ok", false)):
+			view.set_files_status(str(d.get("error", "记录失败，稍后再试。")))
+			return
+		view.set_schedule_items(d.get("items", []))
+		var item: Dictionary = d.get("item", {}) if typeof(d.get("item")) == TYPE_DICTIONARY else {}
+		var stats: Dictionary = d.get("stats", {}) if typeof(d.get("stats")) == TYPE_DICTIONARY else {}
+		var line := "已记录。"
+		if outcome == "deferred":
+			var rp: Dictionary = d.get("replanned", {}) if typeof(d.get("replanned")) == TYPE_DICTIONARY else {}
+			line = "已推迟，优先排到明天"
+			if int(rp.get("planned", 0)) > 0:
+				line += "（本轮重排 %d 条）。" % int(rp.get("planned", 0))
+			else:
+				line += "。"
+		elif outcome == "skipped":
+			line = "已跳过这条任务。"
+		else:
+			var actual := int(round(float(item.get("actual_min", 0.0))))
+			var mean := int(round(float(stats.get("dur_mean", 0.0))))
+			line = "已记录完成，实际 %d 分钟。" % actual
+			if mean > 0:
+				line = "已记录完成，实际 %d 分钟；该类别均值更新为 %d 分钟。" % [actual, mean]
+		view.set_files_status(line)
+		_bump_activity())
+
+func _review_schedule() -> void:
+	if view == null:
+		return
+	if agent == null or not _online:
+		view.set_files_status("后端还没连上，稍后再试。")
+		return
+	view.set_files_busy(true)
+	view.set_files_status("按类别复盘最近 7 天…")
+	agent.fetch_schedule_review(func(ok: bool, _c: int, d: Dictionary):
+		view.set_files_busy(false)
+		if not ok or not bool(d.get("ok", false)):
+			view.set_files_status(str(d.get("error", "复盘失败，稍后再试。")))
+			return
+		var lines: Array[String] = []
+		var summary := str(d.get("summary", "")).strip_edges()
+		if summary != "":
+			lines.append(summary)
+		var rows: Array = d.get("rows", []) if typeof(d.get("rows")) == TYPE_ARRAY else []
+		for r in rows:
+			if lines.size() >= 6:
+				break
+			if typeof(r) != TYPE_DICTIONARY:
+				continue
+			var row: Dictionary = r
+			var bias := int(round(float(row.get("bias_pct", 0.0))))
+			var direction := "偏慢" if bias > 0 else ("偏快" if bias < 0 else "持平")
+			lines.append("%s：计划 %d / 实际 %d 分钟（%s %d%%）；完成 %d，推迟 %d" % [
+				str(row.get("label", row.get("task_type", "任务"))),
+				int(round(float(row.get("planned_mean", 0.0)))),
+				int(round(float(row.get("actual_mean", 0.0)))),
+				direction, absi(bias),
+				int(row.get("done", 0)), int(row.get("deferred", 0))])
+		if lines.is_empty():
+			lines.append("还没有可复盘的记录。")
+		view.set_files_status("\n".join(lines))
 		_bump_activity())
 
 func _bump_activity() -> void:

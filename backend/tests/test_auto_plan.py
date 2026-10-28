@@ -91,5 +91,121 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(auto_plan.plan([archived], now=NOW)["assignments"], [])
 
 
+class DynamicPlanTest(unittest.TestCase):
+    """v4.1.1：分层目标 / 机会约束 / 每日缓冲 / 锁定窗口 / 推迟。"""
+
+    def _item(self, i, title, dur=60, pri=50, start=0.0, deadline=0.0, **kw):
+        row = {"id": i, "title": title, "duration_min": dur, "priority": pri,
+               "start_ts": start, "deadline_ts": deadline, "kind": "task",
+               "status": "planned", "archived": False, "auto_planned": False,
+               "task_type": "general"}
+        row.update(kw)
+        return row
+
+    def test_category_stats_shrink_toward_learned_mean(self):
+        item = self._item(1, "学习任务", 120, 50, task_type="study")
+        out = auto_plan.plan(
+            [item], now=NOW, days=2,
+            category_stats={"study": {"task_type": "study", "dur_mean": 30.0,
+                                      "dur_var": 100.0, "samples": 5}})
+        got = out["assignments"][0]
+        self.assertLess(got["duration_min"], 120)
+        self.assertGreaterEqual(got["duration_min"], 80)
+        self.assertEqual(out["stats"]["groups"], {"study": 1})
+
+    def test_declared_duration_is_kept_without_history(self):
+        item = self._item(1, "自定义时长", 30, 50)
+        out = auto_plan.plan([item], now=NOW, days=1)
+        self.assertEqual(out["assignments"][0]["duration_min"], 30)
+
+    def test_history_prior_prefers_actual_duration(self):
+        history = [{"kind": "task", "status": "done", "duration_min": 60,
+                    "actual_min": 30} for _ in range(3)]
+        item = self._item(1, "新任务", 120, 50)
+        out = auto_plan.plan([item], now=NOW, days=2, history=history)
+        self.assertGreaterEqual(out["stats"]["prior_duration"], 25)
+        self.assertLessEqual(out["stats"]["prior_duration"], 35)
+
+    def test_risk_z_pads_duration_for_chance_constraint(self):
+        item = self._item(1, "风险任务", 60, 50)
+        out = auto_plan.plan([item], now=NOW, days=1, risk_z=0.84)
+        got = out["assignments"][0]
+        self.assertGreater(got["risk_min"], got["duration_min"])
+        self.assertLessEqual(got["risk_min"], got["duration_min"] * 1.35)
+        self.assertEqual(out["stats"]["risk_z"], 0.84)
+
+    def test_daily_buffer_reserves_end_of_day(self):
+        # 工作窗口 08:00-22:00 = 840 分钟；留 120 分钟缓冲后只剩 720，730 分钟放不下。
+        item = self._item(1, "超长任务", 730, 50)
+        with_buffer = auto_plan.plan([item], now=NOW, days=1, buffer_min=120)
+        without = auto_plan.plan([item], now=NOW, days=1, buffer_min=0)
+        self.assertEqual(with_buffer["assignments"], [])
+        self.assertEqual(len(without["assignments"]), 1)
+
+    def test_locked_auto_plan_is_not_moved(self):
+        locked = self._item(1, "锁窗内", 60, 50, start=NOW + 2 * 3600.0,
+                            auto_planned=True)
+        out = auto_plan.plan([locked], now=NOW, days=2, lock_sec=12 * 3600.0)
+        self.assertEqual(out["assignments"], [])
+        self.assertEqual(out["fixed"], 1)
+
+    def test_auto_plan_outside_lock_window_is_replanned(self):
+        later = self._item(1, "锁窗外", 60, 50, start=NOW + 24 * 3600.0,
+                           auto_planned=True)
+        out = auto_plan.plan([later], now=NOW, days=2, lock_sec=12 * 3600.0)
+        self.assertEqual(len(out["assignments"]), 1)
+        self.assertLess(out["assignments"][0]["start_ts"], NOW + 24 * 3600.0)
+
+    def test_auto_plan_beyond_horizon_is_kept(self):
+        later = self._item(1, "窗口外", 60, 50, start=NOW + 4 * 86400.0,
+                           auto_planned=True)
+        out = auto_plan.plan([later], now=NOW, days=3, lock_sec=0)
+        self.assertEqual(out["assignments"], [])
+        self.assertEqual(out["fixed"], 1)
+
+    def test_deferred_task_moves_to_next_day(self):
+        item = self._item(1, "推迟过", 60, 50, defer_count=1)
+        out = auto_plan.plan([item], now=NOW, days=2)
+        got = out["assignments"][0]
+        day = datetime.datetime.fromtimestamp(got["start_ts"]).date()
+        self.assertEqual(day, datetime.datetime(2026, 10, 29).date())
+
+
+class ReplanGateTest(unittest.TestCase):
+    def _item(self, i, title, start=0.0, pri=50, deadline=0.0, **kw):
+        row = {"id": i, "title": title, "duration_min": 60, "priority": pri,
+               "start_ts": start, "deadline_ts": deadline, "kind": "task",
+               "status": "planned", "archived": False, "auto_planned": False}
+        row.update(kw)
+        return row
+
+    def test_planned_items_without_events_do_not_trigger(self):
+        gate = auto_plan.should_replan(
+            [self._item(1, "已排", start=NOW + 3600.0)], now=NOW, horizon_days=1)
+        self.assertFalse(gate["trigger"])
+        self.assertEqual(gate["unplanned_ids"], [])
+
+    def test_new_unplanned_task_triggers(self):
+        gate = auto_plan.should_replan([self._item(1, "待定", pri=85)],
+                                       now=NOW, horizon_days=2)
+        self.assertTrue(gate["trigger"])
+        self.assertIn("urgent_unplanned", gate["reasons"])
+        self.assertEqual(gate["unplanned_ids"], [1])
+
+    def test_overdue_task_triggers_with_id(self):
+        old = self._item(1, "逾期", start=NOW - 3 * 3600.0, pri=80)
+        gate = auto_plan.should_replan([old], now=NOW, horizon_days=1)
+        self.assertTrue(gate["trigger"])
+        self.assertIn("overdue", gate["reasons"])
+        self.assertEqual(gate["overdue_ids"], [1])
+
+    def test_capacity_shortage_triggers(self):
+        fixed = [self._item(9, "占用", start=NOW + 8 * 3600.0, duration_min=600)]
+        tasks = [self._item(i, "高优%d" % i, pri=100) for i in range(1, 9)]
+        gate = auto_plan.should_replan(fixed + tasks, now=NOW, horizon_days=1)
+        self.assertTrue(gate["trigger"])
+        self.assertIn("capacity", gate["reasons"])
+
+
 if __name__ == "__main__":
     unittest.main()

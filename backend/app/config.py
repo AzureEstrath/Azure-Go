@@ -71,6 +71,11 @@ class AzureConfig:
         self.schedule_reminder_enabled = True
         self.schedule_archive_days = 7
         self.schedule_retention_days = 30
+        # v4.1.1 动态排程：每日集中缓冲 / 已承诺窗口 / 机会约束 / EWMA 学习速度。
+        self.schedule_buffer_min = 45       # 每天工作窗口末尾预留的弹性时间（分钟）
+        self.schedule_lock_hours = 12       # 自动安排在未来多少小时内不再移动
+        self.schedule_risk_z = 0.84         # 机会约束：mean + z·σ（0.84 ≈ 80% 完成概率）
+        self.schedule_ewma_alpha = 0.35     # 真实耗时 EWMA 的更新速度
         # —— 自适应难度（v3.11.5）：默认关；基线 1 入门 … 5 严苛，局内最多在基线 ±spread 档内调整 ——
         self.adaptive_difficulty = False
         self.adaptive_difficulty_base = 3
@@ -224,6 +229,14 @@ class AzureConfig:
                 d.get("schedule_archive_days", self.schedule_archive_days))))
             self.schedule_retention_days = max(1, min(3650, int(
                 d.get("schedule_retention_days", self.schedule_retention_days))))
+            self.schedule_buffer_min = max(0, min(240, int(
+                d.get("schedule_buffer_min", self.schedule_buffer_min))))
+            self.schedule_lock_hours = max(0, min(72, int(
+                d.get("schedule_lock_hours", self.schedule_lock_hours))))
+            self.schedule_risk_z = max(0.0, min(2.0, float(
+                d.get("schedule_risk_z", self.schedule_risk_z))))
+            self.schedule_ewma_alpha = max(0.05, min(0.95, float(
+                d.get("schedule_ewma_alpha", self.schedule_ewma_alpha))))
         except (TypeError, ValueError):
             pass
         v = d.get("adaptive_difficulty")        # 只认 JSON true / false（与 profile_enabled 同口径）

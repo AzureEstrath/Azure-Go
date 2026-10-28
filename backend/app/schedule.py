@@ -15,6 +15,8 @@ import math
 import re
 import time
 
+from . import schedule_learning
+
 MAX_SOURCE_TEXT = 9000
 MAX_ITEMS = 60
 TITLE_MAX = 80
@@ -390,6 +392,9 @@ def _parse_item(raw, ref, source):
 
     raw_kind = str(raw.get("kind", "") or "").strip().lower()
     kind = "course" if raw_kind == "course" or period is not None or weekday is not None else "task"
+    task_type = str(raw.get("task_type", raw.get("type", "")) or "").strip().lower()
+    if task_type not in schedule_learning.CATEGORY_PRIOR:
+        task_type = schedule_learning.infer_task_type(title, kind, notes)
     priority = _parse_priority(raw.get("priority", raw.get("importance", raw.get("urgent"))))
     duration = _parse_duration(raw.get("duration_min", raw.get("duration", raw.get("minutes"))))
     deadline_ts = _parse_deadline(raw.get("deadline", raw.get("due", raw.get("due_at"))), ref)
@@ -453,6 +458,7 @@ def _parse_item(raw, ref, source):
         "teacher": teacher,
         "location": location,
         "kind": kind,
+        "task_type": task_type,
         "priority": priority,
         "duration_min": duration,
         "deadline_ts": deadline_ts,

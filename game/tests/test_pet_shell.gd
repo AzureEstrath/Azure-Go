@@ -122,6 +122,13 @@ func _test_view() -> void:
 	v.set_schedule_items([{"when_text": "2026-10-28 15:30", "title": "评审", "notes": ""}])
 	_check("普通日程列表显示", v._schedule_rows.get_child_count() == 1)
 	_check("没有课程时不画空表格", v._schedule_table == null)
+	_check("复盘按钮存在", v._files_review != null)
+	_check("执行反馈 / 复盘信号已定义",
+		v.has_signal("schedule_feedback_requested") and v.has_signal("files_review_requested"))
+	var agenda_wrap = v._schedule_rows.get_child(0)
+	var task_row = agenda_wrap.get_child(1) if agenda_wrap.get_child_count() > 1 else null
+	_check("普通日程行带完成 / 推迟按钮",
+		task_row != null and task_row.get_child_count() == 3)
 	v.set_schedule_items([
 		{"when_text": "2026-10-28 周三 第1-2节 08:00-09:35",
 		 "title": "高等数学", "teacher": "王三强", "location": "二教20",

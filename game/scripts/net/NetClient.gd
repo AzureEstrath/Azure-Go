@@ -474,6 +474,18 @@ func cleanup_schedule(callback: Callable, days := 30) -> void:
 	_fetch_json("/api/schedule/cleanup", HTTPClient.METHOD_POST,
 		{"days": clampi(days, 1, 3650), "include_unarchived": false}, callback, 30.0)
 
+## 执行反馈：done / deferred / skipped；完成后更新类别 EWMA，推迟后后端会立即重排。
+func feedback_schedule(item_id: int, outcome: String, actual_min: int,
+		callback: Callable) -> void:
+	_fetch_json("/api/schedule/feedback", HTTPClient.METHOD_POST,
+		{"id": item_id, "outcome": outcome, "actual_min": maxi(0, actual_min)},
+		callback, 30.0)
+
+## 每周复盘：按类别返回计划 / 实际耗时偏差与完成、推迟计数。
+func fetch_schedule_review(callback: Callable, days := 7) -> void:
+	_fetch_json("/api/schedule/review?days=%d" % clampi(days, 1, 365),
+		HTTPClient.METHOD_GET, {}, callback, 20.0)
+
 ## 最近聊天流水（桌宠聊天面板 / 启动恢复）：`callback(ok, code, {"items":[...]})`。
 func fetch_chat_history(limit: int, callback: Callable) -> void:
 	_fetch_json("/api/chat/history?limit=%d" % clampi(limit, 1, 200),

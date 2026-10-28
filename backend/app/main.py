@@ -69,6 +69,7 @@ from . import coords, events, persona, prompts, sgf
 from . import file_service
 from . import full_review
 from . import schedule as schedule_mod
+from . import schedule_learning
 from .agent import AzureAgent
 from .engine import KataGoEngine
 from .game_store import GameStore
@@ -113,6 +114,61 @@ def _int(v, d=-1):
         return d
 
 
+# —— v4.1.1 动态排程：事件驱动重排的节流 ——
+REPLAN_CHECK_SEC = 300.0       # 每 5 分钟检查一次是否需要重排
+REPLAN_COOLDOWN_SEC = 900.0    # 两次自动重排至少间隔 15 分钟
+
+
+def _schedule_cfg(cfg):
+    """自动排班 / 提醒的配置快照（脏值退回与 auto_plan 一致的默认）。"""
+    def _i(v, d, lo, hi):
+        try:
+            return max(lo, min(hi, int(v)))
+        except (TypeError, ValueError):
+            return d
+
+    def _f(v, d, lo, hi):
+        try:
+            return max(lo, min(hi, float(v)))
+        except (TypeError, ValueError, OverflowError):
+            return d
+
+    return {
+        "days": _i(getattr(cfg, "auto_plan_days", 7), 7, 1, 30),
+        "buffer_min": _i(getattr(cfg, "schedule_buffer_min", 45), 45, 0, 240),
+        "lock_sec": _f(getattr(cfg, "schedule_lock_hours", 12), 12.0, 0.0, 72.0) * 3600.0,
+        "risk_z": _f(getattr(cfg, "schedule_risk_z", 0.0), 0.0, 0.0, 2.0),
+        "alpha": _f(getattr(cfg, "schedule_ewma_alpha", 0.35), 0.35, 0.05, 0.95),
+    }
+
+
+async def _run_auto_plan(store, cfg, days=None, work_start=None, work_end=None):
+    """读库存 → 自动排班 → 写回；params 全部来自配置（测试可注入小库）。"""
+    params = _schedule_cfg(cfg)
+    items = await asyncio.to_thread(store.list_schedule_plan, 200)
+    history = await asyncio.to_thread(store.list_schedule, 200, True, True)
+    loader = getattr(store, "load_schedule_stats", None)
+    category_stats = await asyncio.to_thread(loader) if callable(loader) else {}
+    res = auto_plan.plan(
+        items, now=time.time(),
+        days=params["days"] if days is None else days,
+        work_start=work_start or auto_plan.DEFAULT_WORK_START,
+        work_end=work_end or auto_plan.DEFAULT_WORK_END,
+        history=history, category_stats=category_stats,
+        risk_z=params["risk_z"], buffer_min=params["buffer_min"],
+        lock_sec=params["lock_sec"])
+    if res.get("assignments"):
+        await asyncio.to_thread(store.update_schedule_plan, res["assignments"])
+    return res
+
+
+def _plan_sig(gate):
+    """重排闸门的「事件指纹」：只有新待定 / 新逾期 / 需求变化才值得再排。"""
+    return (tuple(gate.get("unplanned_ids", [])),
+            tuple(gate.get("overdue_ids", [])),
+            int(float(gate.get("demand_min", 0.0)) // 30))
+
+
 def _harden_stdout() -> None:
     """把标准输出的**编码错误策略**改成 ``replace``（v3.9.0）：日志打不出某个字符时不再抛异常。
 
@@ -139,11 +195,16 @@ async def _schedule_reminder_loop(app, cfg):
     - 每 15 秒看一次「已到点 / 即将到点（提前 60 秒）」且未提醒的日程；
     - 她正在对局 / 聊天（``busy``）时这一轮跳过，等下一轮，不抢生成锁；
     - 提醒文本由 `agent.remind_schedule()` 生成（LLM 失败自动退回模板），发 `ai_remind`；
-    - 每小时自动留档 7 天前的条目，每天清理一次超过保留期的归档。
+    - 每小时自动留档 7 天前的条目，每天清理一次超过保留期的归档；
+    - 每 5 分钟过一次事件闸门：新待定 / 逾期 / 容量不足才重排，两次重排至少隔 15 分钟。
     任何异常只打日志；循环本身绝不退出（除非被 cancel）。
     """
     last_archive = 0.0
     last_clean = 0.0
+    last_plan_check = 0.0
+    last_plan_ts = 0.0
+    last_plan_sig = None
+    plan_cfg = _schedule_cfg(cfg)
     while True:
         await asyncio.sleep(15.0)
         life = getattr(app.state, "life", None)
@@ -164,6 +225,35 @@ async def _schedule_reminder_loop(app, cfg):
             print("[Schedule] 自动留档 / 清理失败（已忽略）：%s" % e)
         if bool(getattr(agent, "busy", False)):
             continue
+        # 事件驱动滚动重排（v4.1.1）：只重排未来 1~3 天，锁窗内的自动安排不动。
+        if bool(getattr(cfg, "auto_plan_enabled", True)) and \
+                now - last_plan_check >= REPLAN_CHECK_SEC:
+            last_plan_check = now
+            try:
+                gate_items = await asyncio.to_thread(life.list_schedule_plan, 200)
+                gate = await asyncio.to_thread(
+                    auto_plan.should_replan, gate_items, now,
+                    min(3, plan_cfg["days"]), buffer_min=plan_cfg["buffer_min"])
+                sig = _plan_sig(gate)
+                if gate.get("trigger") and sig != last_plan_sig and \
+                        now - last_plan_ts >= REPLAN_COOLDOWN_SEC:
+                    # 事件驱动只重排未来 1~3 天；更远的自动安排视为已承诺，不扰动。
+                    plan_days = min(3, plan_cfg["days"])
+                    res = await _run_auto_plan(life, cfg, days=plan_days)
+                    last_plan_ts = now
+                    # 重排后重新取一次指纹，避免同一批事件在冷却结束后又触发一次。
+                    after = await asyncio.to_thread(life.list_schedule_plan, 200)
+                    gate2 = await asyncio.to_thread(
+                        auto_plan.should_replan, after, time.time(),
+                        min(3, plan_cfg["days"]), buffer_min=plan_cfg["buffer_min"])
+                    last_plan_sig = _plan_sig(gate2)
+                    print("[Schedule] 事件触发重排（%s）：安排 %d 条" % (
+                        ",".join(gate.get("reasons", [])) or "unknown",
+                        len(res.get("assignments", []))))
+                elif not gate.get("trigger"):
+                    last_plan_sig = sig
+            except Exception as e:          # noqa: BLE001
+                print("[Schedule] 自动重排失败（已忽略）：%s" % e)
         try:
             due = await asyncio.to_thread(life.due_reminders, now, 600.0, 60.0)
         except Exception as e:              # noqa: BLE001
@@ -764,15 +854,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             plan_info = {"planned": 0, "unscheduled": 0, "stats": {}}
             if life_store is not None and bool(getattr(cfg, "auto_plan_enabled", True)):
                 try:
-                    plan_items = await asyncio.to_thread(life_store.list_schedule_plan, 200)
-                    plan_hist = await asyncio.to_thread(life_store.list_schedule, 200, True, True)
-                    pr = auto_plan.plan(
-                        plan_items, now=time.time(),
-                        days=int(getattr(cfg, "auto_plan_days", 7) or 7),
-                        history=plan_hist)
-                    if pr.get("assignments"):
-                        await asyncio.to_thread(life_store.update_schedule_plan,
-                                                pr["assignments"])
+                    pr = await _run_auto_plan(life_store, cfg)
                     plan_info = {"planned": len(pr.get("assignments", [])),
                                  "unscheduled": len(pr.get("unscheduled", [])),
                                  "stats": pr.get("stats", {})}
@@ -830,15 +912,11 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         if store is None:
             return {"ok": False, "error": "生命时间线未装配"}
         b = body or {}
-        items = await asyncio.to_thread(store.list_schedule_plan, 200)
-        history = await asyncio.to_thread(store.list_schedule, 200, True, True)
-        res = auto_plan.plan(
-            items, now=time.time(),
-            days=_int(b.get("days"), int(getattr(cfg, "auto_plan_days", 7) or 7)),
-            work_start=str(b.get("work_start") or "08:00"),
-            work_end=str(b.get("work_end") or "22:00"),
-            history=history)
-        await asyncio.to_thread(store.update_schedule_plan, res["assignments"])
+        res = await _run_auto_plan(
+            store, cfg,
+            days=_int(b.get("days"), _schedule_cfg(cfg)["days"]),
+            work_start=str(b.get("work_start") or auto_plan.DEFAULT_WORK_START),
+            work_end=str(b.get("work_end") or auto_plan.DEFAULT_WORK_END))
         return {"ok": True, "planned": res["assignments"],
                 "unscheduled": res["unscheduled"], "stats": res["stats"],
                 "items": _schedule_payload()}
@@ -885,6 +963,83 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         text = await a().remind_schedule(item, now=now)
         await asyncio.to_thread(store.mark_reminded, item.get("id"), now)
         return {"ok": True, "text": text, "item": item}
+
+    @app.post("/api/schedule/feedback")
+    async def schedule_feedback(body: dict):
+        """记录执行结果（done / deferred / skipped）：更新类别 EWMA 统计；推迟后立即重排。"""
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": False, "error": "生命时间线未装配"}
+        b = body or {}
+        sid = _int(b.get("id"), 0)
+        item = await asyncio.to_thread(store.get_schedule_item, sid)
+        if not item:
+            return {"ok": False, "error": "日程不存在"}
+        outcome = str(b.get("outcome", "done")).strip().lower()
+        if outcome not in ("done", "deferred", "skipped"):
+            outcome = "done"
+        now = time.time()
+        try:
+            actual = max(0.0, float(b.get("actual_min", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            actual = 0.0
+        if outcome == "done" and actual <= 0.0:
+            # 面板没有耗时输入时：按「现在 - 开始时间」估实际耗时；刚开始就点完成则退回计划时长。
+            try:
+                started = float(item.get("start_ts") or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                started = 0.0
+            elapsed = (now - started) / 60.0 if started > 0.0 else 0.0
+            actual = min(1440.0, elapsed) if elapsed >= 5.0 else float(
+                item.get("duration_min") or 60)
+        saved = await asyncio.to_thread(store.record_feedback, sid, outcome, actual, now)
+        if not saved:
+            return {"ok": False, "error": "执行结果写入失败"}
+        stats = await asyncio.to_thread(store.load_schedule_stats) \
+            if callable(getattr(store, "load_schedule_stats", None)) else {}
+        task_type = str(saved.get("task_type") or schedule_learning.infer_task_type(
+            saved.get("title", ""), saved.get("kind", "task"), saved.get("notes", "")))
+        new_stats = schedule_learning.update_stats(
+            stats, task_type, actual,
+            planned_min=float(saved.get("duration_min") or 0),
+            outcome=outcome, now=now, alpha=_schedule_cfg(cfg)["alpha"])
+        await asyncio.to_thread(store.save_schedule_stats, new_stats)
+        replanned = None
+        if outcome == "deferred" and bool(getattr(cfg, "auto_plan_enabled", True)):
+            try:
+                pr = await _run_auto_plan(store, cfg,
+                                          days=min(3, _schedule_cfg(cfg)["days"]))
+                replanned = {"planned": len(pr.get("assignments", [])),
+                             "unscheduled": len(pr.get("unscheduled", []))}
+            except Exception as e:          # noqa: BLE001
+                print("[Schedule] 推迟后的重排失败（已忽略）：%s" % e)
+        return {"ok": True, "item": saved, "stats": new_stats.get(task_type, {}),
+                "replanned": replanned, "items": _schedule_payload()}
+
+    @app.get("/api/schedule/review")
+    async def schedule_review(days: int = 7):
+        """每周复盘：按类别的计划 / 实际耗时偏差与完成、推迟计数（只读）。"""
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": False, "error": "生命时间线未装配"}
+        now = time.time()
+        span = max(1, min(365, int(days or 7)))
+        history = await asyncio.to_thread(store.list_schedule_history, 500) \
+            if callable(getattr(store, "list_schedule_history", None)) else []
+        cutoff = now - span * 86400.0
+
+        def _recent(it):
+            try:
+                return float(it.get("updated_ts") or 0.0) >= cutoff
+            except (TypeError, ValueError, OverflowError):
+                return False
+
+        history = [it for it in history if _recent(it)]
+        stats = await asyncio.to_thread(store.load_schedule_stats) \
+            if callable(getattr(store, "load_schedule_stats", None)) else {}
+        res = schedule_learning.review(history, stats, now=now)
+        res["days"] = span
+        return res
 
     # 复盘是**后端的模式**（只把前端棋盘设成只读挡不住她出声）：期间她不能开口——落子 / 聊天 /
     # 闲置 / 提示 / 分析一律可读拒绝，情绪心跳与语气词在 agent 侧冻结（V14）；回看只推 `state`
