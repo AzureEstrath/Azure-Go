@@ -78,6 +78,13 @@ class PlanTest(unittest.TestCase):
         self.assertLessEqual(by["截止任务"]["start_ts"] + 60 * 60,
                              _ts(2026, 10, 28, 18, 0))
 
+    def test_far_deadline_does_not_preempt_high_priority(self):
+        far = self._item(1, "下周才到期", 60, 10, deadline=NOW + 5 * 86400.0)
+        hot = self._item(2, "今天重要", 60, 100)
+        out = auto_plan.plan([far, hot], now=NOW, days=7)
+        by = {x["title"]: x for x in out["assignments"]}
+        self.assertLess(by["今天重要"]["start_ts"], by["下周才到期"]["start_ts"])
+
     def test_no_room_is_reported_unscheduled(self):
         fixed = self._item(9, "全天占用", 840, 50, start=_ts(2026, 10, 28, 8, 0))
         a = self._item(1, "放不下", 60, 50)
@@ -149,12 +156,12 @@ class DynamicPlanTest(unittest.TestCase):
         self.assertEqual(out["assignments"], [])
         self.assertEqual(out["fixed"], 1)
 
-    def test_auto_plan_outside_lock_window_is_replanned(self):
+    def test_auto_plan_outside_lock_window_keeps_slot(self):
         later = self._item(1, "锁窗外", 60, 50, start=NOW + 24 * 3600.0,
                            auto_planned=True)
         out = auto_plan.plan([later], now=NOW, days=2, lock_sec=12 * 3600.0)
         self.assertEqual(len(out["assignments"]), 1)
-        self.assertLess(out["assignments"][0]["start_ts"], NOW + 24 * 3600.0)
+        self.assertAlmostEqual(out["assignments"][0]["start_ts"], NOW + 24 * 3600.0)
 
     def test_auto_plan_beyond_horizon_is_kept(self):
         later = self._item(1, "窗口外", 60, 50, start=NOW + 4 * 86400.0,
@@ -169,6 +176,95 @@ class DynamicPlanTest(unittest.TestCase):
         got = out["assignments"][0]
         day = datetime.datetime.fromtimestamp(got["start_ts"]).date()
         self.assertEqual(day, datetime.datetime(2026, 10, 29).date())
+
+    def test_transition_gap_keeps_space_around_fixed_events(self):
+        course = self._item(9, "课程", 60, 50, start=NOW + 3600.0,
+                            kind="course", weekday=2, period="1")
+        task = self._item(1, "任务", 60, 50)
+        out = auto_plan.plan([course, task], now=NOW, days=1,
+                             transition_min=10, align_min=30)
+        start = out["assignments"][0]["start_ts"]
+        self.assertGreaterEqual(start, NOW + 2 * 3600.0 + 10 * 60.0)
+
+    def test_task_start_is_aligned_to_half_hour(self):
+        ref = _ts(2026, 10, 28, 8, 7)
+        task = self._item(1, "对齐任务", 60, 50)
+        out = auto_plan.plan([task], now=ref, days=1, align_min=30)
+        start = datetime.datetime.fromtimestamp(out["assignments"][0]["start_ts"])
+        self.assertEqual((start.hour, start.minute), (8, 30))
+
+    def test_grade_counts_and_assignment_grade(self):
+        course = self._item(9, "课程", 60, 50, start=NOW + 3600.0,
+                            kind="course", weekday=2, period="1")
+        committed = self._item(8, "约定", 30, 70, start=NOW + 5 * 3600.0)
+        task = self._item(1, "任务", 60, 50)
+        out = auto_plan.plan([course, committed, task], now=NOW, days=2)
+        grades = out["stats"]["grades"]
+        self.assertEqual(grades.get("fixed"), 1)
+        self.assertEqual(grades.get("committed"), 1)
+        self.assertEqual(grades.get("flexible"), 1)
+        self.assertEqual(out["assignments"][0]["grade"], "flexible")
+        self.assertEqual(out["assignments"][0]["grade_label"], "待安排")
+
+
+class GradeTest(unittest.TestCase):
+    def _item(self, **kw):
+        row = {"id": 1, "title": "x", "duration_min": 60, "priority": 50,
+               "start_ts": 0.0, "deadline_ts": 0.0, "kind": "task",
+               "status": "planned", "archived": False, "auto_planned": False}
+        row.update(kw)
+        return row
+
+    def test_course_is_always_fixed(self):
+        item = self._item(kind="course", weekday=2, period="1-2")
+        self.assertEqual(auto_plan.classify_item(item, now=NOW), auto_plan.GRADE_FIXED)
+
+    def test_user_set_time_is_committed(self):
+        item = self._item(start_ts=NOW + 3600.0)
+        self.assertEqual(auto_plan.classify_item(item, now=NOW), auto_plan.GRADE_COMMITTED)
+
+    def test_missed_user_time_can_be_replanned(self):
+        item = self._item(start_ts=NOW - 3600.0)
+        self.assertEqual(auto_plan.classify_item(item, now=NOW), auto_plan.GRADE_FLEXIBLE)
+        out = auto_plan.plan([item], now=NOW, days=1)
+        self.assertEqual(len(out["assignments"]), 1)
+
+    def test_auto_within_lock_is_locked(self):
+        item = self._item(start_ts=NOW + 3600.0, auto_planned=True)
+        self.assertEqual(auto_plan.classify_item(item, now=NOW, lock_sec=12 * 3600.0),
+                         auto_plan.GRADE_LOCKED)
+
+    def test_deadline_task_is_deadline_driven(self):
+        item = self._item(deadline_ts=NOW + 86400.0)
+        self.assertEqual(auto_plan.classify_item(item, now=NOW), auto_plan.GRADE_DEADLINE)
+
+    def test_date_only_task_is_deadline_driven(self):
+        item = self._item(start_ts=NOW + 3600.0, when_text="2026-10-28（全天）",
+                          deadline_ts=NOW + 12 * 3600.0)
+        self.assertEqual(auto_plan.classify_item(item, now=NOW), auto_plan.GRADE_DEADLINE)
+
+    def test_scheduled_when_text_is_not_date_only(self):
+        item = self._item(start_ts=NOW + 24 * 3600.0, auto_planned=True,
+                          when_text="2026-10-29 08:00-09:00（自动安排）")
+        self.assertEqual(auto_plan.classify_item(item, now=NOW, lock_sec=0),
+                         auto_plan.GRADE_TENTATIVE)
+
+    def test_auto_outside_lock_is_tentative(self):
+        item = self._item(start_ts=NOW + 86400.0, auto_planned=True)
+        self.assertEqual(auto_plan.classify_item(item, now=NOW, lock_sec=12 * 3600.0),
+                         auto_plan.GRADE_TENTATIVE)
+
+    def test_free_task_and_closed_item(self):
+        self.assertEqual(auto_plan.classify_item(self._item(), now=NOW),
+                         auto_plan.GRADE_FLEXIBLE)
+        self.assertEqual(auto_plan.classify_item(self._item(status="done"), now=NOW),
+                         auto_plan.GRADE_CLOSED)
+
+    def test_decorate_adds_readable_grade(self):
+        out = auto_plan.decorate_items([self._item(kind="course", weekday=1,
+                                                   period="3-4")], now=NOW)
+        self.assertEqual(out[0]["grade"], "fixed")
+        self.assertEqual(out[0]["grade_label"], "固定课程")
 
 
 class ReplanGateTest(unittest.TestCase):
@@ -190,6 +286,14 @@ class ReplanGateTest(unittest.TestCase):
                                        now=NOW, horizon_days=2)
         self.assertTrue(gate["trigger"])
         self.assertIn("urgent_unplanned", gate["reasons"])
+        self.assertEqual(gate["unplanned_ids"], [1])
+
+    def test_date_only_task_counts_as_unplanned(self):
+        item = self._item(1, "全天整理", start=NOW + 3600.0,
+                          when_text="2026-10-28（全天）",
+                          deadline_ts=NOW + 12 * 3600.0)
+        gate = auto_plan.should_replan([item], now=NOW, horizon_days=1)
+        self.assertTrue(gate["trigger"])
         self.assertEqual(gate["unplanned_ids"], [1])
 
     def test_overdue_task_triggers_with_id(self):

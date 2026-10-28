@@ -576,6 +576,9 @@ func _show_hover_card(anchor: Control, d: Dictionary) -> void:
 	var when := str(d.get("when_text", "")).strip_edges()
 	if when != "":
 		lines.append(when)
+	var grade := _grade_text(d)
+	if grade != "":
+		lines.append("分级：%s" % grade)
 	var teacher := str(d.get("teacher", "")).strip_edges()
 	var location := str(d.get("location", "")).strip_edges()
 	if teacher != "":
@@ -1049,10 +1052,14 @@ func _build_agenda(items: Array) -> void:
 		var title := str(d.get("title", "")).strip_edges()
 		var status := str(d.get("status", "planned")).strip_edges()
 		var tag := _priority_tag(d)
+		var grade_tag := _grade_tag(d)
 		var row := HBoxContainer.new()
 		row.add_theme_constant_override("separation", 3)
 		var lbl := Label.new()
-		lbl.text = "· %s  %s%s" % [when, tag, title]
+		lbl.text = "· %s  " % when
+		if status == "planned" and grade_tag != "":
+			lbl.text += "[%s] " % grade_tag
+		lbl.text += "%s%s" % [tag, title]
 		if status == "done":
 			lbl.text += "（已完成）"
 		elif status == "cancelled":
@@ -1074,6 +1081,9 @@ func _build_agenda(items: Array) -> void:
 			var meta := "优先级 %d · 类型 %s · 计划 %d 分钟" % [
 				pri, typ, int(d.get("duration_min", 60))]
 			tips.push_front(meta)
+			var grade := _grade_text(d)
+			if grade != "":
+				tips.push_front("分级：%s" % grade)
 		lbl.tooltip_text = "\n".join(tips)
 		row.add_child(lbl)
 		if status == "planned":
@@ -1104,6 +1114,55 @@ func _priority_tag(d: Dictionary) -> String:
 		return "[紧急] "
 	if pri >= 70:
 		return "[高] "
+	return ""
+
+func _grade_tag(d: Dictionary) -> String:
+	"""日程分级短标签（后端已分级；离线 / 测试数据时按字段兜底推断）。"""
+	var grade := str(d.get("grade", "")).strip_edges()
+	if grade == "":
+		if str(d.get("kind", "")) == "course" or str(d.get("period", "")) != "" \
+				or int(d.get("weekday", -1)) >= 0:
+			grade = "fixed"
+		elif int(d.get("start_ts", 0)) > 0 and not bool(d.get("auto_planned", false)):
+			grade = "committed"
+		elif float(d.get("deadline_ts", 0.0)) > 0.0:
+			grade = "deadline"
+		elif bool(d.get("auto_planned", false)):
+			grade = "tentative"
+		else:
+			grade = "flexible"
+	match grade:
+		"fixed":
+			return "固定"
+		"committed":
+			return "约定"
+		"locked":
+			return "锁定"
+		"deadline":
+			return "截止"
+		"tentative":
+			return "可调"
+		"flexible":
+			return "待排"
+	return ""
+
+func _grade_text(d: Dictionary) -> String:
+	var label := str(d.get("grade_label", "")).strip_edges()
+	if label != "":
+		return label
+	match _grade_tag(d):
+		"固定":
+			return "固定课程"
+		"约定":
+			return "已约定（不会自动移动）"
+		"锁定":
+			return "锁定中（本次不重排）"
+		"截止":
+			return "截止驱动（时间可调）"
+		"可调":
+			return "可调整（优先保持原位）"
+		"待排":
+			return "待安排（按优先级放置）"
 	return ""
 
 func draw_schedule_table(c: Control, s: Vector2) -> void:

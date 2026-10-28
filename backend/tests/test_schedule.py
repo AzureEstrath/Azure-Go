@@ -52,6 +52,7 @@ class ScheduleExtractTest(unittest.TestCase):
         ], source="b.txt", now=NOW)
         by_title = {x["title"]: x for x in items}
         self.assertEqual(by_title["全天整理"]["when_text"], "2026-11-01（全天）")
+        self.assertGreater(by_title["全天整理"]["deadline_ts"], 0.0)
         self.assertEqual(by_title["早起"]["when_text"], "2026-10-28 08:00")
 
     def test_extract_items_calls_llm_and_returns_list(self):

@@ -129,6 +129,8 @@ func _test_view() -> void:
 	var task_row = agenda_wrap.get_child(1) if agenda_wrap.get_child_count() > 1 else null
 	_check("普通日程行带完成 / 推迟按钮",
 		task_row != null and task_row.get_child_count() == 3)
+	_check("普通日程行显示自动分级",
+		task_row != null and task_row.get_child(0).text.contains("[待排]"))
 	v.set_schedule_items([
 		{"when_text": "2026-10-28 周三 第1-2节 08:00-09:35",
 		 "title": "高等数学", "teacher": "王三强", "location": "二教20",
@@ -164,9 +166,12 @@ func _test_view() -> void:
 			break
 	if block != null:
 		v._show_hover_card(block, {"title": "高等数学", "when_text": "2026-10-28 周三 第1-2节",
-			"teacher": "王三强", "location": "二教20"})
+			"teacher": "王三强", "location": "二教20",
+			"grade": "fixed", "grade_label": "固定课程"})
 		_check("悬停展开卡显示完整课程信息",
 			v._hover_card.visible and v._hover_label.text.contains("二教20"))
+		_check("悬停展开卡显示课程分级",
+			v._hover_label.text.contains("分级：固定课程"))
 		v._hide_hover_card()
 	else:
 		_check("悬停展开卡显示完整课程信息", false)

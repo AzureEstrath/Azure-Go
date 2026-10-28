@@ -139,6 +139,8 @@ def _schedule_cfg(cfg):
         "lock_sec": _f(getattr(cfg, "schedule_lock_hours", 12), 12.0, 0.0, 72.0) * 3600.0,
         "risk_z": _f(getattr(cfg, "schedule_risk_z", 0.0), 0.0, 0.0, 2.0),
         "alpha": _f(getattr(cfg, "schedule_ewma_alpha", 0.35), 0.35, 0.05, 0.95),
+        "transition_min": _i(getattr(cfg, "schedule_transition_min", 10), 10, 0, 60),
+        "align_min": _i(getattr(cfg, "schedule_align_min", 30), 30, 1, 60),
     }
 
 
@@ -156,7 +158,8 @@ async def _run_auto_plan(store, cfg, days=None, work_start=None, work_end=None):
         work_end=work_end or auto_plan.DEFAULT_WORK_END,
         history=history, category_stats=category_stats,
         risk_z=params["risk_z"], buffer_min=params["buffer_min"],
-        lock_sec=params["lock_sec"])
+        lock_sec=params["lock_sec"], transition_min=params["transition_min"],
+        align_min=params["align_min"])
     if res.get("assignments"):
         await asyncio.to_thread(store.update_schedule_plan, res["assignments"])
     return res
@@ -233,7 +236,8 @@ async def _schedule_reminder_loop(app, cfg):
                 gate_items = await asyncio.to_thread(life.list_schedule_plan, 200)
                 gate = await asyncio.to_thread(
                     auto_plan.should_replan, gate_items, now,
-                    min(3, plan_cfg["days"]), buffer_min=plan_cfg["buffer_min"])
+                    min(3, plan_cfg["days"]), buffer_min=plan_cfg["buffer_min"],
+                    transition_min=plan_cfg["transition_min"])
                 sig = _plan_sig(gate)
                 if gate.get("trigger") and sig != last_plan_sig and \
                         now - last_plan_ts >= REPLAN_COOLDOWN_SEC:
@@ -245,7 +249,8 @@ async def _schedule_reminder_loop(app, cfg):
                     after = await asyncio.to_thread(life.list_schedule_plan, 200)
                     gate2 = await asyncio.to_thread(
                         auto_plan.should_replan, after, time.time(),
-                        min(3, plan_cfg["days"]), buffer_min=plan_cfg["buffer_min"])
+                        min(3, plan_cfg["days"]), buffer_min=plan_cfg["buffer_min"],
+                        transition_min=plan_cfg["transition_min"])
                     last_plan_sig = _plan_sig(gate2)
                     print("[Schedule] 事件触发重排（%s）：安排 %d 条" % (
                         ",".join(gate.get("reasons", [])) or "unknown",
@@ -861,7 +866,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                 except Exception as e:      # noqa: BLE001
                     print("[Schedule] 扫描后自动排班失败（已忽略）：%s" % e)
             return {"ok": True, "folder": scan.get("folder", ""),
-                    "files": _public_file_list(scan), "items": saved,
+                    "files": _public_file_list(scan),
+                    "items": auto_plan.decorate_items(
+                        saved, time.time(), _schedule_cfg(cfg)["lock_sec"]),
                     "memory_written": mem_written, "auto_plan": plan_info,
                     "schedule": _schedule_payload()}
 
@@ -884,7 +891,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         if store is None:
             return []
         try:
-            return store.list_schedule(int(limit), include_archived=bool(include_archived))
+            items = store.list_schedule(int(limit), include_archived=bool(include_archived))
+            return auto_plan.decorate_items(
+                items, time.time(), _schedule_cfg(cfg)["lock_sec"])
         except Exception:                   # noqa: BLE001
             return []
 
@@ -995,6 +1004,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         saved = await asyncio.to_thread(store.record_feedback, sid, outcome, actual, now)
         if not saved:
             return {"ok": False, "error": "执行结果写入失败"}
+        saved = auto_plan.decorate_items(
+            [saved], now, _schedule_cfg(cfg)["lock_sec"])[0]
         stats = await asyncio.to_thread(store.load_schedule_stats) \
             if callable(getattr(store, "load_schedule_stats", None)) else {}
         task_type = str(saved.get("task_type") or schedule_learning.infer_task_type(

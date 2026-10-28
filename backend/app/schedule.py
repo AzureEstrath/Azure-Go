@@ -398,6 +398,13 @@ def _parse_item(raw, ref, source):
     priority = _parse_priority(raw.get("priority", raw.get("importance", raw.get("urgent"))))
     duration = _parse_duration(raw.get("duration_min", raw.get("duration", raw.get("minutes"))))
     deadline_ts = _parse_deadline(raw.get("deadline", raw.get("due", raw.get("due_at"))), ref)
+    # 只有日期、没有时刻的普通任务是「全天截止」：自动排班可以在截止前安排，
+    # 但不应把它当成 09:00 的硬约定。
+    if kind == "task" and date is not None and tm is None and deadline_ts <= 0.0:
+        try:
+            deadline_ts = datetime.datetime.combine(date, datetime.time(23, 59)).timestamp()
+        except (ValueError, OverflowError):
+            deadline_ts = 0.0
     if kind == "course":
         if tm is not None and end_tm is not None:
             try:

@@ -76,6 +76,9 @@ class AzureConfig:
         self.schedule_lock_hours = 12       # 自动安排在未来多少小时内不再移动
         self.schedule_risk_z = 0.84         # 机会约束：mean + z·σ（0.84 ≈ 80% 完成概率）
         self.schedule_ewma_alpha = 0.35     # 真实耗时 EWMA 的更新速度
+        # v4.1.2 日程分级 / 真实手感：课程与约定不移动，任务按 :00/:30 对齐并留切换时间。
+        self.schedule_transition_min = 10   # 课程 / 约定前后的通勤与切换留白（分钟）
+        self.schedule_align_min = 30        # 普通任务开始时间的对齐粒度（分钟）
         # —— 自适应难度（v3.11.5）：默认关；基线 1 入门 … 5 严苛，局内最多在基线 ±spread 档内调整 ——
         self.adaptive_difficulty = False
         self.adaptive_difficulty_base = 3
@@ -237,6 +240,10 @@ class AzureConfig:
                 d.get("schedule_risk_z", self.schedule_risk_z))))
             self.schedule_ewma_alpha = max(0.05, min(0.95, float(
                 d.get("schedule_ewma_alpha", self.schedule_ewma_alpha))))
+            self.schedule_transition_min = max(0, min(60, int(
+                d.get("schedule_transition_min", self.schedule_transition_min))))
+            self.schedule_align_min = max(1, min(60, int(
+                d.get("schedule_align_min", self.schedule_align_min))))
         except (TypeError, ValueError):
             pass
         v = d.get("adaptive_difficulty")        # 只认 JSON true / false（与 profile_enabled 同口径）

@@ -39,9 +39,14 @@ class SchedulePlanningApiTest(unittest.TestCase):
                     body = r.json()
                     self.assertTrue(body["ok"], body)
                     self.assertEqual(len(body["planned"]), 1)
+                    self.assertEqual(body["stats"]["grades"].get("flexible"), 1)
+                    self.assertEqual(body["stats"]["align_min"], 30)
+                    self.assertEqual(body["stats"]["transition_min"], 10)
                     row = [x for x in body["items"] if x["id"] == rid][0]
                     self.assertGreater(row["start_ts"], 0.0)
                     self.assertTrue(row["auto_planned"])
+                    self.assertIn(row["grade"], ("locked", "tentative"))
+                    self.assertIn(row["grade_label"], ("锁定中", "可调整"))
 
                     r = client.post("/api/schedule/remind", json={"id": rid})
                     self.assertTrue(r.json()["ok"])
@@ -58,6 +63,7 @@ class SchedulePlanningApiTest(unittest.TestCase):
                     arch = client.get("/api/schedule?include_archived=1").json()["items"]
                     self.assertEqual(arch[0]["id"], rid)
                     self.assertTrue(arch[0]["archived"])
+                    self.assertEqual(arch[0]["grade"], "closed")
 
                     r = client.post("/api/schedule/cleanup", json={"days": 1})
                     self.assertTrue(r.json()["ok"])
