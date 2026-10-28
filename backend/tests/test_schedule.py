@@ -75,6 +75,70 @@ class ScheduleExtractTest(unittest.TestCase):
         self.assertIn("日程：", schedule.memory_text(
             {"when_text": "2026-10-28 15:30", "title": "评审", "notes": "带电脑"}))
 
+    def test_scan_text_skips_structured_course_table(self):
+        """课程表已由坐标还原并单独入库，不再整表喂 LLM（否则会挤掉聊天公告）。"""
+        scan = {"files": [
+            {"name": "table.jpg", "kind": "image", "ocr": "高等数学 第1-2节",
+             "table": [{"title": "高等数学", "period_start": 1}]},
+            {"name": "chat.jpg", "kind": "image", "table": [],
+             "ocr": "周四(10月29日） | 院系杯男子篮球赛 | 中午12：00-1：00 | 地点：篮球场"},
+        ]}
+        text = schedule.scan_text(scan)
+        self.assertNotIn("高等数学", text)
+        self.assertIn("院系杯男子篮球赛", text)
+        self.assertIn("篮球场", text)
+
+    def test_chat_announcement_fallback(self):
+        """本地模型超时 / 漏掉聊天截图时，规则补抽仍要留下明确活动。"""
+        scan = {"files": [{
+            "name": "chat.jpg", "kind": "image", "table": [],
+            "ocr": "23:23 | 体育委员许宇晨 | 周四(10月29日） | 院系杯男子篮球赛 | "
+                   "中午12：00-1：00 | 材料VS水保 | 地点：篮球场 | "
+                   "各位同学可以前往比赛现场观赛并 | 签到签退，将会获得二课堂加分， | "
+                   "25，26级同学可获得0.2综素加分～",
+        }]}
+        raws = schedule.fallback_event_items(scan, now=NOW)
+        self.assertEqual(len(raws), 1, raws)
+        raw = raws[0]
+        self.assertEqual(raw["title"], "院系杯男子篮球赛")
+        self.assertEqual(raw["date"], "2026-10-29")
+        self.assertEqual(raw["time"], "12:00")
+        self.assertEqual(raw["end_time"], "13:00")
+        self.assertEqual(raw["duration_min"], 60)
+        self.assertEqual(raw["location"], "篮球场")
+        self.assertIn("材料VS水保", raw["notes"])
+
+        items = schedule.normalize_items(raws, source="chat.jpg", now=NOW)
+        self.assertEqual(len(items), 1)
+        it = items[0]
+        self.assertEqual(it["kind"], "task")
+        self.assertEqual(it["date"], "2026-10-29")
+        self.assertEqual(it["when_text"], "2026-10-29 12:00-13:00")
+        self.assertEqual(it["location"], "篮球场")
+        self.assertEqual(it["task_type"], "exercise")
+
+    def test_fallback_ignores_plain_chat(self):
+        scan = {"files": [{
+            "name": "chat.jpg", "kind": "image", "table": [],
+            "ocr": "周四中午12：00-1：00 一起去吃饭吧",
+        }]}
+        self.assertEqual(schedule.fallback_event_items(scan, now=NOW), [])
+
+    def test_merge_fallback_skips_llm_duplicate(self):
+        fb = [{"date": "2026-10-29", "time": "12:00", "title": "院系杯男子篮球赛"}]
+        llm_raw = [{"date": "2026-10-29", "time": "12:00",
+                    "title": "院系杯男子篮球赛", "location": "篮球场"}]
+        merged = schedule.merge_event_fallback(llm_raw, fb)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["location"], "篮球场")
+
+    def test_weekday_event_without_period_is_task(self):
+        items = schedule.normalize_items([
+            {"date": "2026-10-29", "weekday": "周四", "time": "12:00",
+             "end_time": "13:00", "title": "院系杯男子篮球赛", "location": "篮球场"},
+        ], source="chat.jpg", now=NOW)
+        self.assertEqual(items[0]["kind"], "task")
+
     def test_course_items_keep_weekday_period_teacher_location(self):
         """课程表条目：节次跨两节写 1-2，教师/地点/日期都要留下（前端画周课表用）。"""
         items = schedule.normalize_items([

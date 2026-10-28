@@ -193,6 +193,18 @@ func _test_view() -> void:
 		v._hide_hover_card()
 	else:
 		_check("悬停展开卡显示完整课程信息", false)
+	v.set_schedule_items([{
+		"id": 4, "title": "院系杯男子篮球赛（材料 VS 水保）",
+		"when_text": "2026-10-29 周四 12:00-13:00", "weekday": 3, "period": "",
+		"period_start": 0, "start_ts": 1793246400, "kind": "task",
+		"status": "planned", "priority": 50, "duration_min": 60,
+	}])
+	await process_frame
+	var event_wrap = v._schedule_rows.get_child(0)
+	var event_row = event_wrap.get_child(1) if event_wrap.get_child_count() > 1 else null
+	_check("聊天公告提取的活动按普通日程显示并标为约定",
+		event_row != null and event_row.get_child(0).text.contains("篮球赛")
+		and event_row.get_child(0).text.contains("[约定]"))
 	host.size = Vector2(544, 520)
 	await process_frame
 	await process_frame

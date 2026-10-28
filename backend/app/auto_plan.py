@@ -136,8 +136,7 @@ def classify_item(item, now=None, lock_sec=0.0):
         return GRADE_CLOSED
     kind = str(item.get("kind", "task") or "task").strip().lower()
     period = str(item.get("period", "") or "").strip()
-    weekday = _int(item.get("weekday", -1), -1)
-    if kind == "course" or period != "" or 0 <= weekday <= 6:
+    if kind == "course" or period != "":
         return GRADE_FIXED
     start = _num(item.get("start_ts"), 0.0)
     auto = bool(item.get("auto_planned"))

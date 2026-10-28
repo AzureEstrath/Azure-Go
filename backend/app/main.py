@@ -817,6 +817,13 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                         "schedule": _schedule_payload()}
             text = schedule_mod.scan_text(scan)
             raw = await schedule_mod.extract_items(s.llm, text, now=time.time()) if text else []
+            # LLM 超时 / 漏掉聊天里的活动公告时，用规则补抽日期 + 时间 + 标题明确的条目。
+            fallback = schedule_mod.fallback_event_items(scan, now=time.time())
+            if fallback:
+                before = len(raw)
+                raw = schedule_mod.merge_event_fallback(raw, fallback)
+                if len(raw) > before:
+                    print("[Schedule] 规则补抽 %d 条活动公告" % (len(raw) - before))
             # 扫描器从 OCR 坐标直接还原出的课程表条目（星期 / 节次 / 教师 / 地点）：
             # 比 LLM 猜结构可靠，必须并入同一份日程；LLM 抽到的普通日程照常保留。
             table_items = []

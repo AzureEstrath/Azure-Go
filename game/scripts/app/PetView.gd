@@ -1134,8 +1134,7 @@ func _grade_tag(d: Dictionary) -> String:
 	"""日程分级短标签（后端已分级；离线 / 测试数据时按字段兜底推断）。"""
 	var grade := str(d.get("grade", "")).strip_edges()
 	if grade == "":
-		if str(d.get("kind", "")) == "course" or str(d.get("period", "")) != "" \
-				or int(d.get("weekday", -1)) >= 0:
+		if str(d.get("kind", "")) == "course" or str(d.get("period", "")) != "":
 			grade = "fixed"
 		elif int(d.get("start_ts", 0)) > 0 and not bool(d.get("auto_planned", false)):
 			grade = "committed"

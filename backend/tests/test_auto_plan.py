@@ -229,6 +229,16 @@ class GradeTest(unittest.TestCase):
         out = auto_plan.plan([item], now=NOW, days=1)
         self.assertEqual(len(out["assignments"]), 1)
 
+    def test_weekday_event_without_period_is_committed(self):
+        """只有星期的事件（周四篮球赛）是约定，不是固定课程。"""
+        item = self._item(start_ts=NOW + 3600.0, weekday=3)
+        self.assertEqual(auto_plan.classify_item(item, now=NOW),
+                         auto_plan.GRADE_COMMITTED)
+
+    def test_course_without_period_is_still_fixed(self):
+        item = self._item(start_ts=NOW + 3600.0, weekday=3, kind="course")
+        self.assertEqual(auto_plan.classify_item(item, now=NOW), auto_plan.GRADE_FIXED)
+
     def test_auto_within_lock_is_locked(self):
         item = self._item(start_ts=NOW + 3600.0, auto_planned=True)
         self.assertEqual(auto_plan.classify_item(item, now=NOW, lock_sec=12 * 3600.0),

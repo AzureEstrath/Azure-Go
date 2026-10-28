@@ -35,6 +35,19 @@ _EN_WEEKDAYS = {
     "thursday": 3, "thu": 3, "friday": 4, "fri": 4, "saturday": 5, "sat": 5,
     "sunday": 6, "sun": 6,
 }
+# —— 规则补抽（LLM 超时 / 漏掉聊天里的活动公告时兜底）——
+_EVENT_WORDS = (
+    "赛", "比赛", "活动", "讲座", "会议", "开会", "演出", "考试", "面试", "培训",
+    "聚会", "典礼", "报名", "签到", "分享", "宣讲", "班会", "团建", "招聘",
+    "双选", "志愿", "沙龙", "论坛",
+)
+_TIME_RANGE_RE = re.compile(
+    r"(?<!\d)(\d{1,2})\s*[:：]\s*(\d{2})\s*[-~～—–至到]\s*(\d{1,2})\s*[:：]\s*(\d{2})")
+_DATE_MD_RE = re.compile(r"(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+_LOCATION_RE = re.compile(r"(?:地点|场地|地址|位置)\s*[:：]\s*(.{1,40})")
+_CLOCK_ONLY_RE = re.compile(r"^\s*\d{1,2}\s*[:：]\s*\d{2}\s*$")
+_SENDER_RE = re.compile(
+    r"^[\u4e00-\u9fa5]{1,10}(委员|老师|同学|学长|学姐|部长|主任|班长)$")
 
 
 def _clip(text, limit):
@@ -69,36 +82,6 @@ def _json_array(text):
     return []
 
 
-def _course_text(it):
-    """课程条目 → 给 LLM / 记忆看的紧凑一行。"""
-    bits = []
-    wd = it.get("weekday")
-    try:
-        wd = int(wd)
-    except (TypeError, ValueError):
-        wd = -1
-    if 0 <= wd <= 6:
-        bits.append(_WEEKDAY_NAMES[wd])
-    date = str(it.get("date") or "").strip()
-    if date:
-        bits.append(date[5:] if re.match(r"^\d{4}-\d{2}-\d{2}$", date) else date)
-    period = str(it.get("period") or "").strip()
-    if period:
-        bits.append("第%s节" % period)
-    times = " ".join(x for x in (str(it.get("start_time") or "").strip(),
-                                 str(it.get("end_time") or "").strip()) if x)
-    if times:
-        bits.append(times.replace(" ", "-"))
-    title = str(it.get("title") or "").strip()
-    if title:
-        bits.append(title)
-    for key, label in (("teacher", "教师"), ("location", "地点")):
-        val = str(it.get(key) or "").strip()
-        if val:
-            bits.append("%s：%s" % (label, val))
-    return " ".join(bits).strip()
-
-
 def scan_text(scan):
     """把扫描器返回的 files[] 拼成一段给 LLM 的资料文本（限制总长）。"""
     parts = []
@@ -108,20 +91,10 @@ def scan_text(scan):
         name = str(f.get("name", "") or "")
         pieces = []
         table = f.get("table")
-        if isinstance(table, list) and table:
-            rows = []
-            for it in table:
-                if isinstance(it, dict):
-                    line = _course_text(it)
-                    if line:
-                        rows.append("  " + line)
-            if rows:
-                pieces.append("课程表（已按行列还原）：\n" + "\n".join(rows))
-            # 纯图片课表：结构已完整还原，不再把原始 OCR / 小 VLM 的噪声喂给 LLM
-            # （否则同一格会被抽成两条、标题还会略有出入）。PDF 仍保留正文，避免丢别的日程。
-            if str(f.get("kind", "")) == "image":
-                parts.append("文件：%s\n%s" % (name, "\n".join(pieces)))
-                continue
+        # 课程表已经由 OCR 坐标还原并在 main 里单独入库，**不要再喂给 LLM**：
+        # 大表会挤占上下文、拖慢本地模型，甚至让同一批里的聊天通知被漏掉。
+        if isinstance(table, list) and table and str(f.get("kind", "")) == "image":
+            continue
         for key, label in (("text", "文档文本"), ("ocr", "OCR"), ("vlm", "VLM 描述")):
             val = str(f.get(key, "") or "").strip()
             if val:
@@ -143,7 +116,9 @@ async def extract_items(llm, text, now=None):
         "只提取**明确出现过**的日期、时间、课程、约定、会议、提醒、待办；没有就返回空数组。\n"
         "如果文本是课程表：按「星期 + 第几节 + 课程名 + 教师 + 地点」逐条输出；"
         "连续两节就写 period=\"1-2\"，不要拆成两条；date 用表头给出的真实日期。\n"
-        "不要编造日期、教师、地点、人物；不要把普通聊天当成日程；不要把“今天天气”当成事件。\n"
+        "寒暄、表情、没有日期 / 时间 / 地点的普通闲聊不要提取；"
+        "但群通知、公告、聊天记录里明确写出日期、时间、活动或地点的（如比赛、讲座、聚会、开会），"
+        "即使截图来自聊天，也必须提取；不要编造日期、教师、地点、人物。\n"
         "今天是 %s（%s）。相对日期（今天/明天/后天/下周X）请换算成真实日期。\n"
         "只输出 JSON 数组，不要解释、不要代码围栏。字段：\n"
         '[{"date":"YYYY-MM-DD" 或 null, "weekday":"周一" 或 null, '
@@ -165,6 +140,206 @@ async def extract_items(llm, text, now=None):
         print("[Schedule] LLM 提取失败（已忽略）：%s" % e)
         return []
     return _json_array(out)[:MAX_ITEMS]
+
+
+def _event_lines(text):
+    """OCR / 聊天文本 → 一行一条（OCR 常用 `` | `` 分隔）。"""
+    s = str(text or "").replace("｜", "|")
+    s = re.sub(r"\s*\|\s*", "\n", s)
+    return [ln.strip() for ln in s.splitlines() if ln.strip()]
+
+
+def _event_date(text, ref):
+    """公告文本里的日期：优先月/日，其次今天/明天/后天与星期。"""
+    m = _DATE_MD_RE.search(text)
+    if m:
+        year = int(m.group(1)) if m.group(1) else ref.year
+        try:
+            d = datetime.date(year, int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+        # 没写年份且已经过去很久：按明年的同一天理解（避免 1 月的公告被排到去年）。
+        if not m.group(1) and d < ref.date() - datetime.timedelta(days=60):
+            try:
+                d = d.replace(year=ref.year + 1)
+            except ValueError:
+                pass
+        return d
+    for word, delta in (("今天", 0), ("明天", 1), ("后天", 2)):
+        if word in text:
+            return ref.date() + datetime.timedelta(days=delta)
+    for word, wd in _WEEKDAYS.items():
+        if word in text:
+            add = (wd - ref.weekday()) % 7
+            return ref.date() + datetime.timedelta(days=add)
+    return None
+
+
+def _event_time_range(line):
+    """``中午12：00-1：00`` → (开始分钟, 结束分钟, match)；结束早于开始按跨 12 小时补。"""
+    m = _TIME_RANGE_RE.search(str(line or ""))
+    if not m:
+        return None
+    try:
+        sh, sm, eh, em = (int(m.group(i)) for i in range(1, 5))
+    except (TypeError, ValueError):
+        return None
+    if sh > 23 or eh > 23 or sm > 59 or em > 59:
+        return None
+    start = sh * 60 + sm
+    end = eh * 60 + em
+    ctx = str(line)[max(0, m.start() - 4):m.start()]
+    if any(x in ctx for x in ("下午", "傍晚", "晚上", "夜里")) and start < 12 * 60:
+        start += 12 * 60
+    elif "中午" in ctx and start < 11 * 60:
+        start += 12 * 60
+    guard = 0
+    while end <= start and guard < 3:
+        end += 12 * 60
+        guard += 1
+    if end - start > 24 * 60:
+        return None
+    return start, end, m
+
+
+def _event_noise_line(line):
+    s = str(line or "").strip()
+    if s == "" or _CLOCK_ONLY_RE.match(s):
+        return True
+    if len(s) <= 16 and re.search(r"(委员|老师|同学|学长|学姐|部长|主任|班长)", s):
+        return True
+    if _LOCATION_RE.search(s):
+        return True
+    t = _DATE_MD_RE.sub("", s)
+    for w in _WEEKDAYS:
+        t = t.replace(w, "")
+    t = re.sub(r"[\s()（）【】\[\]·,，.。:：\-—/]", "", t)
+    return t == ""
+
+
+def _event_from_text(text, ref):
+    """从聊天公告 / OCR 文本里规则抽一条明确活动；抽不出返回 None。"""
+    lines = _event_lines(text)
+    if not lines:
+        return None
+    time_idx = -1
+    tr = None
+    for i, line in enumerate(lines):
+        got = _event_time_range(line)
+        if got is not None:
+            time_idx = i
+            tr = got
+            break
+    if tr is None:
+        return None
+    date = _event_date(text, ref)
+    if date is None:
+        return None
+
+    title = ""
+    title_idx = -1
+    for i in range(time_idx - 1, -1, -1):
+        if _event_noise_line(lines[i]):
+            continue
+        cand = _DATE_MD_RE.sub("", lines[i])
+        for w in _WEEKDAYS:
+            cand = cand.replace(w, "")
+        cand = _TIME_RANGE_RE.sub("", cand)
+        cand = re.sub(r"^[\s\-–—·•]+|[\s\-–—·•]+$", "", cand).strip()
+        if 2 <= len(cand) <= TITLE_MAX:
+            title = cand
+            title_idx = i
+            break
+    if title == "":
+        return None
+    if not (any(w in title for w in _EVENT_WORDS)
+            or any(k in text for k in ("签到", "报名", "举行", "举办", "集合"))):
+        return None
+
+    location = ""
+    for line in lines:
+        m = _LOCATION_RE.search(line)
+        if m:
+            location = _clip(m.group(1).strip(" .,;，。"), LOCATION_MAX)
+            break
+
+    notes_parts = []
+    for i, line in enumerate(lines):
+        if i == time_idx or i == title_idx or _event_noise_line(line):
+            continue
+        notes_parts.append(line)
+    notes = _clip(" | ".join(notes_parts), NOTES_MAX)
+    start, end, _m = tr
+    duration = max(5, min(24 * 60, end - start))
+
+    def _clock(minutes):
+        minutes %= 24 * 60
+        return "%02d:%02d" % (minutes // 60, minutes % 60)
+
+    return {
+        "date": date.isoformat(),
+        "weekday": None,
+        "period": None,
+        "time": _clock(start),
+        "end_time": _clock(end),
+        "title": title,
+        "location": location,
+        "notes": notes,
+        "priority": 50,
+        "duration_min": duration,
+        "deadline": None,
+        "source": "",
+    }
+
+
+def fallback_event_items(scan, now=None):
+    """规则补抽：LLM 失败 / 漏掉聊天里的活动公告时，至少把明确的日期+时间活动留下。"""
+    ref = datetime.datetime.fromtimestamp(time.time() if now is None else float(now))
+    out, seen = [], set()
+    for f in (scan or {}).get("files", []) if isinstance(scan, dict) else []:
+        if not isinstance(f, dict) or f.get("table"):
+            continue
+        text = "\n".join(str(f.get(k, "") or "").strip()
+                         for k in ("text", "ocr", "vlm") if str(f.get(k, "") or "").strip())
+        if text == "":
+            continue
+        item = _event_from_text(text, ref)
+        if not item:
+            continue
+        key = (item.get("date"), item.get("time"), _norm_title(item.get("title")))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= MAX_ITEMS:
+            break
+    return out
+
+
+def _raw_same_event(a, b):
+    ta, tb = _norm_title(a.get("title", "")), _norm_title(b.get("title", ""))
+    ad, bd = str(a.get("date") or ""), str(b.get("date") or "")
+    if ta and tb and (ta == tb or ta in tb or tb in ta):
+        return not ad or not bd or ad == bd
+    at, bt = _parse_time(a.get("time")), _parse_time(b.get("time"))
+    if at is not None and bt is not None and \
+            abs(at.hour * 60 + at.minute - bt.hour * 60 - bt.minute) <= 5:
+        return (not ad or not bd or ad == bd) and (not ta or not tb)
+    return False
+
+
+def merge_event_fallback(raw_items, fallback_items):
+    """把规则补抽结果并入 LLM 结果；同日期 + 同标题 / 同时刻的不重复添加。"""
+    out = [dict(x) for x in raw_items or [] if isinstance(x, dict)]
+    for fb in fallback_items or []:
+        if not isinstance(fb, dict):
+            continue
+        if any(_raw_same_event(x, fb) for x in out):
+            continue
+        out.append(dict(fb))
+        if len(out) >= MAX_ITEMS:
+            break
+    return out
 
 
 def _int_cn(v):
@@ -391,7 +566,8 @@ def _parse_item(raw, ref, source):
         weekday = date.weekday()
 
     raw_kind = str(raw.get("kind", "") or "").strip().lower()
-    kind = "course" if raw_kind == "course" or period is not None or weekday is not None else "task"
+    # 只有「明确课程 / 有节次」才是课程；仅有星期的时间型事件是普通约定（如周四篮球赛）。
+    kind = "course" if raw_kind == "course" or period is not None else "task"
     task_type = str(raw.get("task_type", raw.get("type", "")) or "").strip().lower()
     if task_type not in schedule_learning.CATEGORY_PRIOR:
         task_type = schedule_learning.infer_task_type(title, kind, notes)
@@ -485,7 +661,7 @@ def normalize_items(raw_items, source="", now=None):
         it = _parse_item(raw, ref, source)
         if not it:
             continue
-        if it["period"] or it["weekday"] >= 0:
+        if it["kind"] == "course" or it["period"]:
             # 课程按**格子**去重（日期 + 星期 + 起始节）：同一格不可能同时上两门课。
             # 扫描器的几何还原排在 LLM 提取之前（main.py 的合并顺序），所以冲突时保留更可靠的那份。
             if it["date"] or it["weekday"] >= 0:
