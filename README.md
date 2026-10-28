@@ -425,7 +425,13 @@ run_test_env.bat tests
 
 ## 10. 导出与发布
 
-`game\export_presets.cfg` 提供 Windows Desktop 导出预设，可在 Godot「项目 → 导出」中自行导出 PCK / 可执行文件。
+`game\export_presets.cfg` 提供 Windows Desktop 导出预设（**PCK 已嵌入 exe**，并排除 `tests/`），可直接用命令行导出：
+
+```powershell
+godot --headless --path game --export-release "Windows Desktop" "build\Azure.exe"
+```
+
+导出后把 `game\config.json` 与仓库根目录的 `Azure.vrm` 复制到 `build\`（与 exe 同目录），双击 `build\Azure.exe` 即可运行。`build/` 是本地产物，已 gitignore。
 
 发布前建议检查：
 
