@@ -3,7 +3,7 @@
 > **桌宠是主程序，围棋是它打开的独立窗口。**
 > 同一套 Azure 人格、情绪、时间线与记忆，在桌宠、围棋窗口和重启后的下一次见面之间保持连续。
 
-**版本：v4.0.0（Release）**
+**版本：v4.1.0（Release）**
 
 Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你说话、看你在忙什么，也可以打开一盘围棋和你下棋。她不是“围棋程序里的桌宠模式”，而是一个有自己的时间、精力、心情与记忆的桌面角色。
 
@@ -63,6 +63,19 @@ Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你�
 - `memories`：可召回的长期记忆（聊天摘要、事件、对局总结、手动写入）。
 - `LifeTimeline`：只追加的生命事件与相对时间事实；桌宠启动时能知道“上一回见到 Estarth 是什么时候”。
 - 共享后端：桌宠、围棋窗口、重启后的 Azure 看到的是同一份情绪与记忆。
+
+### 资料、日程与提醒（v4.1.0）
+
+- **资料箱 → 周课表**：图片 / PDF / 文档经 OCR + VLM 读取；课程表按 OCR 坐标还原成
+  7 天 × 12 节的周课表（星期、节次、教师、地点、日期），不再压成一串文字。
+- **自动排班**：待定任务按**优先级 + 截止时间 + 空闲区间**自动落位；时长 / 优先级先做
+  **正部 James-Stein 收缩估计**（向历史均值收缩，`m < 3` 不收缩），再用优先级密度排序、
+  best-fit 打包空闲段。固定课程与已定时间不被移动。
+- **到点事务提醒**：后端每 15 秒检查一次，到点把事务喂给 LLM 生成一句短提醒；
+  LLM 不可用时自动退回模板气泡。提醒走 `ai_remind`，**不发语音**；面板开着时显示在面板上方的提醒卡。
+- **留档与清理**：过期日程可归档保留（不删除）；超过保留期（默认 30 天）的归档可一键清理；
+  后台每小时自动留档 7 天前条目、每天自动清理过期归档。
+- **课表格子悬停展开**：鼠标停在放不下的课程块上，浮层显示完整课程名 / 教师 / 地点 / 时间 / 备注。
 
 ### 围棋陪练
 
@@ -241,6 +254,11 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `time_aware_enabled` | `true` | 注入绝对 / 相对 / 昼夜时间事实 |
 | `memory_enabled` | `true` | 共享聊天流水、episode、长期记忆 |
 | `assistant_inbox` | 空 | 资料箱路径；留空＝`<repo>/assistant_files/inbox` |
+| `auto_plan_enabled` | `true` | 扫描后自动给待定任务排班 |
+| `auto_plan_days` | `7` | 自动排班的未来天数（1–30） |
+| `schedule_reminder_enabled` | `true` | 到点事务提醒（LLM 生成，失败用模板） |
+| `schedule_archive_days` | `7` | 自动留档 / 手动「归档过期」的天数 |
+| `schedule_retention_days` | `30` | 归档保留天数，超过后自动清理 |
 | `vlm_enabled` | `true` | 自动窥屏 / 资料图片读取；缺环境时退化 |
 | `tts_enabled` | `true` | 语音总开关 |
 | `tts_mode` | `local` | `system` / `local` / `openai` / `aliyun` |
@@ -311,7 +329,11 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `GET /api/life` | 生命时间线快照（状态 / 相对时间 / 最近事件 / 日程） |
 | `GET /api/files` | 资料箱文件列表 |
 | `POST /api/files/scan` | OCR / VLM / 文档读取 → LLM 提取日程 → 写共享日程与记忆 |
-| `GET /api/schedule` | 共享日程列表 |
+| `GET /api/schedule` | 共享日程列表（`include_archived=1` 看留档） |
+| `POST /api/schedule/auto_plan` | 自动排班（优先级 + James-Stein 收缩 + best-fit） |
+| `POST /api/schedule/archive` | 归档过期 / 指定日程（不删除） |
+| `POST /api/schedule/cleanup` | 清理超过保留期的归档 |
+| `POST /api/schedule/remind` | 手动触发一次事务提醒（LLM 文本 / 模板） |
 | `GET /api/chat/history` | 最近聊天流水 |
 | `GET /api/state` | 围棋棋盘权威快照 |
 | `GET /api/health` | 引擎 / LLM / 记忆状态 |
@@ -337,7 +359,7 @@ cd backend
 python -m unittest discover -s tests -q
 ```
 
-当前全量：**957 tests OK**。
+当前全量：**988 tests OK**。
 
 ### 前端门卫
 
@@ -414,6 +436,7 @@ run_test_env.bat tests
 │  ├─ app\memory.py               共享记忆 / episode
 │  ├─ app\file_service.py         资料箱 / 扫描器编排 / VLM 拉起
 │  ├─ app\schedule.py             资料文本 → 日程提取与归一化
+│  ├─ app\auto_plan.py            自动排班（James-Stein 收缩 + 优先级密度 + best-fit）
 │  ├─ app\main.py                 REST / WebSocket
 │  ├─ tests\                      后端测试
 │  └─ data\                       运行产物（gitignore）

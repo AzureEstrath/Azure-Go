@@ -2542,6 +2542,8 @@ func _add_msg(kind: String, text: String) -> void:
 ## （点评等到落子宣告的音频才显示、揭示被推后、最后一条没声音）。
 ## 与 `mark_text_only()` 是同一语义，区别只在于「谁来声明」。
 const AI_NOTICE := "ai_notice"
+## 事务提醒（v4.1.0）：同样**不发** speech；在围棋窗口里当纯文字消息显示，不占语音配对位。
+const AI_REMIND := "ai_remind"
 
 ## 这条 `message` 要不要登记语音配对记录？（**纯函数**，headless 门卫直接断言）
 ## 三种「没有语音」的来源：① 推送方声明（`AI_NOTICE`）；② 调用点本地标记（undo / reset /
@@ -2549,7 +2551,7 @@ const AI_NOTICE := "ai_notice"
 static func message_needs_speech(kind: String, text_only := false) -> bool:
 	if not kind.begins_with("ai"):
 		return false
-	if kind == AI_NOTICE:
+	if kind == AI_NOTICE or kind == AI_REMIND:
 		return false
 	return not text_only
 

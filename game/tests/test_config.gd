@@ -489,6 +489,10 @@ func _run() -> void:
 		not mp.message_needs_speech(mp.AI_NOTICE))
 	_check("message_needs_speech：`ai_notice` 的字面量与后端 `events.AI_NOTICE` 同名（跨端契约）",
 		mp.AI_NOTICE == "ai_notice")
+	_check("message_needs_speech：`ai_remind` ⇒ 不登记（事务提醒没有语音）",
+		not mp.message_needs_speech(mp.AI_REMIND))
+	_check("`ai_remind` 与后端 `events.AI_REMIND` 同名（跨端契约）",
+		mp.AI_REMIND == "ai_remind")
 	_check("message_needs_speech：本地 text_only 标记 ⇒ 不登记（既有语义不变）",
 		not mp.message_needs_speech("ai", true))
 	_check("message_needs_speech：点评 / 落子宣告 / 走神搭话 ⇒ 登记（三条真语音的管线不变）",

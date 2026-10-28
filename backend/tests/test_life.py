@@ -4,6 +4,7 @@
 """
 
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -189,6 +190,127 @@ class LifeStoreTest(unittest.TestCase):
         self.assertEqual(saved[0]["start_ts"], 0.0)
         self.assertEqual(self.store.next_schedule(now=T0), {})
 
+
+    def test_schedule_course_fields_and_dedupe(self):
+        """课程条目带星期 / 节次 / 教师 / 地点；同一门课重复扫描按日期+节次+标题更新而不是新增。"""
+        saved = self.store.upsert_schedule([{
+            "start_ts": T0 + 3600.0, "when_text": "2026-10-28 周三 第1-2节 08:00-09:35",
+            "title": "高等数学", "notes": "", "source": "课表.png",
+            "date": "2026-10-28", "weekday": 2, "period": "1-2",
+            "period_start": 1, "period_end": 2, "start_time": "08:00",
+            "end_time": "09:35", "teacher": "王三强", "location": "二教20",
+        }], source="课表.png", now=T0)
+        self.assertEqual(len(saved), 1)
+        rows = self.store.list_schedule(10)
+        row = rows[0]
+        self.assertEqual(row["weekday"], 2)
+        self.assertEqual(row["period"], "1-2")
+        self.assertEqual(row["period_start"], 1)
+        self.assertEqual(row["period_end"], 2)
+        self.assertEqual(row["start_time"], "08:00")
+        self.assertEqual(row["end_time"], "09:35")
+        self.assertEqual(row["teacher"], "王三强")
+        self.assertEqual(row["location"], "二教20")
+        self.assertEqual(row["date"], "2026-10-28")
+        again = self.store.upsert_schedule([{
+            "start_ts": T0 + 3700.0, "when_text": "2026-10-28 周三 第1-2节 08:00-09:35",
+            "title": "高等数学", "notes": "带上作业", "source": "课表.png",
+            "date": "2026-10-28", "weekday": 2, "period": "1-2",
+            "period_start": 1, "period_end": 2, "start_time": "08:00",
+            "end_time": "09:35", "teacher": "王三强", "location": "二教20",
+        }], source="课表.png", now=T0 + 10)
+        self.assertEqual(len(again), 1)
+        self.assertEqual(again[0]["id"], saved[0]["id"])
+        self.assertEqual(again[0]["notes"], "带上作业")
+        self.assertEqual(len(self.store.list_schedule(10)), 1)
+
+    def test_schedule_reminder_archive_cleanup_and_plan_update(self):
+        """到点提醒 / 留档 / 清理 / 自动排班写入：完整生命周期（纯临时库）。"""
+        saved = self.store.upsert_schedule([
+            {"start_ts": T0 + 120.0, "when_text": "2026-10-27 18:02", "title": "到点任务",
+             "priority": 90, "duration_min": 30, "kind": "task", "source": "a.txt"},
+            {"start_ts": T0 - 20 * 3600.0, "when_text": "昨天", "title": "过期任务",
+             "priority": 40, "duration_min": 20, "kind": "task", "source": "b.txt"},
+        ], source="a.txt", now=T0)
+        self.assertEqual(len(saved), 2)
+        due = self.store.due_reminders(now=T0 + 180.0, window_sec=600, lead_sec=60)
+        self.assertEqual([x["title"] for x in due], ["到点任务"])
+        self.assertTrue(self.store.mark_reminded(due[0]["id"], now=T0 + 180.0))
+        self.assertEqual(self.store.due_reminders(now=T0 + 200.0), [])
+
+        self.assertGreaterEqual(self.store.archive_schedule(now=T0), 1)
+        rows = self.store.list_schedule(20)
+        self.assertEqual([x["title"] for x in rows], ["到点任务"])
+        archived_rows = self.store.list_schedule(20, include_archived=True)
+        expired = [x for x in archived_rows if x["title"] == "过期任务"][0]
+        self.assertTrue(expired["archived"])
+        self.assertGreaterEqual(self.store.cleanup_schedule(days=1, now=T0 + 2 * 86400.0), 1)
+
+        # 自动排班写入：未定任务获得 start_ts / when_text，并标记 auto_planned。
+        task = self.store.upsert_schedule([{
+            "start_ts": 0.0, "when_text": "待定", "title": "待安排", "kind": "task",
+            "priority": 70, "duration_min": 45, "source": "c.txt",
+        }], source="c.txt", now=T0)[0]
+        out = self.store.update_schedule_plan([{
+            "id": task["id"], "start_ts": T0 + 3600.0,
+            "when_text": "2026-10-27 19:00-19:45（自动安排）", "duration_min": 45,
+        }], now=T0)
+        row = [x for x in out if x["id"] == task["id"]][0]
+        self.assertAlmostEqual(row["start_ts"], T0 + 3600.0)
+        self.assertTrue(row["auto_planned"])
+        self.assertIn("自动安排", row["when_text"])
+
+    def test_delete_schedule_source_replaces_old_scan(self):
+        """重扫同一份资料：按来源清掉旧文本行，新的结构化课程再写入。"""
+        self.store.upsert_schedule([{
+            "start_ts": T0 + 60.0, "when_text": "2026-10-27 08:00",
+            "title": "旧文本日程", "source": "课表.jpg",
+        }], source="课表.jpg", now=T0)
+        self.assertEqual(len(self.store.list_schedule(10)), 1)
+        removed = self.store.delete_schedule_source("课表.jpg")
+        self.assertEqual(removed, 1)
+        self.assertEqual(self.store.list_schedule(10), [])
+        self.store.upsert_schedule([{
+            "start_ts": T0 + 3600.0, "when_text": "2026-10-28 周三 第1-2节",
+            "title": "高等数学", "source": "课表.jpg", "date": "2026-10-28",
+            "weekday": 2, "period": "1-2", "teacher": "王三强",
+        }], source="课表.jpg", now=T0)
+        rows = self.store.list_schedule(10)
+        self.assertEqual([x["title"] for x in rows], ["高等数学"])
+
+    def test_old_schedule_table_is_migrated(self):
+        """v4.0.0 之前的旧库只有 7 列：启动时补列，旧行照常可读、新字段走默认值。"""
+        d = tempfile.TemporaryDirectory()
+        path = os.path.join(d.name, "old.db")
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute("""CREATE TABLE schedule_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, start_ts REAL NOT NULL DEFAULT 0,
+                when_text TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'planned', created_ts REAL NOT NULL DEFAULT 0,
+                updated_ts REAL NOT NULL DEFAULT 0)""")
+            conn.execute("INSERT INTO schedule_items(start_ts, when_text, title, source) "
+                         "VALUES(?,?,?,?)", (T0 + 60.0, "2026-10-27 18:00", "旧日程", "old.png"))
+            conn.commit()
+            conn.close()
+            store = life.LifeStore(path, now=T0)
+            try:
+                rows = store.list_schedule(10)
+                self.assertEqual(rows[0]["title"], "旧日程")
+                self.assertEqual(rows[0]["weekday"], -1)
+                self.assertEqual(rows[0]["period"], "")
+                store.upsert_schedule([{
+                    "start_ts": T0 + 3600.0, "when_text": "2026-10-28 周三 第1-2节",
+                    "title": "新课程", "date": "2026-10-28", "weekday": 2,
+                    "period": "1-2", "teacher": "王三强", "location": "二教20",
+                }], source="new.png", now=T0)
+                new_rows = store.list_schedule(10)
+                self.assertEqual({x["title"] for x in new_rows}, {"旧日程", "新课程"})
+            finally:
+                store.close()
+        finally:
+            d.cleanup()
 
     def test_unavailable_db_falls_back_to_memory(self):
         bad = tempfile.TemporaryDirectory()

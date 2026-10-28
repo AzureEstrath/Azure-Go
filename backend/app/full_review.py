@@ -282,7 +282,7 @@ async def comment_segment(agent, record, start, end, index=0, total=1, previous=
             msgs = build_messages(agent, record, {"from": start, "to": end, **seg},
                                   int(index), max(1, int(total)), previous)
             reply = await agent.llm.chat(msgs, max_tokens=COMMENT_TOKENS, think_mode=THINK_MODE)
-            text = actions.clean_actions(agent.clean_reply(reply))
+            text = actions.naturalize(actions.clean_actions(agent.clean_reply(reply)))
         except Exception as e:                  # noqa: BLE001 —— 点评失败退兜底，不拖垮整盘
             print("[FullReview] 点评生成失败（用兜底）：%s" % e)
     if not _usable(text):

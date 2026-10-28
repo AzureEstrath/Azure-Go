@@ -205,29 +205,83 @@ def load_paddle_ocr():
     )
 
 
-def run_ocr(engine, img):
-    """截图 → 识别出的文字（一行行拼起来，限制长度）；engine 为 load_ocr() 的 (kind, ocr)"""
+def run_ocr_items(engine, img, max_side=2048):
+    """截图 / 资料图 → OCR 文本框列表（带坐标），供表格还原使用。
+
+    返回 ``[{"text", "score", "x", "y", "x0", "x1", "y0", "y1"}]``（按识别顺序）。
+    PaddleOCR 回包没有统一坐标字段时坐标一律为 0——调用方必须能接受「只有文本」。
+    """
     import numpy as np
 
-    if max(img.size) > 2048:
-        s = 2048 / max(img.size)
+    if max(img.size) > max_side:
+        s = max_side / max(img.size)
         img = img.resize((int(img.width * s), int(img.height * s)))
     arr = np.ascontiguousarray(np.asarray(img)[:, :, ::-1])   # PIL RGB → BGR
     kind, ocr = engine
-    raw = []
+    items = []
     if kind == "rapid":
         res, _ = ocr(arr)
-        raw = [str(r[1]) for r in (res or [])]
+        for r in res or []:
+            try:
+                text = str(r[1]).strip()
+            except (IndexError, TypeError):
+                continue
+            if not text:
+                continue
+            try:
+                score = float(r[2])
+            except (IndexError, TypeError, ValueError):
+                score = 0.0
+            box = r[0] if len(r) > 0 else []
+            xs = [float(p[0]) for p in box] if box else [0.0]
+            ys = [float(p[1]) for p in box] if box else [0.0]
+            items.append({
+                "text": text, "score": score,
+                "x": round(sum(xs) / len(xs), 1), "y": round(sum(ys) / len(ys), 1),
+                "x0": round(min(xs), 1), "x1": round(max(xs), 1),
+                "y0": round(min(ys), 1), "y1": round(max(ys), 1),
+            })
     else:
         for r in ocr.predict(arr):
             d = r if isinstance(r, dict) else {}
-            raw.extend(str(t) for t in (d.get("rec_texts") or []))
+            texts = [str(t) for t in (d.get("rec_texts") or [])]
+            polys = d.get("rec_polys") or d.get("dt_polys") or []
+            for i, text in enumerate(texts):
+                text = text.strip()
+                if not text:
+                    continue
+                box = polys[i] if i < len(polys) else []
+                try:
+                    xs = [float(p[0]) for p in box]
+                    ys = [float(p[1]) for p in box]
+                except (TypeError, ValueError, IndexError):
+                    xs, ys = [0.0], [0.0]
+                items.append({
+                    "text": text, "score": 0.0,
+                    "x": round(sum(xs) / len(xs), 1) if xs else 0.0,
+                    "y": round(sum(ys) / len(ys), 1) if ys else 0.0,
+                    "x0": round(min(xs), 1) if xs else 0.0,
+                    "x1": round(max(xs), 1) if xs else 0.0,
+                    "y0": round(min(ys), 1) if ys else 0.0,
+                    "y1": round(max(ys), 1) if ys else 0.0,
+                })
+    return items
+
+
+def run_ocr(engine, img, max_chars=400, max_side=2048):
+    """截图 → 识别出的文字（按行拼接，限制长度）；engine 为 load_ocr() 的 (kind, ocr)。
+
+    ``max_chars`` / ``max_side`` 可覆盖：窥屏只要前 400 字（够判断屏幕内容），
+    资料扫描要完整读表格（传更大的上限）。
+    """
+    items = run_ocr_items(engine, img, max_side=max_side)
+    items.sort(key=lambda d: (round(d.get("y", 0.0) / 12.0), d.get("x", 0.0)))
     texts = []
-    for t in raw:
-        t = t.strip()
+    for it in items:
+        t = str(it.get("text", "")).strip()
         if t and (not texts or texts[-1] != t):
             texts.append(t)
-    return " | ".join(texts)[:400]
+    return " | ".join(texts)[:max(1, int(max_chars))]
 
 
 VLM_PROMPT = ("这是一张电脑屏幕截图。用一两句简短的中文描述屏幕上正在做什么"

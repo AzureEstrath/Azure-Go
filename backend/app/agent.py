@@ -16,7 +16,7 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import adaptive, coords, events, joseki_gate, persona, profile, prompt_chains, prompts, pv_lines, time_ctx
+from . import actions, adaptive, coords, events, joseki_gate, persona, profile, prompt_chains, prompts, pv_lines, time_ctx
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, PHASE_PEER, build_graph, is_joseki_mistake, _emit_line,
@@ -2912,6 +2912,57 @@ class AzureAgent:
         # 代际守卫：看门狗刚超时 / 本回合被新调用作废时，这一代不再写事件。
         if self.epoch_ok(token):
             self._record_chat_events()
+
+    # ================= 事务提醒（v4.1.0） =================
+
+    @staticmethod
+    def _reminder_fallback(item) -> str:
+        """LLM 不可用 / 回复失败时的模板提醒（纯文本，绝不空口）。"""
+        title = str((item or {}).get("title", "") or "").strip() or "这件事"
+        when = str((item or {}).get("when_text", "") or "").strip()
+        if len(when) > 40:
+            when = when[:39] + "…"
+        text = "到点了：「%s」" % title
+        if when:
+            text += "（%s）" % when
+        return text + "，别忘了。"
+
+    async def remind_schedule(self, item, now=None) -> str:
+        """到点提醒：事务喂给 LLM 生成一句短提醒；没连接 / 失败时用模板气泡。
+
+        边界：
+        - **不进 busy、不跑编排图**：提醒不该占住棋盘；只走一次快速 LLM 调用（生成锁串行）；
+        - 发 ``ai_remind``（**不发 speech**），前端用常驻提醒卡显示；聊天 / 资料面板开着也能看到；
+        - **不写聊天历史**（提醒不是对话），由调用方（``main.py`` 的提醒循环）写 ``reminded_ts``；
+        - 任何异常都退回模板，绝不让提醒循环挂掉。
+        """
+        title = str((item or {}).get("title", "") or "").strip()
+        if title == "":
+            return ""
+        when = str((item or {}).get("when_text", "") or "").strip()
+        ref = float(now) if now is not None else time.time()
+        try:
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ref))
+        except (OverflowError, OSError, ValueError):
+            stamp = ""
+        reply = ""
+        text = ""
+        try:
+            prompt = (
+                "现在是 %s。Estarth 的日程「%s」到时间了%s。"
+                "用一句很短、自然的中文提醒他（25 字以内）：像朋友提醒，不要像任务播报，"
+                "不要提“日程表 / 数据库 / 系统”，不要编造别的事。"
+            ) % (stamp, title, ("（%s）" % when) if when else "")
+            msgs = [self._sys_msg(), {"role": "user", "content": prompt}]
+            reply = await self._reply(msgs, 80, think_mode=0)
+            text = actions.naturalize(reply).strip()
+        except Exception as e:                  # noqa: BLE001 —— 提醒失败只降级，不影响主循环
+            print("[Agent] 事务提醒生成失败（用模板）：%s" % e)
+            text = ""
+        if text == "" or self._llm_failed(reply):
+            text = self._reminder_fallback(item)
+        self._emit(events.message(events.AI_REMIND, text))
+        return text
 
     async def idle_remark(self, mode="game"):
         """闲置搭话：Estarth 一段时间没动静时，Azure 主动说一句短话。

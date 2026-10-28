@@ -18,6 +18,7 @@
 直接用它发请求前必须自备同样的判断。
 """
 
+import asyncio
 import math
 from types import SimpleNamespace
 
@@ -100,6 +101,10 @@ class LLMClient:
         self._http = http_client                    # 同步路径（invoke）：langchain-openai 1.x 只认它
         self._http_async = http_async_client        # 异步路径（ainvoke）：只认它，测试注入假客户端用
         self._built_extra_body = None
+        # 本机 llama-server 常常只有一个生成槽位（`-np 1`）。资料扫描的日程提取与聊天 / 情绪
+        # 小调用共用同一个客户端时，两条请求并发会把槽位状态搅在一起（实测聊天拿到日程 JSON）。
+        # 所有真正发请求的路径排成一队：单次最长约几十秒，宁可让聊天多等一会儿，也不串台。
+        self._gen_lock = asyncio.Lock()
         # chain 只供 bind_tools / astream / with_structured_output 复用（Task 4/5）。一切真的发请求的
         # 台词路径必须走 chat()：它会先过 _url_ok() 快拦，而未配置 llm_base_url 时 openai 客户端会
         # 静默退回 api.openai.com，真连外网且单次卡几十秒。
@@ -267,6 +272,14 @@ class LLMClient:
     async def chat(self, messages, max_tokens=300, no_think=False, think_mode=None) -> str:
         if not self._url_ok():
             return "调用出错：未配置 LLM 地址（llm_base_url），请在 config.json 里填写"
+        async with self._gen_lock:              # 单槽位服务上串行生成：资料扫描与聊天绝不并发
+            return await self._chat_locked(messages, max_tokens, no_think, think_mode)
+
+    def call_lock(self):
+        """给直接使用 ``chain.astream`` 的流式路径复用同一把生成锁（默认关闭的通道也要串行）。"""
+        return self._gen_lock
+
+    async def _chat_locked(self, messages, max_tokens, no_think, think_mode) -> str:
         budget = self._budget(max_tokens, no_think, think_mode)
         try:
             ai = await self._call(messages, budget)
@@ -317,15 +330,16 @@ class LLMClient:
         """
         if not self._url_ok():                      # 未配置地址：一个请求都不许发（同 chat()）
             return None
-        try:
-            structured = self._sync_chain().with_structured_output(MoodDelta, method="function_calling")
-            out = await structured.ainvoke([{
-                "role": "user",
-                "content": prompts.mood_delta_prompt(cur, region_name, desc),
-            }])
-            if out is None:                         # 服务端没按 schema 回（回成纯文本等）
+        async with self._gen_lock:                  # 与 chat() 同一条队列：单槽位服务不许并发
+            try:
+                structured = self._sync_chain().with_structured_output(MoodDelta, method="function_calling")
+                out = await structured.ainvoke([{
+                    "role": "user",
+                    "content": prompts.mood_delta_prompt(cur, region_name, desc),
+                }])
+                if out is None:                     # 服务端没按 schema 回（回成纯文本等）
+                    return None
+                return [_clamp_delta(out.dv), _clamp_delta(out.dc), _clamp_delta(out.da)]
+            except Exception as e:                  # noqa: BLE001
+                print("[LLM] 情绪结构化输出失败：%s" % e)
                 return None
-            return [_clamp_delta(out.dv), _clamp_delta(out.dc), _clamp_delta(out.da)]
-        except Exception as e:                      # noqa: BLE001
-            print("[LLM] 情绪结构化输出失败：%s" % e)
-            return None

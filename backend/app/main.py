@@ -62,6 +62,8 @@ import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
+from . import actions
+from . import auto_plan
 from . import config as config_mod
 from . import coords, events, persona, prompts, sgf
 from . import file_service
@@ -129,6 +131,54 @@ def _harden_stdout() -> None:
             sys.stdout.reconfigure(errors="replace")
     except Exception:                       # noqa: BLE001 —— 加固失败不是故障，照常启动
         pass
+
+
+async def _schedule_reminder_loop(app, cfg):
+    """后台事务提醒 / 自动留档循环（v4.1.0）。
+
+    - 每 15 秒看一次「已到点 / 即将到点（提前 60 秒）」且未提醒的日程；
+    - 她正在对局 / 聊天（``busy``）时这一轮跳过，等下一轮，不抢生成锁；
+    - 提醒文本由 `agent.remind_schedule()` 生成（LLM 失败自动退回模板），发 `ai_remind`；
+    - 每小时自动留档 7 天前的条目，每天清理一次超过保留期的归档。
+    任何异常只打日志；循环本身绝不退出（除非被 cancel）。
+    """
+    last_archive = 0.0
+    last_clean = 0.0
+    while True:
+        await asyncio.sleep(15.0)
+        life = getattr(app.state, "life", None)
+        agent = getattr(app.state, "agent", None)
+        if life is None or agent is None:
+            continue
+        now = time.time()
+        try:
+            if now - last_archive >= 3600.0:
+                days = max(1, int(getattr(cfg, "schedule_archive_days", 7) or 7))
+                await asyncio.to_thread(life.auto_archive, now, days)
+                last_archive = now
+            if now - last_clean >= 86400.0:
+                keep = max(1, int(getattr(cfg, "schedule_retention_days", 30) or 30))
+                await asyncio.to_thread(life.cleanup_schedule, keep, False, now)
+                last_clean = now
+        except Exception as e:              # noqa: BLE001
+            print("[Schedule] 自动留档 / 清理失败（已忽略）：%s" % e)
+        if bool(getattr(agent, "busy", False)):
+            continue
+        try:
+            due = await asyncio.to_thread(life.due_reminders, now, 600.0, 60.0)
+        except Exception as e:              # noqa: BLE001
+            print("[Schedule] 到点提醒读取失败（已忽略）：%s" % e)
+            continue
+        for it in due:
+            if bool(getattr(agent, "busy", False)):
+                break
+            try:
+                await agent.remind_schedule(it, now=now)
+                await asyncio.to_thread(life.mark_reminded, it.get("id"), now)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:          # noqa: BLE001
+                print("[Schedule] 到点提醒发送失败（已忽略）：%s" % e)
 
 
 # 画像面板（``GET /api/profile``）随各维一起带回来的**最近对局记录**条数（v3.9.0，设计 §6.4 / O20）。
@@ -252,7 +302,19 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             _load_chats = getattr(app.state.agent, "load_recent_chat_history", None)
             if callable(_load_chats):
                 await asyncio.to_thread(_load_chats)
+        # 后台事务提醒 / 自动留档（生产装配才起；测试 autostart=False 保持零副作用）。
+        reminder_task = None
+        if autostart and life_store is not None and bool(
+                getattr(cfg, "schedule_reminder_enabled", True)):
+            reminder_task = asyncio.create_task(_schedule_reminder_loop(app, cfg))
+        app.state.reminder_task = reminder_task
         yield
+        if reminder_task is not None:
+            reminder_task.cancel()
+            try:
+                await reminder_task
+            except asyncio.CancelledError:
+                pass
         if autostart:
             _save_life = getattr(app.state.agent, "save_life", None)
             if callable(_save_life):
@@ -409,6 +471,11 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             except Exception as e:              # noqa: BLE001
                 print("[Memory] 聊天历史读取失败（已忽略）：%s" % e)
                 items = []
+        # 历史里可能残留旧版本模型误吐的日程 JSON（已写进库、无法追溯改写）：
+        # 出口统一转成人话，桌宠 / 围棋的聊天面板都不再显示 `[` 或字段名。
+        for it in items:
+            if isinstance(it, dict):
+                it["reply_text"] = actions.naturalize(it.get("reply_text", ""))
         return {"ok": True, "items": items}
 
     @app.post("/api/summarize")
@@ -655,11 +722,29 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                         "schedule": _schedule_payload()}
             text = schedule_mod.scan_text(scan)
             raw = await schedule_mod.extract_items(s.llm, text, now=time.time()) if text else []
+            # 扫描器从 OCR 坐标直接还原出的课程表条目（星期 / 节次 / 教师 / 地点）：
+            # 比 LLM 猜结构可靠，必须并入同一份日程；LLM 抽到的普通日程照常保留。
+            table_items = []
+            for f in scan.get("files", []) if isinstance(scan, dict) else []:
+                if not isinstance(f, dict):
+                    continue
+                for it in f.get("table", []) or []:
+                    if isinstance(it, dict):
+                        got = dict(it)
+                        got.setdefault("source", str(f.get("name", "")))
+                        table_items.append(got)
             source = ",".join(str(f.get("name", "")) for f in scan.get("files", [])
                               if isinstance(f, dict))
             source = source[:200]
-            items = schedule_mod.normalize_items(raw, source=source, now=time.time())
+            # 顺序：几何还原的课程在前，LLM 的普通日程在后——同一格冲突时保留更可靠的课程表条目。
+            items = schedule_mod.normalize_items(table_items + raw, source=source, now=time.time())
             life_store = getattr(app.state, "life", None)
+            if life_store is not None and items:
+                # 重扫同一批资料：先清掉这份来源的旧行（旧版本只存了文本日程），
+                # 再用这次的结构化结果整体替换，避免「课表 + 旧文字条目」重复出现。
+                old_sources = [str(f.get("name", "")) for f in scan.get("files", [])
+                               if isinstance(f, dict)] + [source]
+                await asyncio.to_thread(life_store.delete_schedule_source, old_sources)
             saved = await asyncio.to_thread(life_store.upsert_schedule, items, source) \
                 if life_store is not None else []
             if life_store is None:
@@ -674,9 +759,28 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                         mem_written += 1
                     except Exception:       # noqa: BLE001
                         pass
+            # 自动排班：新整理出的待定任务（以及之前自动排过的）按优先级 / 空闲时间重新落位。
+            # 固定课程与用户已定时间的条目不动；LLM 失败也不影响扫描结果。
+            plan_info = {"planned": 0, "unscheduled": 0, "stats": {}}
+            if life_store is not None and bool(getattr(cfg, "auto_plan_enabled", True)):
+                try:
+                    plan_items = await asyncio.to_thread(life_store.list_schedule_plan, 200)
+                    plan_hist = await asyncio.to_thread(life_store.list_schedule, 200, True, True)
+                    pr = auto_plan.plan(
+                        plan_items, now=time.time(),
+                        days=int(getattr(cfg, "auto_plan_days", 7) or 7),
+                        history=plan_hist)
+                    if pr.get("assignments"):
+                        await asyncio.to_thread(life_store.update_schedule_plan,
+                                                pr["assignments"])
+                    plan_info = {"planned": len(pr.get("assignments", [])),
+                                 "unscheduled": len(pr.get("unscheduled", [])),
+                                 "stats": pr.get("stats", {})}
+                except Exception as e:      # noqa: BLE001
+                    print("[Schedule] 扫描后自动排班失败（已忽略）：%s" % e)
             return {"ok": True, "folder": scan.get("folder", ""),
                     "files": _public_file_list(scan), "items": saved,
-                    "memory_written": mem_written,
+                    "memory_written": mem_written, "auto_plan": plan_info,
                     "schedule": _schedule_payload()}
 
     def _public_file_list(scan):
@@ -693,19 +797,20 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             })
         return out
 
-    def _schedule_payload(limit=50):
+    def _schedule_payload(limit=50, include_archived=False):
         store = getattr(app.state, "life", None)
         if store is None:
             return []
         try:
-            return store.list_schedule(int(limit))
+            return store.list_schedule(int(limit), include_archived=bool(include_archived))
         except Exception:                   # noqa: BLE001
             return []
 
     @app.get("/api/schedule")
-    async def schedule_list(limit: int = 50):
-        """共享日程：已定日期按时间升序，待定项排后。"""
-        items = await asyncio.to_thread(_schedule_payload, max(0, min(int(limit), 200)))
+    async def schedule_list(limit: int = 50, include_archived: int = 0):
+        """共享日程：已定日期按时间升序，待定项排后；默认不含归档。"""
+        items = await asyncio.to_thread(
+            _schedule_payload, max(0, min(int(limit), 200)), bool(include_archived))
         return {"ok": True, "items": items, "folder": file_service.inbox_dir(cfg)}
 
     @app.post("/api/schedule/status")
@@ -717,6 +822,69 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         changed = await asyncio.to_thread(
             store.set_schedule_status, body.get("id"), str(body.get("status", "done")))
         return {"ok": bool(changed), "items": _schedule_payload()}
+
+    @app.post("/api/schedule/auto_plan")
+    async def schedule_auto_plan(body: dict | None = None):
+        """自动排班：优先级 + James-Stein 收缩 + 空闲区间 best-fit（只动待定 / 自动排过的任务）。"""
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": False, "error": "生命时间线未装配"}
+        b = body or {}
+        items = await asyncio.to_thread(store.list_schedule_plan, 200)
+        history = await asyncio.to_thread(store.list_schedule, 200, True, True)
+        res = auto_plan.plan(
+            items, now=time.time(),
+            days=_int(b.get("days"), int(getattr(cfg, "auto_plan_days", 7) or 7)),
+            work_start=str(b.get("work_start") or "08:00"),
+            work_end=str(b.get("work_end") or "22:00"),
+            history=history)
+        await asyncio.to_thread(store.update_schedule_plan, res["assignments"])
+        return {"ok": True, "planned": res["assignments"],
+                "unscheduled": res["unscheduled"], "stats": res["stats"],
+                "items": _schedule_payload()}
+
+    @app.post("/api/schedule/archive")
+    async def schedule_archive(body: dict | None = None):
+        """留档：指定 id / 过期条目移入归档（不删除）；默认归档 7 天前的条目。"""
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": False, "error": "生命时间线未装配"}
+        b = body or {}
+        ids = b.get("ids") if isinstance(b.get("ids"), list) else None
+        now = time.time()
+        before = b.get("before_ts")
+        if before is None and not ids:
+            # 手动「归档过期」默认按配置的留档天数（7 天），避免把本周还在看的课程归档掉。
+            days = max(1, int(getattr(cfg, "schedule_archive_days", 7) or 7))
+            before = now - days * 86400.0
+        count = await asyncio.to_thread(store.archive_schedule, ids, before, now)
+        return {"ok": True, "archived": count, "items": _schedule_payload()}
+
+    @app.post("/api/schedule/cleanup")
+    async def schedule_cleanup(body: dict | None = None):
+        """清理：删除超过保留期的归档条目（可选连过期未归档一起删）。"""
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": False, "error": "生命时间线未装配"}
+        b = body or {}
+        days = _int(b.get("days"), int(getattr(cfg, "schedule_retention_days", 30) or 30))
+        removed = await asyncio.to_thread(
+            store.cleanup_schedule, days, bool(b.get("include_unarchived", False)), time.time())
+        return {"ok": True, "removed": removed, "items": _schedule_payload()}
+
+    @app.post("/api/schedule/remind")
+    async def schedule_remind(body: dict):
+        """手动触发一次提醒（调试 / 面板预览）：把事务喂给 LLM，失败自动用模板气泡。"""
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": False, "error": "生命时间线未装配"}
+        item = await asyncio.to_thread(store.get_schedule_item, _int(body.get("id"), 0))
+        if not item:
+            return {"ok": False, "error": "日程不存在"}
+        now = time.time()
+        text = await a().remind_schedule(item, now=now)
+        await asyncio.to_thread(store.mark_reminded, item.get("id"), now)
+        return {"ok": True, "text": text, "item": item}
 
     # 复盘是**后端的模式**（只把前端棋盘设成只读挡不住她出声）：期间她不能开口——落子 / 聊天 /
     # 闲置 / 提示 / 分析一律可读拒绝，情绪心跳与语气词在 agent 侧冻结（V14）；回看只推 `state`

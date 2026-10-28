@@ -1,7 +1,8 @@
-"""资料 → 日程：把 OCR / VLM / 文档文本交给 LLM 提取，再归一化成可持久化的日程。
+"""资料 → 日程 / 课程表：把 OCR / VLM / 文档文本交给 LLM 提取，再归一化成可持久化的条目。
 
 设计边界：
-- 只做**明确的日期 / 时间 / 约定 / 待办**提取，不把普通闲聊编成日程；
+- 只做**明确的日期 / 时间 / 约定 / 待办 / 课程**提取，不把普通闲聊编成日程；
+- 课程表要保留**星期、节次、教师、地点**（前端据此画周课表），不能只压成一行文字；
 - LLM 输出必须能落成 JSON 数组；解析失败返回空列表，不猜；
 - 时间归一化在本地时区完成，支持「今天 / 明天 / 后天」、`YYYY-MM-DD`、`M月D日`、`HH:MM`；
 - 没有日期的条目保留为「待定」，不硬塞到今天；没有时间的日期条目按「全天」存 09:00；
@@ -15,15 +16,23 @@ import re
 import time
 
 MAX_SOURCE_TEXT = 9000
-MAX_ITEMS = 30
+MAX_ITEMS = 60
 TITLE_MAX = 80
 NOTES_MAX = 200
+TEACHER_MAX = 40
+LOCATION_MAX = 60
 _CN_NUM = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
            "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 _WEEKDAYS = {"周一": 0, "星期二": 1, "周二": 1, "周三": 2, "星期四": 3,
              "周四": 3, "周五": 4, "周六": 5, "周日": 6, "周天": 6,
              "星期一": 0, "礼拜一": 0, "礼拜二": 1, "礼拜三": 2,
              "礼拜四": 3, "礼拜五": 4, "礼拜六": 5, "礼拜天": 6}
+_WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+_EN_WEEKDAYS = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "friday": 4, "fri": 4, "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
 
 
 def _clip(text, limit):
@@ -52,10 +61,40 @@ def _json_array(text):
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            for key in ("items", "schedule", "events", "data"):
+            for key in ("items", "schedule", "events", "data", "courses"):
                 if isinstance(data.get(key), list):
                     return data[key]
     return []
+
+
+def _course_text(it):
+    """课程条目 → 给 LLM / 记忆看的紧凑一行。"""
+    bits = []
+    wd = it.get("weekday")
+    try:
+        wd = int(wd)
+    except (TypeError, ValueError):
+        wd = -1
+    if 0 <= wd <= 6:
+        bits.append(_WEEKDAY_NAMES[wd])
+    date = str(it.get("date") or "").strip()
+    if date:
+        bits.append(date[5:] if re.match(r"^\d{4}-\d{2}-\d{2}$", date) else date)
+    period = str(it.get("period") or "").strip()
+    if period:
+        bits.append("第%s节" % period)
+    times = " ".join(x for x in (str(it.get("start_time") or "").strip(),
+                                 str(it.get("end_time") or "").strip()) if x)
+    if times:
+        bits.append(times.replace(" ", "-"))
+    title = str(it.get("title") or "").strip()
+    if title:
+        bits.append(title)
+    for key, label in (("teacher", "教师"), ("location", "地点")):
+        val = str(it.get(key) or "").strip()
+        if val:
+            bits.append("%s：%s" % (label, val))
+    return " ".join(bits).strip()
 
 
 def scan_text(scan):
@@ -66,6 +105,21 @@ def scan_text(scan):
             continue
         name = str(f.get("name", "") or "")
         pieces = []
+        table = f.get("table")
+        if isinstance(table, list) and table:
+            rows = []
+            for it in table:
+                if isinstance(it, dict):
+                    line = _course_text(it)
+                    if line:
+                        rows.append("  " + line)
+            if rows:
+                pieces.append("课程表（已按行列还原）：\n" + "\n".join(rows))
+            # 纯图片课表：结构已完整还原，不再把原始 OCR / 小 VLM 的噪声喂给 LLM
+            # （否则同一格会被抽成两条、标题还会略有出入）。PDF 仍保留正文，避免丢别的日程。
+            if str(f.get("kind", "")) == "image":
+                parts.append("文件：%s\n%s" % (name, "\n".join(pieces)))
+                continue
         for key, label in (("text", "文档文本"), ("ocr", "OCR"), ("vlm", "VLM 描述")):
             val = str(f.get(key, "") or "").strip()
             if val:
@@ -78,18 +132,23 @@ def scan_text(scan):
 
 
 async def extract_items(llm, text, now=None):
-    """调用 LLM 从资料文本里提取原始日程条目；失败返回 ``[]``。"""
+    """调用 LLM 从资料文本里提取原始日程 / 课程条目；失败返回 ``[]``。"""
     if llm is None or str(text or "").strip() == "":
         return []
     ref = datetime.datetime.fromtimestamp(time.time() if now is None else float(now))
     prompt = (
-        "你是日程整理助手。下面是从文件里提取的 OCR / VLM / 文档文本。\n"
-        "只提取**明确出现过**的日期、时间、约定、会议、提醒、待办；没有就返回空数组。\n"
-        "不要编造日期、地点、人物；不要把普通聊天当成日程；不要把“今天天气”当成事件。\n"
+        "你是日程 / 课程表整理助手。下面是从文件里提取的 OCR / VLM / 文档文本。\n"
+        "只提取**明确出现过**的日期、时间、课程、约定、会议、提醒、待办；没有就返回空数组。\n"
+        "如果文本是课程表：按「星期 + 第几节 + 课程名 + 教师 + 地点」逐条输出；"
+        "连续两节就写 period=\"1-2\"，不要拆成两条；date 用表头给出的真实日期。\n"
+        "不要编造日期、教师、地点、人物；不要把普通聊天当成日程；不要把“今天天气”当成事件。\n"
         "今天是 %s（%s）。相对日期（今天/明天/后天/下周X）请换算成真实日期。\n"
         "只输出 JSON 数组，不要解释、不要代码围栏。字段：\n"
-        '[{"date":"YYYY-MM-DD" 或 null, "time":"HH:MM" 或 null, '
-        '"title":"简短标题", "notes":"可选备注"}]\n\n'
+        '[{"date":"YYYY-MM-DD" 或 null, "weekday":"周一" 或 null, '
+        '"period":"1-2" 或 null, "time":"HH:MM" 或 null, "end_time":"HH:MM" 或 null, '
+        '"title":"课程或事项", "teacher":"可选", "location":"可选", "notes":"可选", '
+        '"priority":"0-100 的整数（重要/紧急越高）", "duration_min":"预计分钟数", '
+        '"deadline":"YYYY-MM-DD HH:MM 或 null"}]\n\n'
         "资料：\n%s"
     ) % (ref.strftime("%Y-%m-%d"),
          ("周" + "一二三四五六日"[ref.weekday()]),
@@ -97,9 +156,9 @@ async def extract_items(llm, text, now=None):
     msgs = [{"role": "user", "content": prompt}]
     try:
         try:
-            out = await llm.chat(msgs, 700, think_mode=0)
+            out = await llm.chat(msgs, 1200, think_mode=0)
         except TypeError:
-            out = await llm.chat(msgs, 700)
+            out = await llm.chat(msgs, 1200)
     except Exception as e:                  # noqa: BLE001 —— 日程提取绝不打挂端点
         print("[Schedule] LLM 提取失败（已忽略）：%s" % e)
         return []
@@ -122,6 +181,48 @@ def _int_cn(v):
     if len(s) == 3 and s[0] in _CN_NUM and s[1] == "十" and s[2] in _CN_NUM:
         return _CN_NUM[s[0]] * 10 + _CN_NUM[s[2]]
     return None
+
+
+def _parse_weekday(raw):
+    """``周一`` / ``星期一`` / ``Monday`` / 0-6 → 0-6；认不出返回 ``None``。"""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            i = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return i if 0 <= i <= 6 else None
+    s = str(raw).strip().lower()
+    if s == "" or s in ("null", "none", "无", "待定"):
+        return None
+    if s.isdigit():
+        i = int(s)
+        return i if 0 <= i <= 6 else None
+    if s in _EN_WEEKDAYS:
+        return _EN_WEEKDAYS[s]
+    for word, wd in _WEEKDAYS.items():
+        if word in s:
+            return wd
+    return None
+
+
+def _parse_period(raw):
+    """``1-2`` / ``第1-2节`` / ``1,2`` → ``(start, end)``；认不出返回 ``None``。"""
+    if isinstance(raw, (list, tuple)):
+        nums = [int(x) for x in raw if str(x).strip().isdigit()]
+    else:
+        nums = [int(x) for x in re.findall(r"\d{1,2}", str(raw or ""))]
+    if not nums:
+        return None
+    start = nums[0]
+    end = nums[1] if len(nums) > 1 else start
+    if start < 1 or start > 20:
+        return None
+    end = max(start, min(end, 20))
+    if end - start > 6:
+        end = start
+    return start, end
 
 
 def _parse_date(raw, ref):
@@ -178,6 +279,81 @@ def _parse_time(raw):
     return datetime.time(h, minute)
 
 
+def _parse_priority(raw):
+    """优先级 → 0-100（越高越重要）；支持数字 / 高·中·低 / 紧急·重要·普通。"""
+    if isinstance(raw, bool):
+        return 50
+    if isinstance(raw, (int, float)):
+        try:
+            return max(0, min(100, int(round(float(raw)))))
+        except (TypeError, ValueError, OverflowError):
+            return 50
+    s = str(raw or "").strip().lower()
+    if s == "" or s in ("null", "none", "无", "待定"):
+        return 50
+    if s.isdigit():
+        return max(0, min(100, int(s)))
+    if any(w in s for w in ("紧急", "立刻", "马上", "最高", "critical", "urgent")):
+        return 90
+    if any(w in s for w in ("高", "重要", "high", "must")):
+        return 80
+    if any(w in s for w in ("低", "不急", "low", "someday")):
+        return 20
+    if any(w in s for w in ("中", "普通", "一般", "medium", "normal")):
+        return 50
+    return 50
+
+
+def _parse_duration(raw, default=60):
+    """预计时长 → 分钟（5~1440）；支持数字 / "30分钟" / "1.5小时"。"""
+    if isinstance(raw, bool):
+        return int(default)
+    if isinstance(raw, (int, float)):
+        try:
+            v = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return int(default)
+        return max(5, min(1440, int(round(v))))
+    s = str(raw or "").strip().lower()
+    if s == "" or s in ("null", "none", "无", "待定"):
+        return int(default)
+    nums = re.findall(r"\d+(?:\.\d+)?", s)
+    if not nums:
+        return int(default)
+    try:
+        v = float(nums[0])
+    except ValueError:
+        return int(default)
+    if any(w in s for w in ("小时", "钟头", "hour", "h")) and "分钟" not in s and "min" not in s:
+        v *= 60.0
+    return max(5, min(1440, int(round(v))))
+
+
+def _parse_deadline(raw, ref):
+    """截止时间 → 墙钟秒；支持时间戳 / 日期 / "10月28日 18:00"；没有返回 0。"""
+    if raw is None or isinstance(raw, bool):
+        return 0.0
+    if isinstance(raw, (int, float)):
+        try:
+            v = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return v if math.isfinite(v) and v > 0.0 else 0.0
+    s = str(raw or "").strip()
+    if s == "" or s.lower() in ("null", "none", "无", "待定"):
+        return 0.0
+    d = _parse_date(s, ref)
+    if d is None:
+        return 0.0
+    tm = _parse_time(s)
+    if tm is None:
+        tm = datetime.time(23, 59)
+    try:
+        return datetime.datetime.combine(d, tm).timestamp()
+    except (ValueError, OverflowError):
+        return 0.0
+
+
 def _parse_item(raw, ref, source):
     if not isinstance(raw, dict):
         return None
@@ -185,44 +361,136 @@ def _parse_item(raw, ref, source):
     if title == "":
         return None
     notes = _clip(raw.get("notes", raw.get("note", raw.get("details", ""))), NOTES_MAX)
+    teacher = _clip(raw.get("teacher", raw.get("instructor", "")), TEACHER_MAX)
+    location = _clip(raw.get("location", raw.get("place", raw.get("room", ""))), LOCATION_MAX)
+    weekday = _parse_weekday(raw.get("weekday", raw.get("day_of_week", raw.get("week"))))
+    period = _parse_period(raw.get("period", raw.get("periods", raw.get("sections"))))
     date = _parse_date(raw.get("date", raw.get("day", raw.get("when_date", ""))), ref)
-    tm = _parse_time(raw.get("time", raw.get("at", raw.get("when_time", ""))))
-    when_text = ""
-    start_ts = 0.0
-    if date is None and tm is not None:
+    raw_time = str(raw.get("time", raw.get("at", raw.get("start_time", raw.get("start", "")))) or "")
+    tm = _parse_time(raw_time)
+    end_tm = _parse_time(raw.get("end_time", raw.get("end", "")))
+    if end_tm is None:
+        # 模型有时把时间写成 "08:00-09:35"：拆开保留结束时间（周课表要显示时间跨度）。
+        parts = [x for x in re.split(r"[-~～—–]", raw_time) if x.strip()]
+        if len(parts) >= 2:
+            end_tm = _parse_time(parts[1])
+
+    if date is None and weekday is not None:
+        add = (weekday - ref.weekday()) % 7
+        date = ref.date() + datetime.timedelta(days=add)
+        if add == 0 and tm is not None and datetime.datetime.combine(date, tm) <= ref:
+            date = date + datetime.timedelta(days=7)
+    if date is None and tm is not None and period is None and weekday is None:
         date = ref.date()
         if datetime.datetime.combine(date, tm) <= ref:
             date = date + datetime.timedelta(days=1)
+    # 有日期 + 节次但没写星期：直接由日期推星期，前端才能把课程放进周课表的正确列。
+    if weekday is None and date is not None and period is not None:
+        weekday = date.weekday()
+
+    raw_kind = str(raw.get("kind", "") or "").strip().lower()
+    kind = "course" if raw_kind == "course" or period is not None or weekday is not None else "task"
+    priority = _parse_priority(raw.get("priority", raw.get("importance", raw.get("urgent"))))
+    duration = _parse_duration(raw.get("duration_min", raw.get("duration", raw.get("minutes"))))
+    deadline_ts = _parse_deadline(raw.get("deadline", raw.get("due", raw.get("due_at"))), ref)
+    if kind == "course":
+        if tm is not None and end_tm is not None:
+            try:
+                delta = (datetime.datetime.combine(date or ref.date(), end_tm)
+                         - datetime.datetime.combine(date or ref.date(), tm)).total_seconds() / 60.0
+                if delta > 0:
+                    duration = max(5, int(round(delta)))
+            except (ValueError, OverflowError):
+                pass
+        elif period is not None:
+            duration = max(duration, (period[1] - period[0] + 1) * 45)
+
+    when_text = "待定"
+    start_ts = 0.0
+    date_text = ""
     if date is not None:
-        if tm is None:
-            tm = datetime.time(9, 0)
-            when_text = "%s（全天）" % date.isoformat()
-        else:
-            when_text = "%s %s" % (date.isoformat(), tm.strftime("%H:%M"))
+        date_text = date.isoformat()
+    if date is not None and tm is not None:
         start_ts = datetime.datetime.combine(date, tm).timestamp()
-    else:
-        when_text = "待定"
-    return {"start_ts": start_ts, "when_text": when_text, "title": title,
-            "notes": notes, "source": source}
+    elif date is not None and period is not None:
+        # 只知节次：用当天上午九点做排序锚点，真正的展示用 period 字段。
+        start_ts = datetime.datetime.combine(date, datetime.time(9, 0)).timestamp()
+    elif date is not None:
+        start_ts = datetime.datetime.combine(date, datetime.time(9, 0)).timestamp()
+
+    bits = []
+    if date_text:
+        bits.append(date_text)
+    if weekday is not None:
+        bits.append(_WEEKDAY_NAMES[weekday])
+    if period is not None:
+        p0, p1 = period
+        bits.append("第%d-%d节" % (p0, p1) if p1 > p0 else "第%d节" % p0)
+    if tm is not None:
+        t = tm.strftime("%H:%M")
+        if end_tm is not None:
+            t += "-" + end_tm.strftime("%H:%M")
+        bits.append(t)
+    if bits and (tm is not None or period is not None or weekday is not None):
+        when_text = " ".join(bits)
+    elif date is not None:
+        when_text = "%s（全天）" % date_text
+
+    return {
+        "start_ts": start_ts,
+        "when_text": when_text,
+        "title": title,
+        "notes": notes,
+        "source": _clip(raw.get("source", "") or source, 200),
+        "date": date_text,
+        "weekday": weekday if weekday is not None else -1,
+        "period": ("%d-%d" % period) if period is not None and period[1] > period[0]
+                  else (str(period[0]) if period is not None else ""),
+        "period_start": period[0] if period is not None else 0,
+        "period_end": period[1] if period is not None else 0,
+        "start_time": tm.strftime("%H:%M") if tm is not None else "",
+        "end_time": end_tm.strftime("%H:%M") if end_tm is not None else "",
+        "teacher": teacher,
+        "location": location,
+        "kind": kind,
+        "priority": priority,
+        "duration_min": duration,
+        "deadline_ts": deadline_ts,
+        "auto_planned": False,
+    }
+
+
+def _norm_title(text):
+    return re.sub(r"[\s（）()【】\[\]·,，.。:：\-—/]+", "", str(text or ""))
 
 
 def normalize_items(raw_items, source="", now=None):
-    """原始 LLM 条目 → 可写库的日程；去重、排序、限制条数。"""
+    """原始 LLM / OCR 条目 → 可写库的日程；去重、排序、限制条数。"""
     ref = datetime.datetime.fromtimestamp(time.time() if now is None else float(now))
     out, seen = [], set()
     for raw in raw_items or []:
         it = _parse_item(raw, ref, source)
         if not it:
             continue
-        key = (round(float(it["start_ts"]), 1), it["title"])
+        if it["period"] or it["weekday"] >= 0:
+            # 课程按**格子**去重（日期 + 星期 + 起始节）：同一格不可能同时上两门课。
+            # 扫描器的几何还原排在 LLM 提取之前（main.py 的合并顺序），所以冲突时保留更可靠的那份。
+            if it["date"] or it["weekday"] >= 0:
+                key = ("slot", it["date"], it["weekday"], it["period_start"])
+            else:
+                key = ("course", it["date"], it["period"], _norm_title(it["title"]))
+        else:
+            key = ("item", round(float(it["start_ts"]), 1), _norm_title(it["title"]))
         if key in seen:
             continue
         seen.add(key)
         out.append(it)
         if len(out) >= MAX_ITEMS:
             break
-    out.sort(key=lambda x: (x["start_ts"] <= 0, x["start_ts"] if x["start_ts"] > 0 else 0,
-                            x["title"]))
+    out.sort(key=lambda x: (x["start_ts"] <= 0,
+                            x["start_ts"] if x["start_ts"] > 0 else 0,
+                            x["weekday"] if x["weekday"] >= 0 else 9,
+                            x["period_start"], x["title"]))
     return out
 
 
@@ -231,7 +499,14 @@ def memory_text(item):
     when = str(item.get("when_text", "") or "").strip()
     title = str(item.get("title", "") or "").strip()
     notes = str(item.get("notes", "") or "").strip()
+    extra = " ".join(x for x in (str(item.get("teacher", "") or "").strip(),
+                                 ("@" + str(item.get("location", "") or "").strip())
+                                 if str(item.get("location", "") or "").strip()
+                                 and not str(item.get("location", "") or "").startswith("@")
+                                 else str(item.get("location", "") or "").strip()) if x)
     text = "日程：%s %s" % (when, title)
+    if extra:
+        text += "（%s）" % extra
     if notes:
         text += "（%s）" % notes
     return text.strip()

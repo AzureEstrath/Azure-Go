@@ -74,6 +74,63 @@ class ScheduleExtractTest(unittest.TestCase):
         self.assertIn("日程：", schedule.memory_text(
             {"when_text": "2026-10-28 15:30", "title": "评审", "notes": "带电脑"}))
 
+    def test_course_items_keep_weekday_period_teacher_location(self):
+        """课程表条目：节次跨两节写 1-2，教师/地点/日期都要留下（前端画周课表用）。"""
+        items = schedule.normalize_items([
+            {"date": "2026-10-28", "weekday": "周三", "period": "第1-2节",
+             "time": "08:00", "end_time": "09:35", "title": "高等数学(基础)",
+             "teacher": "王三强", "location": "二教20"},
+        ], source="课表.png", now=NOW)
+        self.assertEqual(len(items), 1)
+        it = items[0]
+        self.assertEqual(it["weekday"], 2)
+        self.assertEqual(it["period"], "1-2")
+        self.assertEqual(it["period_start"], 1)
+        self.assertEqual(it["period_end"], 2)
+        self.assertEqual(it["start_time"], "08:00")
+        self.assertEqual(it["end_time"], "09:35")
+        self.assertEqual(it["teacher"], "王三强")
+        self.assertEqual(it["location"], "二教20")
+        self.assertEqual(it["date"], "2026-10-28")
+        self.assertIn("周三", it["when_text"])
+        self.assertIn("第1-2节", it["when_text"])
+        self.assertIn("王三强", schedule.memory_text(it))
+        self.assertIn("@二教20", schedule.memory_text(it))
+
+    def test_task_priority_duration_and_deadline_are_parsed(self):
+        items = schedule.normalize_items([
+            {"title": "写实验报告", "priority": "紧急", "duration": "1.5小时",
+             "deadline": "2026-10-28 18:00"},
+        ], source="todo.txt", now=NOW)
+        it = items[0]
+        self.assertEqual(it["kind"], "task")
+        self.assertEqual(it["priority"], 90)
+        self.assertEqual(it["duration_min"], 90)
+        self.assertGreater(it["deadline_ts"], 0.0)
+        self.assertEqual(it["when_text"], "待定")
+
+    def test_date_with_period_infers_weekday(self):
+        """模型给了日期 + 节次但漏了星期：由日期推星期，前端照样能排进周课表。"""
+        items = schedule.normalize_items([
+            {"date": "2026-10-28", "period": "1-2", "title": "工程图学",
+             "teacher": "徐道春"},
+        ], source="课表.png", now=NOW)
+        self.assertEqual(len(items), 1)
+        it = items[0]
+        self.assertEqual(it["weekday"], 2)      # 2026-10-28 是周三
+        self.assertEqual(it["date"], "2026-10-28")
+        self.assertEqual(it["period"], "1-2")
+
+    def test_same_course_in_two_weeks_is_deduped_by_date_period_title(self):
+        raw = [
+            {"date": "2026-10-28", "period": "1-2", "title": "高等数学"},
+            {"date": "2026-10-28", "period": "1-2", "title": " 高等数学 "},
+            {"date": "2026-11-04", "period": "1-2", "title": "高等数学"},
+        ]
+        items = schedule.normalize_items(raw, source="课表.png", now=NOW)
+        self.assertEqual(len(items), 2, "同一周同一门课只留一条；下一周保留")
+        self.assertEqual({x["date"] for x in items}, {"2026-10-28", "2026-11-04"})
+
 
 class FilesTest(unittest.TestCase):
     def test_list_files_filters_unsupported_and_hidden(self):
@@ -91,6 +148,43 @@ class FilesTest(unittest.TestCase):
             got = file_service.list_files(cfg)
             self.assertTrue(got["ok"])
             self.assertEqual({x["name"] for x in got["files"]}, {"a.txt", "b.png"})
+
+    def test_scan_auto_plans_undated_task(self):
+        """扫描出待定任务后，auto_plan_enabled 会把它排进未来 7 天的空闲时间。"""
+        from fastapi.testclient import TestClient
+        from app import life
+        from app.main import create_app
+        from helpers import StubEngine
+
+        d, py, script = file_service._find_scanner()
+        if not py or not script:
+            self.skipTest("本机没有 peek/.venv 扫描器")
+        with tempfile.TemporaryDirectory() as tmp:
+            inbox = os.path.join(tmp, "inbox")
+            os.makedirs(inbox)
+            with open(os.path.join(inbox, "todo.txt"), "w", encoding="utf-8") as f:
+                f.write("写实验报告，预计一个半小时，很急。")
+            store = life.LifeStore(os.path.join(tmp, "life.db"))
+            try:
+                cfg = AzureConfig()
+                cfg.assistant_inbox = inbox
+                cfg.vlm_auto_start = False
+                cfg.auto_plan_enabled = True
+                llm = StubLLM(text='[{"title":"写实验报告","priority":"紧急",'
+                                  '"duration":"1.5小时"}]')
+                app = create_app(cfg=cfg, engine=StubEngine(), llm=llm,
+                                 autostart=False, life=store)
+                with TestClient(app) as client:
+                    body = client.post("/api/files/scan", json={}).json()
+                    self.assertTrue(body["ok"], body)
+                    self.assertEqual(body["auto_plan"]["planned"], 1)
+                    row = body["schedule"][0]
+                    self.assertEqual(row["title"], "写实验报告")
+                    self.assertGreater(row["start_ts"], 0.0)
+                    self.assertTrue(row["auto_planned"])
+                    self.assertEqual(row["duration_min"], 90)
+            finally:
+                store.close()
 
     def test_scan_endpoint_end_to_end_with_text_file(self):
         """真实扫描器 + 真实 LifeStore + StubLLM：txt → 日程 → 共享日程接口。"""

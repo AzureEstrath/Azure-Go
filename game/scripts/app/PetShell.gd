@@ -74,7 +74,9 @@ func _ready() -> void:
 	cfg = AzureConfig.load_config()
 	GufengTheme.apply_preset(cfg.ui_theme)
 	_tone_re.compile("\\[\\[?\\s*tone\\s*[:：]\\s*([a-zA-Z]+)\\s*\\]\\]?")
-	_brace_re.compile("\\{([^}]*)\\}")
+	# 只认后端白名单那类**短动作标签**（1-16 字、不含引号/冒号/换行）：
+	# 旧写法 `\{([^}]*)\}` 会把模型误吐的 JSON（`{"date":...}`）整段删掉，只剩一个 `[`。
+	_brace_re.compile("\\{([^{}\"\\n]{1,16})\\}")
 	_build_ui()
 	_build_services()
 	_start_services()
@@ -105,6 +107,9 @@ func _build_ui() -> void:
 	view.files_closed.connect(_on_files_closed)
 	view.files_refresh_requested.connect(_load_files)
 	view.files_scan_requested.connect(_scan_files)
+	view.files_auto_plan_requested.connect(_auto_plan_files)
+	view.files_archive_requested.connect(_archive_files)
+	view.files_cleanup_requested.connect(_cleanup_files)
 	view.go_requested.connect(_launch_game)
 	view.size_selected.connect(_on_size_selected)
 	view.quit_requested.connect(_on_quit)
@@ -222,13 +227,13 @@ func _on_net_status(text: String, bad: bool) -> void:
 	if text.strip_edges() != "":
 		print("[Pet] " + text)
 	view.set_online(_online)
-	if _online:
+	if _online and agent != null:
 		_load_chats()
 		agent.fetch_mood(func(ok: bool, _c: int, d: Dictionary):
 			if ok and not d.is_empty():
 				_on_mood(d))
 		agent.fetch_life(_on_life)
-	else:
+	elif not _online:
 		view.set_chat_status("后端连接中…")
 	_peek_ctx_activity = _last_activity
 
@@ -291,8 +296,14 @@ func _on_busy(busy: bool) -> void:
 func _on_message(kind: String, text: String) -> void:
 	if not kind.begins_with("ai"):
 		return
+	var chat_like := kind == "ai" or kind == "ai_comment" or kind == "ai_move"
 	var parsed := _clean_ai(text)
 	if parsed.is_empty():
+		# 空回复 / 认不出的结构化输出：聊天要**解锁并说明**，不能把输入框一直挂在忙态。
+		if chat_like and _chat_busy:
+			_chat_busy = false
+			view.set_chat_busy(false)
+			view.set_chat_status("这条回复没整理好，再说一次试试。")
 		return
 	var body := str(parsed.get("text", ""))
 	var acts: Array = parsed.get("acts", [])
@@ -300,7 +311,14 @@ func _on_message(kind: String, text: String) -> void:
 		view.play_actions(acts)
 	if body == "":
 		return
-	var chat_like := kind == "ai" or kind == "ai_comment" or kind == "ai_move"
+	if kind == "ai_remind":
+		# 事务提醒：面板开着时用压在面板上方的提醒卡，否则直接走待机气泡；不走 TTS。
+		if view.is_chat_open() or view.is_files_open() or view.is_menu_open():
+			view.show_reminder(body, 12.0)
+		else:
+			view.show_bubble(body, 12.0)
+		_bump_activity()
+		return
 	if chat_like and _chat_busy:
 		# 聊天面板里的一次回复：只进面板，不冒泡；随后到达的 speech 事件对应这条
 		view.append_chat("assistant", body)
@@ -338,9 +356,83 @@ func _clean_ai(text: String) -> Dictionary:
 		if act != "":
 			acts.append(act)
 	t = _brace_re.sub(t, "", true).strip_edges()
+	t = clean_display_text(t)
 	if t == "" and acts.is_empty():
 		return {}
 	return {"tone": tone, "text": t, "acts": acts}
+
+## 纯函数（门卫可测）：模型偶尔会直接吐日程 JSON；把它变成可读中文。
+## 普通台词原样返回；认不出的 JSON / 半截数组返回空串（由调用方解锁聊天并提示重发）。
+static func clean_display_text(raw: String) -> String:
+	var t := str(raw).strip_edges()
+	if t == "":
+		return ""
+	var first := t.substr(0, 1)
+	if first != "[" and first != "{":
+		return t
+	# 只有「看起来真的是 JSON」才进下面的解析；`[笑]` / 长动作标签这类台词原样返回。
+	if first == "[":
+		var rest := t.substr(1).strip_edges()
+		var nxt := rest.substr(0, 1)
+		if rest == "" or (nxt != "{" and nxt != "\"" and nxt != "]"):
+			return t
+	elif first == "{":
+		var rest2 := t.substr(1).strip_edges()
+		var nxt2 := rest2.substr(0, 1)
+		if rest2 == "" or (nxt2 != "\"" and nxt2 != "}"):
+			return t
+	# 先挡掉明显截断的 JSON：JSON.parse_string 会往控制台打 ERROR，且这里本来就要按空处理。
+	if first == "[" and not t.contains("]"):
+		return ""
+	if first == "{" and not t.contains("}"):
+		return ""
+	var data = JSON.parse_string(t)
+	if data == null:
+		return ""
+	if typeof(data) == TYPE_DICTIONARY:
+		var d: Dictionary = data
+		for key in ["items", "schedule", "events", "data", "courses", "list"]:
+			if typeof(d.get(key)) == TYPE_ARRAY:
+				data = d[key]
+				break
+	if typeof(data) != TYPE_ARRAY:
+		return ""
+	var lines: Array[String] = []
+	for it in data:
+		if typeof(it) != TYPE_DICTIONARY:
+			continue
+		var item: Dictionary = it
+		var title := str(item.get("title", item.get("name", ""))).strip_edges()
+		if title == "":
+			continue
+		var bits: Array[String] = []
+		var date := str(item.get("date", "")).strip_edges()
+		var tm := str(item.get("time", item.get("start_time", ""))).strip_edges()
+		var period := str(item.get("period", "")).strip_edges()
+		if date != "":
+			bits.append(date)
+		if tm != "":
+			bits.append(tm)
+		if period != "":
+			bits.append("第%s节" % period)
+		bits.append(title)
+		var extra: Array[String] = []
+		var teacher := str(item.get("teacher", "")).strip_edges()
+		var place := str(item.get("location", "")).strip_edges()
+		if teacher != "":
+			extra.append(teacher)
+		if place != "":
+			extra.append(place if place.begins_with("@") else "@" + place)
+		var line := " ".join(bits)
+		if not extra.is_empty():
+			line += "（%s）" % " ".join(extra)
+		lines.append("· " + line)
+		if lines.size() >= 6:
+			break
+	if lines.is_empty():
+		return ""
+	var head := "我把刚才看到的整理成了这些日程：\n" if lines.size() > 1 else "我把刚才看到的整理成了这条日程：\n"
+	return head + "\n".join(lines)
 
 # ================= 聊天 =================
 
@@ -402,7 +494,68 @@ func _scan_files() -> void:
 		var items: Array = d.get("items", [])
 		var sched: Array = d.get("schedule", [])
 		view.set_schedule_items(sched if not sched.is_empty() else items)
-		view.set_files_status("整理出 %d 条日程，已写入共享记忆与上下文。" % items.size())
+		var ap: Dictionary = d.get("auto_plan", {})
+		var planned := int(ap.get("planned", 0))
+		var line := "整理出 %d 条日程，已写入共享记忆与上下文。" % items.size()
+		if planned > 0:
+			line = "整理出 %d 条日程，自动排班已安排 %d 条。" % [items.size(), planned]
+		view.set_files_status(line)
+		_bump_activity())
+
+func _auto_plan_files() -> void:
+	if view == null:
+		return
+	if agent == null or not _online:
+		view.set_files_status("后端还没连上，稍后再试。")
+		return
+	view.set_files_busy(true)
+	view.set_files_status("按优先级与空闲时间自动排班…")
+	agent.auto_plan_schedule(func(ok: bool, _c: int, d: Dictionary):
+		view.set_files_busy(false)
+		if not ok:
+			view.set_files_status(str(d.get("error", "自动排班失败，稍后再试。")))
+			return
+		view.set_schedule_items(d.get("items", []))
+		var planned: Array = d.get("planned", [])
+		var unscheduled: Array = d.get("unscheduled", [])
+		var line := "没有需要排班的待定任务。"
+		if not planned.is_empty():
+			line = "已自动安排 %d 条日程。" % planned.size()
+			if not unscheduled.is_empty():
+				line += "还有 %d 条暂时没有空档。" % unscheduled.size()
+		view.set_files_status(line)
+		_bump_activity())
+
+func _archive_files() -> void:
+	if view == null:
+		return
+	if agent == null or not _online:
+		view.set_files_status("后端还没连上，稍后再试。")
+		return
+	view.set_files_busy(true)
+	agent.archive_schedule(func(ok: bool, _c: int, d: Dictionary):
+		view.set_files_busy(false)
+		if not ok:
+			view.set_files_status(str(d.get("error", "归档失败，稍后再试。")))
+			return
+		view.set_schedule_items(d.get("items", []))
+		view.set_files_status("已归档 %d 条过期日程（仍保留在留档里）。" % int(d.get("archived", 0)))
+		_bump_activity())
+
+func _cleanup_files() -> void:
+	if view == null:
+		return
+	if agent == null or not _online:
+		view.set_files_status("后端还没连上，稍后再试。")
+		return
+	view.set_files_busy(true)
+	agent.cleanup_schedule(func(ok: bool, _c: int, d: Dictionary):
+		view.set_files_busy(false)
+		if not ok:
+			view.set_files_status(str(d.get("error", "清理失败，稍后再试。")))
+			return
+		view.set_schedule_items(d.get("items", []))
+		view.set_files_status("已清理 %d 条超过保留期的旧归档。" % int(d.get("removed", 0)))
 		_bump_activity())
 
 func _bump_activity() -> void:

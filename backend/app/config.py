@@ -65,6 +65,12 @@ class AzureConfig:
         self.life_db_path = ""
         # 资料箱：桌宠右键「资料与日程」扫描的文件夹；留空＝<repo>/assistant_files/inbox。
         self.assistant_inbox = ""
+        # 自动排班 / 到点提醒 / 留档（v4.1.0）：自动排班只管待定与之前自动排过的任务。
+        self.auto_plan_enabled = True
+        self.auto_plan_days = 7
+        self.schedule_reminder_enabled = True
+        self.schedule_archive_days = 7
+        self.schedule_retention_days = 30
         # —— 自适应难度（v3.11.5）：默认关；基线 1 入门 … 5 严苛，局内最多在基线 ±spread 档内调整 ——
         self.adaptive_difficulty = False
         self.adaptive_difficulty_base = 3
@@ -205,6 +211,21 @@ class AzureConfig:
         self.game_db_path = str(d.get("game_db_path", self.game_db_path))
         self.life_db_path = str(d.get("life_db_path", self.life_db_path))
         self.assistant_inbox = str(d.get("assistant_inbox", self.assistant_inbox))
+        v = d.get("auto_plan_enabled")
+        self.auto_plan_enabled = v if isinstance(v, bool) else self.auto_plan_enabled
+        try:
+            self.auto_plan_days = max(1, min(30, int(d.get("auto_plan_days", self.auto_plan_days))))
+        except (TypeError, ValueError):
+            pass
+        v = d.get("schedule_reminder_enabled")
+        self.schedule_reminder_enabled = v if isinstance(v, bool) else self.schedule_reminder_enabled
+        try:
+            self.schedule_archive_days = max(1, min(365, int(
+                d.get("schedule_archive_days", self.schedule_archive_days))))
+            self.schedule_retention_days = max(1, min(3650, int(
+                d.get("schedule_retention_days", self.schedule_retention_days))))
+        except (TypeError, ValueError):
+            pass
         v = d.get("adaptive_difficulty")        # 只认 JSON true / false（与 profile_enabled 同口径）
         self.adaptive_difficulty = v if isinstance(v, bool) else self.adaptive_difficulty
         try:

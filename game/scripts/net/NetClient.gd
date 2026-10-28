@@ -460,6 +460,20 @@ func fetch_schedule(callback: Callable) -> void:
 func scan_assistant_files(callback: Callable) -> void:
 	_fetch_json("/api/files/scan", HTTPClient.METHOD_POST, {}, callback, 300.0)
 
+## 自动排班：优先级 + James-Stein 收缩 + 空闲区间 best-fit；只动待定 / 自动排过的任务。
+func auto_plan_schedule(callback: Callable, days := 7) -> void:
+	_fetch_json("/api/schedule/auto_plan", HTTPClient.METHOD_POST,
+		{"days": clampi(days, 1, 30)}, callback, 60.0)
+
+## 留档：把过期条目移入归档（不删除）。
+func archive_schedule(callback: Callable) -> void:
+	_fetch_json("/api/schedule/archive", HTTPClient.METHOD_POST, {}, callback, 30.0)
+
+## 清理：删除超过保留期的归档条目（默认 30 天，不动未归档）。
+func cleanup_schedule(callback: Callable, days := 30) -> void:
+	_fetch_json("/api/schedule/cleanup", HTTPClient.METHOD_POST,
+		{"days": clampi(days, 1, 3650), "include_unarchived": false}, callback, 30.0)
+
 ## 最近聊天流水（桌宠聊天面板 / 启动恢复）：`callback(ok, code, {"items":[...]})`。
 func fetch_chat_history(limit: int, callback: Callable) -> void:
 	_fetch_json("/api/chat/history?limit=%d" % clampi(limit, 1, 200),

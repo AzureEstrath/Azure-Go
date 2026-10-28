@@ -116,13 +116,57 @@ func _test_view() -> void:
 	await process_frame
 	_check("资料面板能打开", v.is_files_open())
 	_check("资料面板存在", v.get_node_or_null("FilesPanel") != null)
+	_check("小窗口面板占满时宠物让位（不挡文字）", not v._pet_anchor.visible)
 	v.set_files_info("C:/inbox", [{"name": "a.png"}, {"name": "b.pdf"}])
 	_check("资料文件列表显示", v._files_rows.get_child_count() == 2)
 	v.set_schedule_items([{"when_text": "2026-10-28 15:30", "title": "评审", "notes": ""}])
-	_check("日程列表显示", v._schedule_rows.get_child_count() == 1)
+	_check("普通日程列表显示", v._schedule_rows.get_child_count() == 1)
+	_check("没有课程时不画空表格", v._schedule_table == null)
+	v.set_schedule_items([
+		{"when_text": "2026-10-28 周三 第1-2节 08:00-09:35",
+		 "title": "高等数学", "teacher": "王三强", "location": "二教20",
+		 "date": "2026-10-28", "weekday": 2, "period": "1-2",
+		 "period_start": 1, "period_end": 2, "start_time": "08:00", "end_time": "09:35"},
+		{"when_text": "2026-10-27 周二 第6-7节 13:30-15:05",
+		 "title": "学术英语", "teacher": "靳丽莹", "location": "一教30",
+		 "date": "2026-10-27", "weekday": 1, "period": "6-7",
+		 "period_start": 6, "period_end": 7, "start_time": "13:30", "end_time": "15:05"},
+	])
+	_check("周课表网格生成", v._schedule_table != null)
+	_check("课程块跨节落在网格里", v._schedule_table.get_child_count() > 7 + 12)
+	_check("表格宽度按面板铺开", v._schedule_table.custom_minimum_size.x >= 400.0)
+	v.set_schedule_items([
+		{"title": "高等数学", "teacher": "王三强", "location": "二教20",
+		 "date": "2026-10-28", "weekday": 2, "period": "1-2", "period_start": 1,
+		 "period_end": 2, "start_time": "08:00", "end_time": "09:35"},
+		{"title": "高等数学", "teacher": "王三强", "location": "二教20",
+		 "date": "2026-11-04", "weekday": 2, "period": "1-2", "period_start": 1,
+		 "period_end": 2, "start_time": "08:00", "end_time": "09:35"},
+	])
+	_check("同一门课跨周扫描只留一格", v._schedule_table.get_child_count() == 7 + 12 + 1)
+	_check("自动排班 / 归档 / 清理按钮存在",
+		v._files_auto_plan != null and v._files_archive != null and v._files_cleanup != null)
+	v.show_reminder("到点了：「高等数学」，别忘了。")
+	_check("事务提醒卡能弹出", v._reminder != null and v._reminder.visible
+		and v._reminder_label.text.contains("高等数学"))
+	v._reminder.visible = false
+	var block = null
+	for c in v._schedule_table.get_children():
+		if c is Panel:
+			block = c
+			break
+	if block != null:
+		v._show_hover_card(block, {"title": "高等数学", "when_text": "2026-10-28 周三 第1-2节",
+			"teacher": "王三强", "location": "二教20"})
+		_check("悬停展开卡显示完整课程信息",
+			v._hover_card.visible and v._hover_label.text.contains("二教20"))
+		v._hide_hover_card()
+	else:
+		_check("悬停展开卡显示完整课程信息", false)
 	v.close_files()
 	await process_frame
 	_check("资料面板能收起", not v.is_files_open())
+	_check("收起后面板让出的宠物回来", v._pet_anchor.visible)
 	v.queue_free()
 	host.queue_free()
 
@@ -134,6 +178,14 @@ func _test_shell_static() -> void:
 	_check("离开 20 分钟会说回来啦", _shell_script.away_notice(1200.0) != "")
 	_check("离开一天以上会提上次聊到哪", _shell_script.away_notice(90000.0).contains("上次"))
 	_check("离开时长的脏值不冒泡", _shell_script.away_notice(NAN) == "")
+	_check("普通台词原样显示", _shell_script.clean_display_text("嗯，我在。") == "嗯，我在。")
+	var schedule_text: String = _shell_script.clean_display_text(
+		'[{"date":"2026-10-28","time":"08:00","title":"无机化学实验","notes":"杨悠笛 @二教10"}]')
+	_check("日程 JSON 转成人话", schedule_text.contains("无机化学实验") and not schedule_text.contains("\"date\""))
+	_check("半截 JSON 不显示成 [", _shell_script.clean_display_text("[{") == "")
+	_check("认不出的 JSON 不显示", _shell_script.clean_display_text('{"foo":1}') == "")
+	_check("句首 [笑] 不会被当成 JSON", _shell_script.clean_display_text("[笑] 好呀") == "[笑] 好呀")
+	_check("句首长动作标签原样保留", _shell_script.clean_display_text("{轻轻叹了口气}") == "{轻轻叹了口气}")
 	_check("精力低时主动搭话间隔变长", _shell_script.idle_mood_scale(0.2, 0.2) > 1.1)
 	_check("无聊高时主动搭话更频繁", _shell_script.idle_mood_scale(0.7, 0.9) < 1.0)
 	_check("助手开口基线不超过 20 秒", _shell_script.IDLE_FIRST_SEC <= 20.0)

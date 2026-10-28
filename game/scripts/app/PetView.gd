@@ -17,6 +17,9 @@ signal files_opened
 signal files_closed
 signal files_refresh_requested
 signal files_scan_requested
+signal files_auto_plan_requested
+signal files_archive_requested
+signal files_cleanup_requested
 signal go_requested
 signal size_selected(height: int)
 signal quit_requested
@@ -27,7 +30,18 @@ const MARGIN := 10.0
 const BUBBLE_TOP := 8.0
 const MENU_W := 210.0
 const CHAT_W := 230.0
-const FILES_W := 300.0
+const FILES_W := 480.0
+# 周课表网格：左侧节次列 + 7 个星期列 × 12 节。单元格外框与参考图一致，课程块跨行显示。
+const TABLE_HEAD_H := 32.0
+const TABLE_ROW_H := 26.0
+const TABLE_TIME_W := 44.0
+const TABLE_PERIODS := 12
+const COURSE_TINTS := [
+	Color(0.58, 0.84, 0.74, 0.40), Color(0.58, 0.80, 0.93, 0.40),
+	Color(0.96, 0.82, 0.58, 0.40), Color(0.93, 0.70, 0.74, 0.40),
+	Color(0.76, 0.74, 0.93, 0.40), Color(0.68, 0.88, 0.64, 0.40),
+	Color(0.96, 0.89, 0.62, 0.40),
+]
 const DRAG_CLICK_MAX := 4.0
 const INERTIA_FRICTION := 6.0
 const INERTIA_MAX := 1600.0
@@ -54,9 +68,20 @@ var _files_scroll: ScrollContainer
 var _files_folder: Label
 var _files_rows: VBoxContainer
 var _schedule_rows: VBoxContainer
+var _schedule_table: Control
+var _schedule_agenda: VBoxContainer
+var _timetable: Dictionary = {}
 var _files_status: Label
 var _files_scan: Button
 var _files_refresh: Button
+var _files_auto_plan: Button
+var _files_archive: Button
+var _files_cleanup: Button
+var _reminder: PanelContainer
+var _reminder_label: Label
+var _reminder_until := 0
+var _hover_card: PanelContainer
+var _hover_label: Label
 var _online_dot: Label
 var _fx: FxLayer
 
@@ -84,6 +109,14 @@ class FxLayer extends Control:
 	func _draw() -> void:
 		if host != null:
 			host.draw_fx(self)
+
+class GridLayer extends Control:
+	"""周课表的底格：只画表头 / 网格线，课程块是它的子节点（可跨行）。"""
+	var host = null
+
+	func _draw() -> void:
+		if host != null:
+			host.draw_schedule_table(self, size)
 
 func _ready() -> void:
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
@@ -139,6 +172,7 @@ func _build() -> void:
 	_build_menu()
 	_build_chat()
 	_build_files()
+	_build_cards()
 
 func _build_menu() -> void:
 	# 菜单打开时的薄纱：既压暗背景，也让「点空白处收起菜单」在透明窗上可靠命中
@@ -350,15 +384,19 @@ func _build_files() -> void:
 	_files_folder = Label.new()
 	_files_folder.text = "资料箱：assistant_files/inbox"
 	_files_folder.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_files_folder.custom_minimum_size = Vector2(FILES_W - 34, 0)
+	# 自适应宽度，但保底 180：Label 的 autowrap 在 min 宽为 0 时会按 1px 排版（几百行高），
+	# 反而把面板撑到几千像素、按钮全被挤出窗口。
+	_files_folder.custom_minimum_size = Vector2(180, 0)
+	_files_folder.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_files_folder.add_theme_font_size_override("font_size", 10)
 	_files_folder.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	vb.add_child(_files_folder)
 
 	var hint := Label.new()
-	hint.text = "把图片 / PDF / 文档放进资料箱，点「开始处理」；OCR + VLM 会整理成日程。"
+	hint.text = "把图片 / PDF / 文档放进资料箱，点「开始处理」；OCR 会按行列还原课程表，Azure 再整理成日程。"
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	hint.custom_minimum_size = Vector2(FILES_W - 34, 0)
+	hint.custom_minimum_size = Vector2(180, 0)
+	hint.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	hint.add_theme_font_size_override("font_size", 10)
 	hint.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.9))
 	vb.add_child(hint)
@@ -368,7 +406,8 @@ func _build_files() -> void:
 	_files_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	vb.add_child(_files_scroll)
 	var log := VBoxContainer.new()
-	log.custom_minimum_size = Vector2(FILES_W - 34, 0)
+	log.custom_minimum_size = Vector2(0, 0)
+	log.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	log.add_theme_constant_override("separation", 4)
 	_files_scroll.add_child(log)
 
@@ -394,7 +433,8 @@ func _build_files() -> void:
 	_files_status = Label.new()
 	_files_status.text = ""
 	_files_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_files_status.custom_minimum_size = Vector2(FILES_W - 34, 0)
+	_files_status.custom_minimum_size = Vector2(180, 0)
+	_files_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_files_status.add_theme_font_size_override("font_size", 10)
 	_files_status.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	vb.add_child(_files_status)
@@ -415,6 +455,146 @@ func _build_files() -> void:
 	GufengTheme.apply_seal_button(_files_scan, false)
 	_files_scan.pressed.connect(func(): files_scan_requested.emit())
 	row.add_child(_files_scan)
+	# 底部始终可见的「收起」：窗口被限制 / 内嵌在编辑器小视口时，右上角的 × 可能够不到。
+	var collapse := Button.new()
+	collapse.text = "收起"
+	collapse.custom_minimum_size = Vector2(54, 28)
+	GufengTheme.apply_button(collapse)
+	collapse.pressed.connect(close_files)
+	row.add_child(collapse)
+	# 第二排：自动排班 / 留档 / 清理（窄面板也能一行放下）。
+	var row2 := HBoxContainer.new()
+	row2.add_theme_constant_override("separation", 4)
+	vb.add_child(row2)
+	_files_auto_plan = Button.new()
+	_files_auto_plan.text = "自动排班"
+	_files_auto_plan.tooltip_text = "按优先级、截止时间与空闲区间自动排班；时长 / 优先级用 James-Stein 收缩估计"
+	_files_auto_plan.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_files_auto_plan.custom_minimum_size = Vector2(70, 26)
+	GufengTheme.apply_button(_files_auto_plan)
+	_files_auto_plan.pressed.connect(func(): files_auto_plan_requested.emit())
+	row2.add_child(_files_auto_plan)
+	_files_archive = Button.new()
+	_files_archive.text = "归档过期"
+	_files_archive.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_files_archive.custom_minimum_size = Vector2(70, 26)
+	GufengTheme.apply_button(_files_archive)
+	_files_archive.pressed.connect(func(): files_archive_requested.emit())
+	row2.add_child(_files_archive)
+	_files_cleanup = Button.new()
+	_files_cleanup.text = "清理留档"
+	_files_cleanup.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_files_cleanup.custom_minimum_size = Vector2(70, 26)
+	GufengTheme.apply_button(_files_cleanup)
+	_files_cleanup.pressed.connect(func(): files_cleanup_requested.emit())
+	row2.add_child(_files_cleanup)
+
+func _build_cards() -> void:
+	# 事务提醒卡：到点时由 PetShell 调 show_reminder()；压在聊天 / 资料面板之上，12 秒后自动消失。
+	_reminder = PanelContainer.new()
+	_reminder.name = "ReminderCard"
+	_reminder.add_theme_stylebox_override("panel", _card_style())
+	_reminder.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_reminder.visible = false
+	add_child(_reminder)
+	var rv := VBoxContainer.new()
+	rv.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	rv.add_theme_constant_override("separation", 2)
+	var head := Label.new()
+	head.text = "事务提醒"
+	head.add_theme_font_size_override("font_size", 9)
+	head.add_theme_color_override("font_color", GufengTheme.ACCENT)
+	head.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	rv.add_child(head)
+	_reminder_label = Label.new()
+	_reminder_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_reminder_label.custom_minimum_size = Vector2(220, 0)
+	_reminder_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_reminder_label.add_theme_font_size_override("font_size", 12)
+	_reminder_label.add_theme_color_override("font_color", GufengTheme.INK)
+	_reminder_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	rv.add_child(_reminder_label)
+	_reminder.add_child(rv)
+	# 课表格子的悬停展开卡：完整显示课程名 / 教师 / 地点 / 时间 / 备注。
+	_hover_card = PanelContainer.new()
+	_hover_card.name = "HoverCard"
+	_hover_card.add_theme_stylebox_override("panel", _card_style())
+	_hover_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_hover_card.visible = false
+	add_child(_hover_card)
+	_hover_label = Label.new()
+	_hover_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_hover_label.custom_minimum_size = Vector2(180, 0)
+	_hover_label.add_theme_font_size_override("font_size", 10)
+	_hover_label.add_theme_color_override("font_color", GufengTheme.INK)
+	_hover_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_hover_card.add_child(_hover_label)
+
+func _card_style() -> StyleBoxFlat:
+	var sb := GufengTheme.slip(GufengTheme.PAPER_WARM, 9)
+	sb.border_color = GufengTheme.ACCENT
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(10)
+	sb.shadow_color = Color(0, 0, 0, 0.12)
+	sb.shadow_size = 6
+	return sb
+
+func show_reminder(text: String, secs := 12.0) -> void:
+	if _reminder == null or _reminder_label == null:
+		return
+	var clean := str(text).strip_edges()
+	if clean == "":
+		return
+	_reminder_label.text = clean
+	var w := minf(320.0, maxf(200.0, size.x - MARGIN * 2.0))
+	_reminder.custom_minimum_size = Vector2(w - 18.0, 0)
+	_reminder_label.custom_minimum_size = Vector2(w - 36.0, 0)
+	_reminder.visible = true
+	_reminder.position = Vector2(MARGIN, 40.0)
+	_reminder.size = Vector2(w, _reminder.get_combined_minimum_size().y)
+	move_child(_reminder, get_child_count() - 1)
+	_reminder_until = Time.get_ticks_msec() + int(maxf(2.0, secs) * 1000.0)
+
+func _show_hover_card(anchor: Control, d: Dictionary) -> void:
+	if _hover_card == null or _hover_label == null or anchor == null:
+		return
+	var title := str(d.get("title", "")).strip_edges()
+	if title == "":
+		return
+	var lines: Array[String] = [title]
+	var when := str(d.get("when_text", "")).strip_edges()
+	if when != "":
+		lines.append(when)
+	var teacher := str(d.get("teacher", "")).strip_edges()
+	var location := str(d.get("location", "")).strip_edges()
+	if teacher != "":
+		lines.append("教师：%s" % teacher)
+	if location != "":
+		lines.append("地点：%s" % location)
+	var notes := str(d.get("notes", "")).strip_edges()
+	if notes != "":
+		lines.append(notes)
+	_hover_label.text = "\n".join(lines)
+	var w := minf(260.0, maxf(160.0, size.x - 32.0))
+	_hover_label.custom_minimum_size = Vector2(w - 24.0, 0)
+	_hover_card.custom_minimum_size = Vector2(w - 12.0, 0)
+	_hover_card.visible = true
+	_hover_card.reset_size()
+	var card := _hover_card.get_combined_minimum_size()
+	card.x = maxf(card.x, w)
+	var gp := anchor.get_global_rect()
+	var origin := get_global_rect().position
+	var pos := gp.position - origin + Vector2(gp.size.x + 4.0, 0.0)
+	if pos.x + card.x > size.x - 8.0:
+		pos.x = maxf(8.0, gp.position.x - origin.x - card.x - 4.0)
+	pos.y = clampf(pos.y, 8.0, maxf(8.0, size.y - card.y - 8.0))
+	_hover_card.position = pos
+	_hover_card.size = card
+	move_child(_hover_card, get_child_count() - 1)
+
+func _hide_hover_card() -> void:
+	if _hover_card != null:
+		_hover_card.visible = false
 
 func _submit_chat() -> void:
 	var text := _chat_input.text.strip_edges()
@@ -441,7 +621,7 @@ func _chat_size() -> Vector2i:
 
 func _files_size() -> Vector2i:
 	var pw := _pet_width()
-	return Vector2i(maxi(640, int(round(pw)) + int(FILES_W) + 56), maxi(500, pet_height + 170))
+	return Vector2i(maxi(700, int(round(pw)) + int(FILES_W) + 56), maxi(560, pet_height + 170))
 
 func _pet_rect_for(win: Vector2i) -> Rect2:
 	var pw := _pet_width()
@@ -494,9 +674,20 @@ func _layout() -> void:
 		_chat.size = Vector2(CHAT_W, maxf(80.0, s.y - MARGIN * 2.0))
 		_chat.visible = _chat_open
 	if _files != null:
+		# 面板宽度跟着**实际视口**走：编辑器内嵌小窗口 / 小屏上固定 560 会把关闭按钮挤出屏幕。
+		var fw := minf(FILES_W, maxf(260.0, s.x - MARGIN * 2.0))
 		_files.position = Vector2(MARGIN, MARGIN)
-		_files.size = Vector2(FILES_W, maxf(160.0, s.y - MARGIN * 2.0))
+		_files.size = Vector2(fw, maxf(160.0, s.y - MARGIN * 2.0))
 		_files.visible = _files_open
+		# 面板占满宽度时宠物会从半透明面板后面透出来：位置不够就把宠物藏起来。
+		if _pet_anchor != null:
+			var panel_w := 0.0
+			if _files_open:
+				panel_w = _files.size.x
+			elif _chat_open:
+				panel_w = CHAT_W
+			var need := MARGIN * 3.0 + panel_w + _pet_width()
+			_pet_anchor.visible = not ((_files_open or _chat_open) and s.x < need)
 	queue_redraw()
 
 func set_pet_height(h: int) -> void:
@@ -570,12 +761,26 @@ func close_files() -> void:
 		return
 	_files_open = false
 	_files.visible = false
+	_hide_hover_card()
 	_apply_window_size(_base_size(), true)
 	_layout()
 	files_closed.emit()
 
 func is_files_open() -> bool:
 	return _files_open
+
+func _unhandled_key_input(event: InputEvent) -> void:
+	# Esc 也能收起面板：鼠标点不到右上角 / 底部按钮时还有键盘出口。
+	if event != null and event.is_action_pressed("ui_cancel"):
+		if _files_open:
+			close_files()
+			get_viewport().set_input_as_handled()
+		elif _chat_open:
+			close_chat()
+			get_viewport().set_input_as_handled()
+		elif _menu_open:
+			close_menu()
+			get_viewport().set_input_as_handled()
 
 func set_files_info(folder: String, files: Array) -> void:
 	if _files_folder != null:
@@ -600,6 +805,7 @@ func set_files_info(folder: String, files: Array) -> void:
 		lbl.text = "· " + name
 		lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		lbl.autowrap_mode = TextServer.AUTOWRAP_ARBITRARY
+		lbl.custom_minimum_size = Vector2(120, 0)
 		lbl.add_theme_font_size_override("font_size", 10)
 		lbl.add_theme_color_override("font_color", GufengTheme.INK)
 		var err := str(d.get("error", "")).strip_edges()
@@ -612,51 +818,280 @@ func set_files_info(folder: String, files: Array) -> void:
 func set_schedule_items(items: Array) -> void:
 	if _schedule_rows == null:
 		return
+	_hide_hover_card()
 	for c in _schedule_rows.get_children():
 		c.queue_free()
-	if items.is_empty():
-		_schedule_rows.add_child(_files_hint("（还没有整理出日程）"))
-		return
+	_schedule_table = null
+	_schedule_agenda = null
+	_timetable = {}
+	var courses: Array = []
+	var plain: Array = []
 	for it in items:
 		if typeof(it) != TYPE_DICTIONARY:
 			continue
 		var d: Dictionary = it
-		var title := str(d.get("title", "")).strip_edges()
-		if title == "":
+		if str(d.get("title", "")).strip_edges() == "":
 			continue
-		var when := str(d.get("when_text", "")).strip_edges()
+		var wd := int(d.get("weekday", -1))
+		var p0 := int(d.get("period_start", 0))
+		if wd >= 0 and wd < 7 and p0 >= 1 and p0 <= TABLE_PERIODS:
+			courses.append(d)
+		else:
+			plain.append(d)
+	courses = _dedupe_courses(courses)
+	if courses.is_empty() and plain.is_empty():
+		_schedule_rows.add_child(_files_hint("（还没有整理出日程）"))
+		return
+	if not courses.is_empty():
+		_build_timetable(courses)
+	if not plain.is_empty():
+		_build_agenda(plain)
+
+func _dedupe_courses(courses: Array) -> Array:
+	"""同一门课可能来自多周扫描：按「星期 + 起始节 + 标题」去重，保留日期最新的一条。"""
+	var map := {}
+	for it in courses:
+		var d: Dictionary = it
+		var key := "%d|%d|%s" % [int(d.get("weekday", -1)),
+			int(d.get("period_start", 0)), str(d.get("title", ""))]
+		if not map.has(key):
+			map[key] = d
+		else:
+			var old: Dictionary = map[key]
+			if str(d.get("date", "")) > str(old.get("date", "")):
+				map[key] = d
+	var out: Array = []
+	for k in map.keys():
+		out.append(map[k])
+	out.sort_custom(func(a, b):
+		if int(a.get("weekday", 0)) != int(b.get("weekday", 0)):
+			return int(a.get("weekday", 0)) < int(b.get("weekday", 0))
+		return int(a.get("period_start", 0)) < int(b.get("period_start", 0)))
+	return out
+
+func _period_time_map(courses: Array) -> Dictionary:
+	"""节次 → 开始时间（只收每门课的起始节；结束节不冒充下一节的开始时间）。"""
+	var out := {}
+	for it in courses:
+		var d: Dictionary = it
+		var p := int(d.get("period_start", 0))
+		var t0 := str(d.get("start_time", "")).strip_edges()
+		if p >= 1 and t0 != "" and not out.has(p):
+			out[p] = t0
+	return out
+
+func _build_timetable(courses: Array) -> void:
+	# 表格宽度跟着视口走：宽屏最多 FILES_W-44，窄屏（编辑器内嵌 360 / 小窗）保底 400，
+	# 再窄就靠内部横向滚动，绝不把面板撑出视口。
+	var table_w := clampf(size.x - MARGIN * 2.0 - 22.0, 400.0, FILES_W - 44.0)
+	var col_w := (table_w - TABLE_TIME_W) / 7.0
+	var table_h := TABLE_HEAD_H + TABLE_ROW_H * TABLE_PERIODS
+	# —— 周标题：从课程日期推本周一 / 周日 ——
+	var dates: Array[String] = []
+	for it in courses:
+		var ds := str(it.get("date", "")).strip_edges()
+		if ds.length() >= 10:
+			dates.append(ds)
+	var note := Label.new()
+	note.text = "本月课表"
+	var today_col := -1
+	if not dates.is_empty():
+		dates.sort()
+		var week_start := dates[0]
+		var end_txt := ""
+		var mon_unix := 0
+		var unix := int(Time.get_unix_time_from_datetime_string(week_start + "T00:00:00"))
+		if unix > 0:
+			var d0 := Time.get_datetime_dict_from_unix_time(unix)
+			mon_unix = unix - ((int(d0.get("weekday", 0)) + 6) % 7) * 86400
+			var ed := Time.get_datetime_dict_from_unix_time(mon_unix + 6 * 86400)
+			end_txt = "%02d-%02d" % [int(ed.get("month", 0)), int(ed.get("day", 0))]
+		note.text = "本周课表 · %s ~ %s" % [week_start.substr(5), end_txt]
+		# 只有扫描的正是本周时才高亮今天这一列（旧周课表不冒充今天）。
+		var today_unix := int(Time.get_unix_time_from_datetime_string(
+			Time.get_date_string_from_system() + "T00:00:00"))
+		if mon_unix > 0 and today_unix >= mon_unix and today_unix <= mon_unix + 6 * 86400:
+			today_col = (int(Time.get_datetime_dict_from_unix_time(today_unix).get("weekday", 0)) + 6) % 7
+	note.add_theme_font_size_override("font_size", 10)
+	note.add_theme_color_override("font_color", GufengTheme.INK)
+	note.tooltip_text = "从资料图片还原的课程；点课程块可看教师与地点"
+	_schedule_rows.add_child(note)
+	# —— 网格底图 ——
+	# 表格固定 516 宽：宽面板上留一点右边距，窄面板（编辑器内嵌窗口 / 小屏）用内部横向滚动，
+	# 不靠撑大窗口来显示整张表（窗口一旦超出视口，右上角的关闭按钮就点不到了）。
+	var holder := Control.new()
+	holder.custom_minimum_size = Vector2(table_w, table_h)
+	holder.mouse_filter = Control.MOUSE_FILTER_PASS
+	var grid := GridLayer.new()
+	grid.host = self
+	grid.position = Vector2.ZERO
+	grid.size = Vector2(table_w, table_h)
+	grid.custom_minimum_size = Vector2(table_w, table_h)
+	grid.mouse_filter = Control.MOUSE_FILTER_PASS
+	holder.add_child(grid)
+	var hscroll := ScrollContainer.new()
+	hscroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+	hscroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	hscroll.custom_minimum_size = Vector2(0, table_h + 14.0)
+	hscroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hscroll.add_child(holder)
+	_timetable = {"col_w": col_w, "width": table_w, "height": table_h, "today_col": today_col}
+	_schedule_table = grid
+	_schedule_rows.add_child(hscroll)
+	# —— 表头：星期 + 日期 ——
+	var col_dates := {}
+	for it in courses:
+		var wd := int(it.get("weekday", -1))
+		var ds := str(it.get("date", "")).strip_edges()
+		if wd >= 0 and wd < 7 and ds.length() >= 10 and not col_dates.has(wd):
+			col_dates[wd] = ds.substr(5)
+	for wd in range(7):
+		var head := Label.new()
+		var suffix := ""
+		if col_dates.has(wd):
+			suffix = "\n" + str(col_dates[wd])
+		head.text = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][wd] + suffix
+		head.position = Vector2(TABLE_TIME_W + float(wd) * col_w, 1)
+		head.size = Vector2(col_w, TABLE_HEAD_H - 2)
+		head.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		head.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		head.add_theme_font_size_override("font_size", 9 if wd == today_col else 8)
+		head.add_theme_color_override("font_color",
+			GufengTheme.ACCENT if wd == today_col else GufengTheme.INK_SOFT)
+		head.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		grid.add_child(head)
+	# —— 左侧节次 / 时间 ——
+	var times := _period_time_map(courses)
+	for p in range(1, TABLE_PERIODS + 1):
 		var lbl := Label.new()
-		lbl.text = "%s  %s" % [when, title]
+		var t := str(times.get(p, ""))
+		lbl.text = str(p) + ("\n" + t if t != "" else "")
+		lbl.position = Vector2(0, TABLE_HEAD_H + float(p - 1) * TABLE_ROW_H)
+		lbl.size = Vector2(TABLE_TIME_W - 2, TABLE_ROW_H)
+		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		lbl.add_theme_font_size_override("font_size", 7)
+		lbl.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.9))
+		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		grid.add_child(lbl)
+	# —— 课程块（跨节）——
+	for it in courses:
+		var d: Dictionary = it
+		var wd := clampi(int(d.get("weekday", 0)), 0, 6)
+		var p0 := clampi(int(d.get("period_start", 1)), 1, TABLE_PERIODS)
+		var p1 := clampi(int(d.get("period_end", p0)), p0, TABLE_PERIODS)
+		var title := str(d.get("title", "")).strip_edges()
+		var teacher := str(d.get("teacher", "")).strip_edges()
+		var location := str(d.get("location", "")).strip_edges()
+		var tint: Color = COURSE_TINTS[absi(hash(title)) % COURSE_TINTS.size()]
+		var block_h := float(p1 - p0 + 1) * TABLE_ROW_H - 3
+		# 用 Panel（不是 PanelContainer）：课程块要精确控制文字位置，容器会把 Label 压回最小高度。
+		var panel := Panel.new()
+		panel.position = Vector2(TABLE_TIME_W + float(wd) * col_w + 2,
+			TABLE_HEAD_H + float(p0 - 1) * TABLE_ROW_H + 1)
+		panel.size = Vector2(col_w - 4, block_h)
+		panel.mouse_filter = Control.MOUSE_FILTER_PASS
+		var sb := StyleBoxFlat.new()
+		sb.bg_color = tint
+		sb.border_color = Color(tint.r, tint.g, tint.b, 0.85)
+		sb.set_border_width_all(1)
+		sb.set_corner_radius_all(4)
+		panel.add_theme_stylebox_override("panel", sb)
+		var lbl := Label.new()
+		lbl.position = Vector2(3, 1)
+		lbl.size = Vector2(col_w - 10, block_h - 4)
+		var text := title
+		var sub: Array[String] = []
+		if teacher != "":
+			sub.append(teacher)
+		if location != "":
+			sub.append(location)
+		if not sub.is_empty():
+			text += "\n" + " ".join(sub)
+		lbl.text = text
+		lbl.autowrap_mode = TextServer.AUTOWRAP_ARBITRARY
+		lbl.clip_text = true
+		lbl.max_lines_visible = 4
+		lbl.add_theme_font_size_override("font_size", 8)
+		lbl.add_theme_color_override("font_color", GufengTheme.INK)
+		var tip := "%s\n%s %s\n%s" % [title, teacher, location,
+			str(d.get("when_text", "")).strip_edges()]
+		panel.tooltip_text = tip
+		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		panel.add_child(lbl)
+		# 鼠标停留 → 浮层展开完整信息（格子放不下的长课程名 / 教师 / 地点 / 备注）。
+		panel.mouse_entered.connect(func(): _show_hover_card(panel, d))
+		panel.mouse_exited.connect(_hide_hover_card)
+		grid.add_child(panel)
+
+func _build_agenda(items: Array) -> void:
+	var wrap := VBoxContainer.new()
+	wrap.add_theme_constant_override("separation", 2)
+	wrap.custom_minimum_size = Vector2(0, 0)
+	wrap.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_schedule_agenda = wrap
+	_schedule_rows.add_child(wrap)
+	wrap.add_child(_files_hint("其他日程"))
+	for it in items:
+		var d: Dictionary = it
+		var when := str(d.get("when_text", "")).strip_edges()
+		var title := str(d.get("title", "")).strip_edges()
+		var lbl := Label.new()
+		lbl.text = "· %s  %s" % [when, title]
 		lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		lbl.custom_minimum_size = Vector2(FILES_W - 40, 0)
+		lbl.custom_minimum_size = Vector2(180, 0)
+		lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		lbl.add_theme_font_size_override("font_size", 10)
 		lbl.add_theme_color_override("font_color", GufengTheme.INK)
-		var notes := str(d.get("notes", "")).strip_edges()
-		var src := str(d.get("source", "")).strip_edges()
 		var tips: Array[String] = []
-		for x in [notes, src]:
-			if str(x) != "":
-				tips.append(str(x))
+		for x in [str(d.get("notes", "")), str(d.get("teacher", "")), str(d.get("location", ""))]:
+			if str(x).strip_edges() != "":
+				tips.append(str(x).strip_edges())
 		lbl.tooltip_text = "\n".join(tips)
-		_schedule_rows.add_child(lbl)
+		wrap.add_child(lbl)
+
+func draw_schedule_table(c: Control, s: Vector2) -> void:
+	if _timetable.is_empty() or s.x < 4.0 or s.y < 4.0:
+		return
+	var col_w := float(_timetable.get("col_w", 0.0))
+	if col_w <= 0.0:
+		return
+	# 表头浅色底 + 网格线（细、低对比，课程块在它上面跨行）。
+	c.draw_rect(Rect2(Vector2.ZERO, Vector2(s.x, TABLE_HEAD_H)), Color(GufengTheme.ACCENT, 0.10))
+	var today_col := int(_timetable.get("today_col", -1))
+	if today_col >= 0 and today_col < 7:
+		var tx := TABLE_TIME_W + float(today_col) * col_w
+		c.draw_rect(Rect2(tx, 0, col_w, TABLE_HEAD_H), Color(GufengTheme.ACCENT, 0.20))
+		c.draw_rect(Rect2(tx, TABLE_HEAD_H, col_w, s.y - TABLE_HEAD_H), Color(GufengTheme.ACCENT, 0.035))
+	var line := Color(GufengTheme.INK, 0.10)
+	for i in range(TABLE_PERIODS + 1):
+		var y := TABLE_HEAD_H + float(i) * TABLE_ROW_H
+		c.draw_line(Vector2(0, y), Vector2(s.x, y), line, 1.0)
+	for i in range(9):
+		var x := 0.0 if i == 0 else TABLE_TIME_W + float(i - 1) * col_w
+		if i == 8:
+			x = s.x - 1.0
+		c.draw_line(Vector2(x, 0), Vector2(x, s.y), line, 1.0)
+	c.draw_line(Vector2(TABLE_TIME_W, TABLE_HEAD_H), Vector2(TABLE_TIME_W, s.y),
+		Color(GufengTheme.INK, 0.16), 1.0)
 
 func set_files_status(text: String) -> void:
 	if _files_status != null:
 		_files_status.text = str(text)
 
 func set_files_busy(on: bool) -> void:
-	if _files_scan != null:
-		_files_scan.disabled = on
-	if _files_refresh != null:
-		_files_refresh.disabled = on
+	for b in [_files_scan, _files_refresh, _files_auto_plan, _files_archive, _files_cleanup]:
+		if b != null:
+			b.disabled = on
 	if on:
-		set_files_status("正在用 OCR / VLM 阅读资料，再整理成日程…")
+		set_files_status("正在处理，请稍等…")
 
 func _files_hint(text: String) -> Label:
 	var lbl := Label.new()
 	lbl.text = text
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	lbl.custom_minimum_size = Vector2(FILES_W - 40, 0)
+	lbl.custom_minimum_size = Vector2(180, 0)
+	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	lbl.add_theme_font_size_override("font_size", 10)
 	lbl.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.9))
 	return lbl
@@ -784,6 +1219,8 @@ func _start_inertia() -> void:
 
 func _process(delta: float) -> void:
 	_t += delta
+	if _reminder != null and _reminder.visible and Time.get_ticks_msec() >= _reminder_until:
+		_reminder.visible = false
 	_tick_drag(delta)
 	if _inertia:
 		var pos := DisplayServer.window_get_position()

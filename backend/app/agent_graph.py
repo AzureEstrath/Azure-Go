@@ -1347,6 +1347,18 @@ async def _streamed_text(agent, msgs, max_tokens):
     - **流式本身失败**（连接断开 / 服务端报错）**绝不影响这一回合**：返回 ``None`` 让调用方走非流式那条路，
       台词必定完整（前端的气泡最终内容以 ``message`` 为准，会被整条替换）。
     """
+    # 流式通道同样吃同一把生成锁：本机单槽位 llama-server 上，聊天流与资料扫描并发一样会串台。
+    # StubLLM（测试替身）没有 ``call_lock`` ⇒ 行为与没有这把锁时逐字一致。
+    lock_getter = getattr(agent.llm, "call_lock", None)
+    lock = lock_getter() if callable(lock_getter) else None
+    if lock is None:
+        return await _consume_stream(agent, msgs, max_tokens)
+    async with lock:
+        return await _consume_stream(agent, msgs, max_tokens)
+
+
+async def _consume_stream(agent, msgs, max_tokens):
+    """流式消费本体（在 ``_streamed_text`` 的生成锁内执行）。"""
     chunks = agent._stream_chunks(msgs, max_tokens)
     if chunks is None:
         return None
@@ -1386,7 +1398,11 @@ async def _say(agent, msgs, max_tokens, think_mode=None):
     token 流多等一轮；不传时行为与旧版逐字一致。
     """
     text = None if think_mode is not None else await _streamed_text(agent, msgs, max_tokens)
-    return await agent._reply(msgs, max_tokens, think_mode=think_mode) if text is None else text
+    if text is None:
+        text = await agent._reply(msgs, max_tokens, think_mode=think_mode)
+    # 结构化误输出兜底：模型偶尔会直接吐日程 JSON（聊天 / 走神都可能），把它转成人话；
+    # 认不出来的 JSON 返回空串，交给调用方的兜底台词——绝不让 `[` 或字段名进气泡。
+    return actions.naturalize(text)
 
 
 # ================= ④ finalize：发事件、写 memory_log、归位 busy =================
@@ -1537,8 +1553,9 @@ async def _finalize_analyze(agent, data):
 async def _finalize_chat(agent, data):
     """聊天收尾：**先归位 busy**（与今天逐字一致：思考完就解锁），再追加历史、发话、情绪小调用。"""
     agent._set_busy(False)
-    reply = str(data.get("reply") or "")
-    if agent._llm_failed(reply):                # 云端失败：聊天退化为兜底台词
+    # `_say` 已经过一道 naturalize；这里再兜一次，保证**写进聊天历史 / 记忆**的永远是台词而不是 JSON。
+    reply = actions.naturalize(str(data.get("reply") or ""))
+    if agent._llm_failed(reply):                # 云端失败 / 结构化误输出：聊天退化为兜底台词
         reply = agent._fallback_line("chat")
     if _alive(agent, data):                     # 看门狗守卫：旧一代不再写聊天历史
         agent.st.chat_history.append({"role": "assistant", "content": reply})
@@ -1550,7 +1567,9 @@ async def _finalize_chat(agent, data):
 
 async def _finalize_idle(agent, data):
     """闲置搭话收尾（不进 busy，与今天一致）。"""
-    reply = str(data.get("reply") or "")
+    reply = actions.naturalize(str(data.get("reply") or ""))
+    if reply == "":
+        reply = agent._idle_line()
     if _alive(agent, data):                     # 看门狗守卫：旧一代不再写聊天历史
         agent.st.chat_history.append({"role": "assistant", "content": reply})
         await asyncio.to_thread(agent._remember_pet_line, "idle", reply,
@@ -1560,7 +1579,9 @@ async def _finalize_idle(agent, data):
 
 async def _finalize_peer(agent, data):
     """窥屏搭话收尾：与闲置搭话同一条出口（不进 busy，玩家回来可整句作废）。"""
-    reply = str(data.get("reply") or "")
+    reply = actions.naturalize(str(data.get("reply") or ""))
+    if reply == "":
+        reply = agent._idle_line()
     if _alive(agent, data):
         agent.st.chat_history.append({"role": "assistant", "content": reply})
         await asyncio.to_thread(agent._remember_pet_line, "peer", reply,

@@ -603,6 +603,18 @@ class FailSafeTest(unittest.TestCase):
             # 兜底台词要进聊天历史，下一轮上下文才自洽
             self.assertEqual(agent.st.chat_history[-1]["role"], "assistant", tag)
 
+    def test_chat_json_reply_is_naturalized(self):
+        """模型误吐日程 JSON：聊天历史与 WS 台词都必须是可读中文，不能留 `[` / 字段名。"""
+        llm = StubLLM(text='[{"date":"2026-10-28", "time":"08:00", '
+                           '"title":"无机化学实验", "notes":"杨悠笛 @二教10"}]')
+        agent, bus = self._run(llm, lambda a: a.chat("刚刚你看到了什么"))
+        reply = agent.st.chat_history[-1]["content"]
+        self.assertIn("无机化学实验", reply)
+        self.assertNotIn('"date"', reply)
+        self.assertNotIn("[{", reply)
+        texts = [e["text"] for e in bus.messages(events.AI)]
+        self.assertTrue(any("无机化学实验" in t and "date" not in t for t in texts), texts)
+
     def test_summarize_degrades_cleanly(self):
         for llm in (ErrLLM(), BoomLLM()):
             tag = type(llm).__name__
@@ -611,6 +623,36 @@ class FailSafeTest(unittest.TestCase):
             texts = [str(e.get("text", "")) for e in bus.messages(events.AI)]
             self.assertTrue(any(t.startswith("📋 对局总结") for t in texts), tag)
             self._assert_says_something(tag, bus, events.AI)
+
+
+class ReminderTest(unittest.TestCase):
+    """事务提醒：到点把事务喂给 LLM；失败 / 无连接退回模板并照常发 ai_remind。"""
+
+    ITEM = {"id": 1, "title": "高等数学", "when_text": "2026-10-28 周三 08:00"}
+
+    def test_reminder_uses_llm_line_and_emits_ai_remind(self):
+        agent, _eng, llm, bus = _mk()
+        llm.text = "该去上课啦，别迟到。"
+        text = asyncio.run(agent.remind_schedule(self.ITEM, now=1_790_000_000.0))
+        self.assertEqual(text, "该去上课啦，别迟到。")
+        msgs = bus.messages(events.AI_REMIND)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["text"], text)
+        self.assertIn("高等数学", llm.calls[-1][0][-1]["content"])
+
+    def test_reminder_falls_back_without_llm(self):
+        agent, _eng, _llm, bus = _mk()
+        agent.llm = ErrLLM()
+        text = asyncio.run(agent.remind_schedule(self.ITEM, now=1_790_000_000.0))
+        self.assertIn("到点了", text)
+        self.assertIn("高等数学", text)
+        self.assertEqual(bus.messages(events.AI_REMIND)[0]["text"], text)
+
+    def test_empty_title_does_not_emit(self):
+        agent, _eng, _llm, bus = _mk()
+        text = asyncio.run(agent.remind_schedule({"title": "  "}, now=1_790_000_000.0))
+        self.assertEqual(text, "")
+        self.assertEqual(bus.messages(events.AI_REMIND), [])
 
 
 class FakeMemory:
