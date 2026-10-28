@@ -38,6 +38,9 @@ const TABLE_HEAD_H := 32.0
 const TABLE_ROW_H := 26.0
 const TABLE_TIME_W := 44.0
 const TABLE_PERIODS := 12
+# 标准节次开始时间（分钟）：第5节是午间空档，12:00-13:00 的约定会落在这一行。
+const PERIOD_START_MIN := [480, 530, 590, 640, 700, 810, 860, 920, 970, 1110, 1160, 1210]
+const EVENT_TINT := Color(0.96, 0.83, 0.56, 0.55)
 const COURSE_TINTS := [
 	Color(0.58, 0.84, 0.74, 0.40), Color(0.58, 0.80, 0.93, 0.40),
 	Color(0.96, 0.82, 0.58, 0.40), Color(0.93, 0.70, 0.74, 0.40),
@@ -863,6 +866,7 @@ func set_schedule_items(items: Array) -> void:
 	_schedule_agenda = null
 	_timetable = {}
 	var courses: Array = []
+	var timed: Array = []
 	var plain: Array = []
 	for it in items:
 		if typeof(it) != TYPE_DICTIONARY:
@@ -876,14 +880,20 @@ func set_schedule_items(items: Array) -> void:
 			courses.append(d)
 		else:
 			plain.append(d)
+			# 有明确时刻、且不是自动排班的约定：同时画进周表对应时段。
+			var ev := _event_block(d)
+			if not ev.is_empty():
+				timed.append(ev)
 	courses = _dedupe_courses(courses)
+	timed = _dedupe_events(timed)
 	if courses.is_empty() and plain.is_empty():
 		_schedule_rows.add_child(_files_hint("（还没有整理出日程）"))
 		return
-	if not courses.is_empty():
-		_build_timetable(courses)
+	# 先把日程 / 约定列表放在周表上方：即使表格很长，也不会把「其他日程」埋到滚动区底部。
 	if not plain.is_empty():
 		_build_agenda(plain)
+	if not courses.is_empty() or not timed.is_empty():
+		_build_timetable(courses, timed)
 
 func _dedupe_courses(courses: Array) -> Array:
 	"""同一门课可能来自多周扫描：按「星期 + 起始节 + 标题」去重，保留日期最新的一条。"""
@@ -907,6 +917,83 @@ func _dedupe_courses(courses: Array) -> Array:
 		return int(a.get("period_start", 0)) < int(b.get("period_start", 0)))
 	return out
 
+func _weekday_from_item(d: Dictionary) -> int:
+	"""优先用库里的 weekday；没有就从 date / start_ts 推（0=周一）。"""
+	var wd := int(d.get("weekday", -1))
+	if wd >= 0 and wd < 7:
+		return wd
+	var date := str(d.get("date", "")).strip_edges()
+	if date.length() >= 10:
+		var unix := int(Time.get_unix_time_from_datetime_string(date.substr(0, 10) + "T00:00:00"))
+		if unix > 0:
+			var dd := Time.get_datetime_dict_from_unix_time(unix)
+			return (int(dd.get("weekday", 0)) + 6) % 7
+	var ts := float(d.get("start_ts", 0.0))
+	if ts > 0.0:
+		var dd2 := Time.get_datetime_dict_from_unix_time(int(ts))
+		return (int(dd2.get("weekday", 0)) + 6) % 7
+	return -1
+
+func _clock_minutes(text: String) -> int:
+	var re := RegEx.new()
+	re.compile("(\\d{1,2})\\s*[:：]\\s*(\\d{2})")
+	var m := re.search(str(text))
+	if m == null:
+		return -1
+	var h := int(m.get_string(1))
+	var mi := int(m.get_string(2))
+	if h > 23 or mi > 59:
+		return -1
+	return h * 60 + mi
+
+func _item_start_minutes(d: Dictionary) -> int:
+	var t := _clock_minutes(str(d.get("start_time", "")))
+	if t >= 0:
+		return t
+	var when := str(d.get("when_text", ""))
+	if "全天" in when:
+		return -1
+	return _clock_minutes(when)
+
+func _period_index(minutes: int) -> int:
+	var idx := 1
+	for i in range(PERIOD_START_MIN.size()):
+		if minutes >= PERIOD_START_MIN[i]:
+			idx = i + 1
+	return clampi(idx, 1, TABLE_PERIODS)
+
+func _event_block(d: Dictionary) -> Dictionary:
+	"""有明确时刻、尚未自动排班的约定 → 周表块（避免被只画课程的网格漏掉）。"""
+	if bool(d.get("auto_planned", false)):
+		return {}
+	if str(d.get("status", "planned")) != "planned":
+		return {}
+	var wd := _weekday_from_item(d)
+	var start := _item_start_minutes(d)
+	if wd < 0 or start < 0:
+		return {}
+	var dur := maxi(5, int(d.get("duration_min", 60)))
+	var p0 := _period_index(start)
+	var p1 := _period_index(start + dur - 1)
+	var ev := d.duplicate()
+	ev["_event_wd"] = wd
+	ev["_event_p0"] = p0
+	ev["_event_p1"] = maxi(p0, p1)
+	return ev
+
+func _dedupe_events(items: Array) -> Array:
+	var map := {}
+	for it in items:
+		var d: Dictionary = it
+		var key := "%d|%d|%s" % [int(d.get("_event_wd", -1)),
+			int(d.get("_event_p0", 0)), str(d.get("title", ""))]
+		if not map.has(key):
+			map[key] = d
+	var out: Array = []
+	for k in map.keys():
+		out.append(map[k])
+	return out
+
 func _period_time_map(courses: Array) -> Dictionary:
 	"""节次 → 开始时间（只收每门课的起始节；结束节不冒充下一节的开始时间）。"""
 	var out := {}
@@ -918,10 +1005,69 @@ func _period_time_map(courses: Array) -> Dictionary:
 			out[p] = t0
 	return out
 
-func _build_timetable(courses: Array) -> void:
-	# 表格宽度跟着视口走：宽屏最多 FILES_W-44，窄屏（编辑器内嵌 360 / 小窗）保底 400，
-	# 再窄就靠内部横向滚动，绝不把面板撑出视口。
-	var table_w := clampf(size.x - MARGIN * 2.0 - 22.0, 400.0, FILES_W - 44.0)
+func _add_timetable_block(grid: Control, col_w: float, d: Dictionary,
+		wd: int, p0: int, p1: int, is_event: bool) -> void:
+	var title := str(d.get("title", "")).strip_edges()
+	var teacher := str(d.get("teacher", "")).strip_edges()
+	var location := str(d.get("location", "")).strip_edges()
+	var tint: Color = EVENT_TINT if is_event else COURSE_TINTS[absi(hash(title)) % COURSE_TINTS.size()]
+	var block_h := float(p1 - p0 + 1) * TABLE_ROW_H - 3
+	# 用 Panel（不是 PanelContainer）：块要精确控制文字位置，容器会把 Label 压回最小高度。
+	var panel := Panel.new()
+	panel.position = Vector2(TABLE_TIME_W + float(wd) * col_w + 2,
+		TABLE_HEAD_H + float(p0 - 1) * TABLE_ROW_H + 1)
+	panel.size = Vector2(col_w - 4, block_h)
+	panel.mouse_filter = Control.MOUSE_FILTER_PASS
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = tint
+	sb.border_color = Color(GufengTheme.ACCENT, 0.8) if is_event else Color(tint.r, tint.g, tint.b, 0.85)
+	sb.set_border_width_all(1)
+	if is_event:
+		sb.border_width_left = 3
+	sb.set_corner_radius_all(4)
+	panel.add_theme_stylebox_override("panel", sb)
+	var lbl := Label.new()
+	lbl.position = Vector2(3, 1)
+	lbl.size = Vector2(col_w - 10, block_h - 4)
+	var text := title
+	if is_event:
+		# 约定块：窄列优先保留标题；宽列再带一行分级。
+		if col_w >= 52.0:
+			var grade := _grade_text(d)
+			if grade != "":
+				text += "\n" + grade
+	elif col_w >= 52.0:
+		# 窄列不塞教师 / 地点，给课程名留出可读空间；悬停卡仍显示完整信息。
+		var sub: Array[String] = []
+		if teacher != "":
+			sub.append(teacher)
+		if location != "":
+			sub.append(location)
+		if not sub.is_empty():
+			text += "\n" + " ".join(sub)
+	lbl.text = text
+	lbl.autowrap_mode = TextServer.AUTOWRAP_ARBITRARY
+	lbl.clip_text = true
+	lbl.max_lines_visible = 4
+	lbl.add_theme_font_size_override("font_size", 7 if is_event and col_w < 44.0 else 8)
+	lbl.add_theme_color_override("font_color", GufengTheme.INK)
+	var tip := "%s\n%s %s\n%s" % [title, teacher, location,
+		str(d.get("when_text", "")).strip_edges()]
+	if is_event:
+		var grade := _grade_text(d)
+		if grade != "":
+			tip += "\n分级：" + grade
+	panel.tooltip_text = tip
+	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.add_child(lbl)
+	# 鼠标停留 → 浮层展开完整信息（格子放不下的长标题 / 教师 / 地点 / 备注）。
+	panel.mouse_entered.connect(func(): _show_hover_card(panel, d))
+	panel.mouse_exited.connect(_hide_hover_card)
+	grid.add_child(panel)
+
+func _build_timetable(courses: Array, timed: Array = []) -> void:
+	# 表格宽度跟着视口走：7 天优先全部可见；只有极窄窗口才用内部横向滚动。
+	var table_w := clampf(size.x - MARGIN * 2.0 - 22.0, 280.0, FILES_W - 44.0)
 	var col_w := (table_w - TABLE_TIME_W) / 7.0
 	var table_h := TABLE_HEAD_H + TABLE_ROW_H * TABLE_PERIODS
 	# —— 周标题：从课程日期推本周一 / 周日 ——
@@ -952,11 +1098,10 @@ func _build_timetable(courses: Array) -> void:
 			today_col = (int(Time.get_datetime_dict_from_unix_time(today_unix).get("weekday", 0)) + 6) % 7
 	note.add_theme_font_size_override("font_size", 10)
 	note.add_theme_color_override("font_color", GufengTheme.INK)
-	note.tooltip_text = "从资料图片还原的课程；点课程块可看教师与地点"
+	note.tooltip_text = "从资料还原的课程与约定；点色块可看完整信息"
 	_schedule_rows.add_child(note)
 	# —— 网格底图 ——
-	# 表格固定 516 宽：宽面板上留一点右边距，窄面板（编辑器内嵌窗口 / 小屏）用内部横向滚动，
-	# 不靠撑大窗口来显示整张表（窗口一旦超出视口，右上角的关闭按钮就点不到了）。
+	# 表格宽度跟着视口走：7 天优先全部可见；只有极窄窗口才用内部横向滚动。
 	var holder := Control.new()
 	holder.custom_minimum_size = Vector2(table_w, table_h)
 	holder.mouse_filter = Control.MOUSE_FILTER_PASS
@@ -1018,49 +1163,14 @@ func _build_timetable(courses: Array) -> void:
 		var wd := clampi(int(d.get("weekday", 0)), 0, 6)
 		var p0 := clampi(int(d.get("period_start", 1)), 1, TABLE_PERIODS)
 		var p1 := clampi(int(d.get("period_end", p0)), p0, TABLE_PERIODS)
-		var title := str(d.get("title", "")).strip_edges()
-		var teacher := str(d.get("teacher", "")).strip_edges()
-		var location := str(d.get("location", "")).strip_edges()
-		var tint: Color = COURSE_TINTS[absi(hash(title)) % COURSE_TINTS.size()]
-		var block_h := float(p1 - p0 + 1) * TABLE_ROW_H - 3
-		# 用 Panel（不是 PanelContainer）：课程块要精确控制文字位置，容器会把 Label 压回最小高度。
-		var panel := Panel.new()
-		panel.position = Vector2(TABLE_TIME_W + float(wd) * col_w + 2,
-			TABLE_HEAD_H + float(p0 - 1) * TABLE_ROW_H + 1)
-		panel.size = Vector2(col_w - 4, block_h)
-		panel.mouse_filter = Control.MOUSE_FILTER_PASS
-		var sb := StyleBoxFlat.new()
-		sb.bg_color = tint
-		sb.border_color = Color(tint.r, tint.g, tint.b, 0.85)
-		sb.set_border_width_all(1)
-		sb.set_corner_radius_all(4)
-		panel.add_theme_stylebox_override("panel", sb)
-		var lbl := Label.new()
-		lbl.position = Vector2(3, 1)
-		lbl.size = Vector2(col_w - 10, block_h - 4)
-		var text := title
-		var sub: Array[String] = []
-		if teacher != "":
-			sub.append(teacher)
-		if location != "":
-			sub.append(location)
-		if not sub.is_empty():
-			text += "\n" + " ".join(sub)
-		lbl.text = text
-		lbl.autowrap_mode = TextServer.AUTOWRAP_ARBITRARY
-		lbl.clip_text = true
-		lbl.max_lines_visible = 4
-		lbl.add_theme_font_size_override("font_size", 8)
-		lbl.add_theme_color_override("font_color", GufengTheme.INK)
-		var tip := "%s\n%s %s\n%s" % [title, teacher, location,
-			str(d.get("when_text", "")).strip_edges()]
-		panel.tooltip_text = tip
-		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		panel.add_child(lbl)
-		# 鼠标停留 → 浮层展开完整信息（格子放不下的长课程名 / 教师 / 地点 / 备注）。
-		panel.mouse_entered.connect(func(): _show_hover_card(panel, d))
-		panel.mouse_exited.connect(_hide_hover_card)
-		grid.add_child(panel)
+		_add_timetable_block(grid, col_w, d, wd, p0, p1, false)
+	# —— 约定 / 定时事件：按开始时刻落到对应节次行，不再只出现在列表里 ——
+	for it in timed:
+		var ev: Dictionary = it
+		var wd := clampi(int(ev.get("_event_wd", 0)), 0, 6)
+		var p0 := clampi(int(ev.get("_event_p0", 1)), 1, TABLE_PERIODS)
+		var p1 := clampi(int(ev.get("_event_p1", p0)), p0, TABLE_PERIODS)
+		_add_timetable_block(grid, col_w, ev, wd, p0, p1, true)
 
 func _build_agenda(items: Array) -> void:
 	var wrap := VBoxContainer.new()
@@ -1069,7 +1179,7 @@ func _build_agenda(items: Array) -> void:
 	wrap.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_schedule_agenda = wrap
 	_schedule_rows.add_child(wrap)
-	wrap.add_child(_files_hint("其他日程"))
+	wrap.add_child(_files_hint("日程 / 约定"))
 	for it in items:
 		var d: Dictionary = it
 		var when := str(d.get("when_text", "")).strip_edges()

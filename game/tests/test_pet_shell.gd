@@ -161,7 +161,8 @@ func _test_view() -> void:
 	])
 	_check("周课表网格生成", v._schedule_table != null)
 	_check("课程块跨节落在网格里", v._schedule_table.get_child_count() > 7 + 12)
-	_check("表格宽度按面板铺开", v._schedule_table.custom_minimum_size.x >= 400.0)
+	_check("表格宽度按面板铺开（窄窗口也保留 7 天）", v._schedule_table.custom_minimum_size.x >= 280.0
+		and v._schedule_table.custom_minimum_size.x <= 480.0)
 	v.set_schedule_items([
 		{"title": "高等数学", "teacher": "王三强", "location": "二教20",
 		 "date": "2026-10-28", "weekday": 2, "period": "1-2", "period_start": 1,
@@ -193,18 +194,38 @@ func _test_view() -> void:
 		v._hide_hover_card()
 	else:
 		_check("悬停展开卡显示完整课程信息", false)
-	v.set_schedule_items([{
-		"id": 4, "title": "院系杯男子篮球赛（材料 VS 水保）",
-		"when_text": "2026-10-29 周四 12:00-13:00", "weekday": 3, "period": "",
-		"period_start": 0, "start_ts": 1793246400, "kind": "task",
-		"status": "planned", "priority": 50, "duration_min": 60,
-	}])
+	host.size = Vector2(360, 540)
 	await process_frame
-	var event_wrap = v._schedule_rows.get_child(0)
-	var event_row = event_wrap.get_child(1) if event_wrap.get_child_count() > 1 else null
+	await process_frame
+	v.set_schedule_items([
+		{"id": 1, "title": "高等数学", "teacher": "王三强", "location": "二教20",
+		 "date": "2026-10-28", "weekday": 2, "period": "1-2",
+		 "period_start": 1, "period_end": 2, "start_time": "08:00",
+		 "end_time": "09:35", "kind": "course", "status": "planned"},
+		{"id": 4, "title": "院系杯男子篮球赛（材料 VS 水保）",
+		 "when_text": "2026-10-29 周四 12:00-13:00", "weekday": 3, "period": "",
+		 "period_start": 0, "start_ts": 1793246400, "start_time": "12:00",
+		 "end_time": "13:00", "kind": "task", "status": "planned",
+		 "priority": 50, "duration_min": 60},
+	])
+	await process_frame
+	var event_wrap = v._schedule_agenda
+	var event_row = event_wrap.get_child(1) if event_wrap != null and event_wrap.get_child_count() > 1 else null
 	_check("聊天公告提取的活动按普通日程显示并标为约定",
 		event_row != null and event_row.get_child(0).text.contains("篮球赛")
 		and event_row.get_child(0).text.contains("[约定]"))
+	_check("360 宽也能完整显示 7 天", v._schedule_table != null
+		and v._timetable.has("col_w")
+		and float(v._timetable.get("col_w", 0.0)) * 7.0 + 44.0
+			<= float(v._timetable.get("width", 0.0)) + 0.5)
+	var event_block = null
+	if v._schedule_table != null:
+		for c in v._schedule_table.get_children():
+			if c is Panel and c.tooltip_text.contains("篮球赛"):
+				event_block = c
+				break
+	_check("定时约定也画进周表对应时段", event_block != null
+		and event_block.tooltip_text.contains("分级：已约定"))
 	host.size = Vector2(544, 520)
 	await process_frame
 	await process_frame
