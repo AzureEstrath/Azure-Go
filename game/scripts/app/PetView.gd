@@ -69,6 +69,9 @@ var _chat_scroll: ScrollContainer
 var _chat_input: LineEdit
 var _chat_send: Button
 var _chat_status: Label
+## 聊天面板的内存流水（v4.2.6）：后端历史只做「合并」，空响应绝不清空当前会话。
+var _chat_items: Array[Dictionary] = []
+var _chat_rebuilding := false
 var _files: PanelContainer
 var _files_scroll: ScrollContainer
 var _files_folder: Label
@@ -1159,8 +1162,17 @@ func _calendar_cell(date: String, entries: Array, in_month: bool, is_today: bool
 			else Color(GufengTheme.INK_SOFT, 0.4)))
 	num.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	vb.add_child(num)
-	var shown := 0
+	# 日格只有两行：先显示约定 / 事务，再显示课程（v4.2.6）——
+	# 否则一个满课的工作日里，刚记进日程的会议会被课程挤进「+N」。
+	var ordered: Array = []
 	for d in entries:
+		if not _is_course(d):
+			ordered.append(d)
+	for d in entries:
+		if _is_course(d):
+			ordered.append(d)
+	var shown := 0
+	for d in ordered:
 		if shown >= 2:
 			break
 		var lbl := Label.new()
@@ -1452,31 +1464,38 @@ func _period_time_map(courses: Array) -> Dictionary:
 	return out
 
 func _add_timetable_block(grid: Control, col_w: float, d: Dictionary,
-		wd: int, p0: int, p1: int, is_event: bool) -> void:
+		wd: int, p0: int, p1: int, is_event: bool, compact := false) -> void:
 	var title := str(d.get("title", "")).strip_edges()
 	var teacher := str(d.get("teacher", "")).strip_edges()
 	var location := str(d.get("location", "")).strip_edges()
 	var tint: Color = EVENT_TINT if is_event else COURSE_TINTS[absi(hash(title)) % COURSE_TINTS.size()]
 	var block_h := float(p1 - p0 + 1) * TABLE_ROW_H - 3
+	# 与课程同格的事件（v4.2.6）：不整块盖住课程，改成贴在格子底部的一条窄条；
+	# 仍可悬停展开完整信息，既看得见又不会把课程标题遮没。
+	var panel_h := minf(block_h, maxf(14.0, TABLE_ROW_H - 5.0)) if compact else block_h
+	var panel_y := TABLE_HEAD_H + float(p0 - 1) * TABLE_ROW_H + 1
+	if compact:
+		panel_y += block_h - panel_h
 	# 用 Panel（不是 PanelContainer）：块要精确控制文字位置，容器会把 Label 压回最小高度。
 	var panel := Panel.new()
-	panel.position = Vector2(TABLE_TIME_W + float(wd) * col_w + 2,
-		TABLE_HEAD_H + float(p0 - 1) * TABLE_ROW_H + 1)
-	panel.size = Vector2(col_w - 4, block_h)
+	panel.position = Vector2(TABLE_TIME_W + float(wd) * col_w + 2, panel_y)
+	panel.size = Vector2(col_w - 4, panel_h)
 	panel.mouse_filter = Control.MOUSE_FILTER_PASS
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = tint
 	sb.border_color = Color(GufengTheme.ACCENT, 0.8) if is_event else Color(tint.r, tint.g, tint.b, 0.85)
 	sb.set_border_width_all(1)
 	if is_event:
-		sb.border_width_left = 3
+		sb.border_width_left = 2 if compact else 3
 	sb.set_corner_radius_all(4)
 	panel.add_theme_stylebox_override("panel", sb)
 	var lbl := Label.new()
 	lbl.position = Vector2(3, 1)
-	lbl.size = Vector2(col_w - 10, block_h - 4)
+	lbl.size = Vector2(col_w - 10, maxf(8.0, panel_h - 4))
 	var text := title
-	if is_event:
+	if compact:
+		text = "· " + title          # 窄条只放标题，分级信息留给悬停卡
+	elif is_event:
 		# 约定块：窄列优先保留标题；宽列再带一行分级。
 		if col_w >= 52.0:
 			var grade := _grade_text(d)
@@ -1494,8 +1513,8 @@ func _add_timetable_block(grid: Control, col_w: float, d: Dictionary,
 	lbl.text = text
 	lbl.autowrap_mode = TextServer.AUTOWRAP_ARBITRARY
 	lbl.clip_text = true
-	lbl.max_lines_visible = 4
-	lbl.add_theme_font_size_override("font_size", 7 if is_event and col_w < 44.0 else 8)
+	lbl.max_lines_visible = 1 if compact else 4
+	lbl.add_theme_font_size_override("font_size", 7 if (is_event and col_w < 44.0) or compact else 8)
 	lbl.add_theme_color_override("font_color", GufengTheme.INK)
 	# 悬停只保留一个自绘浮层：**不再设置 tooltip_text**，避免 Godot 默认黑底白字提示
 	# 和这张卡同时出现。
@@ -1596,10 +1615,11 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 			occupied["%d|%d" % [wd, p]] = true
 		_add_timetable_block(grid, col_w, d, wd, p0, p1, false)
 	# —— 约定 / 定时事件：按开始时刻落到对应节次行，不再只出现在列表里 ——
-	# 同一格有多个约定时合并成一个「N 项约定」块（悬停卡列出全部）；
-	# 若该格已被课程占用，就不画事件块，避免盖住课程（上方列表仍完整显示）。
+	# 同一格有多个约定时合并成一个「N 项约定」块（悬停卡列出全部）。
+	# v4.2.6：与课程同格时不再整块跳过，改为在格子底部画一条窄条（见 `_add_timetable_block`）。
 	var groups := {}
 	var group_order := []
+	var group_compact := {}
 	for it in timed:
 		var ev: Dictionary = it
 		var wd := clampi(int(ev.get("_event_wd", 0)), 0, 6)
@@ -1610,12 +1630,12 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 			if occupied.has("%d|%d" % [wd, p]):
 				blocked = true
 				break
-		if blocked:
-			continue
 		var key := "%d|%d" % [wd, p0]
 		if not groups.has(key):
 			groups[key] = []
 			group_order.append(key)
+		if blocked:
+			group_compact[key] = true
 		groups[key].append(ev)
 	for key in group_order:
 		var group: Array = groups[key]
@@ -1625,8 +1645,9 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 		var p1 := clampi(int(base.get("_event_p1", p0)), p0, TABLE_PERIODS)
 		for ev in group:
 			p1 = maxi(p1, clampi(int(ev.get("_event_p1", p0)), p0, TABLE_PERIODS))
+		var compact := bool(group_compact.get(key, false))
 		if group.size() == 1:
-			_add_timetable_block(grid, col_w, base, wd, p0, p1, true)
+			_add_timetable_block(grid, col_w, base, wd, p0, p1, true, compact)
 			continue
 		var merged: Dictionary = base.duplicate()
 		merged["title"] = "%d 项约定" % group.size()
@@ -1655,7 +1676,7 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 			lines.append(line)
 		merged["when_text"] = "；".join(whens)
 		merged["notes"] = "\n".join(lines)
-		_add_timetable_block(grid, col_w, merged, wd, p0, p1, true)
+		_add_timetable_block(grid, col_w, merged, wd, p0, p1, true, compact)
 
 func _build_agenda(items: Array, heading := "日程 / 约定") -> void:
 	var wrap := VBoxContainer.new()
@@ -2168,13 +2189,22 @@ func _spawn_ripple(pos: Vector2, radius: float) -> void:
 func append_chat(role: String, text: String) -> void:
 	if _chat_log == null:
 		return
+	var clean := _clean_chat_text(role, text)
+	if clean == "":
+		return
+	if not _chat_rebuilding:
+		_chat_items.append({"role": role, "text": clean})
+	_append_chat_row(role, clean)
+
+func _clean_chat_text(role: String, text: String) -> String:
 	var clean := str(text).strip_edges()
 	if role != "user":
 		# 后台记忆存的是原始回复（可能带语气 / 动作标记）；显示前统一剥掉。
 		clean = _tone_tag_re.sub(clean, "", true).strip_edges()
 		clean = _action_tag_re.sub(clean, "", true).strip_edges()
-	if clean == "":
-		return
+	return clean
+
+func _append_chat_row(role: String, clean: String) -> void:
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	var bubble := PanelContainer.new()
@@ -2204,20 +2234,49 @@ func append_chat(role: String, text: String) -> void:
 	_scroll_chat()
 
 func set_chat_history(items: Array) -> void:
+	"""把后端历史并进当前面板：**空响应绝不清空**，已有会话优先保留（v4.2.6）。
+
+    退出 / 重开桌宠时，后端历史可能因为写入时序暂时为空；此时不能把用户眼前
+    已经出现的聊天擦掉。非空历史按「角色 + 文本」计数合并，未落库的当前消息
+    追加在末尾，下一次打开面板仍能看到。
+    """
 	if _chat_log == null:
 		return
-	for c in _chat_log.get_children():
-		c.queue_free()
+	var incoming: Array[Dictionary] = []
 	for it in items:
 		if typeof(it) != TYPE_DICTIONARY:
 			continue
 		var d: Dictionary = it
-		var u := str(d.get("user_text", "")).strip_edges()
-		var a := str(d.get("reply_text", "")).strip_edges()
+		var u := _clean_chat_text("user", str(d.get("user_text", "")))
+		var a := _clean_chat_text("assistant", str(d.get("reply_text", "")))
 		if u != "":
-			append_chat("user", u)
+			incoming.append({"role": "user", "text": u})
 		if a != "":
-			append_chat("assistant", a)
+			incoming.append({"role": "assistant", "text": a})
+	if incoming.is_empty():
+		return
+	# 现有会话里「历史还没包含」的那部分接在后面（计数去重，不吞合法的重复句）。
+	var counts := {}
+	for d in incoming:
+		var key := "%s|%s" % [str(d.get("role", "")), str(d.get("text", ""))]
+		counts[key] = int(counts.get(key, 0)) + 1
+	var merged: Array[Dictionary] = incoming.duplicate()
+	for d in _chat_items:
+		var k2 := "%s|%s" % [str(d.get("role", "")), str(d.get("text", ""))]
+		if int(counts.get(k2, 0)) > 0:
+			counts[k2] = int(counts[k2]) - 1
+		else:
+			merged.append(d)
+	if merged.size() > 200:
+		merged = merged.slice(merged.size() - 200)
+	_chat_items = merged
+	_chat_rebuilding = true
+	for c in _chat_log.get_children():
+		_chat_log.remove_child(c)
+		c.queue_free()
+	for d in _chat_items:
+		_append_chat_row(str(d.get("role", "")), str(d.get("text", "")))
+	_chat_rebuilding = false
 	_scroll_chat()
 
 func set_chat_busy(on: bool) -> void:

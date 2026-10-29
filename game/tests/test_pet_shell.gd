@@ -131,6 +131,17 @@ func _test_view() -> void:
 		last_text.text.contains("记着呢") and not last_text.text.contains("tone")
 		and not last_text.text.contains("轻轻点头"))
 
+	# v4.2.6：后端历史暂时为空也不能清空当前会话；非空历史与现有消息合并、不重复。
+	var keep_n: int = log.get_child_count()
+	v.set_chat_history([])
+	_check("空历史不清空当前聊天", log.get_child_count() == keep_n)
+	v.set_chat_history([
+		{"user_text": "昨天的约定", "reply_text": "记着呢。"},
+		{"user_text": "你好", "reply_text": "在呢。"},
+	])
+	_check("历史与当前会话合并且不重复",
+		log.get_child_count() == keep_n + 2 and v._chat_items.size() == keep_n + 2)
+
 	v.open_files()
 	await process_frame
 	_check("资料面板能打开", v.is_files_open())
@@ -316,6 +327,46 @@ func _test_view() -> void:
 		_check("悬停卡显示排班理由",
 			v._hover_label.text.contains("排班理由："))
 		v._hide_hover_card()
+
+	# v4.2.6：与课程同格的约定不再消失——课程块底部画窄条；月历日格优先列事务。
+	v.set_schedule_items([
+		{"id": 20, "title": "体育足球", "date": "2026-10-30", "weekday": 4,
+		 "period": "6-7", "period_start": 6, "period_end": 7,
+		 "start_time": "13:30", "end_time": "15:05", "kind": "course",
+		 "status": "planned", "grade": "fixed"},
+		{"id": 21, "title": "电脑线上会议",
+		 "when_text": "2026-10-30 周五 15:00-16:00", "date": "2026-10-30",
+		 "weekday": 4, "start_time": "15:00", "end_time": "16:00",
+		 "kind": "task", "status": "planned", "grade": "committed",
+		 "duration_min": 60},
+	])
+	v.show_week_for_date("2026-10-30")
+	var course_block = null
+	var overlap_block = null
+	if v._schedule_table != null:
+		for c in v._schedule_table.get_children():
+			if c is Panel and c.has_meta("sched_item"):
+				var meta: Dictionary = c.get_meta("sched_item")
+				if str(meta.get("title", "")) == "体育足球":
+					course_block = c
+				elif str(meta.get("title", "")) == "电脑线上会议":
+					overlap_block = c
+	_check("与课程同格的约定仍然画进周表", overlap_block != null)
+	_check("同格约定改为底部窄条、不遮住课程",
+		overlap_block != null and course_block != null
+		and overlap_block.size.y <= float(v.TABLE_ROW_H)
+		and overlap_block.position.y >= course_block.position.y + course_block.size.y - 20.0)
+	v._calendar_month = "2026-10"
+	v.show_month()
+	await process_frame
+	var day_cell = null
+	for cell in v._calendar_grid.get_children():
+		if cell is PanelContainer and str(cell.get_meta("calendar_date", "")) == "2026-10-30":
+			day_cell = cell
+			break
+	_check("满课日的约定在月历日格优先显示",
+		day_cell != null and _calendar_cell_has_text(day_cell, "电脑线上会议"))
+
 	# 已经结束的星期型事件：不再自动重排，但仍应留在它所属那一周的周表里。
 	v.set_schedule_items([
 		{"id": 4, "title": "班级篮球赛",

@@ -77,7 +77,7 @@ var pet_height := 160
 var llm_base_url := "https://api.deepseek.com/v1"   # 云端 LLM（OpenAI 兼容）地址；示例见 README 第四节
 var llm_model := "deepseek-chat"
 var llm_api_key := ""             # 云端 LLM（OpenAI 兼容）的 API Key；留空则不发送 Authorization
-var llm_think_mode := 1           # 思考档位：0=快速（不思考） 1=中等（默认，限定推理预算） 2=强思考（自由推理）
+var llm_think_mode := 0           # 思考档位：0=快速（默认，不思考） 1=中等（限定推理预算） 2=强思考（自由推理）
 ## 说话详略（v3.11.1）：0=精简（点评 1 句 / 聊天 2 句，默认） 1=适中（不加额外约束） 2=详细（2~3 句 / 80 字内）。
 ## 与旧字段 `tts_limit_len`（布尔）同一件事的扩档：读配置时 `reply_style` 优先，只有旧键时按旧语义迁移
 ## （true → 0 / false → 1）；写回时两个键一起写，保证旧版本读到的仍是「开 / 关」两档。
