@@ -492,6 +492,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent.game_store = gstore             # v3.11.5：棋谱库同样无条件接上（懒建库）
             app.state.agent.player_name = cfg.prompt_user_name
             app.state.agent.pet_chat_tts_prebuilt = bool(cfg.pet_chat_tts_prebuilt)
+            app.state.agent.pet_chat_think_level = int(cfg.pet_chat_think_level)
             _adaptive = getattr(app.state.agent, "configure_adaptive", None)
             if callable(_adaptive):                     # v3.11.5：默认关；关着＝落点与现状一致
                 _adaptive(cfg.adaptive_difficulty, cfg.adaptive_difficulty_base,
@@ -507,6 +508,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent.joseki_progress = joseki_progress   # T5：注入的 agent 也接上同一个实例
             app.state.agent.life = life_store    # P0：注入的 agent 也接上同一条生命时间线（None ⇒ 不启用）
             app.state.agent.pet_chat_tts_prebuilt = bool(cfg.pet_chat_tts_prebuilt)
+            app.state.agent.pet_chat_think_level = int(cfg.pet_chat_think_level)
             app.state.agent.profile_store = profile_store       # v3.9.0：画像库同样无条件接上
             # 人格化：测试装配（autostart=False）不读真实 profile.db，也不改提示词；
             # 生产在下面统一 load_persona() 读一次跨局状态。
@@ -515,6 +517,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent.persona_address_name = str(cfg.persona_address_name or "").strip()[:16]
             app.state.agent.player_name = cfg.prompt_user_name
             app.state.agent.pet_chat_tts_prebuilt = bool(cfg.pet_chat_tts_prebuilt)
+            app.state.agent.pet_chat_think_level = int(cfg.pet_chat_think_level)
             # v3.9.0：画像 / 时间感知两个开关同样以 cfg 为准（关着＝现状）
             app.state.agent.profile_enabled = bool(cfg.profile_enabled)
             app.state.agent.time_aware_enabled = bool(cfg.time_aware_enabled)
@@ -812,6 +815,11 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             v = body["pet_chat_tts_prebuilt"]
             if isinstance(v, bool):
                 s.pet_chat_tts_prebuilt = v
+        if "pet_chat_think_level" in body:      # 桌宠聊天思考档：0 无 / 1 低 / 2 中 / 3 强
+            try:
+                s.pet_chat_think_level = max(0, min(3, int(float(body["pet_chat_think_level"]))))
+            except (TypeError, ValueError):
+                pass
         if "tools_enabled" in body:             # 发言侧工具开关：开启后她才会在提示/落子宣告里查资料
             s.tools_enabled = bool(body["tools_enabled"])
         if "tts_local_voice" in body:           # 本地音色：只改后端内存里的 TTS 配置，不重启、不丢棋局

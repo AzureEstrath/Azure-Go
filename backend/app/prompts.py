@@ -980,20 +980,27 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
     return _t(block)
 
 
-def life_context_block(chat_history, long_term="", time_facts=None, profile=None):
-    """聊天专用上下文（v4.2.7）：只给对话 / 长期记忆 / 时间 / 画像，不塞棋面与棋评铁律。
+def life_context_block(chat_history, long_term="", time_facts=None, profile=None, schedule_text=""):
+    """聊天专用上下文（v4.2.7）：只给对话 / 长期记忆 / 时间 / 画像 / 近期真实日程，不塞棋面与棋评铁律。
 
     桌宠聊天、以及围棋窗口里「与棋无关」的闲聊都走这里——模型看不到当前盘面与 KataGo
     形势，就不会把 Q16、胜率这类棋评混进日程闲聊。与棋有关的聊天仍走
     :func:`context_block`（完整盘面 + 铁律）。这是**按话题分流**，不是靠提示词压制输出。
 
-    各空段与 ``context_block`` 同口径：没有内容时不留痕；纯函数，不读全局状态。
+    ``schedule_text``（v4.2.9）是未来 48 小时的真实日程摘要；非空时插在时间/画像块之后，
+    防止「明天不用赶早八」这类与日程冲突的判断。各空段与 ``context_block`` 同口径：
+    没有内容时不留痕；纯函数，不读全局状态。
     """
-    return _t("【最近的对话】\n%s%s%s%s" % (
+    sched = str(schedule_text or "").strip()
+    sched_block = ""
+    if sched != "":
+        sched_block = "\n\n【近期真实日程 · 回答时以此为准，别编造】\n%s" % sched
+    return _t("【最近的对话】\n%s%s%s%s%s" % (
         chat_brief(chat_history),
         long_term_note(long_term),
         time_note(time_facts),
         profile_note(profile, 0),
+        sched_block,
     ))
 
 

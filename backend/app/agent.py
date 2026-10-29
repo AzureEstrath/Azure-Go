@@ -439,6 +439,8 @@ class AzureAgent:
         # 桌宠聊天只用预制音（v4.2.5）：true 时聊天这条链路不合成整句，前端播一句预制情绪音；
         # 语音服务本身仍照常启动（解耦「服务在跑」与「聊天是否调用它」）。
         self.pet_chat_tts_prebuilt = False
+        # 桌宠聊天思考档（v4.2.9）：0 无 / 1 低 / 2 中 / 3 强；棋评仍走 llm_think_mode。
+        self.pet_chat_think_level = 1
 
         # —— 跨局长期记忆：默认不接线（None），由 main.py 的 lifespan 注入 MemoryService ——
         self.memory = memory
@@ -958,24 +960,30 @@ class AzureAgent:
             out = out.replace("\n\n\n", "\n\n")
         return out if out != "" else text
 
-    async def _reply(self, messages, max_tokens=300, think_mode=None) -> str:
+    async def _reply(self, messages, max_tokens=300, think_mode=None, no_think=False) -> str:
         """所有对外展示的 LLM 回复统一过一遍清洗。
 
         ``think_mode`` 可按调用覆盖（桌宠走神/窥屏用快速档，别为一句 20 字的话
         等强思考）；``None`` 沿用客户端全局档位。
+        ``no_think=True``（v4.2.9 桌宠「无思考」档）：连推理预算也不给。
 
         云端失败时 ``LLMClient.chat`` 返回「调用出错：…」文案（不抛异常）；这里再兜住
         「真抛出来」的情况（返回空串），由调用方的兜底台词顶上——她该下的棋、该念的
         落子宣告都不会因此丢掉。
         """
         try:
-            if think_mode is None:
-                text = await self.llm.chat(messages, max_tokens)
-            else:
+            try:
+                text = await self.llm.chat(messages, max_tokens, think_mode=think_mode,
+                                           no_think=no_think)
+            except TypeError:
+                # 鸭子类型替身可能只实现旧签名：先退到「只带档位」，再退到「只带两参」，
+                # 绝不打挂这一回合。
                 try:
-                    text = await self.llm.chat(messages, max_tokens, think_mode=think_mode)
+                    if think_mode is None:
+                        text = await self.llm.chat(messages, max_tokens)
+                    else:
+                        text = await self.llm.chat(messages, max_tokens, think_mode=think_mode)
                 except TypeError:
-                    # 鸭子类型替身只实现旧三参 chat()：快速档退化为普通调用，绝不打挂这一回合。
                     text = await self.llm.chat(messages, max_tokens)
             return self.clean_reply(text)
         except Exception as e:                  # noqa: BLE001

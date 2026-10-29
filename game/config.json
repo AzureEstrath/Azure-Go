@@ -48,6 +48,7 @@
   "pet_enabled": true,
   "pet_height": 160,
   "pet_chat_tts_prebuilt": true,
+  "pet_chat_think_level": 1,
   "profile_enabled": false,
   "prompt_phase_notes": {
 

@@ -127,6 +127,8 @@ var tts_long_chunk := false       # 长句合并：单次 TTS 合成上限 100�
 ## v4.2.5 桌宠聊天只用预制情绪音：true 时聊天回复不再合成整句（CosyVoice 服务照常拉起，
 ## 围棋/试听等路径仍可用）；false 时恢复聊天整句 TTS。默认开——聊天出字不再等语音合成。
 var pet_chat_tts_prebuilt := true
+## v4.2.9 桌宠聊天思考档：0 无 / 1 低（默认）/ 2 中 / 3 强；只影响聊天，棋评仍走 llm_think_mode。
+var pet_chat_think_level := 1
 
 var _path := ""
 var _raw: Dictionary = {}       # 原样保存读到的配置，写回时只覆盖改动项（保留相对路径等写法）
@@ -224,6 +226,7 @@ static func load_config(path := "") -> AzureConfig:
 			c.tts_batch_speak = bool(d.get("tts_batch_speak", c.tts_batch_speak))
 			c.tts_long_chunk = bool(d.get("tts_long_chunk", c.tts_long_chunk))
 			c.pet_chat_tts_prebuilt = bool(d.get("pet_chat_tts_prebuilt", c.pet_chat_tts_prebuilt))
+			c.pet_chat_think_level = clampi(int(d.get("pet_chat_think_level", c.pet_chat_think_level)), 0, 3)
 			c.tts_local_base_url = str(d.get("tts_local_base_url", c.tts_local_base_url)).strip_edges()
 			c.tts_local_model = str(d.get("tts_local_model", c.tts_local_model)).strip_edges()
 			c.tts_local_voice = str(d.get("tts_local_voice", c.tts_local_voice)).strip_edges()
@@ -445,6 +448,7 @@ func save() -> bool:
 		"tts_batch_speak": tts_batch_speak,
 		"tts_long_chunk": tts_long_chunk,
 		"pet_chat_tts_prebuilt": pet_chat_tts_prebuilt,
+		"pet_chat_think_level": pet_chat_think_level,
 	}, true)
 	d.erase("tts_auto_start")                     # 本地语音服务拉起已删除：旧键不再写回
 	d.erase("tts_bf16")

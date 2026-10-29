@@ -102,6 +102,10 @@ func _test_view() -> void:
 	v.close_menu()
 	_check("菜单能收起", not v.is_menu_open())
 	_check("聊天面板有聊天预制音开关", v._prebuilt_check != null)
+	_check("聊天面板有思考档选项（无/低/中/强）",
+		v._think_opt != null and v._think_opt.item_count == 4)
+	v.set_think_level(2)
+	_check("思考档能同步配置", v._think_opt.selected == 2)
 	var toggled := [true]
 	v.prebuilt_tts_toggled.connect(func(on: bool): toggled[0] = on)
 	v.set_prebuilt_tts(true)
@@ -146,6 +150,12 @@ func _test_view() -> void:
 	])
 	_check("历史与当前会话合并且不重复",
 		log.get_child_count() == keep_n + 2 and v._chat_items.size() == keep_n + 2)
+	var dup_n: int = log.get_child_count()
+	v.append_chat("assistant", "重复测试")
+	var dup_one: int = log.get_child_count()
+	v.append_chat("assistant", "重复测试")
+	_check("紧邻同角色同文本回复不重复",
+		dup_one == dup_n + 1 and log.get_child_count() == dup_one)
 
 	v.open_files()
 	await process_frame
@@ -489,6 +499,9 @@ func _test_shell_instance() -> void:
 	_check("聊天面板勾选状态跟随配置",
 		shell.view._prebuilt_check != null
 		and shell.view._prebuilt_check.button_pressed == shell.cfg.pet_chat_tts_prebuilt)
+	_check("聊天思考档跟随配置",
+		shell.view._think_opt != null
+		and shell.view._think_opt.selected == shell.cfg.pet_chat_think_level)
 	shell._on_mood({"energy": 0.21, "boredom": 0.81, "affinity": 0.66, "trust": 0.44, "dominance": 0.55})
 	_check("桌宠接收精力 / 无聊 / 亲密 / 信任 / 掌控感",
 		is_equal_approx(shell._energy, 0.21) and is_equal_approx(shell._boredom, 0.81)

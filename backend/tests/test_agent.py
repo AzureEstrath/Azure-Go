@@ -6,6 +6,7 @@
 
 import asyncio
 import contextlib
+import datetime
 import io
 import os
 import random
@@ -654,16 +655,42 @@ class _FakeTTS:
         return {"mode": "openai", "id": "chat-audio", "tone": ""}
 
 
+class _ChatLife:
+    """只给聊天上下文读的假生命时间线 / 日程库（不碰真实 life.db）。"""
+
+    def __init__(self, rows=None):
+        self.rows = list(rows or [])
+        self.state = {"energy": 0.72, "boredom": 0.16, "affinity": 0.35,
+                      "trust": 0.50, "dominance": 0.50}
+
+    def list_schedule(self, limit=200):
+        return list(self.rows[:int(limit)])
+
+    def touch(self, *args, **kwargs):
+        pass
+
+    def temporal_facts(self, now=None):
+        return {}
+
+    def mood_after_break(self, *args, **kwargs):
+        return {}
+
+
 class PetChatTest(unittest.TestCase):
     """v4.2.5：聊天自然接话 + 结构化重答 + 桌宠聊天只发文字（预制音在前端）。"""
 
-    def _run(self, llm, text="明天晚上有数据科学课", mode="pet", prebuilt=False):
+    def _run(self, llm, text="明天晚上有数据科学课", mode="pet", prebuilt=False,
+             think_level=None, life=None):
         async def run():
             agent, _eng, _llm, bus = _mk()
             agent.llm = llm
             tts = _FakeTTS()
             agent.tts = tts
             agent.pet_chat_tts_prebuilt = prebuilt
+            if think_level is not None:
+                agent.pet_chat_think_level = think_level
+            if life is not None:
+                agent.life = life
             await agent.chat(text, mode)
             return agent, bus, tts
 
@@ -677,12 +704,32 @@ class PetChatTest(unittest.TestCase):
         self.assertNotIn("当前棋面", ctx)
         self.assertNotIn("KataGo 形势", ctx)
 
+    def test_chat_context_includes_upcoming_schedule(self):
+        tomorrow = datetime.datetime.combine(
+            datetime.date.today() + datetime.timedelta(days=1), datetime.time(8, 0))
+        life = _ChatLife([{"id": 1, "title": "有机化学", "status": "planned",
+                           "start_ts": tomorrow.timestamp(), "start_time": "08:00"}])
+        llm = StubLLM()
+        self._run(llm, text="明天要早起吗", life=life)
+        ctx = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertIn("近期真实日程", ctx)
+        self.assertIn("有机化学", ctx)
+        self.assertIn("明天", ctx)
+
     def test_game_chat_about_go_keeps_board_context(self):
         llm = StubLLM()
         _agent, _bus, _tts = self._run(llm, text="这手棋怎么样", mode="game")
         ctx = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
         self.assertIn("当前棋面", ctx)
         self.assertIn("KataGo 形势", ctx)
+
+    def test_pet_chat_think_levels_map_to_llm(self):
+        cases = [(0, 0, True), (1, 0, False), (2, 1, False), (3, 2, False)]
+        for level, think_mode, no_think in cases:
+            llm = StubLLM()
+            self._run(llm, think_level=level)
+            self.assertEqual(llm.think_modes[0], think_mode, "level=%d" % level)
+            self.assertEqual(llm.calls[0][2], no_think, "level=%d no_think" % level)
 
     def test_structured_chat_reply_retried_without_thinking(self):
         llm = _SeqLLM([

@@ -76,6 +76,11 @@ var pet_chat_tts_prebuilt := true:
 	set(v):
 		pet_chat_tts_prebuilt = v
 		_push_settings()
+## 桌宠聊天思考档（v4.2.9）：0 无 / 1 低 / 2 中 / 3 强；只影响聊天，棋评仍走 llm_think_mode。
+var pet_chat_think_level := 1:
+	set(v):
+		pet_chat_think_level = clampi(int(v), 0, 3)
+		_push_settings()
 var reply_style := 0:
 	set(v):
 		reply_style = v
@@ -611,7 +616,8 @@ func _flush_settings() -> void:
 		"persona_address_name": persona_address_name,
 		"adaptive_difficulty": adaptive_difficulty,
 		"adaptive_difficulty_base": adaptive_difficulty_base,
-		"pet_chat_tts_prebuilt": pet_chat_tts_prebuilt})
+		"pet_chat_tts_prebuilt": pet_chat_tts_prebuilt,
+		"pet_chat_think_level": pet_chat_think_level})
 
 ## 取一次 JSON：HTTP 2xx 且响应体是对象才算 ok；其余一律 callback(false, code, {})。
 func _fetch_json(path: String, method: int, body: Dictionary, callback: Callable,

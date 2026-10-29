@@ -121,8 +121,10 @@ func _build_ui() -> void:
 	view.go_requested.connect(_launch_game)
 	view.size_selected.connect(_on_size_selected)
 	view.prebuilt_tts_toggled.connect(_on_prebuilt_tts_toggled)
+	view.think_level_selected.connect(_on_think_level_selected)
 	view.quit_requested.connect(_on_quit)
 	view.set_prebuilt_tts(cfg.pet_chat_tts_prebuilt)
+	view.set_think_level(cfg.pet_chat_think_level)
 
 func _build_services() -> void:
 	tts = TTSClientScript.new()
@@ -168,6 +170,7 @@ func _apply_agent_settings() -> void:
 		return
 	agent.set_tts_local_voice(cfg.tts_local_voice)
 	agent.pet_chat_tts_prebuilt = cfg.pet_chat_tts_prebuilt
+	agent.pet_chat_think_level = cfg.pet_chat_think_level
 	agent.reply_style = cfg.reply_style
 	agent.think_mode = cfg.llm_think_mode
 	agent.joseki_teach = cfg.joseki_teach
@@ -1115,6 +1118,15 @@ func _on_prebuilt_tts_toggled(on: bool) -> void:
 		agent.pet_chat_tts_prebuilt = on
 	view.show_bubble("聊天语音：%s。" % ("只用预制情绪音" if on else "整句合成"), 4.0)
 	_play_tone(_tone_for_mood())
+
+## v4.2.9 桌宠聊天思考档（无 / 低 / 中 / 强）：写回配置并即时推给后端。
+func _on_think_level_selected(level: int) -> void:
+	cfg.pet_chat_think_level = clampi(level, 0, 3)
+	cfg.save()
+	if agent != null:
+		agent.pet_chat_think_level = cfg.pet_chat_think_level
+	var labels := ["无", "低", "中", "强"]
+	view.show_bubble("聊天思考：%s。" % labels[cfg.pet_chat_think_level], 4.0)
 
 func _on_quit() -> void:
 	view.save_position()

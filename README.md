@@ -3,7 +3,7 @@
 > **桌宠是主程序，围棋是它打开的独立窗口。**
 > 同一套 Azure 人格、情绪、时间线与记忆，在桌宠、围棋窗口和重启后的下一次见面之间保持连续。
 
-**版本：v4.2.8（Release）**
+**版本：v4.2.9（Release）**
 
 Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你说话、看你在忙什么，也可以打开一盘围棋和你下棋。她不是“围棋程序里的桌宠模式”，而是一个有自己的时间、精力、心情与记忆的桌面角色。
 
@@ -100,6 +100,9 @@ Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你�
   **v4.2.8**：解决「一直在想」——聊天快速档现在会**真把 `enable_thinking` 切回 false**；
   情绪精修改为后台任务并在下一句聊天到达时取消；日程判断 10 秒、单次 LLM 请求 45 秒硬超时，
   聊天本身 20 秒兜底；本地单槽位模型不再被后台小调用占住。
+  **v4.2.9**：聊天会先读**未来 48 小时的真实日程**再回答（不再出现「明天是周五，不用赶早八」
+  这种和课表冲突的臆测）；同一条回复被历史与 WS 各追加一次时只留一个气泡；桌宠聊天面板新增
+  **无 / 低 / 中 / 强**四档思考，随档位放宽出话超时。
 - **资料箱 → 周课表**：图片 / PDF / 文档经 OCR + VLM 读取；课程表按 OCR 坐标还原成
   7 天 × 12 节的周课表（星期、节次、教师、地点、日期），不再压成一串文字。
 - **重扫不再重复 / 事件不再误判（v4.1.7）**：课程按「日期 + 节次 + 标题」去重，
@@ -317,7 +320,7 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `backend_url` | `http://127.0.0.1:8000` | 后端地址 |
 | `katago_url` | `http://127.0.0.1:8100` | KataGo 服务地址 |
 | `llm_base_url` / `llm_model` / `llm_api_key` | 本地 | 任意 OpenAI 兼容 LLM |
-| `llm_think_mode` | `1` | 棋评思考档位：0 快速 / 1 中等（默认）/ 2 强思考；聊天 / 待机在代码里固定走快速档 |
+| `llm_think_mode` | `1` | 棋评思考档位：0 快速 / 1 中等（默认）/ 2 强思考；聊天档位见 `pet_chat_think_level` |
 | `llm_timeout_sec` | `45` | 单次 LLM 请求硬超时（秒）；卡住时及时释放生成槽位 |
 | `time_aware_enabled` | `true` | 注入绝对 / 相对 / 昼夜时间事实 |
 | `memory_enabled` | `true` | 共享聊天流水、episode、长期记忆 |
@@ -340,6 +343,7 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `tts_local_base_url` | `http://127.0.0.1:9880/v1` | 本地 TTS |
 | `tts_local_voice` | `azure` | 本地音色（如 `azure` / `xiaoya`） |
 | `pet_chat_tts_prebuilt` | `true` | 桌宠聊天只用预制情绪音（不合成整句；CosyVoice 照常启动，聊天面板可切回） |
+| `pet_chat_think_level` | `1` | 桌宠聊天思考档：0 无 / 1 低（默认）/ 2 中 / 3 强；面板可即时切换，棋评不受影响 |
 | `ui_theme` | `mist` | 客户端主题 |
 | `prompt_user_name` | `朋友` | 对玩家的称呼 |
 
@@ -440,7 +444,7 @@ cd backend
 python -m unittest discover -s tests -q
 ```
 
-当前全量：**1063 tests OK**。
+当前全量：**1085 tests OK**。
 
 ### 前端门卫
 
@@ -459,7 +463,7 @@ Get-ChildItem game\tests\test_*.gd | ForEach-Object {
 }
 ```
 
-当前 20 个前端脚本全部通过；`test_pet_shell.gd` 118 项断言（含月历 / 周视图 / 完成保留 / 聊天排程与历史清洗）。
+当前 20 个前端脚本全部通过；`test_pet_shell.gd` 138 项断言（含月历 / 周视图 / 完成保留 / 聊天排程与历史清洗 / 圆形遮罩 / 四档思考 / 气泡去重），`test_config.gd` 221 项断言。
 
 ### 启动自检
 

@@ -42,6 +42,10 @@
 > **v4.2.8：聊天快速档按调用回退到基础 `extra_body`（`enable_thinking:false`），不再被
 > 全局棋评档的思考字段拖慢；情绪精修改后台并可被下一句聊天取消（6 秒上限）；日程判断
 > 10 秒、LLM 请求 45 秒、聊天 20 秒硬超时，卡住时释放单槽位并走兜底。**
+> **v4.2.9：聊天上下文注入未来 48 小时真实日程（`_upcoming_schedule_text` →
+> `prompts.life_context_block` 的【近期真实日程】段），回答不再与课表冲突；相邻同角色同文本
+> 回复不再重复成两个气泡；桌宠聊天面板新增无 / 低 / 中 / 强四档思考（`pet_chat_think_level`），
+> 按档位决定 `think_mode` / `no_think` 与出话超时。**
 > 最后更新：2026-10-29。
 
 ---
@@ -296,7 +300,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | 组 | 字段 |
 | --- | --- |
 | 后端 | `backend_url`、`auto_start_services` |
-| LLM | `llm_base_url`、`llm_model`、`llm_api_key`、`llm_think_mode`、`llm_timeout_sec`、`extra_body` |
+| LLM | `llm_base_url`、`llm_model`、`llm_api_key`、`llm_think_mode`、`llm_timeout_sec`、`pet_chat_think_level`、`extra_body` |
 | 棋力 | `max_visits`、`katago_url`、`katago_token`、`katago_timeout_ms` |
 | 教学 | `joseki_teach`、`joseki_rate`、`adaptive_difficulty` 系列 |
 | 情绪 | `emotion_drift`、`drift_base`、`drift_max` |
@@ -533,7 +537,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 **1081** 个用例，覆盖：
+`backend/tests` 共 **1085** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -614,7 +618,9 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
 13. **聊天上下文分流与圆形桌宠（v4.2.7，纯逻辑 / 前端）**：`agent_graph._prepare_chat`
    用 `_chat_about_go(text)` 规则分流——`mode=pet` 或非棋话题走 `prompts.life_context_block`
    （对话 / 长期记忆 / 时间 / 画像），明确聊棋才走原 `context_block`（盘面 + KataGo + 铁律）。
-   `_speak_chat` 固定 `think_mode=0`；棋评阶段仍用配置档位（默认 1 中等）。
+   `_speak_chat` 在 v4.2.7 固定 `think_mode=0`；v4.2.9 起由桌宠面板的
+   `pet_chat_think_level`（0 无 / 1 低 / 2 中 / 3 强）决定档位与超时；棋评阶段仍用配置档位
+   （默认 1 中等）。
    `PetView` 的桌宠容器改为正方形，`_circle_mask_shader()` 在 fragment 里按 UV 圆裁切、
    透明处补纸色圆底并画淡墨描边；`STRETCH_KEEP_ASPECT_CENTERED` 保证不拉伸变形。
 14. **聊天速度与生成槽位（v4.2.8，后端 / LLM 客户端）**：`LLMClient._extra_for()` 按每次调用
@@ -624,6 +630,16 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
    `chat()` 先 `cancel_background_llm()` 取消它，`_mood_llm_refine` 自身 6 秒超时；
    日程判断 `asyncio.wait_for(10s)`、聊天 `20s`、LLM 请求 `llm_timeout_sec=45` 硬上限。
    所有取消都经 `async with _gen_lock` 释放单槽位生成锁，超时按空回复走兜底台词。
+15. **聊天日程事实与四档思考（v4.2.9）**：`agent_graph._prepare_chat` 的非棋话题分支先
+   `_upcoming_schedule_text()`（`life.list_schedule` 走 to_thread，失败返回空串）取未来 48 小时
+   `status=planned` 的条目，压成「今天 / 明天 / 后天 / 周X + 时刻 + 标题」注入
+   `prompts.life_context_block` 的【近期真实日程 · 回答时以此为准，别编造】段——模型不再
+   靠日期推算「明天有没有早八」。`PetView.append_chat()` 对紧邻同角色同文本直接 return
+  （历史重建 `_chat_rebuilding` 时不触发），解决 DB 历史与 WS `message` 各追加一次；
+  历史合并与空响应不清屏保持不变。桌宠面板 `OptionButton`（无 / 低 / 中 / 强）→
+  `think_level_selected` → `AzureConfig.pet_chat_think_level` 持久化 + `/api/config` 推后端；
+  `_chat_think_params()` 映射 (0,no_think) / (0,False) / (1,False) / (2,False)，
+  `_chat_timeout_for_level()` 为 15 / 20 / 35 / 50 秒；棋评仍走全局 `llm_think_mode`。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 

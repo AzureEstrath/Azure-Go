@@ -49,8 +49,10 @@
 """
 
 import asyncio
+import datetime
 import random
 import sys
+import time
 import uuid
 from typing import TypedDict
 
@@ -74,6 +76,34 @@ MAX_LLM_CALLS_PER_TURN = 4
 # 优先把生成槽位让给用户这句话。
 CHAT_LLM_TIMEOUT_SEC = 20.0
 CHAT_RETRY_TIMEOUT_SEC = 10.0
+
+
+def _chat_think_params(level):
+    """桌宠聊天思考档（v4.2.9）：0 无 / 1 低 / 2 中 / 3 强 → (think_mode, no_think)。
+
+    「无」额外把推理预算整个关掉（``no_think=True``）；「低」仍是快速档，但保留正常输出余量。
+    棋评不受这个设置影响，仍走全局 ``llm_think_mode``。
+    """
+    try:
+        lv = max(0, min(3, int(level)))
+    except (TypeError, ValueError):
+        lv = 1
+    if lv <= 0:
+        return 0, True
+    if lv == 1:
+        return 0, False
+    if lv == 2:
+        return 1, False
+    return 2, False
+
+
+def _chat_timeout_for_level(level):
+    """思考档越高，聊天允许等得越久；「无 / 低」仍保持快速兜底。"""
+    try:
+        lv = max(0, min(3, int(level)))
+    except (TypeError, ValueError):
+        lv = 1
+    return {0: 15.0, 1: CHAT_LLM_TIMEOUT_SEC, 2: 35.0, 3: 50.0}[lv]
 
 # —— 阶段：一次 graph.ainvoke 处理一个 ——
 PHASE_AFTER_PLAYER = "after_player"     # 玩家落子：引擎分析 + 落子 + 定式 + 情绪 + 点评
@@ -725,6 +755,56 @@ async def _prepare_analyze(agent, data):
     )
 
 
+async def _upcoming_schedule_text(agent, hours=48, limit=8):
+    """把未来 48 小时的真实日程压成几行，给聊天模型做事实依据（v4.2.9）。
+
+    聊天里最容易出问题的不是用语，而是「明天不用赶早八」这种**和日程冲突的判断**。
+    这里只读 ``LifeStore.list_schedule``（一次同步查询走 to_thread），失败返回空串，
+    不影响聊天；条目以「今天 / 明天 / 后天 / 周X + 时刻 + 标题」呈现。
+    """
+    life = getattr(agent, "life", None)
+    if life is None:
+        return ""
+    try:
+        rows = list(await asyncio.to_thread(life.list_schedule, 200) or [])
+    except Exception as e:                  # noqa: BLE001 —— 日程读取失败绝不打挂聊天
+        print("[Chat] 近期日程读取失败（已忽略）：%s" % e)
+        return ""
+    now = time.time()
+    today = datetime.date.today()
+    wd_names = "一二三四五六日"
+    lines = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if str(r.get("status", "planned")) != "planned":
+            continue
+        try:
+            start = float(r.get("start_ts", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if start <= 0 or start < now - 60.0 or start > now + hours * 3600.0:
+            continue
+        title = str(r.get("title", "") or "").strip()
+        if title == "":
+            continue
+        d = datetime.datetime.fromtimestamp(start)
+        days = (d.date() - today).days
+        if days == 0:
+            day_label = "今天"
+        elif days == 1:
+            day_label = "明天"
+        elif days == 2:
+            day_label = "后天"
+        else:
+            day_label = "周" + wd_names[d.weekday()]
+        clock = str(r.get("start_time", "") or "").strip() or d.strftime("%H:%M")
+        lines.append("- %s（周%s）%s %s" % (day_label, wd_names[d.weekday()], clock, title))
+        if len(lines) >= limit:
+            break
+    return "\n".join(lines)
+
+
 async def _prepare_chat(agent, data):
     """聊天：长期记忆召回 → 上下文块 + 历史窗口 + 这一句。
 
@@ -745,9 +825,11 @@ async def _prepare_chat(agent, data):
         if mode == "pet" or not _chat_about_go(text):
             # 当前这句会单独作为最后一条 user 消息发送，上下文里不重复它。
             hist_now = list(getattr(agent.st, "chat_history", []) or [])
+            sched_text = await _upcoming_schedule_text(agent)
             ctx = prompts.life_context_block(
                 hist_now[:-1] if hist_now else hist_now, long_term=lt,
-                time_facts=time_facts, profile=profile)
+                time_facts=time_facts, profile=profile,
+                schedule_text=sched_text)
         else:
             ctx = prompts.context_block(
                 agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True,
@@ -1303,12 +1385,22 @@ async def _speak_chat(agent, data, msgs):
     if not msgs:
         data["reply"] = ""
         return
+    mode = str(data.get("mode") or "game")
+    level = 1
+    if mode == "pet":
+        try:
+            level = max(0, min(3, int(getattr(agent, "pet_chat_think_level", 1))))
+        except (TypeError, ValueError):
+            level = 1
+    think_mode, no_think = _chat_think_params(level)
+    chat_timeout = _chat_timeout_for_level(level)
     try:
         raw = await asyncio.wait_for(
-            _say(agent, msgs, 400, think_mode=0, naturalize=False, stream_with_think=True),
-            timeout=CHAT_LLM_TIMEOUT_SEC)
+            _say(agent, msgs, 400, think_mode=think_mode, no_think=no_think,
+                 naturalize=False, stream_with_think=True),
+            timeout=chat_timeout)
     except asyncio.TimeoutError:
-        print("[Chat] 聊天出话超时（%.0f 秒），走兜底" % CHAT_LLM_TIMEOUT_SEC)
+        print("[Chat] 聊天出话超时（%.0f 秒），走兜底" % chat_timeout)
         raw = ""
     if actions.looks_structured(raw):
         retry_msgs = list(msgs) + [{"role": "user", "content": (
@@ -1317,7 +1409,7 @@ async def _speak_chat(agent, data, msgs):
             "或从你们的共同记忆里换个话题。）")}]
         try:
             raw = await asyncio.wait_for(
-                _say(agent, retry_msgs, 260, think_mode=0, naturalize=False),
+                _say(agent, retry_msgs, 260, think_mode=0, no_think=True, naturalize=False),
                 timeout=CHAT_RETRY_TIMEOUT_SEC)
         except asyncio.TimeoutError:
             print("[Chat] 聊天重答超时（走兜底）")
@@ -1452,21 +1544,23 @@ async def _consume_stream(agent, msgs, max_tokens):
     return agent.clean_reply(text)
 
 
-async def _say(agent, msgs, max_tokens, think_mode=None, naturalize=True, stream_with_think=False):
+async def _say(agent, msgs, max_tokens, think_mode=None, naturalize=True, stream_with_think=False,
+               no_think=False):
     """speak 阶段的统一出话口：流式开着就走流式，否则与 Task 2/3/4 的 ``agent._reply`` 同一条路。
 
     ``think_mode`` 显式给值时**跳过流式**（桌宠走神/窥屏的快速档）：这类短句不该为了
     token 流多等一轮；不传时行为与旧版逐字一致。
     ``stream_with_think=True``（v4.2.7 聊天）例外：流式通道仍可走，档位提示只作用于
     非流式回落路径；默认关闭，既有快速档调用行为不变。
+    ``no_think=True``（v4.2.9 桌宠「无思考」档）连推理预算也不给，并且不走流式。
     ``naturalize=False`` 给聊天重答路径：先看原文是不是结构化 JSON，再决定要不要重试；
     其余调用保持默认，行为不变。
     """
     text = None
-    if think_mode is None or stream_with_think:
+    if not no_think and (think_mode is None or stream_with_think):
         text = await _streamed_text(agent, msgs, max_tokens)
     if text is None:
-        text = await agent._reply(msgs, max_tokens, think_mode=think_mode)
+        text = await agent._reply(msgs, max_tokens, think_mode=think_mode, no_think=no_think)
     if not naturalize:
         return text
     # 结构化误输出兜底：模型偶尔会直接吐日程 JSON（聊天 / 走神都可能），把它转成人话；

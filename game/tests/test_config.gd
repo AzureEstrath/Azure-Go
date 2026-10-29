@@ -109,6 +109,13 @@ func _run() -> void:
 	_write_raw({"pet_chat_tts_prebuilt": false})
 	_check("pet_chat_tts_prebuilt=false 读入",
 		not AzureConfig.load_config(TMP).pet_chat_tts_prebuilt)
+	_write_raw({})
+	_check("pet_chat_think_level 缺省 ⇒ 低档（1）",
+		AzureConfig.load_config(TMP).pet_chat_think_level == 1)
+	_write_raw({"pet_chat_think_level": 3})
+	_check("pet_chat_think_level 读入强档", AzureConfig.load_config(TMP).pet_chat_think_level == 3)
+	_write_raw({"pet_chat_think_level": 9})
+	_check("pet_chat_think_level 越界夹到 3", AzureConfig.load_config(TMP).pet_chat_think_level == 3)
 
 	# —— 1e) 窥屏 VLM：开关 / 地址 / 自动拉起 / 端口 / 高级路径（缺省与脏值都不能炸）——
 	_write_raw({"vlm_enabled": false, "vlm_base_url": " http://127.0.0.1:8090/v1 ",
@@ -176,6 +183,7 @@ func _run() -> void:
 	c3.persona_relationship_enabled = true
 	c3.persona_address_name = "搭档"
 	c3.pet_chat_tts_prebuilt = false
+	c3.pet_chat_think_level = 3
 	_check("save() 返回成功", c3.save())
 	var out := _read_raw()
 	for k in DEAD_KEYS:
@@ -198,6 +206,8 @@ func _run() -> void:
 	_check("save() 写回关系称呼名", out.get("persona_address_name", "") == "搭档")
 	_check("save() 写回桌宠聊天预制音开关",
 		not bool(out.get("pet_chat_tts_prebuilt", true)))
+	_check("save() 写回桌宠聊天思考档",
+		int(out.get("pet_chat_think_level", -1)) == 3)
 
 	# —— 4) 定式导学＝开关 + 频率（joseki_teach / joseki_rate）——
 	# 口径与后端 `config._apply` 一致：键缺失 ⇒ 默认（teach=true / rate=0.5）；

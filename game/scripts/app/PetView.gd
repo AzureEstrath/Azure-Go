@@ -25,6 +25,7 @@ signal schedule_feedback_requested(id: int, outcome: String, actual_min: int)
 signal go_requested
 signal size_selected(height: int)
 signal prebuilt_tts_toggled(on: bool)
+signal think_level_selected(level: int)
 signal quit_requested
 
 const SIZE_PRESETS := [120, 160, 200, 240]
@@ -114,6 +115,7 @@ var _chat_open := false
 var _files_open := false
 var _menu_open := false
 var _prebuilt_check: CheckBox
+var _think_opt: OptionButton
 var _pet_box := Rect2()
 var _window_dragging := false
 var _drag_moved := false
@@ -326,6 +328,10 @@ func set_prebuilt_tts(on: bool) -> void:
 	if _prebuilt_check != null:
 		_prebuilt_check.set_pressed_no_signal(on)     # 只同步勾选状态，不反向触发 `prebuilt_tts_toggled`
 
+func set_think_level(level: int) -> void:
+	if _think_opt != null:
+		_think_opt.select(clampi(level, 0, 3))       # `select` 不会触发 item_selected
+
 func _rule(parent: Node) -> void:
 	var r := ColorRect.new()
 	r.color = Color(GufengTheme.INK, 0.20)
@@ -386,6 +392,27 @@ func _build_chat() -> void:
 	_prebuilt_check.add_theme_font_size_override("font_size", 10)
 	_prebuilt_check.toggled.connect(func(on: bool): prebuilt_tts_toggled.emit(on))
 	vb.add_child(_prebuilt_check)
+
+	# v4.2.9：桌宠聊天思考档（无 / 低 / 中 / 强）——只影响聊天，棋评仍走全局档位。
+	var think_row := HBoxContainer.new()
+	think_row.add_theme_constant_override("separation", 4)
+	var think_lbl := Label.new()
+	think_lbl.text = "思考"
+	think_lbl.add_theme_font_size_override("font_size", 10)
+	think_lbl.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
+	think_row.add_child(think_lbl)
+	_think_opt = OptionButton.new()
+	_think_opt.add_item("无", 0)
+	_think_opt.add_item("低", 1)
+	_think_opt.add_item("中", 2)
+	_think_opt.add_item("强", 3)
+	_think_opt.selected = 1
+	_think_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_think_opt.tooltip_text = "聊天思考强度：无 = 直接回答（最快）；低 = 快速档（默认）；\n" \
+		+ "中 = 中等推理；强 = 更完整的推理（更慢）。只影响聊天，棋评不受影响。"
+	_think_opt.item_selected.connect(func(idx: int): think_level_selected.emit(idx))
+	think_row.add_child(_think_opt)
+	vb.add_child(think_row)
 
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 4)
@@ -2225,6 +2252,12 @@ func append_chat(role: String, text: String) -> void:
 	var clean := _clean_chat_text(role, text)
 	if clean == "":
 		return
+	if not _chat_rebuilding and not _chat_items.is_empty():
+		# v4.2.9：历史刚拉回这条回复、WS 的实时 message 又到一次 ⇒ 不再重复同一气泡。
+		# 只按「紧邻同角色同文本」判断，正常的连续不同回复不受影响。
+		var last: Dictionary = _chat_items[_chat_items.size() - 1]
+		if str(last.get("role", "")) == role and str(last.get("text", "")) == clean:
+			return
 	if not _chat_rebuilding:
 		_chat_items.append({"role": role, "text": clean})
 	_append_chat_row(role, clean)

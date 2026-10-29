@@ -1177,6 +1177,22 @@ class ChatStyleRuntimeTest(unittest.TestCase):
             self.assertEqual(app.state.agent.reply_style, 2)
             self.assertEqual(app.state.agent.llm.think_mode, 1)
 
+    def test_pet_chat_think_level_live(self):
+        """v4.2.9：桌宠面板四档思考经 ``/api/config`` 即时写进 agent，越界夹取、脏值不生效。"""
+        app = self._app()
+        with TestClient(app) as client:
+            agent = app.state.agent
+            self.assertEqual(agent.pet_chat_think_level, 1)
+            client.post("/api/config", json={"pet_chat_think_level": 3})
+            self.assertEqual(agent.pet_chat_think_level, 3)
+            client.post("/api/config", json={"pet_chat_think_level": -5})
+            self.assertEqual(agent.pet_chat_think_level, 0)
+            client.post("/api/config", json={"pet_chat_think_level": 9})
+            self.assertEqual(agent.pet_chat_think_level, 3)
+            r = client.post("/api/config", json={"pet_chat_think_level": "abc"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(agent.pet_chat_think_level, 3)
+
     def test_legacy_limit_len_still_maps_to_brief(self):
         app = self._app()
         with TestClient(app) as client:

@@ -127,6 +127,8 @@ class AzureConfig:
         # 桌宠聊天语音（v4.2.5）：默认只用预制音，不调 CosyVoice 合成整句；
         # 服务照常由启动流程拉起（这里只决定聊天这条链路是否合成）。
         self.pet_chat_tts_prebuilt = True
+        # 桌宠聊天思考档（v4.2.9）：0 无 / 1 低（默认）/ 2 中 / 3 强；只影响聊天，不影响棋评。
+        self.pet_chat_think_level = 1
         # —— 本地语音：tts_mode=local 时只走它（失败回落系统语音）；tts_mode=openai 时非空则先试它，
         #    失败再试云端 tts_base_url，最后系统语音（旧配置兼容）——
         self.tts_local_base_url = ""        # 本地 OpenAI 兼容地址（如 http://127.0.0.1:9880/v1）
@@ -328,6 +330,11 @@ class AzureConfig:
         self.tts_long_chunk = bool(d.get("tts_long_chunk", self.tts_long_chunk))
         self.pet_chat_tts_prebuilt = bool(d.get(
             "pet_chat_tts_prebuilt", self.pet_chat_tts_prebuilt))
+        try:
+            self.pet_chat_think_level = max(0, min(3, int(d.get(
+                "pet_chat_think_level", self.pet_chat_think_level))))
+        except (TypeError, ValueError):
+            self.pet_chat_think_level = 1
         self.tts_local_base_url = str(d.get("tts_local_base_url", self.tts_local_base_url))
         self.tts_local_model = str(d.get("tts_local_model", self.tts_local_model))
         self.tts_local_api_key = str(d.get("tts_local_api_key", self.tts_local_api_key))

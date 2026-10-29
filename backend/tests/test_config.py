@@ -64,6 +64,16 @@ class LLMTimeoutConfigTest(unittest.TestCase):
                     json.dump({"llm_timeout_sec": raw}, f)
                 self.assertEqual(AzureConfig.load(p).llm_timeout_sec, want, raw)
 
+    def test_pet_chat_think_level_default_and_clamp(self):
+        self.assertEqual(AzureConfig().pet_chat_think_level, 1)
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            for raw, want in [(3, 3), (9, 3), ("abc", 1)]:
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump({"pet_chat_think_level": raw}, f)
+                self.assertEqual(AzureConfig.load(p).pet_chat_think_level, want, raw)
+
 
 class CloudKatagoConfigTest(unittest.TestCase):
     def test_katago_fields_replaced(self):
