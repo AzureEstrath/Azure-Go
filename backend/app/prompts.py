@@ -980,6 +980,23 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
     return _t(block)
 
 
+def life_context_block(chat_history, long_term="", time_facts=None, profile=None):
+    """聊天专用上下文（v4.2.7）：只给对话 / 长期记忆 / 时间 / 画像，不塞棋面与棋评铁律。
+
+    桌宠聊天、以及围棋窗口里「与棋无关」的闲聊都走这里——模型看不到当前盘面与 KataGo
+    形势，就不会把 Q16、胜率这类棋评混进日程闲聊。与棋有关的聊天仍走
+    :func:`context_block`（完整盘面 + 铁律）。这是**按话题分流**，不是靠提示词压制输出。
+
+    各空段与 ``context_block`` 同口径：没有内容时不留痕；纯函数，不读全局状态。
+    """
+    return _t("【最近的对话】\n%s%s%s%s" % (
+        chat_brief(chat_history),
+        long_term_note(long_term),
+        time_note(time_facts),
+        profile_note(profile, 0),
+    ))
+
+
 def with_context(moves, memory_log, chat_history, prompt, phase, skip_last_chat=False, katago="", board=None,
                  long_term="", events=None, now_move_no=None, profile=None, time_facts=None):
     """在原提示词前附上对局全貌与回忆（原提示词本身不改动）；``long_term`` / ``events`` /

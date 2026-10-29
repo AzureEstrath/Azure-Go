@@ -2480,6 +2480,10 @@ func _button(parent: Node, text: String, cb: Callable) -> Button:
 	return b
 
 func _add_msg(kind: String, text: String) -> void:
+	if kind == AI_SCHEDULE:
+		# v4.2.7：日程补充只是**数据刷新信号**（后端已落库），围棋聊天里不再插播模板确认；
+		# 桌宠资料面板会自行重拉。这样棋评 / 闲聊里不会再突然冒出「日程记好了」。
+		return
 	if _pet_active:
 		_pet_add_msg(kind, text)
 		return

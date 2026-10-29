@@ -1,5 +1,6 @@
 """日程 API：自动排班 / 留档 / 清理 / 手动提醒（临时 LifeStore，不触网）。"""
 
+import datetime
 import os
 import sys
 import tempfile
@@ -206,6 +207,48 @@ class ChatScheduleApiTest(unittest.TestCase):
                     self.assertEqual(len(msgs), 1)
                     self.assertIn("组会", msgs[0]["text"])
                     self.assertIn("提醒", msgs[0]["text"])
+            finally:
+                store.close()
+
+    def test_chat_cancel_removes_takeout_from_schedule(self):
+        """v4.2.7：先说“外卖提醒我去拿”，再改口“不吃了/退掉了”，必须从日程里撤掉。"""
+        with tempfile.TemporaryDirectory() as d:
+            store = LifeStore(os.path.join(d, "life.db"))
+            cfg = AzureConfig()
+            cfg.auto_plan_enabled = False
+            tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+            schedule_text = (
+                '{"schedule": true, "items": ['
+                '{"date": "%s", "time": "23:00", "title": "去拿外卖", "duration_min": 60}]}'
+                % tomorrow)
+            llm = _ChatScheduleLLM(chat_text="好，我记着。", schedule_text=schedule_text)
+            bus = events.RecordingBus()
+            agent = AzureAgent(StubEngine(), llm, bus, joseki_rate=1.0,
+                               joseki_rng=ZeroRng())
+            app = create_app(cfg=cfg, agent=agent, autostart=False, life=store)
+            try:
+                with TestClient(app) as client:
+                    r = client.post("/api/chat", json={
+                        "text": "明天晚上23点外卖送到，提醒我去拿", "mode": "pet"})
+                    self.assertTrue(r.json()["ok"])
+                    scheduled = self._wait_items(store)
+                    self.assertEqual(len(scheduled), 1)
+                    sid = int(scheduled[0]["id"])
+                    self.assertEqual(scheduled[0]["title"], "去拿外卖")
+
+                    r = client.post("/api/chat", json={
+                        "text": "我不吃了，已经退掉了", "mode": "pet"})
+                    self.assertTrue(r.json()["ok"])
+                    end = time.time() + 3.0
+                    while time.time() < end:
+                        if sid not in [int(x["id"]) for x in store.list_schedule(50)]:
+                            break
+                        time.sleep(0.05)
+                    self.assertNotIn(sid, [int(x["id"]) for x in store.list_schedule(50)])
+                    row = store.get_schedule_item(sid)
+                    self.assertEqual(row.get("status"), "cancelled")
+                    msgs = self._wait_messages(bus)
+                    self.assertTrue(any("撤掉" in str(m.get("text", "")) for m in msgs))
             finally:
                 store.close()
 

@@ -201,6 +201,22 @@ def _start_chat_schedule(app, cfg, agent, text):
     task.add_done_callback(tasks.discard)
 
 
+def _recent_chat_text(agent, limit=8):
+    """把最近几轮对话拼成一段**取消判断**用的上下文（当前这句已包含在 chat_history 里）。"""
+    try:
+        hist = list(getattr(getattr(agent, "st", None), "chat_history", []) or [])
+    except Exception:                       # noqa: BLE001
+        hist = []
+    lines = []
+    for m in hist[-max(2, int(limit or 8)):]:
+        if not isinstance(m, dict):
+            continue
+        txt = str(m.get("content", "") or "").strip()
+        if txt:
+            lines.append(txt[:160])
+    return " / ".join(lines)
+
+
 async def _capture_chat_schedule(app, cfg, agent, text):
     """聊天 → 日程：判断、写库、按需自动排班、写记忆、发一条 ``ai_schedule`` 补充。
 
@@ -216,6 +232,34 @@ async def _capture_chat_schedule(app, cfg, agent, text):
         app.state.chat_capture_lock = lock
     async with lock:
         now = time.time()
+        # v4.2.7：先看「这句话是不是在取消已有的日程」——规则匹配现有标题，
+        # 拿不准才让 LLM 结合最近对话判断；课程等固定项不在这里取消。
+        try:
+            candidates = await asyncio.to_thread(life.list_schedule, 200)
+            cancel_ids = await schedule_chat.extract_cancellations(
+                llm, text, _recent_chat_text(agent), candidates, now=now)
+        except Exception as e:              # noqa: BLE001 —— 取消判断失败不影响新增
+            print("[Schedule] 聊天取消判断异常（已忽略）：%s" % e)
+            candidates, cancel_ids = [], []
+        if cancel_ids:
+            by_id = {int(it.get("id", 0) or 0): it for it in candidates if isinstance(it, dict)}
+            cancelled = []
+            for sid in cancel_ids:
+                try:
+                    ok_cancel = await asyncio.to_thread(life.set_schedule_status, sid, "cancelled")
+                except Exception as e:      # noqa: BLE001
+                    print("[Schedule] 取消日程失败（已忽略）：%s" % e)
+                    ok_cancel = False
+                if ok_cancel and sid in by_id:
+                    cancelled.append(by_id[sid])
+            if cancelled:
+                line = schedule_chat.cancellation_confirmation(cancelled)
+                if line:
+                    try:
+                        agent._emit(events.message(events.AI_SCHEDULE, line))
+                    except Exception as e:  # noqa: BLE001
+                        print("[Schedule] 取消日程刷新事件发送失败（已忽略）：%s" % e)
+                return
         try:
             items = await schedule_chat.extract(llm, text, now=now)
         except Exception as e:              # noqa: BLE001 —— 判断失败只打日志

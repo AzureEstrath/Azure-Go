@@ -82,6 +82,67 @@ class ExtractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0]["when_text"], "待定")
 
 
+class CancelTest(unittest.IsolatedAsyncioTestCase):
+    """v4.2.7：语言理解取消日程——规则先匹配现有标题，拿不准再让 LLM 结合上下文。"""
+
+    ITEMS = [
+        {"id": 223, "title": "去拿外卖", "when_text": "2026-10-29 周四 23:00",
+         "start_ts": NOW + 13 * 3600, "status": "planned", "kind": "task",
+         "source": "chat", "period": ""},
+        {"id": 222, "title": "电脑线上会议", "when_text": "2026-10-30 周五 15:00",
+         "start_ts": NOW + 29 * 3600, "status": "planned", "kind": "task",
+         "source": "chat", "period": ""},
+        {"id": 219, "title": "有机化学", "when_text": "2026-10-29 周四 第1-2节",
+         "start_ts": NOW + 22 * 3600, "status": "planned", "kind": "course",
+         "source": "scan", "period": "1-2"},
+    ]
+
+    def test_cancel_gate(self):
+        for text in ("我不吃了，已经退掉了", "会议取消了吗", "算了别提醒我", "不去了"):
+            self.assertTrue(schedule_chat.looks_cancellable(text), text)
+        for text in ("外卖真好吃", "明天下午三点开会", "我有点累"):
+            self.assertFalse(schedule_chat.looks_cancellable(text), text)
+
+    async def test_question_never_cancels(self):
+        llm = StubLLM(text='{"cancel_ids": [222]}')
+        ids = await schedule_chat.extract_cancellations(
+            llm, "会议取消了吗？", "线上会议", self.ITEMS, now=NOW)
+        self.assertEqual(ids, [])
+        self.assertEqual(llm.calls, [])
+
+    async def test_rule_matches_takeout_from_recent_context(self):
+        llm = StubLLM(text='{"cancel_ids": [222]}')
+        context = "外卖今晚23:00才送到，提醒我去拿 / 好嘞！定好23:00的闹钟，到时候叫你"
+        ids = await schedule_chat.extract_cancellations(
+            llm, "我不吃了，已经退掉了", context, self.ITEMS, now=NOW)
+        self.assertEqual(ids, [223])
+        self.assertEqual(llm.calls, [], "规则命中时不应再调 LLM")
+
+    def test_course_is_never_cancelled_by_chat(self):
+        ids = schedule_chat.match_cancellations(
+            "取消有机化学", "有机化学", self.ITEMS, now=NOW)
+        self.assertEqual(ids, [])
+
+    async def test_old_item_outside_window_is_ignored(self):
+        old = [{"id": 9, "title": "去拿外卖", "when_text": "昨天 23:00",
+                "start_ts": NOW - 12 * 3600, "status": "planned", "kind": "task"}]
+        self.assertEqual(schedule_chat.match_cancellations(
+            "外卖不要了", "外卖", old, now=NOW), [])
+
+    async def test_llm_fallback_when_rule_is_ambiguous(self):
+        llm = StubLLM(text='{"cancel_ids": [222]}')
+        ids = await schedule_chat.extract_cancellations(
+            llm, "那个不去了", "嗯，我们聊点别的", self.ITEMS, now=NOW)
+        self.assertEqual(ids, [222])
+        self.assertEqual(len(llm.calls), 1)
+
+    async def test_invalid_or_unknown_ids_are_dropped(self):
+        llm = StubLLM(text='{"cancel_ids": [999, "abc", 222]}')
+        ids = await schedule_chat.extract_cancellations(
+            llm, "那个不去了", "嗯，我们聊点别的", self.ITEMS, now=NOW)
+        self.assertEqual(ids, [222])
+
+
 class ConfirmationTest(unittest.TestCase):
     def test_timed_item_mentions_time_and_reminder(self):
         line = schedule_chat.confirmation([{

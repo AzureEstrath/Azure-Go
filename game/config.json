@@ -33,7 +33,7 @@
       "enable_thinking": true
     }
   },
-  "llm_think_mode": 0,
+  "llm_think_mode": 1,
   "max_tool_calls": 2.0,
   "max_visits": 100,
   "memory_db_path": "",

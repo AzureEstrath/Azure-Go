@@ -35,6 +35,10 @@
 > **v4.2.6：聊天历史改为合并（空响应绝不清空当前面板）；默认思考档位降到快速
 > （`llm_think_mode=0`）；与课程同格的约定在周表课程块底部画窄条，满课日的约定在月历
 > 日格优先显示。**
+> **v4.2.7：桌宠改为圆形头像（方形容器 + 圆形遮罩 shader）；聊天按话题分流上下文——
+> 非棋话题不再注入当前盘面 / KataGo 形势，聊棋才给完整棋面；聊天 / 待机固定快速档、
+> 棋评保持中等档；日程支持规则 + LLM 的**语言取消**（“不吃了 / 退掉了”会撤掉对应条目）；
+> 围棋端不再显示 `ai_schedule` 模板确认。**
 > 最后更新：2026-10-29。
 
 ---
@@ -362,7 +366,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | POST | `/api/move` | 玩家落子 |
 | POST | `/api/hint` | 求提示 |
 | POST | `/api/analyze` | 局面分析 + 点目注记 |
-| POST | `/api/chat` | 聊天；回复后在后台判断是否排入日程，排完推 `ai_schedule` |
+| POST | `/api/chat` | 聊天；回复后在后台判断排入 / 取消日程，变更后推 `ai_schedule` |
 | POST | `/api/summarize` | 结束对局并总结、归档棋谱 |
 | POST | `/api/undo` | 撤销到指定手 |
 | POST | `/api/reset` | 开新局 |
@@ -526,7 +530,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 **1067** 个用例，覆盖：
+`backend/tests` 共 **1076** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -587,7 +591,12 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
    写库 → 按 `auto_plan_enabled` 自动排班 → 写长期记忆 → 推 `ai_schedule`。
    不 await 后台任务，避免长判断拖慢 HTTP 回包、被客户端误判为「没发出去」而重复排队。
    前端 `PetShell` 只把 `ai_schedule` 当数据刷新信号：资料面板开着时重拉日程，不显示额外播报、
-   不碰 `_chat_busy`；`Main.message_needs_speech("ai_schedule")` 恒为 false。
+   不碰 `_chat_busy`；`Main.message_needs_speech("ai_schedule")` 恒为 false，且 v4.2.7 起
+   `Main._add_msg` 直接丢弃它（围棋聊天不再出现模板确认）。
+   **语言取消（v4.2.7）**：同一后台任务先跑 `extract_cancellations()`——`_CANCEL_CUE` 认出
+   “不吃了 / 退掉 / 取消 / 别提醒”，再用「最近对话 + 现有标题二元组」规则匹配（课程与
+   时间窗外条目直接排除）；规则歧义时才把候选清单交给 LLM 输出 `{"cancel_ids":[...]}`。
+   命中后 `LifeStore.set_schedule_status(id, "cancelled")`，展示面立即消失，`ai_schedule` 只刷新面板。
 11. **月历 / 周视图（v4.2.0，纯前端）**：`PetView` 保存一份 `_schedule_items`，按 `_schedule_view`
    重画。月历以周一为第一列、42 个日格；课程按 `date` 只落在它真实的那一天（没有日期的
    旧条目先只在本周显示），普通条目按 `date` / `start_ts` 落到具体日期；点日格
@@ -599,6 +608,12 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
    仍可悬停展开完整信息。`PetView.set_chat_history()` 只做合并：空响应直接返回，
    非空历史按「角色 + 文本」计数去重，未落库的当前消息接在末尾；`_on_chat_opened`
    仍会拉一次历史，但不会再擦掉用户眼前的聊天。
+13. **聊天上下文分流与圆形桌宠（v4.2.7，纯逻辑 / 前端）**：`agent_graph._prepare_chat`
+   用 `_chat_about_go(text)` 规则分流——`mode=pet` 或非棋话题走 `prompts.life_context_block`
+   （对话 / 长期记忆 / 时间 / 画像），明确聊棋才走原 `context_block`（盘面 + KataGo + 铁律）。
+   `_speak_chat` 固定 `think_mode=0`；棋评阶段仍用配置档位（默认 1 中等）。
+   `PetView` 的桌宠容器改为正方形，`_circle_mask_shader()` 在 fragment 里按 UV 圆裁切、
+   透明处补纸色圆底并画淡墨描边；`STRETCH_KEEP_ASPECT_CENTERED` 保证不拉伸变形。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 

@@ -82,6 +82,11 @@ func _test_view() -> void:
 	if tex != null:
 		_check("贴图保持原始比例、不裁切", tex.stretch_mode == TextureRect.STRETCH_KEEP_ASPECT_CENTERED)
 		_check("贴图随容器铺开（不是固定小图）", tex.expand_mode == TextureRect.EXPAND_IGNORE_SIZE)
+		_check("桌宠使用圆形遮罩材质", tex.material is ShaderMaterial
+			and tex.material.shader != null)
+	var pet_rect: Rect2 = v._pet_rect_for(Vector2i(240, 280))
+	_check("桌宠区域为正方形（圆形头像不变形）",
+		is_equal_approx(pet_rect.size.x, pet_rect.size.y))
 
 	var menu = v.get_node_or_null("PetMenu")
 	_check("右键菜单存在", menu != null)

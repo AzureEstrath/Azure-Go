@@ -724,21 +724,30 @@ async def _prepare_chat(agent, data):
 
     消息构造整体照旧裹在同一条 ``try`` 里（与旧 ``chat()`` 逐字一致）：任何意外都按「这次没说出话」
     处理，台词由 ``finalize`` 的兜底顶上，绝不让棋盘锁死。
+
+    v4.2.7 **按话题分流上下文**（不是靠提示词压制输出）：
+    - 桌宠聊天、以及围棋窗口里与棋无关的闲聊 → ``prompts.life_context_block``：
+      只给对话 / 长期记忆 / 时间 / 画像，不塞当前盘面与 KataGo 形势；
+    - 围棋窗口里明确在聊棋（“这手 / 定式 / 胜率 / 盘面”等）→ 原 ``context_block``。
+    这样日程闲聊不会把 Q16、目差之类棋评混进回复，聊棋时又仍有完整盘面。
     """
     text = str(data.get("text") or "")
+    mode = str(data.get("mode") or "game")
     try:
         lt = await asyncio.to_thread(agent._long_term, text)     # 慢 embedding 不得冻住事件循环
         profile, time_facts = await _ctx_extras(agent, data)
-        ctx = prompts.context_block(agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True, agent.st.last_katago, agent.st.board,
-                                    long_term=lt, events=agent.event_log.all(),
-                                    profile=profile, time_facts=time_facts)
-        # v4.2.5：聊天只负责「聊天」——日程由后台另行落库。模型不必复述/确认清单，
-        # 可以自然接住这句话，也可以从共同记忆里换个话题；同时明确禁止把 JSON 当回复。
-        ctx += ("\n\n【这一轮聊天 · 自然接话】\n"
-                "玩家提到日程或安排时，不用整理成 JSON / 清单，也不必每次都只说「记下了」。\n"
-                "可以自然接一句，然后顺着这件事聊；也可以从你们的共同记忆里挑一个相关话题继续，"
-                "或轻轻换一个话题。\n"
-                "只输出聊天文本；日程已经由系统另行记下，不需要你复述。")
+        if mode == "pet" or not _chat_about_go(text):
+            # 当前这句会单独作为最后一条 user 消息发送，上下文里不重复它。
+            hist_now = list(getattr(agent.st, "chat_history", []) or [])
+            ctx = prompts.life_context_block(
+                hist_now[:-1] if hist_now else hist_now, long_term=lt,
+                time_facts=time_facts, profile=profile)
+        else:
+            ctx = prompts.context_block(
+                agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True,
+                agent.st.last_katago, agent.st.board,
+                long_term=lt, events=agent.event_log.all(),
+                profile=profile, time_facts=time_facts)
         msgs = [agent._sys_msg(), agent._user_msg(ctx)]
         hist = agent.st.chat_history
         upto = len(hist) - 1            # 最后一条是刚追加的这句，下面单独发，避免重复
@@ -750,6 +759,21 @@ async def _prepare_chat(agent, data):
     except Exception as e:                      # 意外抛出：按失败处理，别让棋盘锁死
         print("[Agent] 聊天异常：%s" % e)
         return []
+
+
+# 围棋话题词：命中才把完整盘面 / KataGo 形势交给聊天上下文（v4.2.7）。
+_GO_CHAT_WORDS = (
+    "围棋", "下棋", "棋局", "棋盘", "盘面", "这手", "这一手", "刚才那手", "落子",
+    "定式", "布局", "官子", "死活", "做活", "杀棋", "打劫", "劫争", "征子", "大龙",
+    "厚薄", "实地", "外势", "胜率", "目差", "领先", "落后", "大场", "急所", "断点",
+    "角地", "边空", "对杀", "眼位", "扳头", "飞压", "尖冲", "虎口", "扑劫", "靠压",
+)
+
+
+def _chat_about_go(text):
+    """聊天是否在聊棋（纯规则；False ⇒ 用轻量聊天上下文）。"""
+    t = str(text or "").lower()
+    return any(w in t for w in _GO_CHAT_WORDS)
 
 
 async def _prepare_idle(agent, data):
@@ -1273,7 +1297,7 @@ async def _speak_chat(agent, data, msgs):
     if not msgs:
         data["reply"] = ""
         return
-    raw = await _say(agent, msgs, 400, naturalize=False)
+    raw = await _say(agent, msgs, 400, think_mode=0, naturalize=False, stream_with_think=True)
     if actions.looks_structured(raw):
         retry_msgs = list(msgs) + [{"role": "user", "content": (
             "（系统提示：刚才的输出是日程 JSON，不是聊天。请用 Azure 的口吻自然回复玩家，"
@@ -1410,15 +1434,19 @@ async def _consume_stream(agent, msgs, max_tokens):
     return agent.clean_reply(text)
 
 
-async def _say(agent, msgs, max_tokens, think_mode=None, naturalize=True):
+async def _say(agent, msgs, max_tokens, think_mode=None, naturalize=True, stream_with_think=False):
     """speak 阶段的统一出话口：流式开着就走流式，否则与 Task 2/3/4 的 ``agent._reply`` 同一条路。
 
     ``think_mode`` 显式给值时**跳过流式**（桌宠走神/窥屏的快速档）：这类短句不该为了
     token 流多等一轮；不传时行为与旧版逐字一致。
+    ``stream_with_think=True``（v4.2.7 聊天）例外：流式通道仍可走，档位提示只作用于
+    非流式回落路径；默认关闭，既有快速档调用行为不变。
     ``naturalize=False`` 给聊天重答路径：先看原文是不是结构化 JSON，再决定要不要重试；
     其余调用保持默认，行为不变。
     """
-    text = None if think_mode is not None else await _streamed_text(agent, msgs, max_tokens)
+    text = None
+    if think_mode is None or stream_with_think:
+        text = await _streamed_text(agent, msgs, max_tokens)
     if text is None:
         text = await agent._reply(msgs, max_tokens, think_mode=think_mode)
     if not naturalize:

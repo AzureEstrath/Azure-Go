@@ -669,13 +669,20 @@ class PetChatTest(unittest.TestCase):
 
         return asyncio.run(run())
 
-    def test_chat_context_asks_for_natural_continuation(self):
+    def test_chat_context_uses_life_context_for_non_go_talk(self):
         llm = StubLLM()
         _agent, _bus, _tts = self._run(llm)
         ctx = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
-        self.assertIn("自然接话", ctx)
-        self.assertIn("不用整理成 JSON", ctx)
-        self.assertIn("也可以从你们的共同记忆里", ctx)
+        self.assertIn("最近的对话", ctx)
+        self.assertNotIn("当前棋面", ctx)
+        self.assertNotIn("KataGo 形势", ctx)
+
+    def test_game_chat_about_go_keeps_board_context(self):
+        llm = StubLLM()
+        _agent, _bus, _tts = self._run(llm, text="这手棋怎么样", mode="game")
+        ctx = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertIn("当前棋面", ctx)
+        self.assertIn("KataGo 形势", ctx)
 
     def test_structured_chat_reply_retried_without_thinking(self):
         llm = _SeqLLM([
@@ -2278,11 +2285,15 @@ class ProfileTimePromptWiringTest(unittest.TestCase):
 
     @staticmethod
     def _ctx_calls(llm):
-        """所有**带上下文块**的 LLM 调用（正文里含【当前棋面】的那几条），按调用顺序。"""
+        """所有**带上下文块**的 LLM 调用（正文里含【当前棋面】或【最近的对话】的几条），按调用顺序。
+
+        v4.2.7 起非棋话题的聊天走 `life_context_block`（没有【当前棋面】，但有【最近的对话】），
+        它仍是第 8 个装配点，必须一起对照。
+        """
         out = []
         for msgs, _mt, _nt in llm.calls:
             joined = "\n".join(str(m.get("content", "")) for m in msgs)
-            if "【当前棋面" in joined:
+            if "【当前棋面" in joined or "【最近的对话】" in joined:
                 out.append(joined)
         return out
 
@@ -2312,9 +2323,11 @@ class ProfileTimePromptWiringTest(unittest.TestCase):
             self.assertIn("【她眼中的你", joined, "第 %d 条上下文缺画像块" % i)
             self.assertIn("星位", joined, "画像块里要真的有这一维（开局爱走「星位」）")
             self.assertIn("距上次对局", joined, "时间块里要真的有间隔事实")
-        # 两块都插在铁律段**之前**（铁律段本身一个字没动）
+        # 两块都插在铁律段**之前**（铁律段本身一个字没动）；轻量聊天上下文没有铁律段，跳过。
         for joined in ctx:
-            self.assertLess(joined.index("【她眼中的你"), joined.index("（铁律 · 先核对再开口："))
+            if "（铁律 · 先核对再开口：" in joined:
+                self.assertLess(joined.index("【她眼中的你"),
+                                joined.index("（铁律 · 先核对再开口："))
 
     def test_switches_off_keep_the_prompt_byte_identical(self):
         """两个开关都关 ⇒ 提示词与「没有这两个功能」**逐字符一致**，且一次盘都不碰。

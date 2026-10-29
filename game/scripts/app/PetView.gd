@@ -189,6 +189,13 @@ func _build() -> void:
 	_pet_tex.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	_pet_tex.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_pet_tex.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# v4.2.7：桌宠改为圆形头像——方形容器 + 圆形遮罩；透明背景补成纸色圆底，外圈一圈淡墨描边。
+	var mat := ShaderMaterial.new()
+	mat.shader = _circle_mask_shader()
+	mat.set_shader_parameter("bg_color", Color(GufengTheme.PANEL_SOFT, 0.96))
+	mat.set_shader_parameter("ring_color", Color(GufengTheme.ACCENT, 0.85))
+	mat.set_shader_parameter("ring_width", 0.027)
+	_pet_tex.material = mat
 	_pet_anchor.add_child(_pet_tex)
 
 	_fx = FxLayer.new()
@@ -670,9 +677,35 @@ func _submit_chat() -> void:
 # ================= 尺寸 / 窗口 / 布局 =================
 
 func _pet_width() -> float:
-	if _tex == null or _tex.get_height() <= 0:
-		return float(pet_height)
-	return float(pet_height) * float(_tex.get_width()) / float(_tex.get_height())
+	# v4.2.7：圆形头像必须用正方形容器（否则 UV 圆会变成椭圆）。
+	return float(pet_height)
+
+## 圆形遮罩着色器：圆外丢弃，透明背景补纸色圆底，边缘一圈淡墨描边。
+## 贴图仍按 `STRETCH_KEEP_ASPECT_CENTERED` 保持比例，只裁掉圆的四角（不是拉伸变形）。
+static func _circle_mask_shader() -> Shader:
+	var sh := Shader.new()
+	sh.code = """
+shader_type canvas_item;
+uniform vec4 bg_color : source_color = vec4(0.96, 0.94, 0.88, 0.96);
+uniform vec4 ring_color : source_color = vec4(0.18, 0.42, 0.38, 0.85);
+uniform float ring_width = 0.027;
+
+void fragment() {
+    vec2 d = UV - vec2(0.5);
+    float r = length(d);
+    if (r > 0.5) {
+        discard;
+    }
+    vec4 tex = texture(TEXTURE, UV);
+    // 透明处补圆底，角色边缘的半透明像素仍与原图混合。
+    vec4 col = mix(bg_color, tex, tex.a);
+    if (r > 0.5 - ring_width) {
+        col = ring_color;
+    }
+    COLOR = col;
+}
+"""
+	return sh
 
 func _base_size() -> Vector2i:
 	var pw := _pet_width()
