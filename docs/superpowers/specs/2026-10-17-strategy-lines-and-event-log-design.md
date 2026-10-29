@@ -221,7 +221,7 @@ def event_block(events: list[dict], now_move_no: int,
 | 1 | 【当前棋面 · 请时刻记住】 | `board_map` | 棋盘字符画 |
 | 2 | 【KataGo 形势 · 引擎判断，仅供参考】 | 调用方传入 `katago` | 空 →「（暂无引擎形势数据）」 |
 | 3 | 【对局全貌 · 请始终记住】 | `role_brief` + `compact_move_list` + `game_narrative` | 手顺头 10 / 尾 18 |
-| 4 | 【落子评定存档（E=Estarth黑 / A=Azure白）】 | `memory_brief` | 滚动 **18 条**、每条截 **80 字** |
+| 4 | 【落子评定存档（E=玩家黑 / A=Azure白）】 | `memory_brief` | 滚动 **18 条**、每条截 **80 字** |
 | 5 | 【最近的对话】 | `chat_brief` | 窗口 **6 条**、每条 **64 字** |
 | 6 | **长期记忆段**（可选） | `long_term_note` | **空串不留痕**；**插在铁律段之前** |
 | 7 | **（铁律 · 先核对再开口** · 4 条） | 内联 | **逐字符锁定**（`tests/golden/prompts.json`） |

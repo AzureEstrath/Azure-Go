@@ -26,7 +26,7 @@ class GameStoreTest(unittest.TestCase):
             "ts": ts, "moves": moves,
             "move_count": len(moves), "final_black_wr": 0.42,
             "final_score": -1.5, "result": "", "summary": summary,
-            "meta": meta or {"black": "Estarth", "white": "Azure",
+            "meta": meta or {"black": "玩家", "white": "Azure",
                              "notes": [{"move_no": 1, "kind": "review", "side": "E", "text": "好手"}],
                              "losses": []},
         })
@@ -45,7 +45,7 @@ class GameStoreTest(unittest.TestCase):
         rec = self.store.get_game(gid)
         self.assertEqual(rec["moves"], [["black", "Q16"], ["white", "D4"]])
         self.assertEqual(rec["notes"][0]["text"], "好手")
-        self.assertEqual(rec["meta"]["black"], "Estarth")
+        self.assertEqual(rec["meta"]["black"], "玩家")
 
     def test_order_and_limit(self):
         a = self._add(ts=100.0, summary="旧")

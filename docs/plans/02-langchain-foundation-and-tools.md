@@ -371,7 +371,7 @@ from app import prompts, prompt_chains
 class PhaseMessagesTest(unittest.TestCase):
     def setUp(self):
         class C:
-            prompt_user_name = "Estarth"
+            prompt_user_name = "玩家"
             prompt_system = ""
             prompt_phase_notes = {}
         prompts.configure(C())

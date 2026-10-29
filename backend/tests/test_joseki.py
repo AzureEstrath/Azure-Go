@@ -292,8 +292,8 @@ class JosekiEnterPromptSubjectTest(unittest.TestCase):
 
     def test_enter_prompt_has_no_hard_coded_subject(self):
         out = prompts.joseki_enter_prompt("点三三·基本型", "（要点）", "左上")
-        self.assertNotIn("Estarth 这一手", out, "写死「Estarth 这一手」在她那一手时是事实错误")
-        self.assertNotIn("Estarth", out)
+        self.assertNotIn("玩家这一手", out, "写死「玩家这一手」在她那一手时是事实错误")
+        self.assertNotIn("玩家", out)
         # 签名与素材照旧：角 / 课名 / 要点都在，模型照样只拿到素材 + 要求
         self.assertIn("左上", out)
         self.assertIn("点三三·基本型", out)

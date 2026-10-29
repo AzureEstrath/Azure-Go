@@ -226,7 +226,7 @@ class ToolSafetyTest(unittest.TestCase):
         self.assertNotIn("max_completion_tokens", seen[0])
         self.assertEqual([t["function"]["name"] for t in seen[0]["tools"]], ["board_query"])
         self.assertEqual(seen[1]["messages"][-1]["role"], "tool")        # 工具结果作为 ToolMessage 回传
-        self.assertIn("X = Estarth", seen[1]["messages"][-1]["content"])  # 回给模型的是盘面图，不是台词
+        self.assertIn("X =玩家", seen[1]["messages"][-1]["content"])  # 回给模型的是盘面图，不是台词
 
 
 class _StatusErr(Exception):

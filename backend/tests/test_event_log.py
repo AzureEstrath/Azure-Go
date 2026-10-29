@@ -37,12 +37,12 @@ class EventLogTest(unittest.TestCase):
         """去重键 ＝ ``kind`` + 归一化 ``text``（命中则不写）。"""
         from app.event_log import EventLog
         log = EventLog()
-        self.assertIsNotNone(log.add("player_bad", 3, "Estarth这手亏了", {}))
-        self.assertIsNone(log.add("player_bad", 9, "Estarth这手亏了", {}), "同 kind 同 text 不写")
-        self.assertIsNone(log.add("player_bad", 9, "  Estarth这手亏了\n", {}), "归一化后同一句不写")
+        self.assertIsNotNone(log.add("player_bad", 3, "玩家这手亏了", {}))
+        self.assertIsNone(log.add("player_bad", 9, "玩家这手亏了", {}), "同 kind 同 text 不写")
+        self.assertIsNone(log.add("player_bad", 9, " 玩家这手亏了\n", {}), "归一化后同一句不写")
         self.assertEqual(len(log.all()), 1)
-        self.assertIsNotNone(log.add("player_good", 3, "Estarth这手亏了", {}), "不同 kind 照写")
-        self.assertIsNotNone(log.add("player_bad", 3, "Estarth这手好棋", {}), "不同 text 照写")
+        self.assertIsNotNone(log.add("player_good", 3, "玩家这手亏了", {}), "不同 kind 照写")
+        self.assertIsNotNone(log.add("player_bad", 3, "玩家这手好棋", {}), "不同 text 照写")
         self.assertEqual(len(log.all()), 3)
 
     def test_all_covers_from_open_to_now_in_order(self):

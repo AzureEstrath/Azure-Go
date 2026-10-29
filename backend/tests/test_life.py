@@ -198,7 +198,7 @@ class LifeStoreTest(unittest.TestCase):
             "title": "高等数学", "notes": "", "source": "课表.png",
             "date": "2026-10-28", "weekday": 2, "period": "1-2",
             "period_start": 1, "period_end": 2, "start_time": "08:00",
-            "end_time": "09:35", "teacher": "王三强", "location": "二教20",
+            "end_time": "09:35", "teacher": "张老师", "location": "综合楼101",
         }], source="课表.png", now=T0)
         self.assertEqual(len(saved), 1)
         rows = self.store.list_schedule(10)
@@ -209,8 +209,8 @@ class LifeStoreTest(unittest.TestCase):
         self.assertEqual(row["period_end"], 2)
         self.assertEqual(row["start_time"], "08:00")
         self.assertEqual(row["end_time"], "09:35")
-        self.assertEqual(row["teacher"], "王三强")
-        self.assertEqual(row["location"], "二教20")
+        self.assertEqual(row["teacher"], "张老师")
+        self.assertEqual(row["location"], "综合楼101")
         self.assertEqual(row["date"], "2026-10-28")
         again = self.store.upsert_schedule([{
             "start_ts": T0 + 3700.0, "when_text": "2026-10-28 周三 第1-2节 08:00-09:35",
@@ -225,8 +225,8 @@ class LifeStoreTest(unittest.TestCase):
         # 换一张图 / 重扫时 source 会变，但内容相同：不新增，合并来源并保留旧教师。
         self.assertIn("课表.png", again[0]["source"])
         self.assertIn("课表2.png", again[0]["source"])
-        self.assertEqual(again[0]["teacher"], "王三强")
-        self.assertEqual(again[0]["location"], "二教20")
+        self.assertEqual(again[0]["teacher"], "张老师")
+        self.assertEqual(again[0]["location"], "综合楼101")
         self.assertEqual(len(self.store.list_schedule(10)), 1)
 
     def test_startup_cleans_existing_course_duplicates(self):
@@ -236,7 +236,7 @@ class LifeStoreTest(unittest.TestCase):
             "title": "高等数学", "source": "课表.png",
             "date": "2026-10-28", "weekday": 2, "period": "1-2",
             "period_start": 1, "period_end": 2, "start_time": "08:00",
-            "end_time": "09:35", "teacher": "王三强", "location": "二教20",
+            "end_time": "09:35", "teacher": "张老师", "location": "综合楼101",
         }], source="课表.png", now=T0)
         self.assertEqual(len(saved), 1)
         self.store._db.execute(
@@ -253,8 +253,8 @@ class LifeStoreTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("课表.png", rows[0]["source"])
         self.assertIn("课表2.png", rows[0]["source"])
-        self.assertEqual(rows[0]["teacher"], "王三强")
-        self.assertEqual(rows[0]["location"], "二教20")
+        self.assertEqual(rows[0]["teacher"], "张老师")
+        self.assertEqual(rows[0]["location"], "综合楼101")
 
     def test_migration_downgrades_weekday_only_course(self):
         """旧数据把群公告标成 course：没有节次时迁移要降级为普通约定。"""
@@ -375,7 +375,7 @@ class LifeStoreTest(unittest.TestCase):
         self.store.upsert_schedule([{
             "start_ts": T0 + 3600.0, "when_text": "2026-10-28 周三 第1-2节",
             "title": "高等数学", "source": "课表.jpg", "date": "2026-10-28",
-            "weekday": 2, "period": "1-2", "teacher": "王三强",
+            "weekday": 2, "period": "1-2", "teacher": "张老师",
         }], source="课表.jpg", now=T0)
         rows = self.store.list_schedule(10)
         self.assertEqual([x["title"] for x in rows], ["高等数学"])
@@ -405,7 +405,7 @@ class LifeStoreTest(unittest.TestCase):
                 store.upsert_schedule([{
                     "start_ts": T0 + 3600.0, "when_text": "2026-10-28 周三 第1-2节",
                     "title": "新课程", "date": "2026-10-28", "weekday": 2,
-                    "period": "1-2", "teacher": "王三强", "location": "二教20",
+                    "period": "1-2", "teacher": "张老师", "location": "综合楼101",
                 }], source="new.png", now=T0)
                 new_rows = store.list_schedule(10)
                 self.assertEqual({x["title"] for x in new_rows}, {"旧日程", "新课程"})
@@ -581,7 +581,7 @@ class LifePromptTest(unittest.TestCase):
             "next_schedule_in_sec": 3600.0,
         })
         self.assertIn("（夜里）", text)
-        self.assertIn("距上次和 Estarth 互动 2 小时", text)
+        self.assertIn("距上次和玩家互动 2 小时", text)
         self.assertIn("距上次你主动开口 1 小时", text)
         self.assertIn("距上次聊天 2 小时", text)
         self.assertIn("日程上最近的是「和朋友喝咖啡」", text)
@@ -592,7 +592,7 @@ class LifePromptTest(unittest.TestCase):
             "day_phase": "夜里", "since_interaction_sec": 30.0,
         })
         self.assertIn("（夜里）", text)
-        self.assertNotIn("距上次和 Estarth 互动", text)
+        self.assertNotIn("距上次和玩家互动", text)
 
     def test_old_shape_unchanged(self):
         text = prompts.time_note({"date": "2026-10-19", "weekday": "周一", "clock": "21:03"})

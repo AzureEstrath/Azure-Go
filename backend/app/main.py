@@ -1,7 +1,7 @@
 """FastAPI 入口：REST（命令通道）+ WebSocket（事件通道）。
 
 命令通道（REST）——客户端用这些触发后端动作，与 AzureAgent 的方法一一对应：
-    POST /api/move        {x, y}            玩家落子（含点评与她应手）
+    POST /api/move        {x, y}           玩家落子（含点评与她应手）
     POST /api/hint                          方向性提示
     POST /api/analyze                       局面分析
     POST /api/chat        {text}            自由聊天
@@ -15,7 +15,7 @@
                                             profile_enabled / time_aware_enabled）——后两项是
                                             v3.11.1 的「说话详略三档」与「思考强度三档」，均即时生效
     POST /api/reveal                        落子宣告语音开始（需要 round-trip 的客户端）
-    POST /api/interaction {what}            玩家亲密互动（摸头等）
+    POST /api/interaction {what}           玩家亲密互动（摸头等）
     POST /api/idle                          闲置搭话
     POST /api/peer        {fg_title,ocr,vlm} 窥屏搭话（客户端截屏/OCR/VLM 后交后端组织台词）
     POST /api/mood/tick                     情绪心跳（向基线回落）
@@ -34,7 +34,7 @@
     POST /api/memory/write  {tag?, text}    手动写一条长期记忆（关闭 / 空文本时被拒）
     GET  /api/memory/stats                  长期记忆体量（行数 / 归档数 / 向量数 / 库路径）
     POST /api/memory/forget {ids?}/{all}    忘掉指定或全部长期记忆
-    GET  /api/profile                       玩家棋风画像（只读：各维值 + 置信度 + 最近 N 局记录）
+    GET  /api/profile                      玩家棋风画像（只读：各维值 + 置信度 + 最近 N 局记录）
     GET  /api/mood                          当前情绪快照（桌宠用）
     GET  /api/life                          生命时间线快照（状态 / 相对时间 / 最近事件）
     GET  /api/state                         当前棋盘权威快照
@@ -69,6 +69,7 @@ from . import coords, events, persona, prompts, sgf
 from . import file_service
 from . import full_review
 from . import schedule as schedule_mod
+from . import schedule_chat
 from . import schedule_learning
 from .agent import AzureAgent
 from .engine import KataGoEngine
@@ -170,6 +171,94 @@ def _plan_sig(gate):
     return (tuple(gate.get("unplanned_ids", [])),
             tuple(gate.get("overdue_ids", [])),
             int(float(gate.get("demand_min", 0.0)) // 30))
+
+
+# —— v4.2.0 聊天排程：判断与落库都在后端，前端只负责显示 ——
+
+def _start_chat_schedule(app, cfg, agent, text):
+    """聊天回复结束后，起一个后台任务判断「这句话要不要排」。
+
+    不阻塞 ``POST /api/chat`` 的 HTTP 回包：聊天回复已经通过 WS 送达，排程补充稍后以
+    ``ai_schedule`` 事件追加。因为不 await，客户端不会把「回复慢」误判成「消息没发出去」
+    而退回队列重发。
+    """
+    if not bool(getattr(cfg, "schedule_chat_enabled", True)):
+        return
+    if getattr(app.state, "life", None) is None:
+        return
+    if agent is None or not str(text or "").strip():
+        return
+    try:
+        task = asyncio.create_task(_capture_chat_schedule(app, cfg, agent, text))
+    except Exception as e:                  # noqa: BLE001 —— 建任务失败不影响聊天
+        print("[Schedule] 聊天排程任务创建失败（已忽略）：%s" % e)
+        return
+    tasks = getattr(app.state, "chat_capture_tasks", None)
+    if tasks is None:
+        tasks = set()
+        app.state.chat_capture_tasks = tasks
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _capture_chat_schedule(app, cfg, agent, text):
+    """聊天 → 日程：判断、写库、按需自动排班、写记忆、发一条 ``ai_schedule`` 补充。
+
+    单用户桌面场景，用一把锁串行多个后台判断，避免两条聊天同时触发全量重排。
+    """
+    life = getattr(app.state, "life", None)
+    llm = getattr(agent, "llm", None)
+    if life is None or llm is None:
+        return
+    lock = getattr(app.state, "chat_capture_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        app.state.chat_capture_lock = lock
+    async with lock:
+        now = time.time()
+        try:
+            items = await schedule_chat.extract(llm, text, now=now)
+        except Exception as e:              # noqa: BLE001 —— 判断失败只打日志
+            print("[Schedule] 聊天日程判断异常（已忽略）：%s" % e)
+            return
+        if not items:
+            return
+        try:
+            saved = await asyncio.to_thread(life.upsert_schedule, items, "chat")
+        except Exception as e:              # noqa: BLE001
+            print("[Schedule] 聊天日程写入失败（已忽略）：%s" % e)
+            return
+        if not saved:
+            return
+        # 只有「没有明确时刻」的条目才需要排班；已约定 15:00 的会议不该顺带扰动其他任务。
+        needs_plan = any(not str(it.get("start_time", "")).strip() for it in items)
+        if needs_plan and bool(getattr(cfg, "auto_plan_enabled", True)):
+            try:
+                await _run_auto_plan(life, cfg)
+            except Exception as e:          # noqa: BLE001 —— 排班失败仍保留已写入的条目
+                print("[Schedule] 聊天后排班失败（已忽略）：%s" % e)
+        # 重读一遍：自动排班可能刚给待定项写了新的 when_text / start_ts。
+        try:
+            current = await asyncio.to_thread(life.list_schedule_plan, 200)
+            ids = {int(x.get("id", 0)) for x in saved if isinstance(x, dict)}
+            rows = [x for x in current if int(x.get("id", 0)) in ids]
+        except Exception:                   # noqa: BLE001
+            rows = []
+        rows = rows or saved
+        mem = getattr(app.state, "memory", None)
+        if mem is not None and bool(getattr(mem, "available", False)):
+            for it in rows:
+                try:
+                    await asyncio.to_thread(mem.remember_fact,
+                                            schedule_mod.memory_text(it), "schedule")
+                except Exception:           # noqa: BLE001 —— 记忆失败不影响排程
+                    pass
+        line = schedule_chat.confirmation(rows)
+        if line:
+            try:
+                agent._emit(events.message(events.AI_SCHEDULE, line))
+            except Exception as e:          # noqa: BLE001
+                print("[Schedule] 聊天排程补充发送失败（已忽略）：%s" % e)
 
 
 def _harden_stdout() -> None:
@@ -308,6 +397,9 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         # autostart=False 是测试装配：未显式注入就不碰真实 data/life.db，保持门卫零副作用。
         life_store = life if life is not None else (LifeStore(cfg.life_db_path) if autostart else None)
         app.state.life = life_store
+        # 聊天排程的后台判断（v4.2.0）：单用户场景用一把锁串行；退出时一并取消。
+        app.state.chat_capture_lock = asyncio.Lock()
+        app.state.chat_capture_tasks = set()
         # 云端语音：显式注入优先（测试用假 TTS）；默认关闭时 speak() 零请求
         tts_client = tts if tts is not None else _build_tts(cfg)
         app.state.tts = tts_client
@@ -409,6 +501,14 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             try:
                 await reminder_task
             except asyncio.CancelledError:
+                pass
+        # 聊天排程判断是后台任务：退出前取消，避免它继续往已经关闭的库里写。
+        for task in list(getattr(app.state, "chat_capture_tasks", set()) or []):
+            task.cancel()
+        for task in list(getattr(app.state, "chat_capture_tasks", set()) or []):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):   # noqa: BLE001
                 pass
         if autostart:
             _save_life = getattr(app.state.agent, "save_life", None)
@@ -548,7 +648,10 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             return denied
         if s.busy:
             return {"ok": False, "busy": True, "state": s.st.payload()}
-        await s.chat(str(body.get("text", "")), str(body.get("mode", "game")))
+        text = str(body.get("text", ""))
+        await s.chat(text, str(body.get("mode", "game")))
+        # 聊天回复已经通过 WS 送达；排程判断在后台继续，不拖慢这条 HTTP 回包。
+        _start_chat_schedule(app, cfg, s, text)
         return ok()
 
     @app.get("/api/chat/history")
@@ -767,7 +870,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     async def life_snapshot(limit: int = 20):
         """生命时间线快照（桌宠 / 调试）：状态 + 相对时间 + 最近事件。
 
-        与围棋共用同一条后端时间线：桌宠启动时据此知道“上一回见到 Estarth 是什么时候”，
+        与围棋共用同一条后端时间线：桌宠启动时据此知道“上一回见到玩家是什么时候”，
         不必只依赖本地计时器。时间线未装配（测试装配 / 库不可用）时返回可读的空结果。
         """
         store = getattr(app.state, "life", None)

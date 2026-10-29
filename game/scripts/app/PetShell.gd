@@ -253,7 +253,7 @@ func _on_mood(p: Dictionary) -> void:
 	if tts != null:
 		tts.set_mood_pitch(_mood_pitch)
 
-## 后端生命时间线：桌宠与围棋共用同一份“上一回见到 Estarth”的事实。
+## 后端生命时间线：桌宠与围棋共用同一份“上一回见到你”的事实。
 ## 只在第一次连上时用；离开超过 15 分钟才主动提，避免每次重连都重复寒暄。
 func _on_life(ok: bool, _c: int, d: Dictionary) -> void:
 	if not ok or d.is_empty():
@@ -319,6 +319,17 @@ func _on_message(kind: String, text: String) -> void:
 			view.show_reminder(body, 12.0)
 		else:
 			view.show_bubble(body, 12.0)
+		_bump_activity()
+		return
+	if kind == "ai_schedule":
+		# 聊天里刚排完日程：聊天面板开着就追加成一条 assistant 消息，话题可以继续；
+		# 面板关着时走气泡，资料 / 菜单开着时用提醒卡。**不碰 `_chat_busy`、不进语音队列**。
+		if view.is_chat_open():
+			view.append_chat("assistant", body)
+		elif view.is_files_open() or view.is_menu_open():
+			view.show_reminder(body, 10.0)
+		else:
+			view.show_bubble(body, 10.0)
 		_bump_activity()
 		return
 	if chat_like and _chat_busy:
@@ -761,7 +772,7 @@ func _on_interact() -> void:
 		agent.player_interaction("patted")
 		_pat_count += 1
 		if _pat_count % 5 == 0:
-			agent.memory_write("Estarth 在桌面上摸了摸 Azure 的头。", "pet:pat")
+			agent.memory_write("你摸了摸 Azure 的头。", "pet:pat")
 
 func _reaction_line() -> String:
 	if _energy <= 0.30:
@@ -856,7 +867,7 @@ static func humanized_idle_delay_sec(energy: float, boredom: float, affinity: fl
 			base *= 1.08
 		"傍晚":
 			base *= 0.93
-	# 连着主动开口、Estarth 一直没接话：读空气，逐步拉长（不是完全沉默）。
+	# 连着主动开口、你一直没接话：读空气，逐步拉长（不是完全沉默）。
 	if unanswered >= 1:
 		base *= 1.0 + minf(0.75, 0.25 * float(unanswered))
 	# 偶发短追问（亲近/兴致）与偶发长停顿（克制），让节奏不像定时器。

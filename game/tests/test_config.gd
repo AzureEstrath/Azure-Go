@@ -401,7 +401,7 @@ func _run() -> void:
 	if da != null:
 		da.remove("test_config_tmp.json")
 
-	# —— 6′) 玩家棋风画像 / 时间感知（profile_enabled / time_aware_enabled，v3.9.0）——
+	# —— 6′)玩家棋风画像 / 时间感知（profile_enabled / time_aware_enabled，v3.9.0）——
 	# 口径与 `chat_digest_llm` 完全一致：键缺失 ⇒ 默认 false；**只认 JSON 的 true / false**
 	# （`bool("false")` 是 true 的坑同样要挡）；往返读写与未知键原样保留照旧。
 	_write_raw({})
@@ -493,12 +493,16 @@ func _run() -> void:
 		not mp.message_needs_speech(mp.AI_REMIND))
 	_check("`ai_remind` 与后端 `events.AI_REMIND` 同名（跨端契约）",
 		mp.AI_REMIND == "ai_remind")
+	_check("message_needs_speech：`ai_schedule` ⇒ 不登记（聊天排程补充没有语音）",
+		not mp.message_needs_speech(mp.AI_SCHEDULE))
+	_check("`ai_schedule` 与后端 `events.AI_SCHEDULE` 同名（跨端契约）",
+		mp.AI_SCHEDULE == "ai_schedule")
 	_check("message_needs_speech：本地 text_only 标记 ⇒ 不登记（既有语义不变）",
 		not mp.message_needs_speech("ai", true))
 	_check("message_needs_speech：点评 / 落子宣告 / 走神搭话 ⇒ 登记（三条真语音的管线不变）",
 		mp.message_needs_speech("ai_comment") and mp.message_needs_speech("ai_move")
 		and mp.message_needs_speech("ai_idle"))
-	_check("message_needs_speech：玩家 / 系统消息 ⇒ 不登记",
+	_check("message_needs_speech：玩家/ 系统消息 ⇒ 不登记",
 		not mp.message_needs_speech("user") and not mp.message_needs_speech("system"))
 
 	# —— 7) 定式「开关 + 频率」原子推送（v3.7.0 修复波 / 跨任务发现 #2） ——

@@ -19,9 +19,9 @@ class LongTermNoteTest(unittest.TestCase):
         self.assertNotIn("长期记忆", base)
 
     def test_section_inserted_before_iron_rules(self):
-        out = prompts.context_block(MOVES, [], [], "observe", long_term="Estarth 喜欢点三三")
+        out = prompts.context_block(MOVES, [], [], "observe", long_term="玩家喜欢点三三")
         self.assertIn("长期记忆", out)
-        self.assertIn("Estarth 喜欢点三三", out)
+        self.assertIn("玩家喜欢点三三", out)
         self.assertLess(out.index("长期记忆"), out.index("铁律"))
         self.assertIn("A→T 从左到右", out)        # 铁律段正文没被动过
 
@@ -63,7 +63,7 @@ class MemoryServiceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             svc = MemoryService(self._cfg(memory_db_path=os.path.join(d, "m.db")))
             self.assertTrue(svc.available)
-            svc.remember_fact("Estarth 喜欢听定式讲解", tag="estarth")
+            svc.remember_fact("玩家喜欢听定式讲解", tag="estarth")
             self.assertIn("定式讲解", svc.recall_for("讲讲定式"))
             svc.close()
 

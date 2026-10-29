@@ -45,10 +45,10 @@ def relationship_stage(games_total=0, interactions_total=0) -> dict:
             "score": score, "games": games}
 
 
-def relationship_note(stage, user_name="Estarth", address_name="") -> str:
+def relationship_note(stage, user_name="玩家", address_name="") -> str:
     """关系阶段的提示词片段；初识且没下过棋 ⇒ 空串（不改变任何提示词）。
 
-    ``address_name`` 为空 / 关系还没到熟络 ⇒ **始终用 ``user_name``**（默认 Estarth 不变）；
+    ``address_name`` 为空 / 关系还没到熟络 ⇒ **始终用 ``user_name``**（默认玩家不变）；
     填了昵称且阶段到熟络 / 老搭档，才允许她偶尔改用这个称呼。昵称由玩家在设置里选。
     """
     if not isinstance(stage, dict):
@@ -126,9 +126,9 @@ def memory_note(streak=0) -> str:
 # ================= 小目标 =================
 
 INTENTS = (
-    {"key": "quiet", "text": "今天想安静一点：句子短些、语气轻些，多听 Estarth 说话。"},
-    {"key": "curious", "text": "今天对 Estarth 最近在忙什么有点好奇；合适时问一句，别追问。"},
-    {"key": "focused", "text": "今天想认真看看 Estarth 的布局；点评可以更具体一点，但别变成上课。"},
+    {"key": "quiet", "text": "今天想安静一点：句子短些、语气轻些，多听玩家说话。"},
+    {"key": "curious", "text": "今天对玩家最近在忙什么有点好奇；合适时问一句，别追问。"},
+    {"key": "focused", "text": "今天想认真看看玩家的布局；点评可以更具体一点，但别变成上课。"},
     {"key": "playful", "text": "今天心情轻快；偶尔可以开个小玩笑，别过火。"},
 )
 
@@ -169,9 +169,9 @@ def intent_idle_hint(intent) -> str:
         return ""
     key = str(intent.get("key") or "")
     return {
-        "quiet": "如果开口，短一点，别追着聊；Estarth 没接话就收住。",
-        "curious": "可以顺口问一句 Estarth 最近在忙什么；Estarth 不想说就收住，别追问。",
-        "focused": "可以提一句最近总在留意 Estarth 的布局；别把问候变成上课。",
+        "quiet": "如果开口，短一点，别追着聊；玩家没接话就收住。",
+        "curious": "可以顺口问一句玩家最近在忙什么；玩家不想说就收住，别追问。",
+        "focused": "可以提一句最近总在留意玩家的布局；别把问候变成上课。",
         "playful": "可以用一句轻松的小玩笑开场，别过火，也别硬逗。",
     }.get(key, "")
 

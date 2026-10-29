@@ -192,8 +192,7 @@ func play_welcome(name: String) -> bool:
 		return false
 	var res := FILLER_DIR.path_join("welcome_%s.wav" % key)
 	if not ResourceLoader.exists(res):
-		push_warning("[TTS] 预制欢迎语音缺失：%s（退回普通流程）" % res)
-		return false
+		return false                              # 没有预制欢迎语音是常态：静默退回普通流程
 	var st := load(res)
 	if not (st is AudioStream):
 		push_warning("[TTS] 预制欢迎语音无法加载：%s" % res)

@@ -14,7 +14,7 @@ from helpers import mk_agent
 
 def _configure_prompts():
     class C:
-        prompt_user_name = "Estarth"
+        prompt_user_name = "玩家"
         prompt_system = ""
         prompt_phase_notes = {}
     prompts.configure(C())
@@ -109,7 +109,7 @@ class ByteIdentityTest(unittest.TestCase):
         self.addCleanup(_configure_prompts)          # 别把「小明」留给后面的用例
         ctx = prompts.with_context([], [], [], "P", "observe", False, "", None)
         msgs = prompt_chains.build_messages("observe", context=ctx)
-        self.assertNotIn("Estarth", msgs[0]["content"])
+        self.assertNotIn("玩家", msgs[0]["content"])
         self.assertIn("小明", msgs[0]["content"])
         self.assertEqual(msgs, _legacy_messages("", "", "", ctx))
 

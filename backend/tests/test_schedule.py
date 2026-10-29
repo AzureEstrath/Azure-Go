@@ -93,7 +93,7 @@ class ScheduleExtractTest(unittest.TestCase):
         scan = {"files": [{
             "name": "chat.jpg", "kind": "image", "table": [],
             "ocr": "23:23 | 体育委员许宇晨 | 周四(10月29日） | 院系杯男子篮球赛 | "
-                   "中午12：00-1：00 | 材料VS水保 | 地点：篮球场 | "
+                   "中午12：00-1：00 | A队 VS B队 | 地点：篮球场 | "
                    "各位同学可以前往比赛现场观赛并 | 签到签退，将会获得二课堂加分， | "
                    "25，26级同学可获得0.2综素加分～",
         }]}
@@ -106,7 +106,7 @@ class ScheduleExtractTest(unittest.TestCase):
         self.assertEqual(raw["end_time"], "13:00")
         self.assertEqual(raw["duration_min"], 60)
         self.assertEqual(raw["location"], "篮球场")
-        self.assertIn("材料VS水保", raw["notes"])
+        self.assertIn("A队 VS B队", raw["notes"])
 
         items = schedule.normalize_items(raws, source="chat.jpg", now=NOW)
         self.assertEqual(len(items), 1)
@@ -152,7 +152,7 @@ class ScheduleExtractTest(unittest.TestCase):
         items = schedule.normalize_items([
             {"date": "2026-10-28", "weekday": "周三", "period": "第1-2节",
              "time": "08:00", "end_time": "09:35", "title": "高等数学(基础)",
-             "teacher": "王三强", "location": "二教20"},
+             "teacher": "张老师", "location": "综合楼101"},
         ], source="课表.png", now=NOW)
         self.assertEqual(len(items), 1)
         it = items[0]
@@ -162,13 +162,13 @@ class ScheduleExtractTest(unittest.TestCase):
         self.assertEqual(it["period_end"], 2)
         self.assertEqual(it["start_time"], "08:00")
         self.assertEqual(it["end_time"], "09:35")
-        self.assertEqual(it["teacher"], "王三强")
-        self.assertEqual(it["location"], "二教20")
+        self.assertEqual(it["teacher"], "张老师")
+        self.assertEqual(it["location"], "综合楼101")
         self.assertEqual(it["date"], "2026-10-28")
         self.assertIn("周三", it["when_text"])
         self.assertIn("第1-2节", it["when_text"])
-        self.assertIn("王三强", schedule.memory_text(it))
-        self.assertIn("@二教20", schedule.memory_text(it))
+        self.assertIn("张老师", schedule.memory_text(it))
+        self.assertIn("@综合楼101", schedule.memory_text(it))
 
     def test_task_priority_duration_and_deadline_are_parsed(self):
         items = schedule.normalize_items([

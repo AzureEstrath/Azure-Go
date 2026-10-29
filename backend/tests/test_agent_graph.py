@@ -211,7 +211,7 @@ class ToolRouteRealTriggerTest(unittest.TestCase):
         # ③ 台词是模型重写的那句；board_query 的输出一个字符都没进任何 message 文本
         texts = [str(e.get("text", "")) for e in bus.messages()]
         self.assertIn("我看了下盘面，先在右边稳一手。", texts)
-        self.assertFalse(any("X = Estarth" in t for t in texts), "工具输出漏进台词了")
+        self.assertFalse(any("X =玩家" in t for t in texts), "工具输出漏进台词了")
 
     def test_tool_rounds_terminate_and_respect_llm_cap(self):
         """条件边不得死循环：模型永远要工具也必须收敛，且 `decide` 内 LLM 调用数 ≤ 上限。"""
@@ -444,7 +444,7 @@ class JosekiMistakeWiringTest(unittest.TestCase):
         self.assertEqual((got["x"], got["y"]), (1, 4))
         self.assertGreater(got["drop"], 0.10)
         self.assertIs(got["rank_ok"], True)
-        self.assertEqual(got["move_no"], 5)                     # T6：4 手铺好 + 玩家这手 ＝ 第 5 手
+        self.assertEqual(got["move_no"], 5)                     # T6：4 手铺好 +玩家这手 ＝ 第 5 手
 
         # U19：既有俗手记录照旧触发，条目形状 / 文案 / 位置一字不变（走的就是 drop 那半边）
         self.assertEqual(agent.st.bad_moves, [{
@@ -712,7 +712,7 @@ class JosekiActiveSpeechTest(unittest.TestCase):
     # —— ③ 收尾：并进**走完那一方**的发言位 ——
 
     def test_close_follows_the_side_that_finished(self):
-        # ① 玩家走完：角内 3 手吻合后，他落 D17(3,2) 收尾 ⇒ after_player 那条点评
+        # ①玩家走完：角内 3 手吻合后，他落 D17(3,2) 收尾 ⇒ after_player 那条点评
         agent, _eng, llm, _bus = _mk()
         _seed_moves(agent, [["W", "D16"], ["B", "C17"], ["W", "C16"]])
         state = self._after_player(agent, 3, 2)
@@ -811,7 +811,7 @@ class JosekiActiveSpeechTest(unittest.TestCase):
     def test_her_close_is_not_taught_after_the_family_is_learned(self):
         """她那一步同理（v3.7.0 口径修订 T5）：这一族已教过 3 次 ⇒ 门控不放行，退回普通感想。
 
-        玩家那手没出定式结果、这一族又已经教过 3 次 ⇒ `jk_show_card` 在她那一格才定下来、且为假；
+       玩家那手没出定式结果、这一族又已经教过 3 次 ⇒ `jk_show_card` 在她那一格才定下来、且为假；
         她那句是**普通感想**，既不是 `joseki_close_prompt(..., "azure")`、也不发 `joseki` 事件。
         """
         d = tempfile.TemporaryDirectory()
@@ -1314,7 +1314,7 @@ class BusyWatchdogTest(unittest.TestCase):
 # —— 以下为修复轮 R-1（v3.7.0）追加（既有断言一个字符都没改；追加在文件末尾，理由同上）——
 #
 # Wave B 把 4 个「2 手族」的 `kind` 从 `formed` 改成 `entered` 之后，编排里有**三处仍按 `formed`
-# 门控**的耦合没跟着放宽（情绪分支 / `_len_note` / 玩家侧 LLM 失败兜底）。这里按「`entered`（含 2 手族）
+# 门控**的耦合没跟着放宽（情绪分支 / `_len_note` /玩家侧 LLM 失败兜底）。这里按「`entered`（含 2 手族）
 # 也算结构点」把这三条钉死：2 手族走出进入时，三处都必须走**结构点**那一支。
 
 def _system_text(llm):

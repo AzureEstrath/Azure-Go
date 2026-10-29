@@ -20,6 +20,8 @@
 > 连续推迟 ≥ 2 次优先大段空闲。**
 > **v4.1.7：重扫去重（课程按日期 + 节次 + 标题，启动清理历史重复）；群公告事件不再误判成课程；
 > 进行中的约定保持「已约定」；已结束的星期型事件标为「已结束」；同一格多个约定合并显示。**
+> **v4.2.0：聊天 → 日程（规则闸门 + LLM 判断 + 后台落库 / 排班 / 记忆 + `ai_schedule` 补充）；
+> 资料面板默认月历（7×6、年月翻页、今天高亮），点日期进入该周，周视图可前后翻周 / 回本月 / 回月历。**
 > 最后更新：2026-10-29。
 
 ---
@@ -347,7 +349,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | POST | `/api/move` | 玩家落子 |
 | POST | `/api/hint` | 求提示 |
 | POST | `/api/analyze` | 局面分析 + 点目注记 |
-| POST | `/api/chat` | 聊天 |
+| POST | `/api/chat` | 聊天；回复后在后台判断是否排入日程，排完推 `ai_schedule` |
 | POST | `/api/summarize` | 结束对局并总结、归档棋谱 |
 | POST | `/api/undo` | 撤销到指定手 |
 | POST | `/api/reset` | 开新局 |
@@ -392,7 +394,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | type | 关键字段 | 说明 |
 | --- | --- | --- |
 | `hello` | `state`、`mood`、`busy` | 连接同步 |
-| `message` | `kind`、`text`、`move?` | `kind`：`ai` / `ai_notice` / `ai_comment` / `ai_move` / `ai_idle` / `ai_review` / `difficulty` / `user` / `system` |
+| `message` | `kind`、`text`、`move?` | `kind`：`ai` / `ai_notice` / `ai_comment` / `ai_move` / `ai_idle` / `ai_remind` / `ai_schedule` / `ai_review` / `difficulty` / `user` / `system` |
 | `state` | 棋盘、手数、提子等 | 权威快照 |
 | `info` | `winrate`、`score` | 右栏数字 |
 | `estimate` | `komi`、`move_count`、`lead`、`black`、`white`、`cells` | 点目注记，不进 LLM |
@@ -505,7 +507,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 **1046** 个用例，覆盖：
+`backend/tests` 共 **1063** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -516,11 +518,12 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 - 棋谱库、记忆、画像、时间感知；
 - TTS 文本、缓存、阿里云协议、语音链路；
 - 动态日程：James-Stein / EWMA / 变更点 / 机会约束 / 缓冲 / 锁定窗口 / 触发闸门 / 反馈与复盘；
+- 聊天排程：规则闸门 / JSON 解析 / 规范化 / 过去事件过滤 / 补充文案 / 开关 / `ai_schedule` 事件；
 - FastAPI 端点与 WebSocket 事件。
 
 KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
 
-### 6.10 动态日程排程（v4.1.1 ~ v4.1.7）
+### 6.10 动态日程排程（v4.1.1 ~ v4.2.0）
 
 `auto_plan.py`（纯逻辑）+ `schedule_learning.py`（纯学习）+ `life.py`（持久化）分工：
 
@@ -558,6 +561,19 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
    「日期（或星期）+ 节次 + 标题」，不再带 `source`；命中后合并来源与缺失的教师 / 地点 / 备注。
    启动时 `_dedupe_schedule_locked()` 清理旧版留下的重复行。只有带节次的条目才是课程，
    群公告里的比赛 / 活动按普通约定处理；同一格多个约定在周表合并为「N 项约定」块。
+10. **聊天排程（v4.2.0）**：`schedule_chat.py` 先用 `looks_schedulable()` 规则闸门过滤
+   明显没有时间 / 事项线索的闲聊（不发起 LLM 调用），再让模型输出
+   `{"schedule": bool, "items": [...]}`；`schedule.normalize_items()` 规范化后过滤已彻底过去的事件。
+   `main.py` 在 `/api/chat` 回复完成后用**后台任务**（`app.state.chat_capture_tasks`，退出时取消）
+   写库 → 按 `auto_plan_enabled` 自动排班 → 写长期记忆 → 推 `ai_schedule`。
+   不 await 后台任务，避免长判断拖慢 HTTP 回包、被客户端误判为「没发出去」而重复排队。
+   前端 `PetShell` 只在聊天面板打开时把 `ai_schedule` 追加为 assistant 文本；不碰 `_chat_busy`，
+   `Main.message_needs_speech("ai_schedule")` 恒为 false。
+11. **月历 / 周视图（v4.2.0，纯前端）**：`PetView` 保存一份 `_schedule_items`，按 `_schedule_view`
+   重画。月历以周一为第一列、42 个日格；课程按 `weekday` 每周重复，普通条目按 `date` /
+   `start_ts` 落到具体日期；点日格 `show_week_for_date()` 以该周周一为锚点进入周表。
+   周表只把 `date` 落在选中周的定时约定画进节次行；无日期 / 无星期的条目进入「待安排」。
+   前后端职责刻意分开：判断与存储全在后端，日历只消费 `/api/schedule`。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 

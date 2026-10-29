@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -138,6 +139,114 @@ class ScheduleFeedbackApiTest(unittest.TestCase):
 
                     r = client.post("/api/schedule/feedback", json={"id": 99999})
                     self.assertFalse(r.json()["ok"])
+            finally:
+                store.close()
+
+
+class _ChatScheduleLLM(StubLLM):
+    """聊天回复与日程判断共用一次装配：按提示词认领返回不同文本。"""
+
+    def __init__(self, chat_text="好，我记着。", schedule_text=""):
+        super().__init__(text=chat_text)
+        self.schedule_text = schedule_text
+
+    async def chat(self, messages, max_tokens=300, no_think=False, think_mode=None):
+        self.calls.append((list(messages), max_tokens, no_think))
+        self.think_modes.append(think_mode)
+        prompt = str(messages[-1].get("content", "")) if messages else ""
+        if "日程判断器" in prompt:
+            return self.schedule_text
+        return self.text
+
+
+class ChatScheduleApiTest(unittest.TestCase):
+    def _wait_items(self, store, timeout=3.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            items = store.list_schedule(50)
+            if items:
+                return items
+            time.sleep(0.05)
+        return store.list_schedule(50)
+
+    def _wait_messages(self, bus, timeout=3.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            msgs = bus.messages(events.AI_SCHEDULE)
+            if msgs:
+                return msgs
+            time.sleep(0.05)
+        return bus.messages(events.AI_SCHEDULE)
+
+    def test_chat_schedules_and_emits_ai_schedule(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = LifeStore(os.path.join(d, "life.db"))
+            cfg = AzureConfig()
+            cfg.auto_plan_enabled = False
+            llm = _ChatScheduleLLM(schedule_text=(
+                '{"schedule": true, "items": ['
+                '{"date": "2026-10-30", "time": "15:00", "title": "组会",'
+                ' "duration_min": 60}]}'))
+            bus = events.RecordingBus()
+            agent = AzureAgent(StubEngine(), llm, bus, joseki_rate=1.0,
+                               joseki_rng=ZeroRng())
+            app = create_app(cfg=cfg, agent=agent, autostart=False, life=store)
+            try:
+                with TestClient(app) as client:
+                    r = client.post("/api/chat",
+                                    json={"text": "周五下午三点提醒我组会", "mode": "pet"})
+                    self.assertTrue(r.json()["ok"])
+                    items = self._wait_items(store)
+                    self.assertEqual(len(items), 1)
+                    self.assertEqual(items[0]["title"], "组会")
+                    self.assertEqual(items[0]["start_time"], "15:00")
+                    self.assertTrue(any("组会" in str(c[0]) for c in llm.calls
+                                        if c and c[0]))
+                    msgs = self._wait_messages(bus)
+                    self.assertEqual(len(msgs), 1)
+                    self.assertIn("组会", msgs[0]["text"])
+                    self.assertIn("提醒", msgs[0]["text"])
+            finally:
+                store.close()
+
+    def test_plain_chat_does_not_touch_schedule(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = LifeStore(os.path.join(d, "life.db"))
+            cfg = AzureConfig()
+            cfg.auto_plan_enabled = False
+            llm = _ChatScheduleLLM(schedule_text='{"schedule": false}')
+            agent = AzureAgent(StubEngine(), llm, events.RecordingBus(),
+                               joseki_rate=1.0, joseki_rng=ZeroRng())
+            app = create_app(cfg=cfg, agent=agent, autostart=False, life=store)
+            try:
+                with TestClient(app) as client:
+                    r = client.post("/api/chat", json={"text": "有点累", "mode": "pet"})
+                    self.assertTrue(r.json()["ok"])
+                    time.sleep(0.3)
+                    self.assertEqual(store.list_schedule(50), [])
+            finally:
+                store.close()
+
+    def test_disabled_switch_skips_schedule_judgement(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = LifeStore(os.path.join(d, "life.db"))
+            cfg = AzureConfig()
+            cfg.auto_plan_enabled = False
+            cfg.schedule_chat_enabled = False
+            llm = _ChatScheduleLLM(schedule_text=(
+                '{"schedule": true, "items": [{"title": "组会"}]}'))
+            agent = AzureAgent(StubEngine(), llm, events.RecordingBus(),
+                               joseki_rate=1.0, joseki_rng=ZeroRng())
+            app = create_app(cfg=cfg, agent=agent, autostart=False, life=store)
+            try:
+                with TestClient(app) as client:
+                    r = client.post("/api/chat",
+                                    json={"text": "周五下午三点提醒我组会", "mode": "pet"})
+                    self.assertTrue(r.json()["ok"])
+                    time.sleep(0.3)
+                    self.assertEqual(store.list_schedule(50), [])
+                    self.assertFalse(any("日程判断器" in str(c[0]) for c in llm.calls
+                                         if c and c[0]))
             finally:
                 store.close()
 

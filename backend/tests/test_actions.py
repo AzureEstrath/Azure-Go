@@ -17,7 +17,7 @@ class NaturalizeTest(unittest.TestCase):
 
     def test_schedule_json_becomes_readable_line(self):
         raw = ('[{"date":"2026-10-28", "time":"08:00", "title":"无机化学实验",'
-               ' "notes":"杨悠笛 老师 @二教10"}]')
+               ' "notes":"李老师 老师 @综合楼103"}]')
         out = actions.naturalize(raw)
         self.assertIn("无机化学实验", out)
         self.assertIn("2026-10-28", out)
@@ -26,11 +26,11 @@ class NaturalizeTest(unittest.TestCase):
 
     def test_course_json_keeps_teacher_and_location(self):
         raw = ('```json\n[{"weekday":"周三","period":"1-2","title":"高等数学",'
-               '"teacher":"王三强","location":"二教20"}]\n```')
+               '"teacher":"张老师","location":"综合楼101"}]\n```')
         out = actions.naturalize(raw)
         self.assertIn("高等数学", out)
-        self.assertIn("王三强", out)
-        self.assertIn("@二教20", out)
+        self.assertIn("张老师", out)
+        self.assertIn("@综合楼101", out)
 
     def test_unknown_json_is_empty_not_garbage(self):
         self.assertEqual(actions.naturalize('{"foo": 1}'), "")

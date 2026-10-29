@@ -99,7 +99,7 @@ def to_sgf(rec: dict) -> str:
     rec = rec if isinstance(rec, dict) else {}
     meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
     moves = rec.get("moves") if isinstance(rec.get("moves"), list) else []
-    black = str(meta.get("black") or meta.get("player") or rec.get("black") or "Estarth")
+    black = str(meta.get("black") or meta.get("player") or rec.get("black") or "玩家")
     white = str(meta.get("white") or rec.get("white") or "Azure")
     result = str(rec.get("result") or "?").strip() or "?"
     summary = str(rec.get("summary") or "").strip()

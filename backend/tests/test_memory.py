@@ -31,7 +31,7 @@ class StoreTest(unittest.TestCase):
         self.dir.cleanup()
 
     def test_write_then_recall(self):
-        i = self.store.write("Estarth 喜欢在布局阶段点三三", kind="preference", tag="estarth")
+        i = self.store.write("玩家喜欢在布局阶段点三三", kind="preference", tag="estarth")
         self.assertIsInstance(i, int)
         hits = self.store.recall("布局怎么下三三", k=3)
         self.assertEqual(hits[0]["id"], i)
@@ -122,7 +122,7 @@ class StoreTest(unittest.TestCase):
 
     def test_no_embed_fn_degrades_to_keyword(self):
         store = MemoryStore(os.path.join(self.dir.name, "kw.db"), embed_fn=None)
-        store.write("Estarth 喜欢听棋谱讲解", kind="preference", tag="estarth")
+        store.write("玩家喜欢听棋谱讲解", kind="preference", tag="estarth")
         hits = store.recall("讲解", k=3)
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["score"], 0.0)      # 关键词命中：不给伪相似度

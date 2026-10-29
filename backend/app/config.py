@@ -43,7 +43,7 @@ class AzureConfig:
         self.emotion_style = False
         # —— 聊天事件摘要（v3.8.0）：默认规则式（零 LLM）；开启后只在局末 / 空闲补做 LLM 分段 ——
         self.chat_digest_llm = False
-        # —— 玩家棋风画像 + 时间感知（v3.9.0，设计 §6.4）：两个开关**默认都关**（关掉＝现状）——
+        # ——玩家棋风画像 + 时间感知（v3.9.0，设计 §6.4）：两个开关**默认都关**（关掉＝现状）——
         #    关着时提示词里的画像块 / 时间块都不注入（与没有这两个功能逐字符同构）；
         #    读入口径与 `emotion_drift` / `chat_digest_llm` 同形：只认 JSON 的 true / false。
         self.profile_enabled = False
@@ -51,7 +51,7 @@ class AzureConfig:
         # 人格化（关系阶段 / 情绪余温 / 小目标 / 夜間语气）：默认开；关掉＝提示词逐字符不变。
         # 与 `profile_enabled` 解耦：画像记棋风，人格化记「你们一起下过多少盘、她心里还留着什么」。
         self.persona_enabled = True
-        # 关系阶段与称呼变化：**默认关**（称呼保持 prompt_user_name，默认 Estarth 不变）。
+        # 关系阶段与称呼变化：**默认关**（称呼保持 prompt_user_name，默认玩家不变）。
         # 开启后才按局数推进称呼；`persona_address_name` 为空 ⇒ 即便开启也仍用原名。
         self.persona_relationship_enabled = False
         self.persona_address_name = ""
@@ -68,6 +68,8 @@ class AzureConfig:
         # 自动排班 / 到点提醒 / 留档（v4.1.0）：自动排班只管待定与之前自动排过的任务。
         self.auto_plan_enabled = True
         self.auto_plan_days = 7
+        # 聊天里由 Azure 自己判断是否排入日程（v4.2.0）；关闭时聊天与旧版逐字一致。
+        self.schedule_chat_enabled = True
         self.schedule_reminder_enabled = True
         self.schedule_archive_days = 7
         self.schedule_retention_days = 30
@@ -138,7 +140,7 @@ class AzureConfig:
         self.tts_aliyun_tn = True           # 文本归一化：把「12345」读成口语，默认开
         # —— 提示词自定义（留空则用内置 Azure 人设）——
         self.prompt_system = ""
-        self.prompt_user_name = "Estarth"
+        self.prompt_user_name = "玩家"
         self.prompt_phase_notes = {}
 
         self._path = ""
@@ -225,6 +227,8 @@ class AzureConfig:
             self.auto_plan_days = max(1, min(30, int(d.get("auto_plan_days", self.auto_plan_days))))
         except (TypeError, ValueError):
             pass
+        v = d.get("schedule_chat_enabled")
+        self.schedule_chat_enabled = v if isinstance(v, bool) else self.schedule_chat_enabled
         v = d.get("schedule_reminder_enabled")
         self.schedule_reminder_enabled = v if isinstance(v, bool) else self.schedule_reminder_enabled
         try:

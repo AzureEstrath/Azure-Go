@@ -45,7 +45,7 @@ var profile_enabled := false
 ## 人格化（自用版）：关系阶段 / 情绪余温 / 今天的小心思 / 夜間节奏 / 难度与偏航的半句提示。
 ## 默认开；关掉＝后端提示词逐字符不变。由 ⚙ 设置抽屉读写。
 var persona_enabled := true
-## 关系阶段与称呼变化：**默认关**——称呼保持 `prompt_user_name`（默认 Estarth）不变。
+## 关系阶段与称呼变化：**默认关**——称呼保持 `prompt_user_name`（默认 朋友）不变。
 ## 开启后才按局数推进称呼；`persona_address_name` 为空 ⇒ 即便开启也仍用原名。
 var persona_relationship_enabled := false
 var persona_address_name := ""    # 高阶段称呼名（最多 16 字；留空=仍叫 prompt_user_name）
@@ -85,7 +85,7 @@ var reply_style := 0
 var vrm_path := "Azure.vrm"
 # —— 提示词自定义（留空则用内置 Azure 人设）——
 var prompt_system := ""           # 覆盖系统提示词（人设全文）；留空用内置
-var prompt_user_name := "Estarth" # 玩家称呼；会替换提示词中的「Estarth」
+var prompt_user_name := "朋友" # 玩家称呼；会替换提示词里的占位名
 var prompt_phase_notes: Dictionary = {}  # 覆盖阶段提示，键为阶段名（如 after_player / own_turn）
 # —— 云端语音（OpenAI 兼容 /v1/audio/speech；system=Windows 系统语音兜底）——
 var tts_enabled := false

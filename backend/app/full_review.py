@@ -182,7 +182,7 @@ def build_messages(agent, record, seg, index, total, previous="") -> list:
     moves = record.get("moves") if isinstance(record.get("moves"), list) else []
     start = int(seg.get("from", 0))
     end = int(seg.get("to", 0))
-    player = str(getattr(agent, "player_name", "") or "Estarth")
+    player = str(getattr(agent, "player_name", "") or "玩家")
     rows = seg.get("rows") or []
     parts = [
         "你正在和%s一起复盘棋谱库里的一盘棋（共%d手）。这是第%d/%d段，覆盖第%d~%d手。"

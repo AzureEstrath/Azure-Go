@@ -77,7 +77,7 @@ class FlowTest(unittest.TestCase):
         payload = st.payload()
         self.assertEqual(len(payload["stones"]), payload["move_count"])
 
-        # 带标签的记忆：E（Estarth 的棋）与 A（Azure 的棋）
+        # 带标签的记忆：E（玩家的棋）与 A（Azure 的棋）
         tags = {str(m.get("tag", "")) for m in st.memory_log}
         self.assertIn("E", tags)
         self.assertIn("A", tags)
@@ -166,7 +166,7 @@ class FlowTest(unittest.TestCase):
         joined = "\n".join(str(m.get("content", "")) for m in llm.calls[-1][0])
         self.assertIn("Bilibili", joined)
         self.assertIn("围棋教学视频", joined)
-        self.assertIn("Estarth", joined)
+        self.assertIn("玩家", joined)
 
     def test_peer_remark_filters_private_screen(self):
         """窥屏隐私：密码 / 聊天 / 手机号等一律不进口型提示词，只留「私人的东西」。"""
@@ -290,8 +290,8 @@ class FlowTest(unittest.TestCase):
     def test_idle_memory_hint_deduplicates_recent_memories(self):
         agent, _eng, _llm, _bus = _mk()
         agent.memory = _RecallMemory([
-            {"id": 11, "text": "Estarth 上次说喜欢雨天摆棋。", "score": 0.9},
-            {"id": 12, "text": "Estarth 提过想去棋院看看。", "score": 0.8},
+            {"id": 11, "text": "玩家上次说喜欢雨天摆棋。", "score": 0.9},
+            {"id": 12, "text": "玩家提过想去棋院看看。", "score": 0.8},
         ])
         agent.recall_rng = FixedRng(0.0)       # 概率门必定通过
         h1 = agent.idle_memory_hint()
@@ -312,7 +312,7 @@ class FlowTest(unittest.TestCase):
         async def run():
             agent, _eng, llm, _bus = _mk()
             agent.memory = _RecallMemory([
-                {"id": 21, "text": "Estarth 上次说喜欢雨天的棋盘。", "score": 0.9},
+                {"id": 21, "text": "玩家上次说喜欢雨天的棋盘。", "score": 0.9},
             ])
             agent.recall_rng = FixedRng(0.0)
             await agent.idle_remark("pet")
@@ -336,7 +336,7 @@ class FlowTest(unittest.TestCase):
             cfg.memory_max_inject_chars = 240
             mem = MemoryService(cfg)
             try:
-                mem.remember_fact("Estarth 上次说雨天摆棋很开心", tag="test")
+                mem.remember_fact("玩家上次说雨天摆棋很开心", tag="test")
                 agent, _eng, _llm, _bus = _mk()
                 agent.memory = mem
                 agent.mood.v = 0.90
@@ -354,7 +354,7 @@ class FlowTest(unittest.TestCase):
         async def run():
             agent, _eng, llm, _bus = _mk()
             agent.memory = _RecallMemory([
-                {"id": 31, "text": "Estarth 上次说喜欢雨天摆棋。", "score": 0.9},
+                {"id": 31, "text": "玩家上次说喜欢雨天摆棋。", "score": 0.9},
             ])
             agent.recall_rng = FixedRng(0.0)
             await agent.idle_remark("game")
@@ -606,7 +606,7 @@ class FailSafeTest(unittest.TestCase):
     def test_chat_json_reply_is_naturalized(self):
         """模型误吐日程 JSON：聊天历史与 WS 台词都必须是可读中文，不能留 `[` / 字段名。"""
         llm = StubLLM(text='[{"date":"2026-10-28", "time":"08:00", '
-                           '"title":"无机化学实验", "notes":"杨悠笛 @二教10"}]')
+                           '"title":"无机化学实验", "notes":"李老师 @综合楼103"}]')
         agent, bus = self._run(llm, lambda a: a.chat("刚刚你看到了什么"))
         reply = agent.st.chat_history[-1]["content"]
         self.assertIn("无机化学实验", reply)
@@ -693,7 +693,7 @@ class MemoryWiringTest(unittest.TestCase):
 
     def test_memory_text_reaches_prompts(self):
         agent, _eng, _llm, _bus = _mk()
-        agent.memory = FakeMemory("Estarth 喜欢点三三")
+        agent.memory = FakeMemory("玩家喜欢点三三")
 
         async def run():
             await agent.chat("你好")
@@ -701,19 +701,19 @@ class MemoryWiringTest(unittest.TestCase):
         asyncio.run(run())
         # 真实断言：至少一条 user 消息里带上了召回文本
         sent = [m["content"] for c in agent.llm.calls for m in c[0] if m["role"] == "user"]
-        self.assertTrue(any("Estarth 喜欢点三三" in s for s in sent))
+        self.assertTrue(any("玩家喜欢点三三" in s for s in sent))
 
     def test_memory_text_reaches_ai_turn_context(self):
         """她这一回合（_ai_turn）也要带召回文本——这条走 with_context 的透传路径。"""
         agent, _eng, _llm, _bus = _mk()
-        agent.memory = FakeMemory("Estarth 喜欢点三三")
+        agent.memory = FakeMemory("玩家喜欢点三三")
 
         async def run():
             await agent.player_move(3, 3)
 
         asyncio.run(run())
         sent = [m["content"] for c in agent.llm.calls for m in c[0] if m["role"] == "user"]
-        self.assertTrue(any("Estarth 喜欢点三三" in s for s in sent))
+        self.assertTrue(any("玩家喜欢点三三" in s for s in sent))
 
     def test_summary_writes_long_term_memory(self):
         agent, _eng, _llm, _bus = _mk()
@@ -1499,7 +1499,7 @@ class JosekiCardGateTest(unittest.TestCase):
     # —— T6：`move_no` 记在玩家这一手上，事件里带出来 ——
 
     def test_jk_mistake_records_the_players_one_based_move_number(self):
-        """`data["jk_mistake"]["move_no"]` ＝ 玩家这一手的 1 基序号（4 手铺好 + 这手 ＝ 5）。"""
+        """`data["jk_mistake"]["move_no"]` ＝玩家这一手的 1 基序号（4 手铺好 + 这手 ＝ 5）。"""
         agent = self._agent()
         state = self._deviated(agent)
         self.assertEqual(state["data"]["jk_mistake"]["move_no"], 5)
@@ -1924,7 +1924,7 @@ class EmotionDriftTest(unittest.TestCase):
             a = AzureAgent(DriftEngine(), StubLLM(), events.RecordingBus(),
                            joseki_rate=1.0, joseki_rng=ZeroRng(),
                            emotion_drift=drift, drift_rng=rng)
-            await a.player_move(3, 3)                    # 玩家 D16，不挡三条线
+            await a.player_move(3, 3)                    # 玩家D16，不挡三条线
             return a, a.bus
 
         off, bus_off = asyncio.run(run(False, BoomRng()))
@@ -2459,7 +2459,7 @@ class GameRecordWriteTest(unittest.TestCase):
             agent, llm, _bus = self._agent(store)
 
             async def run():
-                await agent.player_move(3, 3)          # 玩家 D16（真亏 30%）
+                await agent.player_move(3, 3)          # 玩家D16（真亏 30%）
                 await agent.summarize("随便聊聊")
 
             asyncio.run(run())
@@ -2678,7 +2678,7 @@ class BusyOwnershipTest(unittest.TestCase):
     复现路径：`_finalize_just_moved` 讲完就 `_set_busy(False)`（设计如此），随后
     `_mood_llm_refine()` 还要跑 1~20 秒（15 秒限频 ⇒ 每两三手出现一次）；玩家在这段窗口里落子
     ⇒ 新回合把 busy 置真，旧回合 finally 回来若无条件清位，就把新回合的锁解了 ⇒ 她还没应手，
-    玩家又能再下一手。
+   玩家又能再下一手。
     """
 
     def _agent(self):
@@ -2741,7 +2741,7 @@ class PersonaStyleTest(unittest.TestCase):
             a = AzureAgent(DriftEngine(), StubLLM(), events.RecordingBus(),
                            joseki_rate=0.0, emotion_style=True, drift_rng=FixedRng(0.0))
             a.mood.v, a.mood.c, a.mood.a = 0.85, 0.55, 0.65
-            await a.player_move(3, 3)                 # 玩家 D16，不挡 B 的 D4
+            await a.player_move(3, 3)                 # 玩家D16，不挡 B 的 D4
             return a
 
         a = asyncio.run(run())

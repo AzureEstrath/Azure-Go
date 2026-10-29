@@ -420,7 +420,7 @@ class MemoryStore:
     # —— 聊天流水（共享记忆的「最近发生了什么」；与可召回 memories 分开） ——
 
     def append_chat(self, user_text: str, reply_text: str, mode: str = "", mood=None) -> int | None:
-        """追加一轮完整聊天（玩家 + Azure），返回行 id；失败返回 ``None``。
+        """追加一轮完整聊天（玩家+ Azure），返回行 id；失败返回 ``None``。
 
         这是**原文流水**：桌宠 / 围棋共用，用于启动时恢复“最近在聊什么”的连续性，
         同时给 memories 写一条可召回的摘要由 ``MemoryService`` 负责。
@@ -495,7 +495,7 @@ class MemoryStore:
         r = _clip(" ".join(str(reply_text or "").split()), MAX_CHAT_REPLY_LEN)
         if u == "" and r == "":
             return None
-        piece = "Estarth：%s；Azure：%s" % (u[:90], r[:110])
+        piece = "玩家：%s；Azure：%s" % (u[:90], r[:110])
         now = self._now()
         closed: list = []
         new_id = None

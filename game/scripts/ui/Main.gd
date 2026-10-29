@@ -157,7 +157,7 @@ const LOCAL_VOICE_PRESETS := [
 	["nvsheng", "女声 · 温柔（轻量）"],
 ]
 
-## 闲置互动：玩家长时间无操作 → 看向玩家 + 歪头 + 偶尔主动搭话（搭话走后端 POST /api/idle）
+## 闲置互动：玩家长时间无操作 → 看向玩家+ 歪头 + 偶尔主动搭话（搭话走后端 POST /api/idle）
 const IDLE_SEC := 12.0
 const IDLE_TALK_FIRST := 18.0
 const IDLE_TALK_MIN := 45.0
@@ -601,7 +601,7 @@ func _pet_on_interact() -> void:
 		agent.player_interaction("patted")
 		get_tree().create_timer(0.35).timeout.connect(_pet_fetch_mood)
 		if _pet_memory_on and _pet_pat_count % 5 == 0:
-			agent.memory_write("Estarth 在桌面上摸了摸 Azure 的头。", "桌宠")
+			agent.memory_write("你摸了摸 Azure 的头。", "桌宠")
 
 func _pet_on_mute(muted: bool) -> void:
 	if _pet_ui != null:
@@ -1751,7 +1751,7 @@ func _build_right_panel(root: Control) -> void:
 	drawer.add_child(rel_row)
 	_acc_check(rel_row, "关系称呼", cfg.persona_relationship_enabled, "persona_relationship",
 		"默认关。开启后按一起下完的局数推进称呼（初识 → 熟悉 → 熟络 → 老搭档）。"
-		+ "右侧填高阶段称呼名；留空则始终用 config.json 的 prompt_user_name（默认 Estarth）。")
+		+ "右侧填高阶段称呼名；留空则始终用 config.json 的 prompt_user_name（默认 朋友）。")
 	var le_addr := LineEdit.new()
 	le_addr.placeholder_text = "称呼名（留空=%s）" % cfg.prompt_user_name
 	le_addr.text = cfg.persona_address_name
@@ -2544,14 +2544,16 @@ func _add_msg(kind: String, text: String) -> void:
 const AI_NOTICE := "ai_notice"
 ## 事务提醒（v4.1.0）：同样**不发** speech；在围棋窗口里当纯文字消息显示，不占语音配对位。
 const AI_REMIND := "ai_remind"
+## 聊天排程补充（v4.2.0）：同样**不发** speech；只作为聊天里的一句补充，不占语音配对位。
+const AI_SCHEDULE := "ai_schedule"
 
 ## 这条 `message` 要不要登记语音配对记录？（**纯函数**，headless 门卫直接断言）
 ## 三种「没有语音」的来源：① 推送方声明（`AI_NOTICE`）；② 调用点本地标记（undo / reset /
-## 允许虚着 / 本地开场问候，走 `pairing.mark_text_only()`）；③ 不是她的话（玩家 / 系统消息）。
+## 允许虚着 / 本地开场问候，走 `pairing.mark_text_only()`）；③ 不是她的话（玩家/ 系统消息）。
 static func message_needs_speech(kind: String, text_only := false) -> bool:
 	if not kind.begins_with("ai"):
 		return false
-	if kind == AI_NOTICE or kind == AI_REMIND:
+	if kind == AI_NOTICE or kind == AI_REMIND or kind == AI_SCHEDULE:
 		return false
 	return not text_only
 
@@ -5647,7 +5649,7 @@ static func review_note_lines(notes, losses) -> Array[String]:
 				str(d2.get("reason", ""))])
 	return out
 
-# ================= 闲置互动（看玩家 / 歪头 / 主动搭话） =================
+# ================= 闲置互动（看玩家/ 歪头 / 主动搭话） =================
 
 ## 鼠标移动、点击、敲键盘都算「玩家有操作」
 func _input(event: InputEvent) -> void:
@@ -5822,7 +5824,7 @@ func _azure_hold_active() -> bool:
 # ================= 长时间闲置窥屏（本地 RapidOCR + Qwen2.5-VL，独立 python 进程一跑一停） =================
 
 ## 这一轮闲置到底说什么：玩家切去了别的窗口就先窥屏，否则普通走神搭话。
-## 游戏窗口在前台 = 玩家就在游戏里（窥屏只会看到游戏本身）：不白起 python 进程。
+## 游戏窗口在前台 =玩家就在游戏里（窥屏只会看到游戏本身）：不白起 python 进程。
 func _request_idle_talk(now: int) -> void:
 	if _pet_active and (agent == null or not _pet_online):
 		_pet_say_local(_pet_pick_local_line())     # 后端未连上：桌宠用本地短句 + 系统语音

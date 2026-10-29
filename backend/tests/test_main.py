@@ -384,7 +384,7 @@ class MemoryHealthTest(unittest.TestCase):
             with TestClient(app) as client:
                 svc = app.state.agent.memory           # lifespan 注入的实例
                 self.assertTrue(svc.available)
-                self.assertIsInstance(svc.remember_fact("Estarth 喜欢点三三", tag="estarth"), int)
+                self.assertIsInstance(svc.remember_fact("玩家喜欢点三三", tag="estarth"), int)
                 self.assertEqual(client.get("/api/health").json()["memory_rows"], 1)
             # 退出时 close()：库已关，统计退回全 0（库文件仍在）
             self.assertEqual(app.state.memory.store.stats()["rows"], 0)
@@ -423,7 +423,7 @@ class MemoryApiEnabledTest(unittest.TestCase):
     def test_write_query_stats_forget_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
             with TestClient(self._app(d)) as client:
-                r = client.post("/api/memory/write", json={"tag": "estarth", "text": "Estarth 喜欢点三三"})
+                r = client.post("/api/memory/write", json={"tag": "estarth", "text": "玩家喜欢点三三"})
                 self.assertEqual(r.status_code, 200)
                 self.assertTrue(r.json()["ok"])
                 self.assertIsInstance(r.json()["id"], int)
@@ -438,7 +438,7 @@ class MemoryApiEnabledTest(unittest.TestCase):
                 self.assertEqual(len(q["items"]), 1)
                 item = q["items"][0]
                 self.assertEqual(set(item), {"id", "ts", "kind", "tag", "text", "score"})
-                self.assertEqual(item["text"], "Estarth 喜欢点三三")
+                self.assertEqual(item["text"], "玩家喜欢点三三")
                 self.assertEqual(item["tag"], "estarth")
                 self.assertEqual(item["kind"], "fact")
 

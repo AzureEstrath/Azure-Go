@@ -200,7 +200,7 @@ def chat_topics(history, window=CHAT_TOPIC_WINDOW):
     - **关键词 / 相似度**：玩家发言命中 ``CHAT_TOPIC_RULES`` 里最靠前的一类即为该段的主题，
       核不上归「闲聊」；主题相同的连续玩家发言并成一段（相似度＝同类关键词）；
     - **两侧都用**（设计 §6.6：输入＝这轮玩家消息 **+ 她的回复**）：主题由玩家发言定，
-      但段的摘要同时收两侧命中的关键词 ——「Estarth 说到 X」用玩家那侧、「我聊到 Y」用她那侧；
+      但段的摘要同时收两侧命中的关键词 ——「玩家说到 X」用玩家那侧、「我聊到 Y」用她那侧；
       她没回关键词时写成「我回应了」（**与有没有她的回复无关地稳定**，故去重不会被回合数打散）；
     - **纯函数、零 LLM**：不碰 ``self``，可直接在事件写入路径上调用。
     """
@@ -209,7 +209,7 @@ def chat_topics(history, window=CHAT_TOPIC_WINDOW):
     uidx = [i for i, m in enumerate(msgs) if str(m.get("role", "")) == "user"]
     if window and window > 0 and len(uidx) > window:
         msgs = msgs[uidx[-int(window)]:]          # 窗口从「第 window 近的玩家发言」起，带上其后回复
-    segs = []                                     # [主题, [Estarth 那侧的关键词], [她那侧的关键词]]
+    segs = []                                     # [主题, [玩家那侧的关键词], [她那侧的关键词]]
     for m in msgs:
         role = str(m.get("role", ""))
         topic, kw = _chat_topic_of(str(m.get("content", "")))
@@ -226,7 +226,7 @@ def chat_topics(history, window=CHAT_TOPIC_WINDOW):
                 segs[-1][2].append(kw)
     out = []
     for topic, his, mine in segs:
-        his_s = ("Estarth 说到%s" % "、".join(his)) if his else "Estarth 随口聊了几句"
+        his_s = ("玩家说到%s" % "、".join(his)) if his else "玩家随口聊了几句"
         mine_s = ("我聊到%s" % "、".join(mine)) if mine else "我回应了"
         out.append((topic, prompts._one_line("%s，%s" % (his_s, mine_s), CHAT_TOPIC_SUMMARY_CHARS)))
     return out
@@ -498,7 +498,7 @@ class AzureAgent:
         self.event_log = EventLog()
 
         # —— 时间感知的采集（v3.9.0，设计 §5-H）：**单手用时的采集是纯后端的**（不要求前端配合）——
-        #    ``session_start`` ＝ 本局开始时刻（本局第一手到达时置位）、``move_ts_list`` ＝ 玩家每一手
+        #    ``session_start`` ＝ 本局开始时刻（本局第一手到达时置位）、``move_ts_list`` ＝玩家每一手
         #    的到达时刻；两者都是**局内内存**、``reset_game()`` 清空，**不进 GameState 快照**
         #    （悔棋不回退——「这一手确实等了这么久」是既成事实）。打点由 ``player_move`` 自己在
         #    ``is_legal`` 通过之后调 ``mark_move_time()``（修复轮 1 / I-1：被拒的落子不打点）；
@@ -512,7 +512,7 @@ class AzureAgent:
         #    （``_digest_chat_llm``），落子回合内一次都不调（性能红线）。
         self.chat_digest_llm = bool(chat_digest_llm)
 
-        # —— 玩家棋风画像 + 时间感知（v3.9.0，设计 §6.4）：两个开关**默认都关**（关掉＝现状）——
+        # ——玩家棋风画像 + 时间感知（v3.9.0，设计 §6.4）：两个开关**默认都关**（关掉＝现状）——
         #    关着时 ``profile_facts`` / ``time_facts`` 直接返回空 dict ⇒ 提示词里的两块都不注入
         #    （与没有这两个功能逐字符同构）。画像库由 ``main.py`` 的 lifespan 注入
         #    （``self.profile_store``，与 ``memory`` / ``joseki_progress`` 同一套装配纪律）；
@@ -525,7 +525,7 @@ class AzureAgent:
         #    ``load_persona()`` 在 lifespan 里读一次 profile.db 的 persona 表（测试不调用 ⇒ 零变化）。
         self.persona_enabled = bool(persona_enabled)
         self.persona_rng = persona_rng if persona_rng is not None else random.Random()
-        # 关系阶段 / 称呼变化：**默认关**，称呼保持 `prompts.user_name`（默认 Estarth）不变。
+        # 关系阶段 / 称呼变化：**默认关**，称呼保持 `prompts.user_name`（默认玩家）不变。
         # 开启后才按局数推进称呼；`persona_address_name` 为空 ⇒ 即便开启也仍用原名。
         self.persona_relationship_enabled = bool(persona_relationship_enabled)
         self.persona_address_name = (str(persona_address_name).strip()[:16]
@@ -539,7 +539,7 @@ class AzureAgent:
         # —— 棋谱库（v3.11.5）：默认不接线（None）⇒ 局末不写库；由 main.py lifespan 注入 GameStore。
         #    ``player_name`` 只用于棋谱的 PB（黑方名），``_library_sig`` 防同一次结束重复归档。
         self.game_store = None
-        self.player_name = "Estarth"
+        self.player_name = "玩家"
         self._library_sig = None
         # —— 自适应难度（v3.11.5）：默认关；基线上下最多 ±spread 档，由 main.py lifespan 按配置接通。
         self.adaptive = adaptive.AdaptiveDifficulty(
@@ -816,8 +816,8 @@ class AzureAgent:
         conv = prompts.to_black_perspective(analysis, num_moves)
         wr = float(conv[0])
         sc = float(conv[1])
-        who = "Estarth（黑）稍优" if sc > 0.5 else ("Azure（白）稍优" if sc < -0.5 else "双方接近")
-        s = "黑方（Estarth）胜率 %.1f%%；目差 %+.1f 目（正数=黑/Estarth 领先，含贴目）；整体 %s。" % (wr * 100.0, sc, who)
+        who = "玩家（黑）稍优" if sc > 0.5 else ("Azure（白）稍优" if sc < -0.5 else "双方接近")
+        s = "黑方（玩家）胜率 %.1f%%；目差 %+.1f 目（正数=黑/玩家领先，含贴目）；整体 %s。" % (wr * 100.0, sc, who)
         own = analysis.get("ownership", [])
         if own:
             b = 0.0
@@ -828,7 +828,7 @@ class AzureAgent:
                     b += f
                 else:
                     w -= f
-            s += " 实地估算：Estarth（黑）约 %.0f 目，Azure（白）约 %.0f 目（按逐点归属估算，仅供参考）。" % (b, w)
+            s += " 实地估算：玩家（黑）约 %.0f 目，Azure（白）约 %.0f 目（按逐点归属估算，仅供参考）。" % (b, w)
         self.st.last_katago = s
 
     def _think_hint(self) -> str:
@@ -1146,7 +1146,7 @@ class AzureAgent:
           预算用尽后不再执行工具，只追加「别再调工具、直接回答」的指令催它收尾；
         - 工具与链的任何失败都不许抛出：失败变成可读 ``ToolMessage``，链抛错则返回空串，
           由调用方的兜底台词顶上（与 ``_reply`` 同一降级）；
-        - 玩家看到的永远是模型重写的自然语言（``clean_reply`` 必经），工具输出只回到模型手里；
+        -玩家看到的永远是模型重写的自然语言（``clean_reply`` 必经），工具输出只回到模型手里；
         - 链不可用（没接 LLM / 未配置地址）或预算为 0 时退回 ``_reply``：与不开工具完全同一条路。
         """
         pool = list(TOOLS if tools is None else tools)
@@ -1233,14 +1233,14 @@ class AzureAgent:
         f = self._life_fields() or {}
         affinity = float(f.get("affinity", 0.35))
         if self.mood.v >= 0.66 or affinity >= 0.65:
-            return "Estarth 开心 喜欢 温暖 约定 一起做过的事"
+            return "玩家开心 喜欢 温暖 约定 一起做过的事"
         if self.mood.v <= 0.40:
-            return "Estarth 难过 安慰 陪伴 低落 最近聊天"
+            return "玩家难过 安慰 陪伴 低落 最近聊天"
         if self.mood.c >= 0.62:
-            return "Estarth 最近在忙 好奇 新鲜事 计划"
+            return "玩家最近在忙 好奇 新鲜事 计划"
         if self.mood.a >= 0.68:
             return "上次聊到 有趣 期待 一起做的事"
-        return "Estarth 最近聊过 喜欢 习惯 事情"
+        return "玩家最近聊过 喜欢 习惯 事情"
 
     def idle_memory_hint(self) -> dict:
         """走神时偶尔挑一条旧事（向量/关键词召回），返回 ``{id,text,score}`` 或 ``{}``。
@@ -1429,13 +1429,13 @@ class AzureAgent:
         elif energy >= 0.80:
             parts.append("你现在精神不错：可以主动一点，但别喧宾夺主。")
         if boredom >= 0.62:
-            parts.append("你已经有一阵子没和 Estarth 互动：心里有点想说话，但先读空气，别催促。")
+            parts.append("你已经有一阵子没和玩家互动：心里有点想说话，但先读空气，别催促。")
         if affinity >= 0.70:
             parts.append("你们已经很熟了：语气可以放松、亲近一点，但别腻。")
         elif affinity <= 0.25:
-            parts.append("你还在观察 Estarth：保持一点分寸，别一下子掏心。")
+            parts.append("你还在观察玩家：保持一点分寸，别一下子掏心。")
         if trust <= 0.30:
-            parts.append("信任还没有完全建立：不要替 Estarth 做决定，也别过度自证。")
+            parts.append("信任还没有完全建立：不要替玩家做决定，也别过度自证。")
         if dominance <= 0.30:
             parts.append("你此刻有点没底气：允许自己说不确定，别逞强。")
         elif dominance >= 0.70:
@@ -1484,7 +1484,7 @@ class AzureAgent:
         if mem is None or not bool(getattr(mem, "available", False)):
             return
         try:
-            result = "黑方（Estarth）胜率 %s，目差 %s" % (self._pct(black_wr), "%+.1f" % score)
+            result = "黑方（玩家）胜率 %s，目差 %s" % (self._pct(black_wr), "%+.1f" % score)
             mem.remember_game(list(self.st.moves), result, str(summary or ""))
         except Exception as e:                  # noqa: BLE001
             print("[Agent] 长期记忆写入异常（已忽略）：%s" % e)
@@ -1965,7 +1965,7 @@ class AzureAgent:
         if self.session_start is None:
             self.session_start = t
         self.move_ts_list.append(t)
-        # 落子也是“她还活着、和 Estarth 在同一张桌上”的时间事实；只推进时间戳，不逐手写事件行。
+        # 落子也是“她还活着、和玩家在同一张桌上”的时间事实；只推进时间戳，不逐手写事件行。
         self._life_touch("game_move", event=False, now=t)
 
     def time_facts(self, *, now=None, last_game_ts=None, game_ts_list=None):
@@ -2299,7 +2299,7 @@ class AzureAgent:
             "result": "",
             "summary": summary,
             "meta": {
-                "black": str(getattr(self, "player_name", "") or "Estarth"),
+                "black": str(getattr(self, "player_name", "") or "玩家"),
                 "white": "Azure",
                 "source": "game",
                 "notes": [dict(n) for n in self.st.move_notes if isinstance(n, dict)],
@@ -2434,7 +2434,7 @@ class AzureAgent:
         finally:
             self._greet_busy = False
 
-    # ================= 玩家落子 =================
+    # =================玩家落子 =================
 
     async def player_move(self, x, y):
         """玩家落子：点评 → 她思考落子 → 落子后感想。
@@ -2782,13 +2782,13 @@ class AzureAgent:
         for m in list(self.st.chat_history)[-CHAT_DIGEST_MAX_MSGS:]:
             if not isinstance(m, dict):
                 continue
-            who = "Estarth" if str(m.get("role", "")) == "user" else "我"
+            who = "玩家" if str(m.get("role", "")) == "user" else "我"
             t = " ".join(str(m.get("content", "")).split())
             if t != "":
                 lines.append("%s：%s" % (who, t))
         if not lines:
             return 0
-        prompt = ("下面是这盘棋里我和 Estarth 的聊天记录。请按主题把它分成若干段，每段一行，"
+        prompt = ("下面是这盘棋里我和玩家的聊天记录。请按主题把它分成若干段，每段一行，"
                   "格式为「主题：一句话摘要」，主题用两到四个字，摘要不超过二十字；"
                   "不要复述原话，不要输出别的解释。\n\n" + "\n".join(lines))
         try:
@@ -2949,7 +2949,7 @@ class AzureAgent:
         text = ""
         try:
             prompt = (
-                "现在是 %s。Estarth 的日程「%s」到时间了%s。"
+                "现在是 %s。玩家的日程「%s」到时间了%s。"
                 "用一句很短、自然的中文提醒他（25 字以内）：像朋友提醒，不要像任务播报，"
                 "不要提“日程表 / 数据库 / 系统”，不要编造别的事。"
             ) % (stamp, title, ("（%s）" % when) if when else "")
@@ -2965,7 +2965,7 @@ class AzureAgent:
         return text
 
     async def idle_remark(self, mode="game"):
-        """闲置搭话：Estarth 一段时间没动静时，Azure 主动说一句短话。
+        """闲置搭话：玩家一段时间没动静时，Azure 主动说一句短话。
 
         同样走看门狗（超时也解锁 + 前推一代），只是它**不进 busy**：与今天一致（空闲搭话不锁棋盘）。
         注意「新的公开调用会 ``begin_epoch()``」顺带带来了一个既有语义的加强：玩家一回来就落子时，
@@ -2986,7 +2986,7 @@ class AzureAgent:
         """窥屏搭话：玩家切去别的窗口时，结合前台窗口 / OCR / VLM 描述主动说一句。
 
         与 ``idle_remark`` 同一条「不进 busy」的通道（空闲搭话不锁棋盘），但 prompt 里带上看到的内容。
-        玩家一回来就会 ``begin_epoch()``，这一代随即作废——与前端丢弃迟到的窥屏结果一致。
+       玩家一回来就会 ``begin_epoch()``，这一代随即作废——与前端丢弃迟到的窥屏结果一致。
         """
         if self.busy:
             return

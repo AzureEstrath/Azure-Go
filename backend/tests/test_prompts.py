@@ -298,7 +298,7 @@ class TestConfigureOverride(_Base):
             self.eq(prompts.phase_note("observe"), g["phase_note_observe"], "configure phase_note observe")
             self.eq(prompts.phase_note("chat"), g["phase_note_chat"], "configure phase_note chat")
             self.eq(prompts.role_brief(MOVES_SHORT, "observe"), g["role_brief"], "configure role_brief")
-            self.eq(prompts._t("Estarth 你好"), g["_t"], "configure _t")
+            self.eq(prompts._t("玩家 你好"), g["_t"], "configure _t")
         finally:
             prompts.configure(DEFAULT_CFG)   # 复原默认配置
         # 复原校验：默认态不含覆盖
@@ -398,11 +398,11 @@ class TestJosekiActiveTemplates(_Base):
             self.assertIn(self.NAME, out)
             self.assertIn(self.KEY, out)
             self.assertIn(self.CORNER, out)
-        # 谁走完的说清楚：玩家 / Azure 各一份，互不串味
-        self.assertIn("Estarth", player)
+        # 谁走完的说清楚：玩家/ Azure 各一份，互不串味
+        self.assertIn("玩家", player)
         self.assertNotIn("Azure", player)
         self.assertIn("Azure", azure)
-        self.assertNotIn("Estarth", azure)
+        self.assertNotIn("玩家", azure)
         self.assertNotEqual(player, azure)
 
     def test_role_note_inverts_when_the_player_owns_the_corner(self):
@@ -412,7 +412,7 @@ class TestJosekiActiveTemplates(_Base):
         self.assertIn("角色对调", out)
         self.assertIn("「你 / 我 / 自己」都指对面", out)
         self.assertIn("「他 / 对方 / 别人」指你自己", out)
-        self.assertNotIn("Estarth", out)
+        self.assertNotIn("玩家", out)
 
     def test_role_note_keeps_azure_as_the_corner_owner(self):
         """角主是白（Azure 自己）时，要点里的「我/自己」仍是「我」、「他/对方」是「你」。"""
@@ -614,13 +614,13 @@ class TestProfileTimeBlocks(_Base):
         full = prompts.time_note(_facts())
         self.assertIn("现在是 2026-10-19 周一 21:03", full)
         self.assertIn("本局已下 2 小时 3 分", full)
-        self.assertIn("Estarth 平均每手 42 秒", full)
+        self.assertIn("玩家平均每手 42 秒", full)
         self.assertIn("距上次对局 3 天", full)
-        self.assertIn("连续第 4 天在陪 Estarth", full)
+        self.assertIn("连续第 4 天在陪玩家", full)
 
         # 只差「连续天数」那一行放不下 ⇒ 丢它，其余全留
-        out = prompts.time_note(_facts(), max_chars=len(full) - len("连续第 4 天在陪 Estarth") - 1)
-        self.assertEqual(out, full.replace("\n连续第 4 天在陪 Estarth", ""))
+        out = prompts.time_note(_facts(), max_chars=len(full) - len("连续第 4 天在陪玩家") - 1)
+        self.assertEqual(out, full.replace("\n连续第 4 天在陪玩家", ""))
         # 再收紧一行 ⇒ 「距上次对局」也先走，当前时间留住
         out2 = prompts.time_note(_facts(), max_chars=len(out) - len("距上次对局 3 天") - 1)
         self.assertNotIn("距上次对局", out2)
@@ -709,9 +709,9 @@ class TestProfileTimeBlocks(_Base):
                                game_ts_list=[1792414980.0])
         out = prompts.time_note(facts)
         self.assertIn("本局已下 2 小时 3 分", out)
-        self.assertIn("Estarth 平均每手 1 分 24 秒", out)
+        self.assertIn("玩家平均每手 1 分 24 秒", out)
         self.assertIn("距上次对局 3 天", out)
-        self.assertIn("连续第 1 天在陪 Estarth", out)
+        self.assertIn("连续第 1 天在陪玩家", out)
 
     def test_missing_axes_are_not_read_as_the_opposite(self):
         """修复轮 1 / I-2：**缺键 ⇒ 该句不出现**（不是被念成 0 那一侧）。"""
@@ -730,7 +730,7 @@ class TestProfileTimeBlocks(_Base):
         self.assertNotIn("很少脱先", prompts.profile_note(axes, 40), "只落 1 手 ⇒ 脱先无信号")
 
     def test_infinite_values_do_not_produce_broken_lines(self):
-        """修复轮 1 / Minor #5：``inf`` 不许抛、也不许拼出「Estarth 平均每手 」这种半句话。"""
+        """修复轮 1 / Minor #5：``inf`` 不许抛、也不许拼出「玩家平均每手 」这种半句话。"""
         inf = float("inf")
         t = {"date": "2026-10-19", "weekday": "周一", "clock": "21:03",
              "session_sec": inf, "avg_move_sec": inf, "last_gap_days": inf, "streak_days": inf}

@@ -137,37 +137,66 @@ func _test_view() -> void:
 	_check("资料窗口不再撑到 700 宽", v._files_size().x <= 560)
 	v.set_files_info("C:/inbox", [{"name": "a.png"}, {"name": "b.pdf"}])
 	_check("资料文件列表显示", v._files_rows.get_child_count() == 2)
+	v._calendar_month = "2026-10"
 	v.set_schedule_items([{"when_text": "2026-10-28 15:30", "title": "评审", "notes": ""}])
-	_check("普通日程列表显示", v._schedule_rows.get_child_count() == 1)
-	_check("没有课程时不画空表格", v._schedule_table == null)
+	_check("月历默认显示 42 个日格", v._calendar_grid != null
+		and v._calendar_grid.get_child_count() == 42)
+	_check("月历标题显示年月", v._calendar_title != null
+		and v._calendar_title.text.contains("2026") and v._calendar_title.text.contains("10"))
+	_check("没有课程时默认不画周表", v._schedule_table == null)
+	_check("本月日程列表显示", v._schedule_agenda != null
+		and v._schedule_agenda.get_child_count() >= 2)
 	_check("复盘按钮存在", v._files_review != null)
 	_check("执行反馈 / 复盘信号已定义",
 		v.has_signal("schedule_feedback_requested") and v.has_signal("files_review_requested"))
-	var agenda_wrap = v._schedule_rows.get_child(0)
+	var agenda_wrap = v._schedule_agenda
 	var task_row = agenda_wrap.get_child(1) if agenda_wrap.get_child_count() > 1 else null
 	_check("普通日程行带完成 / 推迟按钮",
 		task_row != null and task_row.get_child_count() == 3)
 	_check("普通日程行显示自动分级",
 		task_row != null and task_row.get_child(0).text.contains("[待排]"))
+	v._shift_month(1)
+	_check("月历能翻到下个月", v._calendar_title != null
+		and v._calendar_title.text.contains("11"))
+	v._shift_month(-1)
+	_check("月历能翻回本月", v._calendar_title != null
+		and v._calendar_title.text.contains("10"))
+	var click_ev := InputEventMouseButton.new()
+	click_ev.button_index = MOUSE_BUTTON_LEFT
+	click_ev.pressed = true
+	v._on_calendar_cell_input(click_ev, "2026-10-29")
+	_check("点月历日期进入那一周", v._schedule_view == "week"
+		and v._week_start == "2026-10-26")
+	v._open_current_week()
+	_check("本周按钮回到当前周", v._week_start == "" and v._schedule_view == "week")
+	v.show_month()
+	_check("月历按钮能回到月历", v._calendar_grid != null)
+	await process_frame
+	await process_frame
+	_check("窄窗口月历网格不超出面板", v._calendar_grid != null
+		and v._calendar_grid.size.x <= v._files.size.x + 0.5)
 	v.set_schedule_items([
 		{"when_text": "2026-10-28 周三 第1-2节 08:00-09:35",
-		 "title": "高等数学", "teacher": "王三强", "location": "二教20",
+		 "title": "高等数学", "teacher": "张老师", "location": "综合楼101",
 		 "date": "2026-10-28", "weekday": 2, "period": "1-2",
 		 "period_start": 1, "period_end": 2, "start_time": "08:00", "end_time": "09:35"},
 		{"when_text": "2026-10-27 周二 第6-7节 13:30-15:05",
-		 "title": "学术英语", "teacher": "靳丽莹", "location": "一教30",
+		 "title": "学术英语", "teacher": "李老师", "location": "综合楼203",
 		 "date": "2026-10-27", "weekday": 1, "period": "6-7",
 		 "period_start": 6, "period_end": 7, "start_time": "13:30", "end_time": "15:05"},
 	])
+	v.show_week_for_date("2026-10-28")
+	_check("点日期能打开对应周", v._week_start == "2026-10-26"
+		and v._week_title != null and v._week_title.text.contains("10月"))
 	_check("周课表网格生成", v._schedule_table != null)
 	_check("课程块跨节落在网格里", v._schedule_table.get_child_count() > 7 + 12)
 	_check("表格宽度按面板铺开（窄窗口也保留 7 天）", v._schedule_table.custom_minimum_size.x >= 280.0
 		and v._schedule_table.custom_minimum_size.x <= 480.0)
 	v.set_schedule_items([
-		{"title": "高等数学", "teacher": "王三强", "location": "二教20",
+		{"title": "高等数学", "teacher": "张老师", "location": "综合楼101",
 		 "date": "2026-10-28", "weekday": 2, "period": "1-2", "period_start": 1,
 		 "period_end": 2, "start_time": "08:00", "end_time": "09:35"},
-		{"title": "高等数学", "teacher": "王三强", "location": "二教20",
+		{"title": "高等数学", "teacher": "张老师", "location": "综合楼101",
 		 "date": "2026-11-04", "weekday": 2, "period": "1-2", "period_start": 1,
 		 "period_end": 2, "start_time": "08:00", "end_time": "09:35"},
 	])
@@ -186,10 +215,10 @@ func _test_view() -> void:
 	if block != null:
 		_check("课程块不再使用原生黑底 tooltip", block.tooltip_text == "")
 		v._show_hover_card(block, {"title": "高等数学", "when_text": "2026-10-28 周三 第1-2节",
-			"teacher": "王三强", "location": "二教20",
+			"teacher": "张老师", "location": "综合楼101",
 			"grade": "fixed", "grade_label": "固定课程"})
 		_check("悬停展开卡显示完整课程信息",
-			v._hover_card.visible and v._hover_label.text.contains("二教20"))
+			v._hover_card.visible and v._hover_label.text.contains("综合楼101"))
 		_check("悬停展开卡显示课程分级",
 			v._hover_label.text.contains("分级：固定课程"))
 		v._hide_hover_card()
@@ -199,21 +228,21 @@ func _test_view() -> void:
 	await process_frame
 	await process_frame
 	v.set_schedule_items([
-		{"id": 1, "title": "高等数学", "teacher": "王三强", "location": "二教20",
+		{"id": 1, "title": "高等数学", "teacher": "张老师", "location": "综合楼101",
 		 "date": "2026-10-28", "weekday": 2, "period": "1-2",
 		 "period_start": 1, "period_end": 2, "start_time": "08:00",
 		 "end_time": "09:35", "kind": "course", "status": "planned"},
-		{"id": 4, "title": "院系杯男子篮球赛（材料 VS 水保）",
+		{"id": 4, "title": "班级篮球赛（A 队 VS B 队）",
 		 "when_text": "2026-10-29 周四 12:00-13:00", "weekday": 3, "period": "",
 		 "period_start": 0, "start_ts": 1793246400, "start_time": "12:00",
 		 "end_time": "13:00", "kind": "task", "status": "planned",
-		 "grade": "committed", "grade_label": "已约定", "location": "篮球场",
+		 "grade": "committed", "grade_label": "已约定", "location": "体育馆",
 		 "priority": 50, "duration_min": 60},
-		{"id": 5, "title": "院系杯男子足球赛（材料 VS 林草二队）",
+		{"id": 5, "title": "班级足球赛（A 队 VS C 队）",
 		 "when_text": "2026-10-29 周四 12:20-13:20", "weekday": 3, "period": "",
 		 "period_start": 0, "start_ts": 1793247600, "start_time": "12:20",
 		 "end_time": "13:20", "kind": "task", "status": "planned",
-		 "grade": "committed", "grade_label": "已约定", "location": "足球场",
+		 "grade": "committed", "grade_label": "已约定", "location": "体育馆",
 		 "priority": 50, "duration_min": 60},
 	])
 	await process_frame
@@ -277,7 +306,7 @@ func _test_shell_static() -> void:
 	_check("离开时长的脏值不冒泡", _shell_script.away_notice(NAN) == "")
 	_check("普通台词原样显示", _shell_script.clean_display_text("嗯，我在。") == "嗯，我在。")
 	var schedule_text: String = _shell_script.clean_display_text(
-		'[{"date":"2026-10-28","time":"08:00","title":"无机化学实验","notes":"杨悠笛 @二教10"}]')
+		'[{"date":"2026-10-28","time":"08:00","title":"无机化学实验","notes":"李老师 @综合楼103"}]')
 	_check("日程 JSON 转成人话", schedule_text.contains("无机化学实验") and not schedule_text.contains("\"date\""))
 	_check("半截 JSON 不显示成 [", _shell_script.clean_display_text("[{") == "")
 	_check("认不出的 JSON 不显示", _shell_script.clean_display_text('{"foo":1}') == "")
@@ -338,6 +367,7 @@ func _test_shell_instance() -> void:
 	_check("生命时间线刷新慢变量",
 		is_equal_approx(shell._energy, 0.33) and is_equal_approx(shell._boredom, 0.44))
 	_test_speech_policy(shell)
+	_test_chat_schedule_note(shell)
 	shell.queue_free()
 	await process_frame
 
@@ -387,6 +417,17 @@ func _test_speech_policy(shell) -> void:
 	shell.tts = null
 	fake_tts.free()
 	fake_agent.free()
+
+## 聊天排程补充：面板开着时追加成 assistant 消息，但不抢 `_chat_busy`（话题还能继续）。
+func _test_chat_schedule_note(shell) -> void:
+	shell.view.open_chat()
+	var before: int = shell.view._chat_log.get_child_count()
+	shell._chat_busy = true
+	shell._on_message("ai_schedule", "好，日程记好了：「组会」（10月30日 周五 15:00）。")
+	_check("聊天排程补充进入聊天面板", shell.view._chat_log.get_child_count() == before + 1)
+	_check("聊天排程补充不抢聊天 busy", shell._chat_busy)
+	shell._chat_busy = false
+	shell.view.close_chat()
 
 func _test_launcher() -> void:
 	_check("默认配置开桌宠 ⇒ 桌宠外壳",

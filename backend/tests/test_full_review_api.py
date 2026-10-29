@@ -35,7 +35,7 @@ class FullReviewApiTest(unittest.TestCase):
         self.store = GameStore(os.path.join(self.dir, "games.db"))
         self.gid = self.store.add_game({
             "moves": MOVES, "move_count": len(MOVES), "summary": "测试复盘",
-            "meta": {"black": "Estarth", "white": "Azure",
+            "meta": {"black": "玩家", "white": "Azure",
                      "notes": [{"move_no": 2, "kind": "review", "side": "E",
                                 "text": "这手有点急"}]},
         })

@@ -742,7 +742,7 @@ func _animate_tilt(dt: float) -> void:
 		_tilt_next = _t + 0.6
 	_tilt_cur += (_tilt_target - _tilt_cur) * clampf(dt * 3.2, 0.0, 1.0)
 
-# ================= 表情反应（Estarth 棋的不同表现） =================
+# ================= 表情反应（你棋的不同表现） =================
 
 ## 思考中（KataGo 分析 / LLM 生成）保持中性表情，结束后回到常态微笑
 func set_thinking(v: bool) -> void:

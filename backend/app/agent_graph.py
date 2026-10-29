@@ -290,7 +290,7 @@ async def _prepare_after_player(agent, data):
     gtp = coords.xy_to_gtp(x, y)
     n = len(agent.st.moves)
 
-    # ① 玩家落子前局面：缓存复用，否则现算（黑方视角，用于给这一手排名）
+    # ①玩家落子前局面：缓存复用，否则现算（黑方视角，用于给这一手排名）
     analysis = {}
     if agent.st.pre_analysis is not None and int(agent.st.pre_analysis["n"]) == n:
         analysis = agent.st.pre_analysis["a"]
@@ -312,7 +312,7 @@ async def _prepare_after_player(agent, data):
             player_rank = i
             break
 
-    # ② 玩家落子后局面（轮到白方）：用于选择 Azure 的应手
+    # ②玩家落子后局面（轮到白方）：用于选择 Azure 的应手
     #    v3.8.0：**只有这一次**分析加深度——预测线 A/B/C 只吃这一次返回的 ``moveInfos``
     #    （零额外调用），但需要更深的搜索才拿得到足够长的 ``pv``；``post`` 复算与提示 / 分析 /
     #    总结一律用默认深度（全局加深会让每回合都变慢）。深度**只增不减**（``_deep_visits``）：
@@ -446,7 +446,7 @@ async def _prepare_after_player(agent, data):
             and str(jk.get("family") or "") in agent.st.joseki_counted):
         agent._mood_event("lesson_followed", burst="pleased")
 
-    # ④″″ 玩家侧事件（v3.8.0 / P3 的四个写入点之二）：好手 / 坏手各写一条 —— spec §一 的动机
+    # ④″″玩家侧事件（v3.8.0 / P3 的四个写入点之二）：好手 / 坏手各写一条 —— spec §一 的动机
     #      「这盘棋我先亏了一手、你后来又送我一块」这种**跨手脉络**正是靠它们才有载体。
     #      判据与上面那次情绪分流**同一档**（见 ``_record_player_event``）；``player_ok`` /
     #      ``player_off``（常态）不写。本块**无 ``await``**，且在 ``:298`` 那道 ``_alive`` 守卫之后 ⇒
@@ -476,18 +476,18 @@ async def _prepare_after_player(agent, data):
             "player", _joseki_owner(jk))
     if eval_prompt == "":
         if player_rank == 0:
-            eval_prompt = ("Estarth下了 %s，这是我算的最优手！胜率%s。肯定这手，1句；"
+            eval_prompt = ("玩家下了 %s，这是我算的最优手！胜率%s。肯定这手，1句；"
                            "说清它在干什么（占角/守角/夹击/扩张/补断之类）或改变了什么，别只堆「精妙/漂亮」。"
                            % (gtp, agent._pct(winrate_before)))
         elif 0 < player_rank < 3:
-            eval_prompt = ("Estarth下了 %s，Top%d，胜率%s。肯定这手，1句；"
+            eval_prompt = ("玩家下了 %s，Top%d，胜率%s。肯定这手，1句；"
                            "说清它在干什么/为什么好，别只堆空泛夸奖。"
                            % (gtp, player_rank + 1, agent._pct(winrate_before)))
         elif player_rank >= 0:
-            eval_prompt = ("Estarth下了 %s，不在前5。委婉指出问题，1句；"
+            eval_prompt = ("玩家下了 %s，不在前5。委婉指出问题，1句；"
                            "说清哪里可惜或让对方得到了什么，给点鼓励。" % gtp)
         else:
-            eval_prompt = ("Estarth下了 %s，没进我算的前5。慵懒表示不太理解，1句；"
+            eval_prompt = ("玩家下了 %s，没进我算的前5。慵懒表示不太理解，1句；"
                            "说清你看不懂的点，别空泛。" % gtp)
         eval_prompt += (" 用你自己的口吻评，1句就好，别像解说员那样说「黑方/白棋」；"
                         "先结合【当前棋面】确认这手落在哪、周围有没有子再说；"
@@ -605,12 +605,12 @@ async def _prepare_just_moved(agent, data):
     # just_moved＝**全局局面分析**——不评任何单独一手、不复述坐标与上一句的夸奖词。
     # 数据来自她落子后的这次引擎复算（`post`），与手动「局面分析」同一口径。
     azure_wr = 1.0 - wr
-    lead = "你略占上风" if azure_wr > 0.5 else ("局面胶着" if azure_wr > 0.45 else "Estarth领先")
+    lead = "你略占上风" if azure_wr > 0.5 else ("局面胶着" if azure_wr > 0.45 else "玩家领先")
     global_prompt = (
         "当前局面：%s，共%d手。你（Azure，执白）算出的判断：白方胜率约%s（%s），目差%s（正数是你领先）。"
         "请用你自己的视角（我/你，别说「黑方/白棋」）做**全局局面分析**，2-3句："
         "先说局面走向、厚薄与实地谁占优；再说关键处、薄弱处或下一步的大方向。"
-        "**不要评价任何单独一手（你自己的刚落子、Estarth那手都不评价），不要复述落点坐标，"
+        "**不要评价任何单独一手（你自己的刚落子、玩家那手都不评价），不要复述落点坐标，"
         "也不要用「精妙/漂亮/太漂亮/占先机/留有余地/稳健」这类夸奖词或上一句的句式**；"
         "先结合【当前棋面】核对再说，别提到盘上没有的子；不要用「感觉这盘棋会很有趣」"
         "「接下来看看你如何应对」「静待…应对」这类套话；不要加 emoji / 图标。"
@@ -669,7 +669,7 @@ async def _prepare_observe(agent, data):
     own = analysis.get("ownership") or []
     if own and _alive(agent, data):                 # 提示：顺手刷新领地图，不新增引擎调用
         agent._emit(events.ownership(own, n))
-    prompt = "当前局面：%s。我算到的好点：%s。Estarth还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）；换个说法开场，别重复你上一次提示的句式和口头禅。" % (
+    prompt = "当前局面：%s。我算到的好点：%s。玩家还没落子，结合【当前棋面】给个方向性提示，1-2句；不要直接说坐标，提到某片区域前先确认那里确实有子（没有的子别乱说）；换个说法开场，别重复你上一次提示的句式和口头禅。" % (
         prompts.board_summary(agent.st.move_seq), agent._py_list(tops))
     profile, time_facts = await _ctx_extras(agent, data)
     return agent._phase_messages(
@@ -706,8 +706,8 @@ async def _prepare_analyze(agent, data):
     est = estimate.build(analysis, n, agent.st.board.stones_list())
     if est is not None:
         agent._emit(events.estimate(est))
-    lead = "你略占上风" if azure_wr > 0.5 else ("局面胶着" if azure_wr > 0.45 else "Estarth领先")
-    prompt = "当前局面：%s，共%d手。你（Azure，执白）算出的判断：白方胜率约%s（%s），目差%s（正数是你领先）。你在考虑的几个点：%s。请用你自己的视角（我/你，别说「黑方/白棋」）分析当前局势3-4句：局面走向、关键处或薄弱处，可以点醒Estarth；语气慵懒但专业，先结合【当前棋面】核对再说，别提到盘上没有的子。" % (
+    lead = "你略占上风" if azure_wr > 0.5 else ("局面胶着" if azure_wr > 0.45 else "玩家领先")
+    prompt = "当前局面：%s，共%d手。你（Azure，执白）算出的判断：白方胜率约%s（%s），目差%s（正数是你领先）。你在考虑的几个点：%s。请用你自己的视角（我/你，别说「黑方/白棋」）分析当前局势3-4句：局面走向、关键处或薄弱处，可以点醒玩家；语气慵懒但专业，先结合【当前棋面】核对再说，别提到盘上没有的子。" % (
         prompts.board_summary(agent.st.move_seq), n, agent._pct(azure_wr), lead, "%+.1f" % (-score_black), agent._py_list(tops))
     data["info"] = {"wr": black_wr, "score": score_black}
     profile, time_facts = await _ctx_extras(agent, data)
@@ -757,12 +757,12 @@ async def _prepare_idle(agent, data):
     mode = str(data.get("mode") or "game")
     agent._mood_event("idle_near" if mode == "pet" else "idle_bored")
     if mode == "pet":
-        prompt = ("桌面上安静了一小会儿。你是 Estarth 的桌面助手，不要长时间不吭声；"
+        prompt = ("桌面上安静了一小会儿。你是玩家的桌面助手，不要长时间不吭声；"
                   "主动说一句很短的话（20字以内）：可以接刚才的话头、问一句他正在忙什么、"
                   "关心或陪一句。不要每次都用「在吗」「还在不在」「要不要继续」这类空泛问句，"
                   "也不要连续追问；亲切、克制、1 句。")
     else:
-        prompt = ("Estarth 已经有一段时间没有动静了，你有点好奇对面在做什么。"
+        prompt = ("玩家已经有一段时间没有动静了，你有点好奇对面在做什么。"
                   "主动开口说一句很短的话（20字以内）：问问对面还在不在、在忙什么，"
                   "或要不要继续下棋、聊聊天。慵懒、亲切，1句。")
     # 桌宠与围棋闲聊共用同一份主动回忆：按情绪偶尔带起一件旧事（不是每句都提）。
@@ -822,7 +822,7 @@ async def _prepare_summary(agent, data):
         prev = await asyncio.to_thread(agent.profile_facts)   # 已自带降级（关着 / 读失败 ⇒ {}）
         data["profile_prev"] = prev
         block = prompts.progress_note(prev, rec)
-    prompt = "对局结束，共%d手。\n序列：%s\n最终黑胜率：%s，目差：%s\nEstarth备注：%s%s\n\n写总结：1.对局回顾 2.给Estarth的改进建议 2-3条 3.你的心情\n用Azure口吻，150-250字，慵懒真诚。" % (
+    prompt = "对局结束，共%d手。\n序列：%s\n最终黑胜率：%s，目差：%s\n玩家备注：%s%s\n\n写总结：1.对局回顾 2.给玩家的改进建议 2-3条 3.你的心情\n用Azure口吻，150-250字，慵懒真诚。" % (
         n, seq, agent._pct(final_wr), "%+.1f" % final_score, note, block)
     data["wr"] = final_wr
     data["score"] = final_score
@@ -975,7 +975,7 @@ async def _decide_own_turn(agent, data):
     data["lt"] = lt
 
     think_hint = "你准备虚着（pass）" if ai_gtp == "pass" else "你准备下在 %s" % ai_gtp
-    think_prompt = "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过Estarth那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。换一个全新的说法，别总用「嗯~」「唔」开头，句式也别和刚才那条点评一样。" % think_hint
+    think_prompt = "轮到你下了。%s。用你自己的口吻（我/你）一句话说出这一手的用意：打算下在哪、想在当前盘面上达成什么、跟最近这几手有什么呼应，直接说。注意：你刚点评过玩家那一手，这里不要再评价它、不要改口说相反的话，也别复述点评；不要用「黑方/白棋」的旁观口吻。换一个全新的说法，别总用「嗯~」「唔」开头，句式也别和刚才那条点评一样。" % think_hint
     # 情绪偏航（人格化）：只有最终落点**真的是**那个偏航点时，才允许她用半句带出自己的小心思。
     # 关着人格化 / 工具轮把落点改回最优解 ⇒ 一个字都不加（与现状逐字符一致）。
     drift = data.get("drift") if isinstance(data.get("drift"), dict) else {}

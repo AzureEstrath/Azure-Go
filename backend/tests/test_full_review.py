@@ -44,7 +44,7 @@ class FakeBusAgent:
         self.katago = engine
         self.llm = llm
         self.tts = tts
-        self.player_name = "Estarth"
+        self.player_name = "玩家"
         self.bus = RecordingBus()
         self.turn_id = ""
         self._speech_seq = 0

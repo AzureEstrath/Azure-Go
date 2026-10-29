@@ -21,7 +21,7 @@ class SgfRoundTripTest(unittest.TestCase):
         self.assertEqual(got["moves"][0], ["black", "Q16"])
         self.assertEqual(got["moves"][1], ["white", "D4"])
         self.assertEqual(got["summary"], DEMO_RECORD["summary"])
-        self.assertEqual(got["black"], "Estarth")
+        self.assertEqual(got["black"], "玩家")
         self.assertEqual(got["white"], "Azure")
         notes = DEMO_RECORD["meta"]["notes"]
         self.assertEqual(len(got["notes"]), len(notes))

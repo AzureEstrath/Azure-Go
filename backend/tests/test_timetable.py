@@ -27,9 +27,9 @@ class TimetableTest(unittest.TestCase):
             _box("08:00", 50, 200), _box("08:45", 50, 220),
             _box("08:50", 50, 300), _box("09:35", 50, 320),
             # 周一 1-2 节：课程名 / 教师 / 地点
-            _box("高等数学", 150, 160), _box("王三强", 150, 185), _box("@二教20", 150, 210),
+            _box("高等数学", 150, 160), _box("张老师", 150, 185), _box("@综合楼101", 150, 210),
             # 周二 1-2 节
-            _box("无机化学", 256, 160), _box("杨悠笛", 256, 185), _box("@二教10", 256, 210),
+            _box("无机化学", 256, 160), _box("李老师", 256, 185), _box("@综合楼103", 256, 210),
         ]
 
     def test_restores_weekday_period_teacher_and_location(self):
@@ -42,8 +42,8 @@ class TimetableTest(unittest.TestCase):
         self.assertEqual(math["period"], "1-2")
         self.assertEqual(math["start_time"], "08:00")
         self.assertEqual(math["end_time"], "09:35")
-        self.assertEqual(math["teacher"], "王三强")
-        self.assertEqual(math["location"], "二教20")
+        self.assertEqual(math["teacher"], "张老师")
+        self.assertEqual(math["location"], "综合楼101")
         self.assertEqual(by["无机化学"]["weekday"], 1)
 
     def test_text_render_mentions_week_and_teacher(self):
@@ -51,8 +51,8 @@ class TimetableTest(unittest.TestCase):
         text = azure_files.timetable_text(got)
         self.assertIn("周一", text)
         self.assertIn("第1-2节", text)
-        self.assertIn("教师：王三强", text)
-        self.assertIn("地点：二教20", text)
+        self.assertIn("教师：张老师", text)
+        self.assertIn("地点：综合楼101", text)
 
     def test_no_date_header_returns_empty(self):
         self.assertEqual(azure_files.timetable_from_ocr([

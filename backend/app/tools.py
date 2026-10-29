@@ -52,7 +52,7 @@ async def katago_analyze(
         mv = str((m or {}).get("move", ""))
         if mv != "":
             tops.append(mv)
-    return "KataGo 复算：黑方（Estarth）胜率 %.1f%%，目差 %+.1f 目（正数＝黑领先）；候选点：%s。" % (
+    return "KataGo 复算：黑方（玩家）胜率 %.1f%%，目差 %+.1f 目（正数＝黑领先）；候选点：%s。" % (
         float(conv[0]) * 100.0, float(conv[1]), "、".join(tops) if tops else "（没有候选点）")
 
 

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 让 Azure 跨局记得 Estarth——把对局总结与玩家偏好写成长期记忆（SQLite + 云端 embedding 语义检索），在合适的调用点把最相关的几条注入上下文。
+**Goal:** 让 Azure 跨局记得玩家——把对局总结与玩家偏好写成长期记忆（SQLite + 云端 embedding 语义检索），在合适的调用点把最相关的几条注入上下文。
 
 **Architecture:** 新增 `backend/app/memory.py`（存储 + 检索 + 注入文本），与现有**局内记忆** `state.py:memory_log`（E/A 标签、上限 18 条、随快照回滚）互不替代：局内记忆管“这盘棋”，长期记忆管“这个人”。embedding 走**云端** OpenAI 兼容接口；接口不可用时自动降级为关键词检索（不崩、不刷屏）。功能默认关闭（`memory_enabled=false`）。
 
@@ -88,7 +88,7 @@ class StoreTest(unittest.TestCase):
         self.dir.cleanup()
 
     def test_write_then_recall(self):
-        i = self.store.write("Estarth 喜欢在布局阶段点三三", kind="preference", tag="estarth")
+        i = self.store.write("玩家喜欢在布局阶段点三三", kind="preference", tag="estarth")
         self.assertIsInstance(i, int)
         hits = self.store.recall("布局怎么下三三", k=3)
         self.assertEqual(hits[0]["id"], i)
@@ -126,7 +126,7 @@ class StoreTest(unittest.TestCase):
 
     def test_no_embed_fn_degrades_to_keyword(self):
         store = MemoryStore(os.path.join(self.dir.name, "kw.db"), embed_fn=None)
-        store.write("Estarth 喜欢听棋谱讲解", kind="preference", tag="estarth")
+        store.write("玩家喜欢听棋谱讲解", kind="preference", tag="estarth")
         hits = store.recall("讲解", k=3)
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["score"], 0.0)      # 关键词命中：不给伪相似度
@@ -229,9 +229,9 @@ class LongTermNoteTest(unittest.TestCase):
         self.assertNotIn("长期记忆", base)
 
     def test_section_inserted_before_iron_rules(self):
-        out = prompts.context_block(MOVES, [], [], "observe", long_term="Estarth 喜欢点三三")
+        out = prompts.context_block(MOVES, [], [], "observe", long_term="玩家喜欢点三三")
         self.assertIn("长期记忆", out)
-        self.assertIn("Estarth 喜欢点三三", out)
+        self.assertIn("玩家喜欢点三三", out)
         self.assertLess(out.index("长期记忆"), out.index("铁律"))
         self.assertIn("A→T 从左到右", out)        # 铁律段正文没被动过
 
@@ -273,7 +273,7 @@ class MemoryServiceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             svc = MemoryService(self._cfg(memory_db_path=os.path.join(d, "m.db")))
             self.assertTrue(svc.available)
-            svc.remember_fact("Estarth 喜欢听定式讲解", tag="estarth")
+            svc.remember_fact("玩家喜欢听定式讲解", tag="estarth")
             self.assertIn("定式讲解", svc.recall_for("讲讲定式"))
             svc.close()
 
@@ -354,7 +354,7 @@ class MemoryWiringTest(unittest.TestCase):
 
     def test_memory_text_reaches_prompts(self):
         agent, _eng, _llm, _bus = _mk()
-        agent.memory = FakeMemory("Estarth 喜欢点三三")
+        agent.memory = FakeMemory("玩家喜欢点三三")
 
         async def run():
             await agent.chat("你好")
@@ -363,7 +363,7 @@ class MemoryWiringTest(unittest.TestCase):
         joined = " ".join(m["content"] for _msgs, _a, _b in [] for m in [])  # 占位，见下方真实断言
         # 真实断言：至少一条 user 消息里带上了召回文本
         sent = [m["content"] for c in agent.llm.calls for m in c[0] if m["role"] == "user"]
-        self.assertTrue(any("Estarth 喜欢点三三" in s for s in sent))
+        self.assertTrue(any("玩家喜欢点三三" in s for s in sent))
 
     def test_summary_writes_long_term_memory(self):
         agent, _eng, _llm, _bus = _mk()

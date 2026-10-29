@@ -4,6 +4,7 @@
   "adaptive_difficulty_base": 3,
   "auto_plan_days": 7.0,
   "auto_plan_enabled": true,
+  "schedule_chat_enabled": true,
   "auto_start_services": true,
   "backend_url": "http://127.0.0.1:8000",
   "chat_digest_llm": false,
@@ -48,7 +49,7 @@
 
   },
   "prompt_system": "",
-  "prompt_user_name": "Estarth",
+  "prompt_user_name": "朋友",
   "reply_style": 0,
   "schedule_align_min": 30.0,
   "schedule_archive_days": 7.0,

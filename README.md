@@ -3,7 +3,7 @@
 > **桌宠是主程序，围棋是它打开的独立窗口。**
 > 同一套 Azure 人格、情绪、时间线与记忆，在桌宠、围棋窗口和重启后的下一次见面之间保持连续。
 
-**版本：v4.1.7（Release）**
+**版本：v4.2.0（Release）**
 
 Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你说话、看你在忙什么，也可以打开一盘围棋和你下棋。她不是“围棋程序里的桌宠模式”，而是一个有自己的时间、精力、心情与记忆的桌面角色。
 
@@ -61,11 +61,20 @@ Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你�
 - `chat_history`：桌宠与围棋共用的最近聊天原文流水。
 - `episodes`：按 **6 轮 / 620 字 / 15 分钟空档 / 情绪效价跳变 0.30** 自动收束的聊天片段。
 - `memories`：可召回的长期记忆（聊天摘要、事件、对局总结、手动写入）。
-- `LifeTimeline`：只追加的生命事件与相对时间事实；桌宠启动时能知道“上一回见到 Estarth 是什么时候”。
+- `LifeTimeline`：只追加的生命事件与相对时间事实；桌宠启动时能知道“上一回见到你是什么时候”。
 - 共享后端：桌宠、围棋窗口、重启后的 Azure 看到的是同一份情绪与记忆。
 
-### 资料、日程与提醒（v4.1.7）
+### 资料、日程与提醒（v4.2.0）
 
+- **聊天里 Azure 自己判断要不要排（v4.2.0）**：聊天回复完成后，后端先用规则闸门过滤掉
+  明显没有时间 / 事项线索的闲聊（不浪费模型调用），再由 LLM 判断「这句话是不是玩家自己的
+  约定 / 任务 / 截止 / 提醒」，是则抽取、写入共享日程、按需自动排班并写入长期记忆。
+  排完补一句 `ai_schedule`（**不发语音**）：聊天面板开着时追加成一条 assistant 消息，话题可以继续；
+  面板关着时走气泡。前端不参与「排不排」的判断，只负责显示。
+  可用 `schedule_chat_enabled=false` 关闭，聊天行为与旧版一致。
+- **年月历 → 周视图（v4.2.0）**：资料 / 日程面板默认显示**7×6 的月历**（年月标题、今天高亮、
+  有课的日期直接显示课程 / 约定小条）；点某一天打开那一周，周视图可前后翻周、一键回本周 / 月历。
+  课程按星期每周重复，定时约定只显示在所属周；月历上方可翻年 / 翻月，下方按「本月日程 / 待安排」列出条目。
 - **资料箱 → 周课表**：图片 / PDF / 文档经 OCR + VLM 读取；课程表按 OCR 坐标还原成
   7 天 × 12 节的周课表（星期、节次、教师、地点、日期），不再压成一串文字。
 - **重扫不再重复 / 事件不再误判（v4.1.7）**：课程按「日期 + 节次 + 标题」去重，
@@ -294,6 +303,7 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `schedule_buffer_min` | `45` | 每天工作窗口末尾预留的弹性时间（分钟） |
 | `schedule_lock_hours` | `12` | 自动安排在未来多少小时内不再移动 |
 | `schedule_risk_z` | `0.84` | 机会约束的 z 值（0.84 ≈ 80% 完成概率） |
+| `schedule_chat_enabled` | `true` | 聊天里由 Azure 自己判断是否排入日程（关闭后聊天行为与旧版一致） |
 | `schedule_ewma_alpha` | `0.35` | 真实耗时 EWMA 的更新速度 |
 | `schedule_align_min` | `30` | 普通任务开始时间的对齐粒度（分钟） |
 | `schedule_transition_min` | `10` | 课程 / 约定前后的通勤与切换留白（分钟） |
@@ -303,7 +313,7 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `tts_local_base_url` | `http://127.0.0.1:9880/v1` | 本地 TTS |
 | `tts_local_voice` | `azure` | 本地音色（如 `azure` / `xiaoya`） |
 | `ui_theme` | `mist` | 客户端主题 |
-| `prompt_user_name` | `Estarth` | 对玩家的称呼 |
+| `prompt_user_name` | `朋友` | 对玩家的称呼 |
 
 完整字段与后端读取方见 `TECHNICAL.md`。部分设置可在围棋窗口设置面板中即时修改并写回配置；服务地址类配置通常需要重启后端。
 
@@ -358,7 +368,7 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 
 | 端点 | 作用 |
 | --- | --- |
-| `POST /api/chat` | 聊天；`mode=pet/game` 共享记忆 |
+| `POST /api/chat` | 聊天；`mode=pet/game` 共享记忆。回复后由后端后台判断是否排入日程，排完推 `ai_schedule` |
 | `POST /api/idle` | 走神搭话 |
 | `POST /api/peer` | 窥屏搭话 |
 | `POST /api/interaction` | 摸头等互动 |
@@ -387,6 +397,8 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 - `speech` 与对应 `message` 同 `turn_id`、`seq` 递增配对；
 - `mode=openai` 时前端按 `id` 取音频；`mode=system` 时带文本；
 - 桌宠聊天可播完整 TTS；待机 / 窥屏只用预制语气音，不退系统语音。
+- `message.kind=ai_remind`（到点提醒）与 `ai_schedule`（聊天排程补充）**都不发 speech**；
+  `ai_schedule` 在聊天面板打开时作为 assistant 文本追加，不抢聊天 busy、不占语音配对位。
 
 ---
 
@@ -399,7 +411,7 @@ cd backend
 python -m unittest discover -s tests -q
 ```
 
-当前全量：**1046 tests OK**。
+当前全量：**1063 tests OK**。
 
 ### 前端门卫
 
@@ -418,7 +430,7 @@ Get-ChildItem game\tests\test_*.gd | ForEach-Object {
 }
 ```
 
-当前 20 个前端脚本全部通过；`test_pet_shell.gd` 100 项断言。
+当前 20 个前端脚本全部通过；`test_pet_shell.gd` 111 项断言（含月历 / 周视图 / 聊天排程补充）。
 
 ### 启动自检
 

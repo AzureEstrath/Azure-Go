@@ -69,7 +69,7 @@ DEMO_RECORD = {
     "meta": {
         "demo": True,
         "title": "示例棋局 · 分投布局",
-        "black": "Estarth",
+        "black": "玩家",
         "white": "Azure",
         "source": "demo",
         "notes": [

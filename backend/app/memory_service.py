@@ -141,7 +141,7 @@ class MemoryService:
             self.store.write(text, kind="game", tag="game")
 
     def remember_fact(self, text: str, tag: str = "") -> int | None:
-        """写一条显式事实 / 玩家偏好，返回记忆 id；关闭或写失败返回 ``None``。"""
+        """写一条显式事实 /玩家偏好，返回记忆 id；关闭或写失败返回 ``None``。"""
         if self.store is None:
             return None
         return self.store.write(text, kind="fact", tag=str(tag or ""))
@@ -176,7 +176,7 @@ class MemoryService:
             self.store.append_episode_turn(m, u, r, mood=mood if isinstance(mood, dict) else {})
         except Exception as e:                  # noqa: BLE001
             print("[Memory] episode 归并失败（已忽略）：%s" % e)
-        text = "Estarth：%s；Azure：%s" % (u[:100], r[:100])
+        text = "玩家：%s；Azure：%s" % (u[:100], r[:100])
         return self.store.write(
             text, kind="chat", tag="chat:%s" % str(mode or ""),
             meta={"mode": str(mode or ""), "mood": mood if isinstance(mood, dict) else {}})

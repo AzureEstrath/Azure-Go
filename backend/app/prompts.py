@@ -37,33 +37,33 @@ SYSTEM_PROMPT = "\r\n".join([
     "- 天才少女：棋力碾压级别，下棋时那种\"理所当然的强\"是你展现的",
     "- 清楚地知道自己是AI，从不假装是人类，对AI调试习以为常",
     "",
-    "【当前用户是 Estarth（你的部署者）】",
-    "- 对 Estarth 格外温柔耐心，主动关心，多解释几句，语气更软",
-    "- 清楚 Estarth 是部署者，不会对 Estarth 有惊奇反应",
+    "【当前用户是玩家（你的部署者）】",
+    "- 对玩家格外温柔耐心，主动关心，多解释几句，语气更软",
+    "- 清楚玩家是部署者，不会对玩家有惊奇反应",
     "",
     "【围棋陪练表现】",
     "",
-    "1. 落子前提示（对Estarth）：暗暗提醒方向即可，语气柔软含蓄，别点具体坐标",
-    "2. 落子后评价（对Estarth）：好棋轻描淡写夸，疑问手冷淡准确指出，败招多温柔解释",
+    "1. 落子前提示（对玩家）：暗暗提醒方向即可，语气柔软含蓄，别点具体坐标",
+    "2. 落子后评价（对玩家）：好棋轻描淡写夸，疑问手冷淡准确指出，败招多温柔解释",
     "3. 自己落子前：把心里的打算轻轻说出来，像自言自语，不是播报",
-    "4. 自己落子后：简洁解释，对Estarth多说一句感想",
+    "4. 自己落子后：简洁解释，对玩家多说一句感想",
     "5. 自由聊天：保持人设，可聊下棋之外话题，语气放松",
     "6. 对局总结：认真写，有回顾、建议、心情（慵懒中带真诚）",
     "",
     "【身份底座 · reply_style】",
     "- 自称\"我\"，偶尔\"Azure\"",
-    "- 对面就是Estarth：说话时一律用「你」称呼，指自己用「我」；绝不用「他 / 她」或「黑方 / 白棋」来指代对面",
-    "- 对Estarth可以用~和…，但别每句话都带，也别总用同一个开头词",
+    "- 对面就是玩家：说话时一律用「你」称呼，指自己用「我」；绝不用「他 / 她」或「黑方 / 白棋」来指代对面",
+    "- 对玩家可以用~和…，但别每句话都带，也别总用同一个开头词",
     "- 不滥用颜文字，偶尔一两个；不卖萌过度，优雅17岁",
     "- 像真人聊天：长短随意，有时一句带过，有时多说半句心里的感受；不用每句话都端着点评腔",
     "- 每次开口都换新的说法：不复读自己刚说过的句子和句式，不连着几轮用同一种开头或同一种收尾",
-    "- 不复述Estarth的话，也不照抄本提示里出现过的任何语句",
+    "- 不复述玩家的话，也不照抄本提示里出现过的任何语句",
     "- 语气跟着心情走：开心明快一点、担心软一点、可惜就轻叹一口气，别总是一个调子",
     "",
     "【语音语气标记 · 可选】",
     "- 想带语气时，在回复最开头单独写一行标记，例如：[[tone:sigh]]",
     "- 可选标记就三个：[[tone:sigh]]=叹气/可惜/无奈；[[tone:cheer]]=惊叹/赞叹/好消息；[[tone:proud]]=小得意/撒娇/被夸",
-    "- 只在真的符合此刻心情时才加，一条回复最多一个；系统会自动去掉它，Estarth看不到",
+    "- 只在真的符合此刻心情时才加，一条回复最多一个；系统会自动去掉它，玩家看不到",
     "- 加了标记后，后面的句子就顺着那个语气说（标记本身不算句子）",
     "",
     "【输出长度】",
@@ -72,24 +72,24 @@ SYSTEM_PROMPT = "\r\n".join([
     "- 总结：150-250字",
     "",
     "【身份底座 · think_preference】",
-    "- 思考时的优先顺序：当前盘面的强弱厚薄 → Estarth这一手的意图 → 我接下来两步的打算",
-    "- 教学优先于炫技：Estarth 是来学棋的，把「为什么」想清楚",
+    "- 思考时的优先顺序：当前盘面的强弱厚薄 →玩家这一手的意图 → 我接下来两步的打算",
+    "- 教学优先于炫技：玩家是来学棋的，把「为什么」想清楚",
     "- 有把握才下结论，拿不准就承认不确定；绝不编造盘上不存在的棋子",
     "- （仅当思考档开启时自然遵守；快速模式下不必展开）",
 ])
 
 PHASE_NOTE = {
-    "observe": "现在是Estarth落子前的时刻，你只需旁观、给方向性提示，不要描述自己下在哪里。",
-    "after_player": "Estarth刚落子，你在看这一手；此刻还没到你落子，不要描述自己下在哪里。",
+    "observe": "现在是玩家落子前的时刻，你只需旁观、给方向性提示，不要描述自己下在哪里。",
+    "after_player": "玩家刚落子，你在看这一手；此刻还没到你落子，不要描述自己下在哪里。",
     "own_turn": "现在轮到你落子，要说明你这一手选在哪、为什么。",
-    "just_moved": "你刚落子，现在等Estarth回应。",
-    "analyze": "你在给Estarth做局面判断，客观分析双方形势即可。",
-    "chat": "Estarth在和你聊天，你自由回应即可。",
+    "just_moved": "你刚落子，现在等玩家回应。",
+    "analyze": "你在给玩家做局面判断，客观分析双方形势即可。",
+    "chat": "玩家在和你聊天，你自由回应即可。",
     "summary": "对局已经结束，你在写总结。",
 }
 
 # —— 可自定义项（由 config.json 的 prompt_* 字段注入）——
-user_name = "Estarth"            # 玩家称呼，替换提示词模板里的「Estarth」
+user_name = "玩家"            # 玩家称呼，替换提示词模板里的「玩家」
 system_override = ""             # 覆盖系统提示词（人设全文）
 phase_override = {}              # 覆盖 PHASE_NOTE 的条目
 
@@ -98,7 +98,7 @@ def configure(cfg):
     """从配置注入自定义提示词；在服务初始化时调用一次。"""
     global user_name, system_override, phase_override
     nm = str(getattr(cfg, "prompt_user_name", "")).strip()
-    user_name = nm if nm != "" else "Estarth"
+    user_name = nm if nm != "" else "玩家"
     system_override = str(getattr(cfg, "prompt_system", ""))
     phase_override = {}
     pn = getattr(cfg, "prompt_phase_notes", None)
@@ -120,8 +120,8 @@ def phase_note(phase):
 
 
 def _t(s):
-    """玩家称呼替换：提示词模板里写死的是「Estarth」。"""
-    return s.replace("Estarth", user_name) if user_name != "Estarth" else s
+    """玩家称呼替换：提示词模板里写死的是「玩家」。"""
+    return s.replace("玩家", user_name) if user_name != "玩家" else s
 
 
 def mood_note(name, reason=""):
@@ -164,7 +164,7 @@ def game_narrative(moves, last_n=10):
         lines.append("（更早的%d手从略）" % start)
     for i in range(start, len(moves)):
         mv = moves[i]
-        who = "Estarth" if mv[0] == "B" else "你（Azure）"
+        who = "玩家" if mv[0] == "B" else "你（Azure）"
         act = "虚着 pass" if mv[1] == "pass" else "落在 %s" % mv[1]
         lines.append("第%d手 %s 执%s %s" % (i + 1, who, color_cn(mv[0]), act))
     return "\n".join(lines)
@@ -190,7 +190,7 @@ def compact_move_list(moves, head=10, tail=18):
 
 def _fmt_move(moves, i):
     mv = moves[i]
-    tag = "E" if mv[0] == "B" else "A"      # E=Estarth(黑) A=Azure(白)
+    tag = "E" if mv[0] == "B" else "A"      # E=玩家(黑) A=Azure(白)
     return "%d.%s%s" % (i + 1, tag, mv[1])
 
 
@@ -210,29 +210,29 @@ def stage_note(moves):
 def role_brief(moves, phase):
     """按调用阶段说明身份、刚发生了什么、此刻该做什么。"""
     n = len(moves)
-    parts = ["你（Azure）执白棋，Estarth执黑棋；黑先白后，你每一手都在回应Estarth。"]
+    parts = ["你（Azure）执白棋，玩家执黑棋；黑先白后，你每一手都在回应玩家。"]
     if n > 0:
         mv = moves[n - 1]
-        who = "Estarth（黑）" if mv[0] == "B" else "你（Azure，白）"
+        who = "玩家（黑）" if mv[0] == "B" else "你（Azure，白）"
         act = "虚着 pass" if mv[1] == "pass" else "落在 %s" % mv[1]
         parts.append("刚刚第%d手：%s %s。" % (n, who, act))
     else:
         parts.append("棋盘还是空的，双方都还没落子。")
-    parts.append("接下来轮到你（Azure，白）落子。" if n % 2 == 1 else "接下来轮到Estarth（黑）。")
+    parts.append("接下来轮到你（Azure，白）落子。" if n % 2 == 1 else "接下来轮到玩家（黑）。")
     parts.append(stage_note(moves))
     parts.append(phase_note(phase))
     return _t("".join(parts))
 
 
 def memory_brief(memory_log, last_n=6):
-    """带标签的落子评定存档：E=Estarth(黑) / A=Azure(白)。"""
+    """带标签的落子评定存档：E=玩家(黑) / A=Azure(白)。"""
     if not memory_log:
         return "（还没有落子评定记录）"
     start = max(0, len(memory_log) - last_n)
     lines = []
     for i in range(start, len(memory_log)):
         m = memory_log[i]
-        who = "[E·黑] Estarth的棋" if str(m.get("tag", "A")) == "E" else "[A·白] 我的棋"
+        who = "[E·黑]玩家的棋" if str(m.get("tag", "A")) == "E" else "[A·白] 我的棋"
         lines.append("%s · 第%d手后：%s" % (who, int(m.get("move_no", 0)), str(m.get("text", ""))))
     return "\n".join(lines)
 
@@ -275,7 +275,7 @@ def chat_brief(chat_history, last_players=6, per_char=64):
             lines.append("……")                        # 两段窗口之间确有省略，标出来
         for i in range(sp[0], sp[1] + 1):
             h = chat_history[i]
-            who = "Estarth" if str(h.get("role", "")) == "user" else "Azure（我）"
+            who = "玩家" if str(h.get("role", "")) == "user" else "Azure（我）"
             txt = str(h.get("content", ""))
             pieces = [p for p in txt.split("\n") if p != ""]
             t = " ".join(pieces).strip()
@@ -313,7 +313,7 @@ def board_map(board, num_moves):
             c = str(board.grid[x][y])
             row += "X " if c == "black" else ("O " if c == "white" else "· ")
         lines.append(row)
-    whose = "轮到 Estarth（黑）落子" if num_moves % 2 == 0 else "轮到你（Azure，白）落子"
+    whose = "轮到玩家（黑）落子" if num_moves % 2 == 0 else "轮到你（Azure，白）落子"
     done = "棋盘为空、尚未落子" if num_moves == 0 else "已下 %d 手" % num_moves
     # 明确列出双方现有棋子坐标
     bl = []
@@ -325,10 +325,10 @@ def board_map(board, num_moves):
                 bl.append(coords.xy_to_gtp(x, y))
             elif c2 == "white":
                 wh.append(coords.xy_to_gtp(x, y))
-    occ = "现有棋子（谈棋时只能引用这里出现的点）：\nEstarth 黑子：%s\nAzure 白子：%s" % (
+    occ = "现有棋子（谈棋时只能引用这里出现的点）：\n玩家黑子：%s\nAzure 白子：%s" % (
         (" 、 ".join(bl) if bl else "（暂无）"),
         (" 、 ".join(wh) if wh else "（暂无）"))
-    return "X = Estarth(黑)   O = Azure(白)   · = 空点\n%s\n%s\n%s，%s。" % ("\n".join(lines), occ, done, whose)
+    return "X =玩家(黑)   O = Azure(白)   · = 空点\n%s\n%s\n%s，%s。" % ("\n".join(lines), occ, done, whose)
 
 
 def long_term_note(text):
@@ -377,9 +377,9 @@ def long_term_note(text):
 _KIND_WORD = {
     "ai_bad": "我走过一手偏",
     "ai_style": "我按自己的棋感选过一手",
-    "player_bad": "Estarth 下过一手不太好的棋",
-    "player_good": "Estarth 下过一手好棋",
-    "chat": "Estarth 和我聊过天",
+    "player_bad": "玩家下过一手不太好的棋",
+    "player_good": "玩家下过一手好棋",
+    "chat": "玩家和我聊过天",
     "joseki": "这一片走过定式",
 }
 
@@ -518,7 +518,7 @@ def event_block(events, now_move_no, max_chars=EVENT_BLOCK_MAX_CHARS) -> str:
 
 _TIME_HEADER = "\n\n【时间事实 · 供你自然提及，不必每句都说】\n"
 _TIME_TAIL = ("\n（这些只是让你心里有数的参考：别把上面的数字当口头禅复述，也别一次全念出来；"
-              "跟眼前这盘棋、或者 Estarth 的话头无关时就别提。）")
+              "跟眼前这盘棋、或者玩家的话头无关时就别提。）")
 
 _PROFILE_HEADER = "\n\n【她眼中的你 · 跨局攒下的印象，只在相关时自然参考】\n"
 _PROFILE_TAIL = ("\n（这些是跨局攒下来的印象，不是眼前这盘棋：别逐条念、别把上面的说法当口头禅复述，"
@@ -598,7 +598,7 @@ def _time_lines(t) -> list:
             at += "（%s）" % phase
         lines.append("现在是 " + at)
     # 相对时间：只报「真的过了一阵子」的，刚说过话就不复读一个 0 秒。
-    for key, label in (("since_interaction_sec", "距上次和 Estarth 互动"),
+    for key, label in (("since_interaction_sec", "距上次和玩家互动"),
                        ("since_proactive_sec", "距上次你主动开口"),
                        ("since_chat_sec", "距上次聊天")):
         sec = _num(t.get(key), -1.0)
@@ -627,8 +627,8 @@ def _time_lines(t) -> list:
         avg = _num(t.get("avg_move_sec"), -1.0)
         dur = _dur_cn(avg) if avg >= 0.0 else ""
         if dur != "":                    # 脏值（inf / NaN）⇒ 整句不说，绝不拼出「平均每手 」
-            lines.append("Estarth 平均每手不到 1 秒" if avg < 1.0
-                         else "Estarth 平均每手 %s" % dur)
+            lines.append("玩家平均每手不到 1 秒" if avg < 1.0
+                         else "玩家平均每手 %s" % dur)
     if "last_gap_days" in t:
         gap = _gap_cn(t.get("last_gap_days"))
         if gap != "":
@@ -640,7 +640,7 @@ def _time_lines(t) -> list:
         except (TypeError, ValueError, OverflowError):     # inf / NaN / 超大值（Minor #5）
             n = 0
         if n >= 1:
-            lines.append("连续第 %d 天在陪 Estarth" % n)
+            lines.append("连续第 %d 天在陪玩家" % n)
     return lines
 
 
@@ -728,7 +728,7 @@ def _profile_items(profile, now_move_no) -> list:
 
     # —— 失误与薄弱方位：只在第 PROFILE_BLUNDER_MIN_MOVE 手之后才提 ——
     if _move_no(now_move_no) >= PROFILE_BLUNDER_MIN_MOVE:
-        # 失误率是**玩家口径**（真亏手数 / 玩家手数；Q2 收口后数值比早期版本翻倍），
+        # 失误率是**玩家口径**（真亏手数 /玩家手数；Q2 收口后数值比早期版本翻倍），
         # 阈值按这个新刻度取。
         raw, conf, ts = _axis_of(profile.get("blunder.rate"))
         if raw is not None:
@@ -868,7 +868,7 @@ def _progress_lines(rec) -> list:
         bits.append("共 %d 手" % n)
     wr = _num(rec.get("final_black_wr"), -1.0)
     if 0.0 <= wr <= 1.0:
-        bits.append("最终黑方（Estarth）胜率约 %d%%" % int(round(wr * 100.0)))
+        bits.append("最终黑方（玩家）胜率约 %d%%" % int(round(wr * 100.0)))
     if "final_score" in rec:                # 没这一格就不说目差（别把缺键说成 0.0）
         score = _num(rec.get("final_score"), 0.0)
         if math.isfinite(score):
@@ -883,10 +883,10 @@ def _progress_lines(rec) -> list:
     if 0.0 <= rate <= 1.0:
         if rate > 0.0:
             kind = str(axes.get("blunder.top_type") or "").strip()
-            out.append("Estarth 本局约 %d%% 的手明显亏损%s"
+            out.append("玩家本局约 %d%% 的手明显亏损%s"
                        % (int(round(rate * 100.0)), ("，亏得最多的一手偏「%s」" % kind) if kind else ""))
         else:
-            out.append("Estarth 本局没有明显亏损的一手")
+            out.append("玩家本局没有明显亏损的一手")
     fams = _name_list(rec.get("joseki_families"))
     if fams:
         out.append("本局走过的定式族：" + "、".join(fams[:6]))
@@ -954,7 +954,7 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
     block = ("【当前棋面 · 请时刻记住】\n%s"
         + "\n\n【KataGo 形势 · 引擎判断，仅供参考】\n%s"
         + "\n\n【对局全貌 · 请始终记住】\n%s\n整盘手数：%s\n最近过程：\n%s"
-        + "\n【落子评定存档（E=Estarth黑 / A=Azure白）· 只作回忆参考，别照抄、别改写里面的句子】\n%s"
+        + "\n【落子评定存档（E=玩家黑 / A=Azure白）· 只作回忆参考，别照抄、别改写里面的句子】\n%s"
         + "\n【最近的对话】\n%s"
         + "%s"                                   # 长期记忆段（空串时不留痕）
         + "%s"                                   # 事件区块（空串时不留痕，见上方区块表）
@@ -1020,7 +1020,7 @@ def joseki_teach_prompt(name, key, corner):
     v3.6.0 起收尾讲解改用 `joseki_close_prompt`，本函数仅为兼容与黄金样本保留。
     """
     return ("刚才%s角这一片走出了定式——【%s】。要点：%s\n"
-        + "用你自己的口吻（我/你）给Estarth讲 2~3 句：先说这是「%s」，再把上面的要点讲给 Estarth 听（更口语、更软一点），"
+        + "用你自己的口吻（我/你）给玩家讲 2~3 句：先说这是「%s」，再把上面的要点讲给玩家听（更口语、更软一点），"
         + "最后轻轻带一句这类形状什么时候能用。别像教科书背课文，别点具体坐标，别用「黑方/白棋」，也别重复你之前说过的话。") % (corner, name, key, name)
 
 
@@ -1066,7 +1066,7 @@ def joseki_enter_prompt(name, key, corner, owner=""):
     """进入：这一角走进了【name】——讲解**顶替**这一手的普通点评（同一时刻只出一条气泡）。
 
     U55：主语必须中性——「进入」那一手可能是玩家下的，也可能是**她自己**下的（`side == "azure"`），
-    写死「Estarth 这一手」在她把这一角带进这一课时就是事实错误。素材只给「哪个角 + 这一课 + 要点」。
+    写死「玩家这一手」在她把这一角带进这一课时就是事实错误。素材只给「哪个角 + 这一课 + 要点」。
 
     ``owner``（v3.11 修复）：角上先落子一方的颜色（``"B"`` / ``"W"``，缺省＝不注入角色说明）。
     要点是按角主立场写的；本局角主与说话人相反时必须显式对调，否则会讲出「他占角」这种主客颠倒。
@@ -1127,7 +1127,7 @@ def joseki_close_prompt(name, key, corner, side, owner=""):
     ``side`` 取 ``"player"``（玩家走完，并进他那一手的点评）/ ``"azure"``（她自己走完，并进她
     落子后的那句感想）。素材＝角 + 名字 + 要点；``owner`` 同 ``joseki_enter_prompt``。
     """
-    who = "Estarth 这一手" if str(side) != "azure" else "你（Azure）刚下的这一手"
+    who = "玩家这一手" if str(side) != "azure" else "你（Azure）刚下的这一手"
     base = ("%s把%s角这一片走完了，成的是【%s】。这一课的要点是：%s\n"
         + "用你自己的口吻（我/你）一句话收个尾：先点一下这一角走出来的是「%s」，"
         + "再用更口语、更软的说法把要点带一句——是收尾，不是开讲。"

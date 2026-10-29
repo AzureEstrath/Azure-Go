@@ -77,6 +77,14 @@ var _schedule_rows: VBoxContainer
 var _schedule_table: Control
 var _schedule_agenda: VBoxContainer
 var _timetable: Dictionary = {}
+# 年月历 / 周视图（v4.2.0）：默认月历；点某天打开那一周，周视图可前后翻周。
+var _schedule_items: Array = []
+var _schedule_view := "month"        # "month" | "week"
+var _calendar_month := ""            # "YYYY-MM"；空 = 当前月
+var _week_start := ""                # "YYYY-MM-DD" 周一；空 = 当前周
+var _calendar_grid: GridContainer
+var _calendar_title: Label
+var _week_title: Label
 var _files_status: Label
 var _files_scan: Button
 var _files_refresh: Button
@@ -793,8 +801,13 @@ func open_files() -> void:
 	_menu.visible = false
 	_menu_open = false
 	_bubble.visible = false
+	# 每次打开都回到当前月 / 当前周：用户上次翻到十二月，不该成为这次打开的第一眼。
+	_schedule_view = "month"
+	_calendar_month = ""
+	_week_start = ""
 	_apply_window_size(_files_size(), true)
 	_layout()
+	_render_schedule()
 	_files.visible = true
 	files_opened.emit()
 
@@ -858,43 +871,414 @@ func set_files_info(folder: String, files: Array) -> void:
 		_files_rows.add_child(row)
 
 func set_schedule_items(items: Array) -> void:
-	if _schedule_rows == null:
-		return
-	_hide_hover_card()
-	for c in _schedule_rows.get_children():
-		c.queue_free()
-	_schedule_table = null
-	_schedule_agenda = null
-	_timetable = {}
-	var courses: Array = []
-	var timed: Array = []
-	var plain: Array = []
+	_schedule_items = []
 	for it in items:
 		if typeof(it) != TYPE_DICTIONARY:
 			continue
 		var d: Dictionary = it
 		if str(d.get("title", "")).strip_edges() == "":
 			continue
+		_schedule_items.append(d)
+	_render_schedule()
+
+## 视图切换：月历（默认）/ 周表。数据只存一份，切换只重画。
+func show_month() -> void:
+	_schedule_view = "month"
+	_render_schedule()
+
+## 点某天 → 打开那一周（周一为起点）。
+func show_week_for_date(date: String) -> void:
+	var ds := str(date).strip_edges()
+	if ds.length() < 10:
+		ds = _today_key()
+	var unix := _date_unix(ds.substr(0, 10))
+	if unix <= 0:
+		return
+	_week_start = Time.get_date_string_from_unix_time(unix - _weekday_index(unix) * 86400)
+	_calendar_month = _week_start.substr(0, 7)
+	_schedule_view = "week"
+	_render_schedule()
+
+func _render_schedule() -> void:
+	if _schedule_rows == null:
+		return
+	_hide_hover_card()
+	# 先 remove 再 queue_free：切月 / 切周时旧视图不会和新视图叠在同一帧里。
+	for c in _schedule_rows.get_children():
+		_schedule_rows.remove_child(c)
+		c.queue_free()
+	_schedule_table = null
+	_schedule_agenda = null
+	_timetable = {}
+	_calendar_grid = null
+	_calendar_title = null
+	_week_title = null
+	if _schedule_items.is_empty():
+		_schedule_rows.add_child(_files_hint("（还没有整理出日程）"))
+		return
+	var courses: Array = []
+	var plain: Array = []
+	for d in _schedule_items:
 		var wd := int(d.get("weekday", -1))
 		var p0 := int(d.get("period_start", 0))
 		if wd >= 0 and wd < 7 and p0 >= 1 and p0 <= TABLE_PERIODS:
 			courses.append(d)
 		else:
 			plain.append(d)
-			# 有明确时刻、且不是自动排班的约定：同时画进周表对应时段。
+	courses = _dedupe_courses(courses)
+	if _schedule_view == "week":
+		_render_week(courses, plain)
+	else:
+		_render_month(courses, plain)
+
+# ================= 日期工具 =================
+
+func _date_unix(date: String) -> int:
+	var ds := str(date).strip_edges()
+	if ds.length() < 10:
+		return 0
+	return int(Time.get_unix_time_from_datetime_string(ds.substr(0, 10) + "T00:00:00"))
+
+func _today_key() -> String:
+	return Time.get_date_string_from_system()
+
+func _weekday_index(unix: int) -> int:
+	var dd := Time.get_datetime_dict_from_unix_time(int(unix))
+	return (int(dd.get("weekday", 0)) + 6) % 7
+
+func _item_date_key(d: Dictionary) -> String:
+	"""条目所属日期：优先库里的 date，其次 start_ts；没有日期返回空串。"""
+	var date := str(d.get("date", "")).strip_edges()
+	if date.length() >= 10:
+		return date.substr(0, 10)
+	var ts := float(d.get("start_ts", 0.0))
+	if ts > 0.0:
+		return Time.get_date_string_from_unix_time(int(ts))
+	return ""
+
+func _month_key() -> String:
+	if _calendar_month.length() >= 7:
+		return _calendar_month.substr(0, 7)
+	return _today_key().substr(0, 7)
+
+func _week_start_key() -> String:
+	if _week_start.length() >= 10:
+		return _week_start.substr(0, 10)
+	var today := _today_key()
+	var unix := _date_unix(today)
+	if unix <= 0:
+		return today
+	return Time.get_date_string_from_unix_time(unix - _weekday_index(unix) * 86400)
+
+func _week_contains_date(date: String) -> bool:
+	var d := _date_unix(date)
+	var ws := _date_unix(_week_start_key())
+	return d > 0 and ws > 0 and d >= ws and d < ws + 7 * 86400
+
+func _item_in_week(d: Dictionary) -> bool:
+	var key := _item_date_key(d)
+	if key != "":
+		return _week_contains_date(key)
+	return _weekday_from_item(d) >= 0
+
+func _is_course(d: Dictionary) -> bool:
+	return str(d.get("kind", "")) == "course" or str(d.get("period", "")) != "" \
+		or int(d.get("period_start", 0)) >= 1
+
+func _period_minutes(d: Dictionary) -> int:
+	var p := int(d.get("period_start", 0))
+	if p >= 1 and p <= PERIOD_START_MIN.size():
+		return int(PERIOD_START_MIN[p - 1])
+	return -1
+
+func _item_clock(d: Dictionary) -> String:
+	var t := str(d.get("start_time", "")).strip_edges()
+	if t != "":
+		return t
+	var m := _period_minutes(d)
+	if m < 0:
+		m = _item_start_minutes(d)
+	if m < 0:
+		return ""
+	return "%02d:%02d" % [int(m / 60.0), m % 60]
+
+func _item_sort_minutes(d: Dictionary) -> int:
+	var m := _item_start_minutes(d)
+	if m >= 0:
+		return m
+	m = _period_minutes(d)
+	return m if m >= 0 else 1 << 30
+
+func _sort_schedule_items(a: Dictionary, b: Dictionary) -> bool:
+	return _item_sort_minutes(a) < _item_sort_minutes(b)
+
+func _month_day(unix: int) -> String:
+	var dd := Time.get_datetime_dict_from_unix_time(int(unix))
+	return "%d月%d日" % [int(dd.get("month", 0)), int(dd.get("day", 0))]
+
+func _friendly_date(date: String) -> String:
+	if date.length() < 10:
+		return date
+	return "%s %s" % [_month_day(_date_unix(date)),
+		["周一", "周二", "周三", "周四", "周五", "周六", "周日"][
+			_weekday_index(_date_unix(date))]]
+
+# ================= 月历 =================
+
+func _render_month(courses: Array, plain: Array) -> void:
+	var month := _month_key()
+	var bar := HBoxContainer.new()
+	bar.add_theme_constant_override("separation", 3)
+	_schedule_rows.add_child(bar)
+	bar.add_child(_nav_button("‹‹", func(): _shift_month(-12)))
+	bar.add_child(_nav_button("‹", func(): _shift_month(-1)))
+	var title := Label.new()
+	title.text = "%s 年 %s 月" % [month.substr(0, 4), month.substr(5, 2)]
+	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 11)
+	title.add_theme_color_override("font_color", GufengTheme.INK)
+	title.custom_minimum_size = Vector2(90, 0)
+	bar.add_child(title)
+	_calendar_title = title
+	bar.add_child(_nav_button("›", func(): _shift_month(1)))
+	bar.add_child(_nav_button("››", func(): _shift_month(12)))
+	var this_week := _compact_button("本周")
+	this_week.pressed.connect(_open_current_week)
+	bar.add_child(this_week)
+
+	_schedule_rows.add_child(_files_hint("点某一天打开那一周；课程按周重复显示。"))
+
+	var heads := GridContainer.new()
+	heads.columns = 7
+	heads.add_theme_constant_override("h_separation", 2)
+	heads.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	for name in ["一", "二", "三", "四", "五", "六", "日"]:
+		var lbl := Label.new()
+		lbl.text = "周" + name
+		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		lbl.add_theme_font_size_override("font_size", 9)
+		lbl.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
+		lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		heads.add_child(lbl)
+	_schedule_rows.add_child(heads)
+
+	var grid := GridContainer.new()
+	grid.columns = 7
+	grid.add_theme_constant_override("h_separation", 2)
+	grid.add_theme_constant_override("v_separation", 2)
+	grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_calendar_grid = grid
+	_schedule_rows.add_child(grid)
+	var first_unix := _date_unix(month + "-01")
+	var start_unix := first_unix - _weekday_index(first_unix) * 86400
+	var today := _today_key()
+	for i in range(42):
+		var unix := start_unix + i * 86400
+		var date := Time.get_date_string_from_unix_time(unix)
+		grid.add_child(_calendar_cell(date, _day_items(date, courses, plain),
+			date.begins_with(month), date == today))
+
+	var month_items: Array = []
+	for d in plain:
+		var key := _item_date_key(d)
+		if key != "" and key.begins_with(month):
+			month_items.append(d)
+	month_items.sort_custom(_sort_schedule_items)
+	if not month_items.is_empty():
+		_build_agenda(month_items, "本月日程")
+	var undated := _undated_items(plain)
+	if not undated.is_empty():
+		_build_agenda(undated, "待安排")
+	if month_items.is_empty() and undated.is_empty() and courses.is_empty():
+		_schedule_rows.add_child(_files_hint("本月还没有日程；点日期打开那一周。"))
+
+func _calendar_cell(date: String, entries: Array, in_month: bool, is_today: bool) -> PanelContainer:
+	var cell := PanelContainer.new()
+	cell.custom_minimum_size = Vector2(0, 52)
+	cell.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cell.mouse_filter = Control.MOUSE_FILTER_STOP
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(GufengTheme.PANEL_SOFT, 0.92 if in_month else 0.32)
+	sb.border_color = GufengTheme.ACCENT if is_today else Color(GufengTheme.BORDER_SOFT, 0.55)
+	sb.set_border_width_all(2 if is_today else 1)
+	sb.set_corner_radius_all(4)
+	sb.content_margin_left = 3
+	sb.content_margin_right = 3
+	sb.content_margin_top = 1
+	sb.content_margin_bottom = 2
+	cell.add_theme_stylebox_override("panel", sb)
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", 0)
+	cell.add_child(vb)
+	var num := Label.new()
+	num.text = str(int(date.substr(8, 2)))
+	num.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	num.add_theme_font_size_override("font_size", 9)
+	num.add_theme_color_override("font_color",
+		GufengTheme.ACCENT if is_today else (GufengTheme.INK if in_month
+			else Color(GufengTheme.INK_SOFT, 0.4)))
+	num.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	vb.add_child(num)
+	var shown := 0
+	for d in entries:
+		if shown >= 2:
+			break
+		var lbl := Label.new()
+		var t := _item_clock(d)
+		lbl.text = (t + " " + str(d.get("title", ""))) if t != "" else "· " + str(d.get("title", ""))
+		lbl.clip_text = true
+		lbl.max_lines_visible = 1
+		lbl.add_theme_font_size_override("font_size", 8)
+		lbl.add_theme_color_override("font_color",
+			GufengTheme.INK if in_month and not _is_course(d) else GufengTheme.INK_SOFT)
+		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		vb.add_child(lbl)
+		shown += 1
+	if entries.size() > shown:
+		var more := Label.new()
+		more.text = "+%d" % (entries.size() - shown)
+		more.add_theme_font_size_override("font_size", 8)
+		more.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.8))
+		more.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		vb.add_child(more)
+	cell.set_meta("calendar_date", date)
+	cell.mouse_entered.connect(func(): _show_day_hover(cell, date, entries))
+	cell.mouse_exited.connect(_hide_hover_card)
+	cell.gui_input.connect(_on_calendar_cell_input.bind(date))
+	return cell
+
+func _day_items(date: String, courses: Array, plain: Array) -> Array:
+	var wd := _weekday_index(_date_unix(date))
+	var out: Array = []
+	for d in courses:
+		if _weekday_from_item(d) == wd:
+			out.append(d)
+	for d in plain:
+		var key := _item_date_key(d)
+		if key == date:
+			out.append(d)
+		elif key == "" and _weekday_from_item(d) == wd:
+			out.append(d)
+	out.sort_custom(_sort_schedule_items)
+	return out
+
+func _undated_items(items: Array) -> Array:
+	var out: Array = []
+	for d in items:
+		if typeof(d) != TYPE_DICTIONARY:
+			continue
+		if _item_date_key(d) == "" and _weekday_from_item(d) < 0:
+			out.append(d)
+	out.sort_custom(_sort_schedule_items)
+	return out
+
+func _on_calendar_cell_input(event: InputEvent, date: String) -> void:
+	if event is InputEventMouseButton:
+		var mb := event as InputEventMouseButton
+		if mb.pressed and mb.button_index == MOUSE_BUTTON_LEFT:
+			show_week_for_date(date)
+			accept_event()
+
+func _show_day_hover(anchor: Control, date: String, entries: Array) -> void:
+	var lines: Array[String] = []
+	for d in entries:
+		var t := _item_clock(d)
+		var title := str(d.get("title", "")).strip_edges()
+		var loc := str(d.get("location", "")).strip_edges()
+		var line := (t + " " if t != "" else "") + title
+		if loc != "":
+			line += " · " + loc
+		lines.append(line)
+	var info := {
+		"title": _friendly_date(date),
+		"when_text": "点一下打开这一周",
+		"grade": "day",
+		"notes": "\n".join(lines) if not lines.is_empty() else "（这一天没有日程）",
+	}
+	_show_hover_card(anchor, info)
+
+func _nav_button(text: String, cb: Callable) -> Button:
+	var b := _compact_button(text)
+	b.custom_minimum_size = Vector2(26, 22)
+	b.pressed.connect(cb)
+	return b
+
+func _shift_month(delta: int) -> void:
+	var month := _month_key()
+	var year := int(month.substr(0, 4))
+	var idx := int(month.substr(5, 2)) - 1 + delta
+	year += int(floor(float(idx) / 12.0))
+	idx = ((idx % 12) + 12) % 12
+	_calendar_month = "%04d-%02d" % [year, idx + 1]
+	_schedule_view = "month"
+	_render_schedule()
+
+func _open_current_week() -> void:
+	_week_start = ""
+	_calendar_month = ""
+	_schedule_view = "week"
+	_render_schedule()
+
+func _shift_week(delta: int) -> void:
+	var ws := _week_start_key()
+	var unix := _date_unix(ws)
+	if unix <= 0:
+		return
+	_week_start = Time.get_date_string_from_unix_time(unix + delta * 7 * 86400)
+	_calendar_month = _week_start.substr(0, 7)
+	_render_schedule()
+
+# ================= 周表 =================
+
+func _render_week(courses: Array, plain: Array) -> void:
+	var bar := HBoxContainer.new()
+	bar.add_theme_constant_override("separation", 3)
+	_schedule_rows.add_child(bar)
+	bar.add_child(_nav_button("‹", func(): _shift_week(-1)))
+	var title := Label.new()
+	title.text = _week_title_text()
+	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 10)
+	title.add_theme_color_override("font_color", GufengTheme.INK)
+	title.custom_minimum_size = Vector2(90, 0)
+	bar.add_child(title)
+	_week_title = title
+	bar.add_child(_nav_button("›", func(): _shift_week(1)))
+	var month_btn := _compact_button("月历")
+	month_btn.pressed.connect(show_month)
+	bar.add_child(month_btn)
+	var this_btn := _compact_button("本周")
+	this_btn.pressed.connect(_open_current_week)
+	bar.add_child(this_btn)
+	_schedule_rows.add_child(_files_hint("课程按周重复；定时约定只显示这一周。"))
+
+	var timed: Array = []
+	var week_plain: Array = []
+	for d in plain:
+		if _item_in_week(d):
+			week_plain.append(d)
 			var ev := _event_block(d)
 			if not ev.is_empty():
 				timed.append(ev)
-	courses = _dedupe_courses(courses)
 	timed = _dedupe_events(timed)
-	if courses.is_empty() and plain.is_empty():
-		_schedule_rows.add_child(_files_hint("（还没有整理出日程）"))
+	week_plain.sort_custom(_sort_schedule_items)
+	if not week_plain.is_empty():
+		_build_agenda(week_plain, "本周日程")
+	var undated := _undated_items(plain)
+	if not undated.is_empty():
+		_build_agenda(undated, "待安排")
+	if courses.is_empty() and timed.is_empty():
+		_schedule_rows.add_child(_files_hint("本周没有课程或定时约定；可以切到月历看其他周。"))
 		return
-	# 先把日程 / 约定列表放在周表上方：即使表格很长，也不会把「其他日程」埋到滚动区底部。
-	if not plain.is_empty():
-		_build_agenda(plain)
-	if not courses.is_empty() or not timed.is_empty():
-		_build_timetable(courses, timed)
+	_build_timetable(courses, timed)
+
+func _week_title_text() -> String:
+	var ws := _date_unix(_week_start_key())
+	if ws <= 0:
+		return "本周"
+	return "%s - %s" % [_month_day(ws), _month_day(ws + 6 * 86400)]
 
 func _dedupe_courses(courses: Array) -> Array:
 	"""同一门课可能来自多周扫描：按「星期 + 起始节 + 标题」去重，保留日期最新的一条。"""
@@ -964,9 +1348,7 @@ func _period_index(minutes: int) -> int:
 	return clampi(idx, 1, TABLE_PERIODS)
 
 func _event_block(d: Dictionary) -> Dictionary:
-	"""有明确时刻、尚未自动排班的约定 → 周表块（避免被只画课程的网格漏掉）。"""
-	if bool(d.get("auto_planned", false)):
-		return {}
+	"""有明确时刻的约定 / 自动安排 → 周表块（避免被只画课程的网格漏掉）。"""
 	if str(d.get("grade", "")) == "closed":
 		return {}
 	if str(d.get("status", "planned")) != "planned":
@@ -1069,32 +1451,19 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 	var table_w := clampf(size.x - MARGIN * 2.0 - 22.0, 280.0, FILES_W - 44.0)
 	var col_w := (table_w - TABLE_TIME_W) / 7.0
 	var table_h := TABLE_HEAD_H + TABLE_ROW_H * TABLE_PERIODS
-	# —— 周标题：从课程日期推本周一 / 周日 ——
-	var dates: Array[String] = []
-	for it in courses:
-		var ds := str(it.get("date", "")).strip_edges()
-		if ds.length() >= 10:
-			dates.append(ds)
+	# —— 周标题：以选中的周一为起点（课程按周重复，不再从扫描日期推） ——
+	var ws := _week_start_key()
+	var ws_unix := _date_unix(ws)
 	var note := Label.new()
-	note.text = "本月课表"
+	var end_txt := ""
+	if ws_unix > 0:
+		var ed := Time.get_datetime_dict_from_unix_time(ws_unix + 6 * 86400)
+		end_txt = "%02d-%02d" % [int(ed.get("month", 0)), int(ed.get("day", 0))]
+	note.text = "本周课表 · %s ~ %s" % [ws.substr(5), end_txt]
 	var today_col := -1
-	if not dates.is_empty():
-		dates.sort()
-		var week_start := dates[0]
-		var end_txt := ""
-		var mon_unix := 0
-		var unix := int(Time.get_unix_time_from_datetime_string(week_start + "T00:00:00"))
-		if unix > 0:
-			var d0 := Time.get_datetime_dict_from_unix_time(unix)
-			mon_unix = unix - ((int(d0.get("weekday", 0)) + 6) % 7) * 86400
-			var ed := Time.get_datetime_dict_from_unix_time(mon_unix + 6 * 86400)
-			end_txt = "%02d-%02d" % [int(ed.get("month", 0)), int(ed.get("day", 0))]
-		note.text = "本周课表 · %s ~ %s" % [week_start.substr(5), end_txt]
-		# 只有扫描的正是本周时才高亮今天这一列（旧周课表不冒充今天）。
-		var today_unix := int(Time.get_unix_time_from_datetime_string(
-			Time.get_date_string_from_system() + "T00:00:00"))
-		if mon_unix > 0 and today_unix >= mon_unix and today_unix <= mon_unix + 6 * 86400:
-			today_col = (int(Time.get_datetime_dict_from_unix_time(today_unix).get("weekday", 0)) + 6) % 7
+	var today_unix := _date_unix(_today_key())
+	if ws_unix > 0 and today_unix >= ws_unix and today_unix < ws_unix + 7 * 86400:
+		today_col = _weekday_index(today_unix)
 	note.add_theme_font_size_override("font_size", 10)
 	note.add_theme_color_override("font_color", GufengTheme.INK)
 	_schedule_rows.add_child(note)
@@ -1119,12 +1488,11 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 	_timetable = {"col_w": col_w, "width": table_w, "height": table_h, "today_col": today_col}
 	_schedule_table = grid
 	_schedule_rows.add_child(hscroll)
-	# —— 表头：星期 + 日期 ——
+	# —— 表头：星期 + 选中周的日期 ——
 	var col_dates := {}
-	for it in courses:
-		var wd := int(it.get("weekday", -1))
-		var ds := str(it.get("date", "")).strip_edges()
-		if wd >= 0 and wd < 7 and ds.length() >= 10 and not col_dates.has(wd):
+	if ws_unix > 0:
+		for wd in range(7):
+			var ds := Time.get_date_string_from_unix_time(ws_unix + wd * 86400)
 			col_dates[wd] = ds.substr(5)
 	for wd in range(7):
 		var head := Label.new()
@@ -1222,14 +1590,15 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 		merged["notes"] = "\n".join(lines)
 		_add_timetable_block(grid, col_w, merged, wd, p0, p1, true)
 
-func _build_agenda(items: Array) -> void:
+func _build_agenda(items: Array, heading := "日程 / 约定") -> void:
 	var wrap := VBoxContainer.new()
 	wrap.add_theme_constant_override("separation", 2)
 	wrap.custom_minimum_size = Vector2(0, 0)
 	wrap.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_schedule_agenda = wrap
+	if _schedule_agenda == null:
+		_schedule_agenda = wrap
 	_schedule_rows.add_child(wrap)
-	wrap.add_child(_files_hint("日程 / 约定"))
+	wrap.add_child(_files_hint(heading))
 	for it in items:
 		var d: Dictionary = it
 		var when := str(d.get("when_text", "")).strip_edges()

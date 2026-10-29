@@ -23,7 +23,7 @@ class GameState:
         # 本局全部真亏手（v3.7.0）：{move_no, gtp, drop, reason}；只有 drop > 0.10 才入账，不截断。
         # bad_moves 语义不变（最近 3 条俗手，供右侧栏「俗手回档」），这是另开的一份完整账
         self.losses = []
-        # 带标签的对局记忆：{tag, move_no, text}；E=Estarth(黑)的棋，A=Azure(白)的棋
+        # 带标签的对局记忆：{tag, move_no, text}；E=玩家(黑)的棋，A=Azure(白)的棋
         self.memory_log = []
         # 定式识别去重记录：{key, move_no}；随快照回滚（悔棋后可以重新讲解）
         self.joseki_log = []
@@ -74,7 +74,7 @@ class GameState:
 
     def log_memory(self, tag, text, move_no):
         """记录一条带标签的对局记忆（思考前回忆用）：
-        tag = "E"（对 Estarth 这手的分析/评价）或 "A"（Azure 自己的落子分析与思路）。
+        tag = "E"（对玩家这手的分析/评价）或 "A"（Azure 自己的落子分析与思路）。
         """
         t = " ".join(s for s in text.split("\n") if s != "").strip()
         if t == "":
