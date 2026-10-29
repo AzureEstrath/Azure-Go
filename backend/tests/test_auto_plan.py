@@ -259,6 +259,15 @@ class GradeTest(unittest.TestCase):
         out = auto_plan.plan([item], now=NOW, days=1)
         self.assertEqual(len(out["assignments"]), 1)
 
+    def test_ongoing_event_is_committed_and_not_replanned(self):
+        """已经开始但还没结束的约定（如 12:00-13:00 比赛）不能当成待安排。"""
+        item = self._item(start_ts=NOW - 30 * 60.0)
+        self.assertEqual(auto_plan.classify_item(item, now=NOW),
+                         auto_plan.GRADE_COMMITTED)
+        out = auto_plan.plan([item], now=NOW, days=1)
+        self.assertEqual(out["assignments"], [])
+        self.assertEqual(out["fixed"], 1)
+
     def test_weekday_event_without_period_is_committed(self):
         """只有星期的事件（周四篮球赛）是约定，不是固定课程。"""
         item = self._item(start_ts=NOW + 3600.0, weekday=3)

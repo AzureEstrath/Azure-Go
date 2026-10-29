@@ -1154,19 +1154,71 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		grid.add_child(lbl)
 	# —— 课程块（跨节）——
+	var occupied := {}
 	for it in courses:
 		var d: Dictionary = it
 		var wd := clampi(int(d.get("weekday", 0)), 0, 6)
 		var p0 := clampi(int(d.get("period_start", 1)), 1, TABLE_PERIODS)
 		var p1 := clampi(int(d.get("period_end", p0)), p0, TABLE_PERIODS)
+		for p in range(p0, p1 + 1):
+			occupied["%d|%d" % [wd, p]] = true
 		_add_timetable_block(grid, col_w, d, wd, p0, p1, false)
 	# —— 约定 / 定时事件：按开始时刻落到对应节次行，不再只出现在列表里 ——
+	# 同一格有多个约定时合并成一个「N 项约定」块（悬停卡列出全部）；
+	# 若该格已被课程占用，就不画事件块，避免盖住课程（上方列表仍完整显示）。
+	var groups := {}
+	var group_order := []
 	for it in timed:
 		var ev: Dictionary = it
 		var wd := clampi(int(ev.get("_event_wd", 0)), 0, 6)
 		var p0 := clampi(int(ev.get("_event_p0", 1)), 1, TABLE_PERIODS)
 		var p1 := clampi(int(ev.get("_event_p1", p0)), p0, TABLE_PERIODS)
-		_add_timetable_block(grid, col_w, ev, wd, p0, p1, true)
+		var blocked := false
+		for p in range(p0, p1 + 1):
+			if occupied.has("%d|%d" % [wd, p]):
+				blocked = true
+				break
+		if blocked:
+			continue
+		var key := "%d|%d" % [wd, p0]
+		if not groups.has(key):
+			groups[key] = []
+			group_order.append(key)
+		groups[key].append(ev)
+	for key in group_order:
+		var group: Array = groups[key]
+		var base: Dictionary = group[0]
+		var wd := clampi(int(base.get("_event_wd", 0)), 0, 6)
+		var p0 := clampi(int(base.get("_event_p0", 1)), 1, TABLE_PERIODS)
+		var p1 := clampi(int(base.get("_event_p1", p0)), p0, TABLE_PERIODS)
+		for ev in group:
+			p1 = maxi(p1, clampi(int(ev.get("_event_p1", p0)), p0, TABLE_PERIODS))
+		if group.size() == 1:
+			_add_timetable_block(grid, col_w, base, wd, p0, p1, true)
+			continue
+		var merged: Dictionary = base.duplicate()
+		merged["title"] = "%d 项约定" % group.size()
+		merged["grade"] = "committed"
+		merged["grade_label"] = "已约定"
+		var whens: Array[String] = []
+		var seen_when := {}
+		var lines: Array[String] = []
+		for ev in group:
+			var title := str(ev.get("title", "")).strip_edges()
+			var when := str(ev.get("when_text", "")).strip_edges()
+			var loc := str(ev.get("location", "")).strip_edges()
+			if when != "" and not seen_when.has(when):
+				seen_when[when] = true
+				whens.append(when)
+			var line := title
+			if when != "":
+				line += "（%s）" % when
+			if loc != "":
+				line += " " + loc
+			lines.append(line)
+		merged["when_text"] = "；".join(whens)
+		merged["notes"] = "\n".join(lines)
+		_add_timetable_block(grid, col_w, merged, wd, p0, p1, true)
 
 func _build_agenda(items: Array) -> void:
 	var wrap := VBoxContainer.new()

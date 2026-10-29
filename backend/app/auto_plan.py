@@ -144,11 +144,13 @@ def classify_item(item, now=None, lock_sec=0.0):
     auto = bool(item.get("auto_planned"))
     date_only = _date_only(item)
     ref = _num(now, time.time()) or time.time()
-    # 用户定下的时间只要还没过去（含刚好到点）就是不可动的约定；错过的任务允许重排。
-    if start >= ref and not auto and not date_only:
+    dur = _clamp(_int(item.get("duration_min"), DEFAULT_DURATION), 5, 24 * 60) * 60.0
+    end = start + dur if start > 0.0 else 0.0
+    # 用户定下的约定只要**还没结束**（含正在进行）就不可移动；已经结束的才允许重排。
+    if start > 0.0 and not auto and not date_only and end > ref:
         return GRADE_COMMITTED
     lock = max(0.0, _num(lock_sec, 0.0))
-    if auto and start > 0.0 and start > ref and (start - ref) <= lock:
+    if auto and start > 0.0 and end > ref and (start - ref) <= lock:
         return GRADE_LOCKED
     if date_only or _num(item.get("deadline_ts"), 0.0) > 0.0:
         return GRADE_DEADLINE

@@ -565,9 +565,9 @@ def _parse_item(raw, ref, source):
     if weekday is None and date is not None and period is not None:
         weekday = date.weekday()
 
-    raw_kind = str(raw.get("kind", "") or "").strip().lower()
-    # 只有「明确课程 / 有节次」才是课程；仅有星期的时间型事件是普通约定（如周四篮球赛）。
-    kind = "course" if raw_kind == "course" or period is not None else "task"
+    # 只有**真的带节次**的条目才是课程；群公告里的「周四篮球赛」即使模型写了
+    # kind=course，也按普通约定处理（否则会被当成不可移动的固定课）。
+    kind = "course" if period is not None else "task"
     task_type = str(raw.get("task_type", raw.get("type", "")) or "").strip().lower()
     if task_type not in schedule_learning.CATEGORY_PRIOR:
         task_type = schedule_learning.infer_task_type(title, kind, notes)

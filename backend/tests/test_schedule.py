@@ -135,9 +135,17 @@ class ScheduleExtractTest(unittest.TestCase):
     def test_weekday_event_without_period_is_task(self):
         items = schedule.normalize_items([
             {"date": "2026-10-29", "weekday": "周四", "time": "12:00",
-             "end_time": "13:00", "title": "院系杯男子篮球赛", "location": "篮球场"},
+             "end_time": "13:00", "title": "院系杯男子篮球赛", "location": "篮球场",
+             "kind": "course"},
         ], source="chat.jpg", now=NOW)
         self.assertEqual(items[0]["kind"], "task")
+
+    def test_course_with_period_stays_course(self):
+        items = schedule.normalize_items([
+            {"date": "2026-10-29", "weekday": "周四", "period": "1-2",
+             "title": "高等数学", "kind": "course"},
+        ], source="table.jpg", now=NOW)
+        self.assertEqual(items[0]["kind"], "course")
 
     def test_course_items_keep_weekday_period_teacher_location(self):
         """课程表条目：节次跨两节写 1-2，教师/地点/日期都要留下（前端画周课表用）。"""

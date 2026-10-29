@@ -214,15 +214,61 @@ class LifeStoreTest(unittest.TestCase):
         self.assertEqual(row["date"], "2026-10-28")
         again = self.store.upsert_schedule([{
             "start_ts": T0 + 3700.0, "when_text": "2026-10-28 周三 第1-2节 08:00-09:35",
-            "title": "高等数学", "notes": "带上作业", "source": "课表.png",
+            "title": "高等数学", "notes": "带上作业", "source": "课表2.png",
             "date": "2026-10-28", "weekday": 2, "period": "1-2",
             "period_start": 1, "period_end": 2, "start_time": "08:00",
-            "end_time": "09:35", "teacher": "王三强", "location": "二教20",
-        }], source="课表.png", now=T0 + 10)
+            "end_time": "09:35", "teacher": "", "location": "",
+        }], source="课表2.png", now=T0 + 10)
         self.assertEqual(len(again), 1)
         self.assertEqual(again[0]["id"], saved[0]["id"])
         self.assertEqual(again[0]["notes"], "带上作业")
+        # 换一张图 / 重扫时 source 会变，但内容相同：不新增，合并来源并保留旧教师。
+        self.assertIn("课表.png", again[0]["source"])
+        self.assertIn("课表2.png", again[0]["source"])
+        self.assertEqual(again[0]["teacher"], "王三强")
+        self.assertEqual(again[0]["location"], "二教20")
         self.assertEqual(len(self.store.list_schedule(10)), 1)
+
+    def test_startup_cleans_existing_course_duplicates(self):
+        """旧版按 source 去重留下的重复行，启动时按课程格子清理并合并来源。"""
+        saved = self.store.upsert_schedule([{
+            "start_ts": T0 + 3600.0, "when_text": "2026-10-28 周三 第1-2节 08:00-09:35",
+            "title": "高等数学", "source": "课表.png",
+            "date": "2026-10-28", "weekday": 2, "period": "1-2",
+            "period_start": 1, "period_end": 2, "start_time": "08:00",
+            "end_time": "09:35", "teacher": "王三强", "location": "二教20",
+        }], source="课表.png", now=T0)
+        self.assertEqual(len(saved), 1)
+        self.store._db.execute(
+            "INSERT INTO schedule_items(start_ts, title, source, date_text, weekday, period, "
+            "period_start, period_end, start_time, end_time, kind, status) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?, 'planned')",
+            (T0 + 3600.0, "高等数学", "课表2.png", "2026-10-28", 2, "1-2",
+             1, 2, "08:00", "09:35", "course"))
+        self.store._db.commit()
+        self.assertEqual(len(self.store.list_schedule(10)), 2)
+        self.store.close()
+        self.store = life.LifeStore(self.path)
+        rows = self.store.list_schedule(10)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("课表.png", rows[0]["source"])
+        self.assertIn("课表2.png", rows[0]["source"])
+        self.assertEqual(rows[0]["teacher"], "王三强")
+        self.assertEqual(rows[0]["location"], "二教20")
+
+    def test_migration_downgrades_weekday_only_course(self):
+        """旧数据把群公告标成 course：没有节次时迁移要降级为普通约定。"""
+        saved = self.store.upsert_schedule([{
+            "start_ts": T0 + 7200.0, "when_text": "2026-10-29 周四 12:00-13:00",
+            "title": "院系杯男子篮球赛", "source": "chat.jpg",
+            "date": "2026-10-29", "weekday": 3, "period": "",
+            "start_time": "12:00", "end_time": "13:00", "kind": "course",
+        }], source="chat.jpg", now=T0)
+        self.assertEqual(saved[0]["kind"], "course")
+        self.store.close()
+        self.store = life.LifeStore(self.path)
+        rows = self.store.list_schedule(10)
+        self.assertEqual(rows[0]["kind"], "task")
 
     def test_schedule_reminder_archive_cleanup_and_plan_update(self):
         """到点提醒 / 留档 / 清理 / 自动排班写入：完整生命周期（纯临时库）。"""

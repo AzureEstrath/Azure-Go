@@ -195,6 +195,17 @@ def _clip(text, limit=MAX_SUMMARY_LEN):
     return s[:limit - 1] + "…"
 
 
+def _merge_sources(old, new, limit=200):
+    """合并扫描来源：按逗号拆分去重，保留先后顺序（不丢之前扫到的文件名）。"""
+    out = []
+    for text in (old, new):
+        for part in str(text or "").split(","):
+            name = part.strip()
+            if name and name not in out:
+                out.append(name)
+    return ",".join(out)[:limit]
+
+
 def _safe_int(v, default=0):
     """脏值 → 默认整数（bool 不算数字，避免 True 变成 1 混进星期 / 节次）。"""
     if isinstance(v, bool):
@@ -560,16 +571,29 @@ class LifeStore:
                     auto_planned = 1 if bool(it.get("auto_planned", False)) else 0
                     task_type = _clip(it.get("task_type", ""), 24) or (
                         "course" if kind == "course" else "general")
-                    if period != "" or weekday >= 0:
+                    # 去重键**不再包含 source**：同一课表换一张图 / 重扫一次时 source 会变，
+                    # 旧逻辑会把整张表再插一遍。课程按「日期（或星期）+ 节次 + 标题」，
+                    # 普通条目按「开始时间 + 标题」；命中后合并 source 与缺失字段。
+                    row = None
+                    if kind == "course" and (date_text != "" or weekday >= 0):
+                        if date_text != "":
+                            row = self._db.execute(
+                                "SELECT id, source, notes, teacher, location FROM schedule_items "
+                                "WHERE archived = 0 AND date_text = ? AND period = ? "
+                                "AND title = ? ORDER BY id ASC LIMIT 1",
+                                (date_text, period, title)).fetchone()
+                        else:
+                            row = self._db.execute(
+                                "SELECT id, source, notes, teacher, location FROM schedule_items "
+                                "WHERE archived = 0 AND date_text = '' AND weekday = ? "
+                                "AND period = ? AND title = ? ORDER BY id ASC LIMIT 1",
+                                (weekday, period, title)).fetchone()
+                    if row is None:
                         row = self._db.execute(
-                            "SELECT id FROM schedule_items WHERE source = ? AND date_text = ? "
-                            "AND period = ? AND title = ? ORDER BY id ASC LIMIT 1",
-                            (src, date_text, period, title)).fetchone()
-                    else:
-                        row = self._db.execute(
-                            "SELECT id FROM schedule_items WHERE source = ? AND start_ts = ? "
-                            "AND title = ? ORDER BY id ASC LIMIT 1",
-                            (src, start, title)).fetchone()
+                            "SELECT id, source, notes, teacher, location FROM schedule_items "
+                            "WHERE archived = 0 AND start_ts = ? AND title = ? "
+                            "ORDER BY id ASC LIMIT 1",
+                            (start, title)).fetchone()
                     if row is None:
                         cur = self._db.execute(
                             "INSERT INTO schedule_items(start_ts, when_text, title, notes, source, "
@@ -583,13 +607,18 @@ class LifeStore:
                         sid = int(cur.lastrowid)
                     else:
                         sid = int(row[0])
+                        src = _merge_sources(row[1], src)
+                        # 新扫描缺字段时保留旧值，避免「换一张图后教师 / 地点被清空」。
+                        notes = notes or str(row[2] or "")
+                        teacher = teacher or str(row[3] or "")
+                        location = location or str(row[4] or "")
                         self._db.execute(
                             "UPDATE schedule_items SET start_ts = ?, when_text = ?, notes = ?, "
-                            "date_text = ?, weekday = ?, period = ?, period_start = ?, period_end = ?, "
-                            "start_time = ?, end_time = ?, teacher = ?, location = ?, kind = ?, "
-                            "priority = ?, duration_min = ?, deadline_ts = ?, auto_planned = ?, "
-                            "task_type = ?, updated_ts = ? WHERE id = ?",
-                            (start, when_text, notes, date_text, weekday, period, p_start, p_end,
+                            "source = ?, date_text = ?, weekday = ?, period = ?, period_start = ?, "
+                            "period_end = ?, start_time = ?, end_time = ?, teacher = ?, location = ?, "
+                            "kind = ?, priority = ?, duration_min = ?, deadline_ts = ?, "
+                            "auto_planned = ?, task_type = ?, updated_ts = ? WHERE id = ?",
+                            (start, when_text, notes, src, date_text, weekday, period, p_start, p_end,
                              start_time, end_time, teacher, location, kind, priority, duration,
                              deadline, auto_planned, task_type, t, sid))
                     got = self._db.execute(
@@ -1089,11 +1118,71 @@ class LifeStore:
             for sql in _SCHEMA:
                 db.execute(sql)
             self._migrate_schedule_locked(db)
+            self._dedupe_schedule_locked(db)
             db.commit()
             self._db = db
         except Exception as e:              # noqa: BLE001 —— 库不可用＝只保留内存时间线
             print("[Life] 时间线库不可用（降级为内存）：%s" % e)
             self._db = None
+
+    @staticmethod
+    def _dedupe_schedule_locked(db):
+        """启动时清掉历史重复：同一课程格子 / 同一时刻同一标题只保留最新一行。
+
+        旧版去重键带 ``source``，每次重扫或新增一张课表都会把整张表再插一遍；
+        这里做一次幂等清理：保留 ``updated_ts`` 最新的一行，合并 source 与
+        教师 / 地点 / 备注，再删除其余行。失败只打日志，不影响启动。
+        """
+        try:
+            rows = db.execute(
+                "SELECT id, source, date_text, weekday, period, start_ts, title, notes, "
+                "teacher, location, updated_ts, kind FROM schedule_items "
+                "WHERE archived = 0 AND status = 'planned' ORDER BY id").fetchall()
+            groups = {}
+            for r in rows:
+                title = str(r[6] or "").strip()
+                if title == "":
+                    continue
+                period = str(r[4] or "").strip()
+                kind = str(r[11] or "").strip()
+                if kind == "course" or period != "":
+                    date_text = str(r[2] or "").strip()
+                    if date_text != "":
+                        key = ("course", date_text, period, title)
+                    else:
+                        key = ("course", _safe_int(r[3], -1), period, title)
+                else:
+                    key = ("task", float(r[5] or 0.0), title)
+                groups.setdefault(key, []).append(r)
+            removed = 0
+            for group in groups.values():
+                if len(group) < 2:
+                    continue
+                keep = max(group, key=lambda x: (float(x[10] or 0.0), int(x[0])))
+                src = ""
+                notes = str(keep[7] or "")
+                teacher = str(keep[8] or "")
+                location = str(keep[9] or "")
+                for r in group:
+                    src = _merge_sources(src, r[1])
+                    if len(str(r[7] or "")) > len(notes):
+                        notes = str(r[7])
+                    if len(str(r[8] or "")) > len(teacher):
+                        teacher = str(r[8])
+                    if len(str(r[9] or "")) > len(location):
+                        location = str(r[9])
+                db.execute(
+                    "UPDATE schedule_items SET source = ?, notes = ?, teacher = ?, "
+                    "location = ? WHERE id = ?",
+                    (src, notes, teacher, location, int(keep[0])))
+                for r in group:
+                    if int(r[0]) != int(keep[0]):
+                        db.execute("DELETE FROM schedule_items WHERE id = ?", (int(r[0]),))
+                        removed += 1
+            if removed:
+                print("[Life] 日程去重：清理 %d 条历史重复" % removed)
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 日程去重失败（忽略）：%s" % e)
 
     @staticmethod
     def _migrate_schedule_locked(db):
@@ -1103,9 +1192,12 @@ class LifeStore:
             for name, spec in _SCHEDULE_EXTRA_COLS.items():
                 if name not in have:
                     db.execute("ALTER TABLE schedule_items ADD COLUMN %s %s" % (name, spec))
-            # 旧课表行没有 kind：按「有星期 / 有节次」补成 course，避免混进任务的收缩统计。
+            # 旧课表行没有 kind：只有**真的带节次**的才补成 course；仅写星期的是普通约定
+            # （如群公告里的「周四篮球赛」），不能当成不可移动的固定课。
             db.execute("UPDATE schedule_items SET kind = 'course' "
-                       "WHERE kind = 'task' AND (period <> '' OR weekday >= 0)")
+                       "WHERE kind = 'task' AND period <> ''")
+            db.execute("UPDATE schedule_items SET kind = 'task' "
+                       "WHERE kind = 'course' AND period = '' AND period_start = 0")
         except Exception as e:              # noqa: BLE001 —— 迁移失败只打日志
             print("[Life] 日程表升级失败（继续用旧列）：%s" % e)
 
