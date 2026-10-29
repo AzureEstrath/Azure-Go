@@ -114,6 +114,12 @@ func _test_view() -> void:
 	await process_frame
 	_check("聊天面板能收起", not v.is_chat_open())
 	_check("聊天记录保留在面板里", log.get_child_count() == 2)
+	v.append_chat("assistant", "[[tone:proud]] {轻轻点头} 记着呢")
+	var last_row = log.get_child(log.get_child_count() - 1)
+	var last_text: Label = last_row.get_child(0).get_child(0)
+	_check("聊天气泡不显示语气 / 动作标记",
+		last_text.text.contains("记着呢") and not last_text.text.contains("tone")
+		and not last_text.text.contains("轻轻点头"))
 
 	v.open_files()
 	await process_frame

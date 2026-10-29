@@ -16,7 +16,7 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import actions, adaptive, coords, events, joseki_gate, persona, profile, prompt_chains, prompts, pv_lines, time_ctx
+from . import actions, adaptive, coords, events, joseki_gate, persona, profile, prompt_chains, prompts, pv_lines, speech_text, time_ctx
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, PHASE_PEER, build_graph, is_joseki_mistake, _emit_line,
@@ -1341,6 +1341,9 @@ class AzureAgent:
                 continue
             u = str(r.get("user_text", "") or "").strip()
             a = str(r.get("reply_text", "") or "").strip()
+            if a:
+                # 旧库里的回复可能还带 [[tone:...]]：恢复上下文前先剥掉，别让模型学着复读。
+                a = speech_text.extract_tone(a)[1].strip()
             if u:
                 hist.append({"role": "user", "content": u[:240]})
             if a:

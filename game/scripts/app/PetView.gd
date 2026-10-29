@@ -102,6 +102,9 @@ var _hover_card: PanelContainer
 var _hover_label: Label
 var _online_dot: Label
 var _fx: FxLayer
+# 聊天历史清洗：旧记忆里可能存着 [[tone:...]] / {动作} 这类舞台标记，面板里不能原样显示。
+var _tone_tag_re := RegEx.new()
+var _action_tag_re := RegEx.new()
 
 var _chat_open := false
 var _files_open := false
@@ -141,6 +144,8 @@ func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
 	if theme == null:
 		theme = GufengTheme.build_theme(GufengTheme.font())
+	_tone_tag_re.compile("\\[\\[?\\s*tone\\s*[:：]\\s*[a-zA-Z]+\\s*\\]\\]?")
+	_action_tag_re.compile("\\{([^{}\"\\n]{1,16})\\}")
 	_tex = load("res://assets/azure_pet.png") as Texture2D
 	_build()
 	resized.connect(_layout)
@@ -885,6 +890,7 @@ func set_schedule_items(items: Array) -> void:
 func show_month() -> void:
 	_schedule_view = "month"
 	_render_schedule()
+	call_deferred("_reset_schedule_scroll")
 
 ## 点某天 → 打开那一周（周一为起点）。
 func show_week_for_date(date: String) -> void:
@@ -898,6 +904,7 @@ func show_week_for_date(date: String) -> void:
 	_calendar_month = _week_start.substr(0, 7)
 	_schedule_view = "week"
 	_render_schedule()
+	call_deferred("_reset_schedule_scroll")
 
 func _render_schedule() -> void:
 	if _schedule_rows == null:
@@ -1233,12 +1240,14 @@ func _shift_month(delta: int) -> void:
 	_calendar_month = "%04d-%02d" % [year, idx + 1]
 	_schedule_view = "month"
 	_render_schedule()
+	call_deferred("_reset_schedule_scroll")
 
 func _open_current_week() -> void:
 	_week_start = ""
 	_calendar_month = ""
 	_schedule_view = "week"
 	_render_schedule()
+	call_deferred("_reset_schedule_scroll")
 
 func _shift_week(delta: int) -> void:
 	var ws := _week_start_key()
@@ -1248,6 +1257,7 @@ func _shift_week(delta: int) -> void:
 	_week_start = Time.get_date_string_from_unix_time(unix + delta * 7 * 86400)
 	_calendar_month = _week_start.substr(0, 7)
 	_render_schedule()
+	call_deferred("_reset_schedule_scroll")
 
 # ================= 周表 =================
 
@@ -1305,6 +1315,11 @@ func _week_title_text() -> String:
 	if ws <= 0:
 		return "本周"
 	return "%s - %s" % [_month_day(ws), _month_day(ws + 6 * 86400)]
+
+func _reset_schedule_scroll() -> void:
+	"""切月 / 切周后回到顶部：否则用户从月历下半屏点进来，会看不见周标题与表头。"""
+	if _files_scroll != null:
+		_files_scroll.scroll_vertical = 0
 
 func _dedupe_courses(courses: Array) -> Array:
 	"""同一周的同一门课：按「日期 + 星期 + 起始节 + 标题」去重（不再跨周合并）。"""
@@ -1476,8 +1491,9 @@ func _add_timetable_block(grid: Control, col_w: float, d: Dictionary,
 	grid.add_child(panel)
 
 func _build_timetable(courses: Array, timed: Array = []) -> void:
-	# 表格宽度跟着视口走：7 天优先全部可见；只有极窄窗口才用内部横向滚动。
-	var table_w := clampf(size.x - MARGIN * 2.0 - 22.0, 280.0, FILES_W - 44.0)
+	# 表格宽度跟着视口走：7 天优先全部可见；预留外层纵向滚动条约 14px，
+	# 否则 360px 宽窗口会多出 12px 横向滚动条、右侧星期列被裁掉。
+	var table_w := clampf(size.x - MARGIN * 2.0 - 36.0, 280.0, FILES_W - 44.0)
 	var col_w := (table_w - TABLE_TIME_W) / 7.0
 	var table_h := TABLE_HEAD_H + TABLE_ROW_H * TABLE_PERIODS
 	# —— 周标题：以选中的周一为起点（课程按周重复，不再从扫描日期推） ——
@@ -2130,6 +2146,10 @@ func append_chat(role: String, text: String) -> void:
 	if _chat_log == null:
 		return
 	var clean := str(text).strip_edges()
+	if role != "user":
+		# 后台记忆存的是原始回复（可能带语气 / 动作标记）；显示前统一剥掉。
+		clean = _tone_tag_re.sub(clean, "", true).strip_edges()
+		clean = _action_tag_re.sub(clean, "", true).strip_edges()
 	if clean == "":
 		return
 	var row := HBoxContainer.new()

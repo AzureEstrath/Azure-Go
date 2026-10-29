@@ -57,7 +57,7 @@ from typing import TypedDict
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from . import actions, coords, decay, estimate, events, persona, prompts
+from . import actions, coords, decay, estimate, events, persona, prompts, speech_text
 from .llm_chain import ThinkStream, content_of, content_text_of
 from .tools import TOOLS
 
@@ -1557,9 +1557,11 @@ async def _finalize_chat(agent, data):
     reply = actions.naturalize(str(data.get("reply") or ""))
     if agent._llm_failed(reply):                # 云端失败 / 结构化误输出：聊天退化为兜底台词
         reply = agent._fallback_line("chat")
+    # 历史 / 记忆只存「可读台词」：语气标记留给 message + speech 配对，不能进聊天面板或被模型复读。
+    stored = speech_text.extract_tone(reply)[1] or reply
     if _alive(agent, data):                     # 看门狗守卫：旧一代不再写聊天历史
-        agent.st.chat_history.append({"role": "assistant", "content": reply})
-        await asyncio.to_thread(agent._remember_chat_turn, str(data.get("text") or ""), reply,
+        agent.st.chat_history.append({"role": "assistant", "content": stored})
+        await asyncio.to_thread(agent._remember_chat_turn, str(data.get("text") or ""), stored,
                                 str(data.get("mode") or "game"))
     await _emit_deduped(agent, events.AI, reply, epoch=data.get("epoch"))
     await agent._mood_llm_refine()
@@ -1570,9 +1572,10 @@ async def _finalize_idle(agent, data):
     reply = actions.naturalize(str(data.get("reply") or ""))
     if reply == "":
         reply = agent._idle_line()
+    stored = speech_text.extract_tone(reply)[1] or reply
     if _alive(agent, data):                     # 看门狗守卫：旧一代不再写聊天历史
-        agent.st.chat_history.append({"role": "assistant", "content": reply})
-        await asyncio.to_thread(agent._remember_pet_line, "idle", reply,
+        agent.st.chat_history.append({"role": "assistant", "content": stored})
+        await asyncio.to_thread(agent._remember_pet_line, "idle", stored,
                                 str(data.get("mode") or "game"))
     await _emit_deduped(agent, events.AI_IDLE, reply, epoch=data.get("epoch"))
 
@@ -1582,9 +1585,10 @@ async def _finalize_peer(agent, data):
     reply = actions.naturalize(str(data.get("reply") or ""))
     if reply == "":
         reply = agent._idle_line()
+    stored = speech_text.extract_tone(reply)[1] or reply
     if _alive(agent, data):
-        agent.st.chat_history.append({"role": "assistant", "content": reply})
-        await asyncio.to_thread(agent._remember_pet_line, "peer", reply,
+        agent.st.chat_history.append({"role": "assistant", "content": stored})
+        await asyncio.to_thread(agent._remember_pet_line, "peer", stored,
                                 str(data.get("mode") or "game"))
     await _emit_deduped(agent, events.AI_IDLE, reply, epoch=data.get("epoch"))
 
