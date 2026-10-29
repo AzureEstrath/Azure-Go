@@ -268,6 +268,16 @@ class GradeTest(unittest.TestCase):
         self.assertEqual(out["assignments"], [])
         self.assertEqual(out["fixed"], 1)
 
+    def test_ended_weekday_event_is_closed_and_not_replanned(self):
+        """已结束的「星期型」事件是历史，不能第二天再排一遍。"""
+        item = self._item(start_ts=NOW - 2 * 3600.0, weekday=3)
+        self.assertEqual(auto_plan.classify_item(item, now=NOW), auto_plan.GRADE_CLOSED)
+        out = auto_plan.plan([item], now=NOW, days=2)
+        self.assertEqual(out["assignments"], [])
+        gate = auto_plan.should_replan([item], now=NOW, horizon_days=1)
+        self.assertFalse(gate["trigger"])
+        self.assertEqual(gate["unplanned_ids"], [])
+
     def test_weekday_event_without_period_is_committed(self):
         """只有星期的事件（周四篮球赛）是约定，不是固定课程。"""
         item = self._item(start_ts=NOW + 3600.0, weekday=3)

@@ -138,6 +138,7 @@ def classify_item(item, now=None, lock_sec=0.0):
         return GRADE_CLOSED
     kind = str(item.get("kind", "task") or "task").strip().lower()
     period = str(item.get("period", "") or "").strip()
+    weekday = _int(item.get("weekday", -1), -1)
     if kind == "course" or period != "":
         return GRADE_FIXED
     start = _num(item.get("start_ts"), 0.0)
@@ -147,8 +148,13 @@ def classify_item(item, now=None, lock_sec=0.0):
     dur = _clamp(_int(item.get("duration_min"), DEFAULT_DURATION), 5, 24 * 60) * 60.0
     end = start + dur if start > 0.0 else 0.0
     # 用户定下的约定只要**还没结束**（含正在进行）就不可移动；已经结束的才允许重排。
-    if start > 0.0 and not auto and not date_only and end > ref:
-        return GRADE_COMMITTED
+    if start > 0.0 and not auto and not date_only:
+        if end > ref:
+            return GRADE_COMMITTED
+        # 群公告 / 比赛这类「只有星期、没有节次」的事件已经结束：保留为历史，不再自动重排，
+        # 避免第二天把球赛再排一遍。普通用户任务仍可重排（手动「推迟」也会重置时间）。
+        if 0 <= weekday <= 6:
+            return GRADE_CLOSED
     lock = max(0.0, _num(lock_sec, 0.0))
     if auto and start > 0.0 and end > ref and (start - ref) <= lock:
         return GRADE_LOCKED
@@ -664,11 +670,17 @@ def should_replan(items, now=None, horizon_days=3, work_start=DEFAULT_WORK_START
         dur = _clamp(_int(it.get("duration_min"), DEFAULT_DURATION), 5, 24 * 60) * 60.0
         pri = _clamp(_int(it.get("priority"), DEFAULT_PRIORITY), 0, 100)
         dl = _num(it.get("deadline_ts"), 0.0)
+        period = str(it.get("period", "") or "").strip()
+        weekday = _int(it.get("weekday", -1), -1)
         # 只有日期 / 没有时刻的任务视为「全天截止」：09:00 只是显示锚点，不能当作已占用。
         if start <= 0.0 or (not bool(it.get("auto_planned")) and _date_only(it)):
             unplanned.append(it)
             if pri >= 70 or (dl > 0 and dl - ref <= 24 * 3600.0):
                 demand += dur
+            continue
+        # 已结束的「星期型」事件（比赛 / 公告）是历史，不触发重排，也不把第二天再排一遍。
+        if not bool(it.get("auto_planned")) and period == "" and 0 <= weekday <= 6 \
+                and ref > start + dur + grace:
             continue
         if ref > start + dur + grace:
             overdue.append(it)

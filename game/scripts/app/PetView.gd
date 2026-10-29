@@ -967,6 +967,8 @@ func _event_block(d: Dictionary) -> Dictionary:
 	"""有明确时刻、尚未自动排班的约定 → 周表块（避免被只画课程的网格漏掉）。"""
 	if bool(d.get("auto_planned", false)):
 		return {}
+	if str(d.get("grade", "")) == "closed":
+		return {}
 	if str(d.get("status", "planned")) != "planned":
 		return {}
 	var wd := _weekday_from_item(d)
@@ -1304,6 +1306,8 @@ func _grade_tag(d: Dictionary) -> String:
 			return "可调"
 		"flexible":
 			return "待排"
+		"closed":
+			return "结束"
 	return ""
 
 func _grade_text(d: Dictionary) -> String:
@@ -1323,6 +1327,8 @@ func _grade_text(d: Dictionary) -> String:
 			return "可调整（优先保持原位）"
 		"待排":
 			return "待安排（按优先级放置）"
+		"结束":
+			return "已结束（不再自动重排）"
 	return ""
 
 func _reason_text(d: Dictionary) -> String:
@@ -1345,6 +1351,8 @@ func _reason_text(d: Dictionary) -> String:
 			text = "上次自动安排，原时间可行时优先保位"
 		"待排":
 			text = "待安排，按优先级密度放入最早空档"
+		"结束":
+			text = "已结束，不再自动重排"
 	if bool(d.get("auto_planned", false)):
 		var defer := int(d.get("defer_count", 0))
 		if defer >= 2:
