@@ -609,11 +609,11 @@ class FailSafeTest(unittest.TestCase):
                            '"title":"无机化学实验", "notes":"李老师 @综合楼103"}]')
         agent, bus = self._run(llm, lambda a: a.chat("刚刚你看到了什么"))
         reply = agent.st.chat_history[-1]["content"]
-        self.assertIn("无机化学实验", reply)
+        self.assertEqual(reply, "嗯，记下了。")
         self.assertNotIn('"date"', reply)
         self.assertNotIn("[{", reply)
         texts = [e["text"] for e in bus.messages(events.AI)]
-        self.assertTrue(any("无机化学实验" in t and "date" not in t for t in texts), texts)
+        self.assertTrue(any("记下了" in t and "date" not in t for t in texts), texts)
 
     def test_summarize_degrades_cleanly(self):
         for llm in (ErrLLM(), BoomLLM()):

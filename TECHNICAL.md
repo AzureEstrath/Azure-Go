@@ -27,6 +27,8 @@
 > 切月 / 切周后回到顶部，周标题与表头不会被滚动位置藏住。**
 > **v4.2.3：完成的任务保留在日历/周表（`/api/schedule` 对展示面 include_done=True，标「已完成」）；
 > 聊天默认思考档位改为中等（`llm_think_mode=1`），思考扩展字段随档位启用。**
+> **v4.2.4：聊天排程不再单独播报（`ai_schedule` 只作面板刷新信号）；日程 JSON 误输出只回
+> 「嗯，记下了。」；聊天流水 / 聊天类长期记忆已清空后重启（日程事实保留）。**
 > 最后更新：2026-10-29。
 
 ---
@@ -523,7 +525,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 - 棋谱库、记忆、画像、时间感知；
 - TTS 文本、缓存、阿里云协议、语音链路；
 - 动态日程：James-Stein / EWMA / 变更点 / 机会约束 / 缓冲 / 锁定窗口 / 触发闸门 / 反馈与复盘；
-- 聊天排程：规则闸门 / JSON 解析 / 规范化 / 过去事件过滤 / 补充文案 / 开关 / `ai_schedule` 事件；
+- 聊天排程：规则闸门 / JSON 解析 / 规范化 / 过去事件过滤 / 面板刷新信号 / 开关 / `ai_schedule` 事件；
 - FastAPI 端点与 WebSocket 事件。
 
 KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
@@ -572,8 +574,8 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
    `main.py` 在 `/api/chat` 回复完成后用**后台任务**（`app.state.chat_capture_tasks`，退出时取消）
    写库 → 按 `auto_plan_enabled` 自动排班 → 写长期记忆 → 推 `ai_schedule`。
    不 await 后台任务，避免长判断拖慢 HTTP 回包、被客户端误判为「没发出去」而重复排队。
-   前端 `PetShell` 只在聊天面板打开时把 `ai_schedule` 追加为 assistant 文本；不碰 `_chat_busy`，
-   `Main.message_needs_speech("ai_schedule")` 恒为 false。
+   前端 `PetShell` 只把 `ai_schedule` 当数据刷新信号：资料面板开着时重拉日程，不显示额外播报、
+   不碰 `_chat_busy`；`Main.message_needs_speech("ai_schedule")` 恒为 false。
 11. **月历 / 周视图（v4.2.0，纯前端）**：`PetView` 保存一份 `_schedule_items`，按 `_schedule_view`
    重画。月历以周一为第一列、42 个日格；课程按 `date` 只落在它真实的那一天（没有日期的
    旧条目先只在本周显示），普通条目按 `date` / `start_ts` 落到具体日期；点日格

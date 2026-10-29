@@ -62,9 +62,9 @@ AI_IDLE = "ai_idle"          # 闲置搭话（玩家一回来可整句作废）
 AI_REVIEW = "ai_review"      # 全盘复盘的一段点评（v3.11.5；退出复盘后迟到的这类台词前端直接丢弃）
 AI_REMIND = "ai_remind"      # 事务提醒（v4.1.0）：到点由后端主动推送，**不发 speech**；
                              # 前端用常驻提醒卡显示，聊天/资料面板开着时也压在面板上方
-AI_SCHEDULE = "ai_schedule"  # 聊天里自动排完日程后的补充（v4.2.0）：**不发 speech**；
-                             # 聊天面板开着时追加成一条 assistant 消息（话题可以继续），
-                             # 面板关着时走待机气泡；不抢 `_chat_busy`、不占语音配对位
+AI_SCHEDULE = "ai_schedule"  # 聊天里自动排完日程后的数据刷新信号（v4.2.4）：**不发 speech**；
+                             # 不再显示为聊天消息；资料面板开着时由前端重拉日程，
+                             # 不抢 `_chat_busy`、不占语音配对位
 DIFFICULTY = "difficulty"     # 自适应难度档位变化（v3.11.5；只喂状态栏，不产生台词/语音）
 USER = "user"
 SYSTEM = "system"

@@ -322,14 +322,10 @@ func _on_message(kind: String, text: String) -> void:
 		_bump_activity()
 		return
 	if kind == "ai_schedule":
-		# 聊天里刚排完日程：聊天面板开着就追加成一条 assistant 消息，话题可以继续；
-		# 面板关着时走气泡，资料 / 菜单开着时用提醒卡。**不碰 `_chat_busy`、不进语音队列**。
-		if view.is_chat_open():
-			view.append_chat("assistant", body)
-		elif view.is_files_open() or view.is_menu_open():
-			view.show_reminder(body, 10.0)
-		else:
-			view.show_bubble(body, 10.0)
+		# 聊天里刚排完日程：**不显示额外播报**（生硬，也没必要打断聊天）；
+		# 只当数据刷新信号——资料面板开着时重拉一次日程，让新条目立刻出现。
+		if view.is_files_open():
+			_load_files()
 		_bump_activity()
 		return
 	if chat_like and _chat_busy:
@@ -374,7 +370,7 @@ func _clean_ai(text: String) -> Dictionary:
 		return {}
 	return {"tone": tone, "text": t, "acts": acts}
 
-## 纯函数（门卫可测）：模型偶尔会直接吐日程 JSON；把它变成可读中文。
+## 纯函数（门卫可测）：模型偶尔会直接吐日程 JSON；只给一句自然确认，不再逐条播报。
 ## 普通台词原样返回；认不出的 JSON / 半截数组返回空串（由调用方解锁聊天并提示重发）。
 static func clean_display_text(raw: String) -> String:
 	var t := str(raw).strip_edges()
@@ -410,42 +406,12 @@ static func clean_display_text(raw: String) -> String:
 				break
 	if typeof(data) != TYPE_ARRAY:
 		return ""
-	var lines: Array[String] = []
 	for it in data:
-		if typeof(it) != TYPE_DICTIONARY:
-			continue
-		var item: Dictionary = it
-		var title := str(item.get("title", item.get("name", ""))).strip_edges()
-		if title == "":
-			continue
-		var bits: Array[String] = []
-		var date := str(item.get("date", "")).strip_edges()
-		var tm := str(item.get("time", item.get("start_time", ""))).strip_edges()
-		var period := str(item.get("period", "")).strip_edges()
-		if date != "":
-			bits.append(date)
-		if tm != "":
-			bits.append(tm)
-		if period != "":
-			bits.append("第%s节" % period)
-		bits.append(title)
-		var extra: Array[String] = []
-		var teacher := str(item.get("teacher", "")).strip_edges()
-		var place := str(item.get("location", "")).strip_edges()
-		if teacher != "":
-			extra.append(teacher)
-		if place != "":
-			extra.append(place if place.begins_with("@") else "@" + place)
-		var line := " ".join(bits)
-		if not extra.is_empty():
-			line += "（%s）" % " ".join(extra)
-		lines.append("· " + line)
-		if lines.size() >= 6:
-			break
-	if lines.is_empty():
-		return ""
-	var head := "我把刚才看到的整理成了这些日程：\n" if lines.size() > 1 else "我把刚才看到的整理成了这条日程：\n"
-	return head + "\n".join(lines)
+		if typeof(it) == TYPE_DICTIONARY:
+			var title := str(it.get("title", it.get("name", ""))).strip_edges()
+			if title != "":
+				return "嗯，记下了。"
+	return ""
 
 # ================= 聊天 =================
 

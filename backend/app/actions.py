@@ -134,9 +134,10 @@ def _course_line(it):
 
 
 def naturalize(text) -> str:
-    """JSON 形态的回复 → 可读中文；普通台词原样返回。
+    """JSON 形态的回复 → 一句自然确认；普通台词原样返回。
 
-    日程数组 / ``{"items": [...]}`` 会转成「我把刚才看到的整理成了这些日程：」+ 最多 6 行；
+    模型偶尔会把日程 JSON 当成聊天回复；真正落库由 ``schedule_chat`` 的后台任务负责，
+    这里不再把日程逐条念出来（那样太像播报），只回一句「嗯，记下了。」。
     无法识别的 JSON 返回空串——调用方据此走兜底台词，**绝不把半截 JSON 塞给用户**。
     """
     raw = str(text or "")
@@ -149,18 +150,7 @@ def naturalize(text) -> str:
                 data = data[key]
                 break
     if isinstance(data, list):
-        lines = []
         for it in data:
-            if not isinstance(it, dict):
-                continue
-            line = _course_line(it)
-            if line:
-                lines.append("· " + line)
-            if len(lines) >= 6:
-                break
-        if lines:
-            head = ("我把刚才看到的整理成了这些日程：" if len(lines) > 1
-                    else "我把刚才看到的整理成了这条日程：")
-            more = "（还有更多，已经放进日程表）" if len(data) > len(lines) else ""
-            return head + "\n" + "\n".join(lines) + more
+            if isinstance(it, dict) and _course_line(it):
+                return "嗯，记下了。"
     return ""

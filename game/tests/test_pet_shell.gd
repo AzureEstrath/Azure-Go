@@ -380,7 +380,7 @@ func _test_shell_static() -> void:
 	_check("普通台词原样显示", _shell_script.clean_display_text("嗯，我在。") == "嗯，我在。")
 	var schedule_text: String = _shell_script.clean_display_text(
 		'[{"date":"2026-10-28","time":"08:00","title":"无机化学实验","notes":"李老师 @综合楼103"}]')
-	_check("日程 JSON 转成人话", schedule_text.contains("无机化学实验") and not schedule_text.contains("\"date\""))
+	_check("日程 JSON 只转一句自然确认", schedule_text == "嗯，记下了。")
 	_check("半截 JSON 不显示成 [", _shell_script.clean_display_text("[{") == "")
 	_check("认不出的 JSON 不显示", _shell_script.clean_display_text('{"foo":1}') == "")
 	_check("句首 [笑] 不会被当成 JSON", _shell_script.clean_display_text("[笑] 好呀") == "[笑] 好呀")
@@ -491,13 +491,13 @@ func _test_speech_policy(shell) -> void:
 	fake_tts.free()
 	fake_agent.free()
 
-## 聊天排程补充：面板开着时追加成 assistant 消息，但不抢 `_chat_busy`（话题还能继续）。
+## 聊天排程补充：不显示额外播报，只当数据刷新信号；也不抢 `_chat_busy`。
 func _test_chat_schedule_note(shell) -> void:
 	shell.view.open_chat()
 	var before: int = shell.view._chat_log.get_child_count()
 	shell._chat_busy = true
 	shell._on_message("ai_schedule", "好，日程记好了：「组会」（10月30日 周五 15:00）。")
-	_check("聊天排程补充进入聊天面板", shell.view._chat_log.get_child_count() == before + 1)
+	_check("聊天排程不再插入生硬播报", shell.view._chat_log.get_child_count() == before)
 	_check("聊天排程补充不抢聊天 busy", shell._chat_busy)
 	shell._chat_busy = false
 	shell.view.close_chat()

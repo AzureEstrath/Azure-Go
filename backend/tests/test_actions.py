@@ -15,22 +15,17 @@ class NaturalizeTest(unittest.TestCase):
         self.assertFalse(actions.looks_structured(line))
         self.assertEqual(actions.naturalize(line), line)
 
-    def test_schedule_json_becomes_readable_line(self):
-        raw = ('[{"date":"2026-10-28", "time":"08:00", "title":"无机化学实验",'
-               ' "notes":"李老师 老师 @综合楼103"}]')
-        out = actions.naturalize(raw)
-        self.assertIn("无机化学实验", out)
-        self.assertIn("2026-10-28", out)
+    def test_schedule_json_becomes_short_ack(self):
+        out = actions.naturalize(
+            '[{"date":"2026-10-28","time":"08:00","title":"无机化学实验"}]')
+        self.assertEqual(out, "嗯，记下了。")
         self.assertNotIn('"date"', out)
         self.assertNotIn("[{", out)
 
-    def test_course_json_keeps_teacher_and_location(self):
+    def test_course_json_is_not_read_aloud(self):
         raw = ('```json\n[{"weekday":"周三","period":"1-2","title":"高等数学",'
                '"teacher":"张老师","location":"综合楼101"}]\n```')
-        out = actions.naturalize(raw)
-        self.assertIn("高等数学", out)
-        self.assertIn("张老师", out)
-        self.assertIn("@综合楼101", out)
+        self.assertEqual(actions.naturalize(raw), "嗯，记下了。")
 
     def test_unknown_json_is_empty_not_garbage(self):
         self.assertEqual(actions.naturalize('{"foo": 1}'), "")
