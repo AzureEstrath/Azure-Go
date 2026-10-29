@@ -332,6 +332,27 @@ func _test_view() -> void:
 	_check("已结束的两条约定仍留在本周周表", closed_block != null)
 	_check("已结束的合并块标为已结束", closed_block != null
 		and str(closed_block.get_meta("sched_item").get("grade", "")) == "closed")
+	# 完成的任务也不能从周表消失（后端 include_done + 前端允许 done）。
+	v.set_schedule_items([{
+		"id": 6, "title": "交实验报告",
+		"when_text": "2026-10-29 周四 19:00-20:00", "date": "2026-10-29",
+		"weekday": 3, "period": "", "period_start": 0, "start_ts": 1793271600,
+		"start_time": "19:00", "end_time": "20:00", "kind": "task",
+		"status": "done", "grade": "closed", "grade_label": "已结束",
+		"duration_min": 60,
+	}])
+	v.show_week_for_date("2026-10-29")
+	var done_block = null
+	if v._schedule_table != null:
+		for c in v._schedule_table.get_children():
+			if c is Panel and c.has_meta("sched_item") \
+					and str(c.get_meta("sched_item").get("title", "")) == "交实验报告":
+				done_block = c
+				break
+	_check("完成的任务仍留在周表", done_block != null
+		and str(done_block.get_meta("sched_item").get("status", "")) == "done")
+	_check("完成的任务悬停显示已完成", done_block != null
+		and v._grade_text(done_block.get_meta("sched_item")).contains("已完成"))
 	host.size = Vector2(544, 520)
 	await process_frame
 	await process_frame

@@ -88,7 +88,7 @@ class AzureConfig:
         self.llm_base_url = "https://api.deepseek.com/v1"   # 云端 OpenAI 兼容地址（与 game/config.json 模板一致）
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
-        self.llm_think_mode = 0
+        self.llm_think_mode = 1          # 默认中等思考（0 快速 / 1 中等 / 2 强思考）
         # 说话详略（v3.11.1）：0=精简（1 句 / 20 字，默认——与旧「短回复」开关的默认 true 一致）
         # 1=适中（不加额外约束）2=详细（2~3 句 / 80 字内）。
         # 与旧字段 `tts_limit_len`（布尔）同一件事的扩档：文件里两个键都在时以 `reply_style` 为准，

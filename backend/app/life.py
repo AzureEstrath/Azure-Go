@@ -964,10 +964,13 @@ class LifeStore:
             print("[Life] 日程读取失败（已忽略）：%s" % e)
             return {}
 
-    def list_schedule(self, limit=50, include_undated=True, include_archived=False):
+    def list_schedule(self, limit=50, include_undated=True, include_archived=False,
+                      include_done=False):
         """日程列表：先按时间升序列出已定日期的，再按新到旧列出待定项。
 
-        默认**不含归档**（周课表 / 日程面板只看当前）；``include_archived=True`` 供留档查看。
+        默认**不含归档、不含已完成**（自动排班 / 提醒只看 planned）；``include_archived=True``
+        供留档查看；``include_done=True`` 给日历展示用——完成的任务仍留在周表里（标「已完成」）。
+        取消 / 归档仍然不进来。
         """
         try:
             n = max(0, min(int(limit or 0), 200))
@@ -976,18 +979,19 @@ class LifeStore:
         if n == 0 or self._db is None:
             return []
         arch = "" if include_archived else " AND archived = 0"
+        state = " AND status IN ('planned', 'done')" if include_done else " AND status = 'planned'"
         try:
             with self._lock:
                 dated = [self._schedule_row(r) for r in self._db.execute(
-                    "SELECT %s FROM schedule_items WHERE status = 'planned' AND start_ts > 0%s "
-                    "ORDER BY start_ts ASC, id ASC LIMIT ?" % (_SCHEDULE_SELECT, arch),
+                    "SELECT %s FROM schedule_items WHERE start_ts > 0%s%s "
+                    "ORDER BY start_ts ASC, id ASC LIMIT ?" % (_SCHEDULE_SELECT, state, arch),
                     (n,)).fetchall()]
                 rest = n - len(dated)
                 undated = []
                 if include_undated and rest > 0:
                     undated = [self._schedule_row(r) for r in self._db.execute(
-                        "SELECT %s FROM schedule_items WHERE status = 'planned' AND start_ts <= 0%s "
-                        "ORDER BY id DESC LIMIT ?" % (_SCHEDULE_SELECT, arch),
+                        "SELECT %s FROM schedule_items WHERE start_ts <= 0%s%s "
+                        "ORDER BY id DESC LIMIT ?" % (_SCHEDULE_SELECT, state, arch),
                         (rest,)).fetchall()]
             return dated + undated
         except Exception as e:              # noqa: BLE001

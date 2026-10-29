@@ -1394,8 +1394,10 @@ func _event_block(d: Dictionary) -> Dictionary:
 
     ``closed`` 只表示「不再自动重排」，不是「从历史里消失」：本周已经结束的比赛仍要
     留在这一周的周表里（灰色「已结束」标签），否则用户会看到事项在月历里、周表里却没有。
+    已完成的条目同样保留（「已完成」），只有取消 / 归档不进来。
     """
-	if str(d.get("status", "planned")) != "planned":
+	var status := str(d.get("status", "planned"))
+	if status != "planned" and status != "done":
 		return {}
 	var wd := _weekday_from_item(d)
 	var start := _item_start_minutes(d)
@@ -1700,6 +1702,8 @@ func _priority_tag(d: Dictionary) -> String:
 
 func _grade_tag(d: Dictionary) -> String:
 	"""日程分级短标签（后端已分级；离线 / 测试数据时按字段兜底推断）。"""
+	if str(d.get("status", "")) == "done":
+		return "完成"
 	var grade := str(d.get("grade", "")).strip_edges()
 	if grade == "":
 		if str(d.get("kind", "")) == "course" or str(d.get("period", "")) != "":
@@ -1730,6 +1734,8 @@ func _grade_tag(d: Dictionary) -> String:
 	return ""
 
 func _grade_text(d: Dictionary) -> String:
+	if str(d.get("status", "")) == "done":
+		return "已完成（保留在日历里）"
 	var label := str(d.get("grade_label", "")).strip_edges()
 	if label != "":
 		return label
@@ -1772,6 +1778,8 @@ func _reason_text(d: Dictionary) -> String:
 			text = "待安排，按优先级密度放入最早空档"
 		"结束":
 			text = "已结束，不再自动重排"
+		"完成":
+			text = "已完成，仍保留在日历里"
 	if bool(d.get("auto_planned", false)):
 		var defer := int(d.get("defer_count", 0))
 		if defer >= 2:

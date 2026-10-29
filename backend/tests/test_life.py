@@ -179,6 +179,10 @@ class LifeStoreTest(unittest.TestCase):
         self.assertTrue(self.store.set_schedule_status(saved[0]["id"], "done"))
         self.assertEqual(self.store.next_schedule(now=T0), {})
         self.assertEqual(len(self.store.list_schedule(10)), 1)
+        # 日历展示：完成的任务仍要留在列表里（标 done），否则周表会把它删掉。
+        shown = self.store.list_schedule(10, include_done=True)
+        self.assertEqual(len(shown), 2)
+        self.assertTrue(any(r["status"] == "done" for r in shown))
 
     def test_schedule_dirty_values_are_safe(self):
         self.assertEqual(self.store.upsert_schedule([], source="x"), [])

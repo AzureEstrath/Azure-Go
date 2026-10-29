@@ -1001,7 +1001,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         if store is None:
             return []
         try:
-            items = store.list_schedule(int(limit), include_archived=bool(include_archived))
+            items = store.list_schedule(int(limit), include_archived=bool(include_archived),
+                                        include_done=True)
             return auto_plan.decorate_items(
                 items, time.time(), _schedule_cfg(cfg)["lock_sec"])
         except Exception:                   # noqa: BLE001
