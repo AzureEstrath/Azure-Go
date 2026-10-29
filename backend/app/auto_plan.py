@@ -20,6 +20,8 @@ v4.1.2 起每条日程先**自动分级**（``classify_item``）：
 - 固定课程 / 用户已定时间 / 锁定窗口内的自动安排是占用区间；
 - 每个任务按**最早一天 + 剩余最小**的 best-fit 放入空闲段；
 - 新任务对齐到本地 :00/:30；固定项前后留 ``transition_min`` 通勤 / 切换时间；
+- 连续推迟 ≥ 2 次的任务优先放进至少两倍时长的连续空档，不再死磕碎片时间；
+- 每条安排带一句 ``reason``（截止优先 / 优先级 / 大段空闲 / 风险缓冲），供悬停卡解释；
 - ``risk_z`` > 0 时按机会约束把时长放大（80% 完成概率 ≈ 0.84σ）；
 - ``buffer_min`` 是**每日集中弹性块**（工作窗口末尾预留，不逐任务加安全时间）；
 - ``lock_sec`` 内的自动安排不再移动（计划者—执行者分离，降低心理摩擦）。
@@ -374,6 +376,32 @@ def _risk_duration(base_min, target_var, risk_z):
     return max(5, int(round(base * factor / 5.0) * 5))
 
 
+def _plan_reason(row, kept=False, late=False):
+    """给一条自动安排生成很短的人话理由（悬停卡显示，不写库）。"""
+    parts = []
+    if kept:
+        parts.append("保持原定时间")
+    else:
+        defer = _int(row["item"].get("defer_count"), 0)
+        if defer >= 2:
+            parts.append("连续推迟 %d 次，优先大段空闲" % defer)
+        elif defer == 1:
+            parts.append("上次推迟，优先明天")
+        if row["deadline_ts"] > 0:
+            parts.append("按截止时间优先")
+        elif row["priority"] >= 70:
+            parts.append("优先级高，先占合适空档")
+        else:
+            parts.append("按优先级密度放入最早空档")
+        if row["duration"] > row["base_duration"]:
+            parts.append("按 80% 完成概率留出缓冲")
+        if row["category_samples"] > 0:
+            parts.append("参考类别历史耗时")
+    if late:
+        parts.append("已晚于截止时间")
+    return "；".join(parts[:3])
+
+
 def plan(items, now=None, days=7, work_start=DEFAULT_WORK_START,
          work_end=DEFAULT_WORK_END, history=None, category_stats=None,
          risk_z=DEFAULT_RISK_Z, buffer_min=0, lock_sec=0,
@@ -484,6 +512,7 @@ def plan(items, now=None, days=7, work_start=DEFAULT_WORK_START,
     for row in ordered:
         dur_sec = row["duration"] * 60.0
         dl = row["deadline_ts"]
+        defer = _int(row["item"].get("defer_count"), 0)
         existing = _num(row["item"].get("start_ts"), 0.0) if row["item"].get("auto_planned") else 0.0
         if existing <= ref:
             existing = 0.0
@@ -491,7 +520,7 @@ def plan(items, now=None, days=7, work_start=DEFAULT_WORK_START,
         fallback = None
         # 推迟过的任务优先排到明天（「推迟」≠ 原地再排一次）；只有未来没有别的空档才回到今天。
         day_order = list(range(horizon))
-        if _int(row["item"].get("defer_count"), 0) > 0 and horizon > 1:
+        if defer > 0 and horizon > 1:
             day_order = list(range(1, horizon)) + [0]
         for rank, day in enumerate(day_order):
             bounds = _day_bounds(day, ref, ws, we, buffer)
@@ -501,11 +530,13 @@ def plan(items, now=None, days=7, work_start=DEFAULT_WORK_START,
             for s0, s1 in slots:
                 if s1 - s0 < dur_sec:
                     continue
+                # 连续推迟 ≥ 2 次：优先放进至少两倍时长的连续空档，不再死磕碎片时间。
+                spacious = 0 if (defer >= 2 and (s1 - s0) >= dur_sec * 2.0) else 1
                 # 先看「保持原位」：之前自动排过、锁定窗外的任务，原时间仍可用就不移动。
                 if existing > 0.0 and existing >= s0 - 1e-6 and \
                         existing + dur_sec <= s1 + 1e-6 and \
                         (dl <= 0 or existing + dur_sec <= dl + 1e-6):
-                    cand = (0, rank, (s1 - existing) - dur_sec, existing)
+                    cand = (0, 0, rank, (s1 - existing) - dur_sec, existing)
                     if best is None or cand < best:
                         best = cand
                 # 新任务对齐到 :00 / :30，接近真实日历习惯；放不下时才用 5 分钟粒度。
@@ -520,18 +551,19 @@ def plan(items, now=None, days=7, work_start=DEFAULT_WORK_START,
                     continue
                 same = 0 if existing > 0.0 and abs(start - existing) <= 60.0 else 1
                 leftover = (s1 - start) - dur_sec
-                cand = (same, rank, leftover, start)
+                cand = (same, spacious, rank, leftover, start)
                 if best is None or cand < best:
                     best = cand
         if best is None and fallback is not None:
-            best = (0, 0, 0.0, fallback[0])
+            best = (0, 1, 0, 0.0, fallback[0])
         if best is None:
             unscheduled.append({"id": row["id"], "title": row["title"],
                                 "reason": "未来 %d 天没有足够的空闲" % horizon})
             continue
-        start = best[3]
+        start = best[4]
         end = start + dur_sec
         late = bool(dl > 0 and start + dur_sec > dl + 1e-6)
+        kept = bool(existing > 0.0 and abs(start - existing) <= 60.0)
         busy.append((start, end))
         assignments.append({
             "id": row["id"], "title": row["title"], "start_ts": start,
@@ -540,6 +572,7 @@ def plan(items, now=None, days=7, work_start=DEFAULT_WORK_START,
             "priority": row["priority"], "task_type": row["cat"],
             "grade": row["grade"], "grade_label": GRADE_LABEL.get(row["grade"], row["grade"]),
             "score": round(row["score"], 4), "late": late,
+            "reason": _plan_reason(row, kept=kept, late=late),
         })
 
     return {

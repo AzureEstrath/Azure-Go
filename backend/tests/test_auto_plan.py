@@ -68,6 +68,36 @@ class PlanTest(unittest.TestCase):
         first = sorted(out["assignments"], key=lambda x: x["start_ts"])[0]
         self.assertEqual(first["title"], "短任务")
 
+    def test_deferred_twice_prefers_large_block(self):
+        """连续推迟 ≥2 次：宁可放到后一天的大段空闲，也不再塞进当天碎片。"""
+        busy_day1 = self._item(9, "周四占用", 750, 50, start=_ts(2026, 10, 29, 8, 0))
+        once = self._item(1, "推迟一次", 60, 50, defer_count=1)
+        twice = self._item(2, "连续推迟", 60, 50, defer_count=2)
+        out = auto_plan.plan([busy_day1, once, twice], now=NOW, days=3)
+        by = {x["title"]: x for x in out["assignments"]}
+        once_day = datetime.datetime.fromtimestamp(by["推迟一次"]["start_ts"]).date()
+        twice_day = datetime.datetime.fromtimestamp(by["连续推迟"]["start_ts"]).date()
+        self.assertEqual(once_day, datetime.datetime(2026, 10, 29).date())
+        self.assertEqual(twice_day, datetime.datetime(2026, 10, 30).date())
+        self.assertIn("连续推迟", by["连续推迟"]["reason"])
+        self.assertIn("大段空闲", by["连续推迟"]["reason"])
+
+    def test_assignment_reason_mentions_deadline_and_buffer(self):
+        task = self._item(1, "报告", 60, 80, deadline=_ts(2026, 10, 28, 18, 0))
+        out = auto_plan.plan([task], now=NOW, days=1,
+                             category_stats={"study": {"mean": 60, "var": 900,
+                                                       "samples": 5, "bonus": 0}},
+                             risk_z=0.84)
+        got = out["assignments"][0]
+        self.assertIn("截止", got["reason"])
+        self.assertIn("缓冲", got["reason"])
+
+    def test_kept_slot_says_so(self):
+        task = self._item(1, "保持原位", 60, 50, start=NOW + 2 * 3600.0,
+                          auto_planned=True)
+        out = auto_plan.plan([task], now=NOW, days=1)
+        self.assertEqual(out["assignments"][0]["reason"], "保持原定时间")
+
     def test_deadline_task_is_placed_before_deadline(self):
         fixed = self._item(9, "整天占用", 480, 50, start=_ts(2026, 10, 28, 9, 0))
         urgent = self._item(1, "截止任务", 60, 60, deadline=_ts(2026, 10, 28, 18, 0))

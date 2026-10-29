@@ -184,6 +184,7 @@ func _test_view() -> void:
 			block = c
 			break
 	if block != null:
+		_check("课程块不再使用原生黑底 tooltip", block.tooltip_text == "")
 		v._show_hover_card(block, {"title": "高等数学", "when_text": "2026-10-28 周三 第1-2节",
 			"teacher": "王三强", "location": "二教20",
 			"grade": "fixed", "grade_label": "固定课程"})
@@ -206,6 +207,7 @@ func _test_view() -> void:
 		 "when_text": "2026-10-29 周四 12:00-13:00", "weekday": 3, "period": "",
 		 "period_start": 0, "start_ts": 1793246400, "start_time": "12:00",
 		 "end_time": "13:00", "kind": "task", "status": "planned",
+		 "grade": "committed", "grade_label": "已约定",
 		 "priority": 50, "duration_min": 60},
 	])
 	await process_frame
@@ -221,11 +223,24 @@ func _test_view() -> void:
 	var event_block = null
 	if v._schedule_table != null:
 		for c in v._schedule_table.get_children():
-			if c is Panel and c.tooltip_text.contains("篮球赛"):
+			if c is Panel and c.has_meta("sched_item") \
+					and str(c.get_meta("sched_item").get("title", "")).contains("篮球赛"):
 				event_block = c
 				break
 	_check("定时约定也画进周表对应时段", event_block != null
-		and event_block.tooltip_text.contains("分级：已约定"))
+		and str(event_block.get_meta("sched_item").get("grade_label", "")) == "已约定")
+	_check("定时约定块也不使用原生黑底 tooltip", event_block != null
+		and event_block.tooltip_text == "")
+	var event_lbl = event_row.get_child(0) if event_row != null else null
+	_check("日程行不再使用原生黑底 tooltip", event_lbl != null
+		and event_lbl.tooltip_text == "")
+	if event_lbl != null:
+		v._show_hover_card(event_lbl, event_lbl.get_meta("sched_item"))
+		_check("日程行悬停只显示一张自绘卡",
+			v._hover_card.visible and v._hover_label.text.contains("篮球赛"))
+		_check("悬停卡显示排班理由",
+			v._hover_label.text.contains("排班理由："))
+		v._hide_hover_card()
 	host.size = Vector2(544, 520)
 	await process_frame
 	await process_frame

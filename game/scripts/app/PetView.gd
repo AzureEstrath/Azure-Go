@@ -488,7 +488,6 @@ func _build_files() -> void:
 	vb.add_child(_files_actions)
 	_files_auto_plan = Button.new()
 	_files_auto_plan.text = "自动排班"
-	_files_auto_plan.tooltip_text = "按优先级、截止时间与空闲区间自动排班；时长 / 优先级用 James-Stein 收缩估计"
 	_files_auto_plan.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_files_auto_plan.custom_minimum_size = Vector2(70, 26)
 	GufengTheme.apply_button(_files_auto_plan)
@@ -510,7 +509,6 @@ func _build_files() -> void:
 	_files_actions.add_child(_files_cleanup)
 	_files_review = Button.new()
 	_files_review.text = "复盘"
-	_files_review.tooltip_text = "按类别看计划 / 实际耗时偏差与完成、推迟次数"
 	_files_review.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_files_review.custom_minimum_size = Vector2(70, 26)
 	GufengTheme.apply_button(_files_review)
@@ -596,6 +594,9 @@ func _show_hover_card(anchor: Control, d: Dictionary) -> void:
 	var grade := _grade_text(d)
 	if grade != "":
 		lines.append("分级：%s" % grade)
+	var reason := _reason_text(d)
+	if reason != "":
+		lines.append("排班理由：%s" % reason)
 	var teacher := str(d.get("teacher", "")).strip_edges()
 	var location := str(d.get("location", "")).strip_edges()
 	if teacher != "":
@@ -1051,13 +1052,9 @@ func _add_timetable_block(grid: Control, col_w: float, d: Dictionary,
 	lbl.max_lines_visible = 4
 	lbl.add_theme_font_size_override("font_size", 7 if is_event and col_w < 44.0 else 8)
 	lbl.add_theme_color_override("font_color", GufengTheme.INK)
-	var tip := "%s\n%s %s\n%s" % [title, teacher, location,
-		str(d.get("when_text", "")).strip_edges()]
-	if is_event:
-		var grade := _grade_text(d)
-		if grade != "":
-			tip += "\n分级：" + grade
-	panel.tooltip_text = tip
+	# 悬停只保留一个自绘浮层：**不再设置 tooltip_text**，避免 Godot 默认黑底白字提示
+	# 和这张卡同时出现。
+	panel.set_meta("sched_item", d)
 	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	panel.add_child(lbl)
 	# 鼠标停留 → 浮层展开完整信息（格子放不下的长标题 / 教师 / 地点 / 备注）。
@@ -1098,7 +1095,6 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 			today_col = (int(Time.get_datetime_dict_from_unix_time(today_unix).get("weekday", 0)) + 6) % 7
 	note.add_theme_font_size_override("font_size", 10)
 	note.add_theme_color_override("font_color", GufengTheme.INK)
-	note.tooltip_text = "从资料还原的课程与约定；点色块可看完整信息"
 	_schedule_rows.add_child(note)
 	# —— 网格底图 ——
 	# 表格宽度跟着视口走：7 天优先全部可见；只有极窄窗口才用内部横向滚动。
@@ -1204,29 +1200,18 @@ func _build_agenda(items: Array) -> void:
 		lbl.add_theme_font_size_override("font_size", 10)
 		lbl.add_theme_color_override("font_color",
 			GufengTheme.INK_SOFT if status != "planned" else GufengTheme.INK)
-		var tips: Array[String] = []
-		for x in [str(d.get("notes", "")), str(d.get("teacher", "")),
-				str(d.get("location", ""))]:
-			if str(x).strip_edges() != "":
-				tips.append(str(x).strip_edges())
-		if status == "planned":
-			var pri := int(d.get("priority", 50))
-			var typ := str(d.get("task_type", "general"))
-			var meta := "优先级 %d · 类型 %s · 计划 %d 分钟" % [
-				pri, typ, int(d.get("duration_min", 60))]
-			tips.push_front(meta)
-			var grade := _grade_text(d)
-			if grade != "":
-				tips.push_front("分级：%s" % grade)
-		lbl.tooltip_text = "\n".join(tips)
+		# 悬停只显示一张自绘卡；不再用 Godot 默认的黑底 tooltip（会和卡片重复）。
+		lbl.set_meta("sched_item", d)
+		lbl.mouse_entered.connect(func(): _show_hover_card(lbl, d))
+		lbl.mouse_exited.connect(_hide_hover_card)
 		row.add_child(lbl)
 		if status == "planned":
 			# 执行反馈：完成 → 后端按「现在 - 开始时间」估实际耗时；推迟 → 明天优先再排。
-			var bd := _compact_button("完成", "记录完成；实际耗时按当前时间与计划开始估算")
+			var bd := _compact_button("完成")
 			bd.pressed.connect(func(): schedule_feedback_requested.emit(
 				int(d.get("id", 0)), "done", 0))
 			row.add_child(bd)
-			var bp := _compact_button("推迟", "先记下来，优先排到明天；连续推迟会更新类别偏好")
+			var bp := _compact_button("推迟")
 			bp.pressed.connect(func(): schedule_feedback_requested.emit(
 				int(d.get("id", 0)), "deferred", 0))
 			row.add_child(bp)
@@ -1288,6 +1273,36 @@ func _grade_text(d: Dictionary) -> String:
 			return "待安排（按优先级放置）"
 	return ""
 
+func _reason_text(d: Dictionary) -> String:
+	"""悬停卡里的排班理由：后端 assignment 带 reason 时直接用，否则按字段兜底推断。"""
+	var custom := str(d.get("reason", "")).strip_edges()
+	if custom != "":
+		return custom
+	var tag := _grade_tag(d)
+	var text := ""
+	match tag:
+		"固定":
+			text = "固定课程，不自动移动"
+		"约定":
+			text = "已约定时间，不自动移动"
+		"锁定":
+			text = "在锁定窗内，本次不重排"
+		"截止":
+			text = "按截止时间优先，时间可调"
+		"可调":
+			text = "上次自动安排，原时间可行时优先保位"
+		"待排":
+			text = "待安排，按优先级密度放入最早空档"
+	if bool(d.get("auto_planned", false)):
+		var defer := int(d.get("defer_count", 0))
+		if defer >= 2:
+			text = "连续推迟 %d 次，优先放到较大空档" % defer
+		elif defer == 1:
+			text = "上次推迟过，优先排到明天"
+	if str(d.get("when_text", "")).contains("已超截止"):
+		text += "；已晚于截止"
+	return text
+
 func draw_schedule_table(c: Control, s: Vector2) -> void:
 	if _timetable.is_empty() or s.x < 4.0 or s.y < 4.0:
 		return
@@ -1335,11 +1350,10 @@ func _files_hint(text: String) -> Label:
 	lbl.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.9))
 	return lbl
 
-func _compact_button(text: String, tip := "") -> Button:
+func _compact_button(text: String) -> Button:
 	"""小号文字按钮：紧凑边距，窄面板的日程行里也放得下。"""
 	var b := Button.new()
 	b.text = text
-	b.tooltip_text = tip
 	b.custom_minimum_size = Vector2(34, 20)
 	b.add_theme_font_size_override("font_size", 10)
 	var normal := StyleBoxFlat.new()
