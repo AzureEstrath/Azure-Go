@@ -34,6 +34,49 @@ def _client(handler, **kw):
                      http_async_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), **kw)
 
 
+class PerCallThinkTest(unittest.TestCase):
+    """v4.2.8：per-call 快速档必须同时去掉思考扩展字段（否则聊天仍会开思考、卡 20 秒）。"""
+
+    def test_fast_call_restores_base_think_flag(self):
+        """基础配置显式 `enable_thinking:false` 时，快速档必须把它带回去（不是删掉整块）。"""
+        seen = []
+
+        def handler(req):
+            seen.append(json.loads(req.content.decode("utf-8")))
+            return httpx.Response(200, json=_reply("好"))
+
+        c = _client(handler, think_mode=1,
+                    base_extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                    think_extra_body={"chat_template_kwargs": {"enable_thinking": True}})
+        asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100, think_mode=0))
+        self.assertEqual(seen[0]["chat_template_kwargs"]["enable_thinking"], False)
+
+    def test_fast_call_strips_think_extra_body(self):
+        seen = []
+
+        def handler(req):
+            seen.append(json.loads(req.content.decode("utf-8")))
+            return httpx.Response(200, json=_reply("好"))
+
+        c = _client(handler, think_mode=1,
+                    think_extra_body={"chat_template_kwargs": {"enable_thinking": True}})
+        asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100, think_mode=0))
+        self.assertNotIn("chat_template_kwargs", seen[0])
+        self.assertIn("max_tokens", seen[0])
+
+    def test_no_think_flag_also_strips_think_extra_body(self):
+        seen = []
+
+        def handler(req):
+            seen.append(json.loads(req.content.decode("utf-8")))
+            return httpx.Response(200, json=_reply("好"))
+
+        c = _client(handler, think_mode=1,
+                    think_extra_body={"reasoning_effort": "high"})
+        asyncio.run(c.chat([{"role": "user", "content": "hi"}], 100, no_think=True))
+        self.assertNotIn("reasoning_effort", seen[0])
+
+
 class CleanContentTest(unittest.TestCase):
     def test_strip_think_block(self):
         c = LLMClient()

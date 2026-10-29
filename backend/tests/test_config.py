@@ -42,6 +42,29 @@ class DelocalizedLLMTest(unittest.TestCase):
         self.assertIsNone(importlib.util.find_spec("app.services"))
 
 
+class LLMTimeoutConfigTest(unittest.TestCase):
+    """v4.2.8：单次 LLM 请求硬超时，脏值 / 越界回退，不影响启动。"""
+
+    def test_default_and_round_trip(self):
+        self.assertEqual(AzureConfig().llm_timeout_sec, 45.0)
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"llm_timeout_sec": 18.5}, f)
+            self.assertEqual(AzureConfig.load(p).llm_timeout_sec, 18.5)
+
+    def test_dirty_and_out_of_range(self):
+        import tempfile, json
+        cases = [("abc", 45.0), (1, 5.0), (999, 300.0)]
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            for raw, want in cases:
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump({"llm_timeout_sec": raw}, f)
+                self.assertEqual(AzureConfig.load(p).llm_timeout_sec, want, raw)
+
+
 class CloudKatagoConfigTest(unittest.TestCase):
     def test_katago_fields_replaced(self):
         c = AzureConfig()

@@ -212,22 +212,42 @@ class LLMClient:
         """用户在 ``extra_body`` 里显式写死了输出上限：注入的预算必须让位（尊重配置）。"""
         return "max_tokens" in body or "max_completion_tokens" in body
 
-    def _extra_for(self, budget) -> dict:
+    def _extra_for(self, budget, think_mode=None, no_think=False) -> dict:
         """本次调用要绑定的扩展字段：用户配置打底，未被写死时补上输出上限。
 
         输出上限走 ``max_tokens``（``bind`` 到请求体顶层）而不是 ``ainvoke(max_tokens=...)``：
         后者会被 langchain-openai 改名成 ``max_completion_tokens``，目标服务端不认。
+
+        v4.2.8：**按调用重算思考扩展字段**。全局档位是 1（棋评中等）时，聊天 / 情绪小调用
+        显式传 ``think_mode=0`` 或 ``no_think=True``，必须改用基础 extra_body（例如
+        ``enable_thinking:false``）；否则模型仍会开思考，前端就会一直等（单槽位本地模型实测 >20 秒）。
         """
         if self._extra_body_unsupported:
             return {}
-        body = dict(self.extra_body or {})
+        # v4.2.8 的两种底稿：
+        # · 快速档（mode<=0）用基础 extra_body（含 enable_thinking:false），**不是**把
+        #   `chat_template_kwargs` 整块删掉——删掉会让服务端回到默认模板，反而继续思考；
+        # · 思考档（mode>0）用全局已合并的 extra_body（基础 + 思考字段）。
+        # 外部对 `extra_body` 的写入（测试 / 运行期调试）若不属于思考字段，也并回基础底稿。
+        base = dict(self._base_extra_body or {})
+        global_eff = dict(self.extra_body or {})
+        think_keys = {str(k) for k in (self._think_extra_body or {})}
+        for key, val in global_eff.items():
+            if key not in base and key not in think_keys:
+                base[key] = val
+        try:
+            mode = 0 if no_think else int(self.think_mode if think_mode is None else think_mode)
+        except (TypeError, ValueError):
+            mode = int(self.think_mode or 0)
+        body = dict(global_eff) if mode > 0 else base
         if not self._pins_budget(body):
             body["max_tokens"] = budget
         return body
 
-    async def _call(self, messages, budget):
+    async def _call(self, messages, budget, think_mode=None, no_think=False):
         """发一次请求：按调用把扩展字段与输出上限合并后 bind 到链上（不重建模型）。"""
-        return await self._sync_chain().bind(extra_body=self._extra_for(budget)).ainvoke(messages)
+        return await self._sync_chain().bind(
+            extra_body=self._extra_for(budget, think_mode, no_think)).ainvoke(messages)
 
     def _strip_on_reject(self, e) -> bool:
         """服务端明确拒绝参数（HTTP 400/422）时去掉扩展字段与注入的输出上限，重试一次。
@@ -282,13 +302,13 @@ class LLMClient:
     async def _chat_locked(self, messages, max_tokens, no_think, think_mode) -> str:
         budget = self._budget(max_tokens, no_think, think_mode)
         try:
-            ai = await self._call(messages, budget)
+            ai = await self._call(messages, budget, think_mode=think_mode, no_think=no_think)
         except openai.APIStatusError as e:
             print("[LLM] HTTP %d：%s" % (e.status_code, str(e)[:200]))
             if not self._strip_on_reject(e):
                 return "调用出错：" + self._reason_of(e)
             try:
-                ai = await self._call(messages, budget)
+                ai = await self._call(messages, budget, think_mode=think_mode, no_think=no_think)
             except Exception as e2:                 # noqa: BLE001
                 print("[LLM] 调用失败：%s" % e2)
                 return "调用出错：" + self._reason_of(e2)

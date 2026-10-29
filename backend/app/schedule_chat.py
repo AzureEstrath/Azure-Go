@@ -11,6 +11,7 @@
 ``schedule_chat_enabled=false`` 时调用方直接跳过本模块（与旧行为逐字一致）。
 """
 
+import asyncio
 import datetime
 import json
 import re
@@ -21,6 +22,9 @@ from . import schedule
 MAX_TEXT = 1200
 MAX_ITEMS = 4
 TITLE_MAX = 32
+# 后台日程判断的单次 LLM 上限（v4.2.8）：本地单槽位模型偶尔会卡在长输出上，
+# 超时就放弃这一轮，绝不占着生成锁拖慢下一句聊天。
+LLM_TIMEOUT_SEC = 10.0
 
 # 时间线索：只要出现一个就值得让模型判断（不是「一定排」）。
 _TIME_CUE = re.compile(
@@ -166,9 +170,11 @@ async def extract(llm, text, now=None):
     msgs = [{"role": "user", "content": prompt}]
     try:
         try:
-            out = await llm.chat(msgs, 500, think_mode=0)
+            out = await asyncio.wait_for(
+                llm.chat(msgs, 500, think_mode=0), timeout=LLM_TIMEOUT_SEC)
         except TypeError:
-            out = await llm.chat(msgs, 500)
+            out = await asyncio.wait_for(
+                llm.chat(msgs, 500), timeout=LLM_TIMEOUT_SEC)
     except Exception as e:                  # noqa: BLE001 —— 聊天排程绝不打挂聊天
         print("[Schedule] 聊天日程判断失败（已忽略）：%s" % e)
         return []
@@ -340,9 +346,13 @@ async def extract_cancellations(llm, text, context_text, items, now=None):
     ) % ("\n".join(lines), _clip(context_text, 600), _clip(text, MAX_TEXT))
     try:
         try:
-            out = await llm.chat([{"role": "user", "content": prompt}], 200, think_mode=0)
+            out = await asyncio.wait_for(
+                llm.chat([{"role": "user", "content": prompt}], 200, think_mode=0),
+                timeout=LLM_TIMEOUT_SEC)
         except TypeError:
-            out = await llm.chat([{"role": "user", "content": prompt}], 200)
+            out = await asyncio.wait_for(
+                llm.chat([{"role": "user", "content": prompt}], 200),
+                timeout=LLM_TIMEOUT_SEC)
     except Exception as e:                  # noqa: BLE001 —— 取消判断失败不影响聊天
         print("[Schedule] 取消日程判断失败（已忽略）：%s" % e)
         return []

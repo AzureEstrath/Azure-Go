@@ -465,6 +465,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         if agent is None:
             eng = engine if engine is not None else KataGoEngine(cfg.katago_url, cfg.katago_token, cfg.max_visits, cfg.katago_timeout_ms)
             cli = llm if llm is not None else LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key,
+                                                         timeout_sec=cfg.llm_timeout_sec,
                                                          think_mode=cfg.llm_think_mode,
                                                          base_extra_body=cfg.llm_extra_body,
                                                          think_extra_body=cfg.llm_think_extra_body)

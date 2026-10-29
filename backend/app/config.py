@@ -89,6 +89,8 @@ class AzureConfig:
         self.llm_model = "deepseek-chat"
         self.llm_api_key = ""
         self.llm_think_mode = 1          # 默认中等（0 快速 / 1 中等 / 2 强思考）：棋评保持语言质量
+        # 单次 LLM 请求的硬超时（v4.2.8）：本地模型偶发卡住时，不让请求占着生成槽位几十秒。
+        self.llm_timeout_sec = 45.0
         # 说话详略（v3.11.1）：0=精简（1 句 / 20 字，默认——与旧「短回复」开关的默认 true 一致）
         # 1=适中（不加额外约束）2=详细（2~3 句 / 80 字内）。
         # 与旧字段 `tts_limit_len`（布尔）同一件事的扩档：文件里两个键都在时以 `reply_style` 为准，
@@ -270,6 +272,11 @@ class AzureConfig:
             self.llm_think_mode = max(0, min(2, int(d.get("llm_think_mode", self.llm_think_mode))))
         else:
             self.llm_think_mode = 2 if bool(d.get("llm_think_strong", False)) else 0   # 旧键（bool）迁移
+        try:
+            self.llm_timeout_sec = max(5.0, min(300.0, float(d.get(
+                "llm_timeout_sec", self.llm_timeout_sec))))
+        except (TypeError, ValueError):
+            self.llm_timeout_sec = 45.0
         # 说话详略：`reply_style` 优先（脏值退回默认 0 = 精简）；只有旧键 `tts_limit_len` 时按旧语义迁移。
         if "reply_style" in d:
             try:

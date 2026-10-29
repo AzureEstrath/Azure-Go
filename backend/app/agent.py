@@ -33,6 +33,8 @@ from .tools import TOOLS, failed as tool_failed
 # LLM「情绪变化」小调用：限频 + 忙时跳过，保护主对话的响应速度与 KV 前缀缓存
 MOOD_LLM_GAP_MS = 15000
 MOOD_LLM_MAX_TOKENS = 32
+# 情绪小调用只是锦上添花：超过这个时间就取消，绝不占着单槽位生成锁拖慢下一句聊天。
+MOOD_LLM_TIMEOUT_SEC = 6.0
 
 # 主动回忆：同一条旧事 30 分钟内不再提；提示词里只放一小段，避免把记忆库倒出来
 IDLE_RECALL_AVOID_SEC = 1800.0
@@ -557,6 +559,7 @@ class AzureAgent:
 
         self._mood_region = -1
         self._mood_ms = 0
+        self._mood_task = None             # 后台情绪精修任务（v4.2.8）：新聊天到达时取消
         self._mood_desc = ""
         self._mood_reason = ""             # 最近一次情绪事件的「为什么」：给提示词带一两回合
         self._mood_reason_until = -1       # 手数上界；超过就自动不提
@@ -1636,11 +1639,38 @@ class AzureAgent:
         self._mood_ms = now
         desc = self._mood_desc
         self._mood_desc = ""
-        d = await self._mood_delta((self.mood.v, self.mood.c, self.mood.a), desc)
+        try:
+            d = await asyncio.wait_for(
+                self._mood_delta((self.mood.v, self.mood.c, self.mood.a), desc),
+                timeout=MOOD_LLM_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            print("[Agent] 情绪小调用超时（跳过，不占用下一句）")
+            return
         if d is None:
             return
         self.mood.apply_delta(d[0], d[1], d[2])
         self.sync_mood(False)
+
+    def cancel_background_llm(self):
+        """取消后台情绪精修（v4.2.8）：新聊天到达时先让出单槽位生成锁。
+
+        本地 llama-server 只有一个生成槽位；情绪小调用若卡在结构化输出上，会把
+        `LLMClient._gen_lock` 占住，下一句聊天就只能排在它后面。这里取消在途任务，
+        让聊天优先；情绪只保留本地事件结算结果，不影响连续性。
+        """
+        task = getattr(self, "_mood_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._mood_task = None
+
+    def spawn_mood_refine(self):
+        """把情绪精修丢到后台（不阻塞 `/api/chat` 回包，也不挡下一句）。"""
+        self.cancel_background_llm()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._mood_task = loop.create_task(self._mood_llm_refine())
 
     @staticmethod
     def _chat_event(kind) -> str:
@@ -2890,6 +2920,7 @@ class AzureAgent:
 
         ``mode`` 只用于共享记忆：``pet``（桌宠聊天面板）或 ``game``（围棋内聊天）。
         """
+        self.cancel_background_llm()          # v4.2.8：新聊天优先，先让后台情绪小调用让出生成锁
         if self.busy:
             return
         if text is None or text.strip() == "":

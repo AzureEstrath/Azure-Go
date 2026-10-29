@@ -34,6 +34,7 @@
     }
   },
   "llm_think_mode": 1,
+  "llm_timeout_sec": 45.0,
   "max_tool_calls": 2.0,
   "max_visits": 100,
   "memory_db_path": "",

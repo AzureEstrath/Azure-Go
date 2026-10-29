@@ -39,6 +39,9 @@
 > 非棋话题不再注入当前盘面 / KataGo 形势，聊棋才给完整棋面；聊天 / 待机固定快速档、
 > 棋评保持中等档；日程支持规则 + LLM 的**语言取消**（“不吃了 / 退掉了”会撤掉对应条目）；
 > 围棋端不再显示 `ai_schedule` 模板确认。**
+> **v4.2.8：聊天快速档按调用回退到基础 `extra_body`（`enable_thinking:false`），不再被
+> 全局棋评档的思考字段拖慢；情绪精修改后台并可被下一句聊天取消（6 秒上限）；日程判断
+> 10 秒、LLM 请求 45 秒、聊天 20 秒硬超时，卡住时释放单槽位并走兜底。**
 > 最后更新：2026-10-29。
 
 ---
@@ -293,7 +296,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | 组 | 字段 |
 | --- | --- |
 | 后端 | `backend_url`、`auto_start_services` |
-| LLM | `llm_base_url`、`llm_model`、`llm_api_key`、`llm_think_mode`、`extra_body` |
+| LLM | `llm_base_url`、`llm_model`、`llm_api_key`、`llm_think_mode`、`llm_timeout_sec`、`extra_body` |
 | 棋力 | `max_visits`、`katago_url`、`katago_token`、`katago_timeout_ms` |
 | 教学 | `joseki_teach`、`joseki_rate`、`adaptive_difficulty` 系列 |
 | 情绪 | `emotion_drift`、`drift_base`、`drift_max` |
@@ -530,7 +533,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 **1076** 个用例，覆盖：
+`backend/tests` 共 **1081** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -614,6 +617,13 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
    `_speak_chat` 固定 `think_mode=0`；棋评阶段仍用配置档位（默认 1 中等）。
    `PetView` 的桌宠容器改为正方形，`_circle_mask_shader()` 在 fragment 里按 UV 圆裁切、
    透明处补纸色圆底并画淡墨描边；`STRETCH_KEEP_ASPECT_CENTERED` 保证不拉伸变形。
+14. **聊天速度与生成槽位（v4.2.8，后端 / LLM 客户端）**：`LLMClient._extra_for()` 按每次调用
+   的 `think_mode` / `no_think` 重算扩展字段——快速档回到**基础** `llm_extra_body`
+   （`enable_thinking:false`），不是简单删除思考键（删掉会回到服务端默认模板、继续思考）。
+   情绪精修从 `_finalize_chat` 的 await 改为 `spawn_mood_refine()` 后台任务：下一句
+   `chat()` 先 `cancel_background_llm()` 取消它，`_mood_llm_refine` 自身 6 秒超时；
+   日程判断 `asyncio.wait_for(10s)`、聊天 `20s`、LLM 请求 `llm_timeout_sec=45` 硬上限。
+   所有取消都经 `async with _gen_lock` 释放单槽位生成锁，超时按空回复走兜底台词。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 

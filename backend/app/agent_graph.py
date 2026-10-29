@@ -69,6 +69,12 @@ NODE_NAMES = ("prepare", "decide", "speak", "finalize")
 # 一次回合内**总 LLM 调用次数**上限（含工具轮）：工具预算之外的硬闸，由 decide 消费（Task 3）
 MAX_LLM_CALLS_PER_TURN = 4
 
+# 聊天出话的硬上限（v4.2.8）：本地单槽位模型偶发卡住时，绝不让前端一直“正在想”。
+# 超时后按空回复处理，由 finalize 的兜底台词顶上；下一次聊天会取消后台情绪小调用，
+# 优先把生成槽位让给用户这句话。
+CHAT_LLM_TIMEOUT_SEC = 20.0
+CHAT_RETRY_TIMEOUT_SEC = 10.0
+
 # —— 阶段：一次 graph.ainvoke 处理一个 ——
 PHASE_AFTER_PLAYER = "after_player"     # 玩家落子：引擎分析 + 落子 + 定式 + 情绪 + 点评
 PHASE_OWN_TURN = "own_turn"             # 她思考并落子（含落子宣告与应手）
@@ -1297,13 +1303,25 @@ async def _speak_chat(agent, data, msgs):
     if not msgs:
         data["reply"] = ""
         return
-    raw = await _say(agent, msgs, 400, think_mode=0, naturalize=False, stream_with_think=True)
+    try:
+        raw = await asyncio.wait_for(
+            _say(agent, msgs, 400, think_mode=0, naturalize=False, stream_with_think=True),
+            timeout=CHAT_LLM_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        print("[Chat] 聊天出话超时（%.0f 秒），走兜底" % CHAT_LLM_TIMEOUT_SEC)
+        raw = ""
     if actions.looks_structured(raw):
         retry_msgs = list(msgs) + [{"role": "user", "content": (
             "（系统提示：刚才的输出是日程 JSON，不是聊天。请用 Azure 的口吻自然回复玩家，"
             "不要输出 JSON、不要整理清单；可以只说「记下了」，也可以顺势聊这件事，"
             "或从你们的共同记忆里换个话题。）")}]
-        raw = await _say(agent, retry_msgs, 260, think_mode=0, naturalize=False)
+        try:
+            raw = await asyncio.wait_for(
+                _say(agent, retry_msgs, 260, think_mode=0, naturalize=False),
+                timeout=CHAT_RETRY_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            print("[Chat] 聊天重答超时（走兜底）")
+            raw = ""
     data["reply"] = actions.naturalize(str(raw or ""))
 
 
@@ -1580,7 +1598,7 @@ async def _finalize_just_moved(agent, data):
     if data.get("jk_show_card"):
         agent._joseki_emit(data.get("jk2") or {}, True, None, epoch=data.get("epoch"))
     agent._set_busy(False)
-    await agent._mood_llm_refine()
+    agent.spawn_mood_refine()             # v4.2.8：丢后台（6 秒上限），不占住下一回合的生成锁
     # 不在这里 emit state：落子的可见更新由 reveal_move() 在她这段语音开始时触发
 
 
@@ -1622,7 +1640,9 @@ async def _finalize_chat(agent, data):
                     and bool(getattr(agent, "pet_chat_tts_prebuilt", False)))
     await _emit_deduped(agent, events.AI, reply, epoch=data.get("epoch"),
                         with_speech=not pet_prebuilt)
-    await agent._mood_llm_refine()
+    # v4.2.8：情绪精修改成后台任务——`/api/chat` 立刻回包，下一句聊天到达时还会取消它，
+    # 不再让本地单槽位模型被一个结构化小调用占住几十秒。
+    agent.spawn_mood_refine()
 
 
 async def _finalize_idle(agent, data):
