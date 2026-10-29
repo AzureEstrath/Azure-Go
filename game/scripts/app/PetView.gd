@@ -925,7 +925,6 @@ func _render_schedule() -> void:
 			courses.append(d)
 		else:
 			plain.append(d)
-	courses = _dedupe_courses(courses)
 	if _schedule_view == "week":
 		_render_week(courses, plain)
 	else:
@@ -975,11 +974,29 @@ func _week_contains_date(date: String) -> bool:
 	var ws := _date_unix(_week_start_key())
 	return d > 0 and ws > 0 and d >= ws and d < ws + 7 * 86400
 
+## 当前这一周是否包含某天（周一为起点）；月历里「只有星期没有日期」的条目只在本周显示。
+func _current_week_contains(date: String) -> bool:
+	var today := _today_key()
+	var ws := _date_unix(today)
+	if ws <= 0:
+		return false
+	ws -= _weekday_index(ws) * 86400
+	var d := _date_unix(date)
+	return d > 0 and d >= ws and d < ws + 7 * 86400
+
 func _item_in_week(d: Dictionary) -> bool:
 	var key := _item_date_key(d)
 	if key != "":
 		return _week_contains_date(key)
-	return _weekday_from_item(d) >= 0
+	# 只有星期 / 没有日期的条目不再每周重复，先只在当前周显示。
+	return _weekday_from_item(d) >= 0 and _week_contains_date(_today_key())
+
+func _course_in_week(d: Dictionary) -> bool:
+	"""基底课表只显示它所属的那一周；没有日期的旧条目先只在本周显示。"""
+	var key := _item_date_key(d)
+	if key != "":
+		return _week_contains_date(key)
+	return _weekday_from_item(d) >= 0 and _week_contains_date(_today_key())
 
 func _is_course(d: Dictionary) -> bool:
 	return str(d.get("kind", "")) == "course" or str(d.get("period", "")) != "" \
@@ -1047,7 +1064,7 @@ func _render_month(courses: Array, plain: Array) -> void:
 	this_week.pressed.connect(_open_current_week)
 	bar.add_child(this_week)
 
-	_schedule_rows.add_child(_files_hint("点某一天打开那一周；课程按周重复显示。"))
+	_schedule_rows.add_child(_files_hint("点某一天打开那一周；课程只显示在它的日期上。"))
 
 	var heads := GridContainer.new()
 	heads.columns = 7
@@ -1152,13 +1169,16 @@ func _day_items(date: String, courses: Array, plain: Array) -> Array:
 	var wd := _weekday_index(_date_unix(date))
 	var out: Array = []
 	for d in courses:
-		if _weekday_from_item(d) == wd:
+		var key := _item_date_key(d)
+		if key == date:
+			out.append(d)
+		elif key == "" and _weekday_from_item(d) == wd and _current_week_contains(date):
 			out.append(d)
 	for d in plain:
 		var key := _item_date_key(d)
 		if key == date:
 			out.append(d)
-		elif key == "" and _weekday_from_item(d) == wd:
+		elif key == "" and _weekday_from_item(d) == wd and _current_week_contains(date):
 			out.append(d)
 	out.sort_custom(_sort_schedule_items)
 	return out
@@ -1232,6 +1252,12 @@ func _shift_week(delta: int) -> void:
 # ================= 周表 =================
 
 func _render_week(courses: Array, plain: Array) -> void:
+	# 基底课表不再每周套同一张：只收日期落在选中周的课程（无日期的旧条目只在当前周显示）。
+	var week_courses: Array = []
+	for c in courses:
+		if _course_in_week(c):
+			week_courses.append(c)
+	week_courses = _dedupe_courses(week_courses)
 	var bar := HBoxContainer.new()
 	bar.add_theme_constant_override("separation", 3)
 	_schedule_rows.add_child(bar)
@@ -1252,7 +1278,7 @@ func _render_week(courses: Array, plain: Array) -> void:
 	var this_btn := _compact_button("本周")
 	this_btn.pressed.connect(_open_current_week)
 	bar.add_child(this_btn)
-	_schedule_rows.add_child(_files_hint("课程按周重复；定时约定只显示这一周。"))
+	_schedule_rows.add_child(_files_hint("课程只显示所属周；定时约定只显示这一周。"))
 
 	var timed: Array = []
 	var week_plain: Array = []
@@ -1269,10 +1295,10 @@ func _render_week(courses: Array, plain: Array) -> void:
 	var undated := _undated_items(plain)
 	if not undated.is_empty():
 		_build_agenda(undated, "待安排")
-	if courses.is_empty() and timed.is_empty():
+	if week_courses.is_empty() and timed.is_empty():
 		_schedule_rows.add_child(_files_hint("本周没有课程或定时约定；可以切到月历看其他周。"))
 		return
-	_build_timetable(courses, timed)
+	_build_timetable(week_courses, timed)
 
 func _week_title_text() -> String:
 	var ws := _date_unix(_week_start_key())
@@ -1281,22 +1307,23 @@ func _week_title_text() -> String:
 	return "%s - %s" % [_month_day(ws), _month_day(ws + 6 * 86400)]
 
 func _dedupe_courses(courses: Array) -> Array:
-	"""同一门课可能来自多周扫描：按「星期 + 起始节 + 标题」去重，保留日期最新的一条。"""
+	"""同一周的同一门课：按「日期 + 星期 + 起始节 + 标题」去重（不再跨周合并）。"""
 	var map := {}
 	for it in courses:
 		var d: Dictionary = it
-		var key := "%d|%d|%s" % [int(d.get("weekday", -1)),
-			int(d.get("period_start", 0)), str(d.get("title", ""))]
+		var key := "%s|%d|%d|%s" % [str(d.get("date", "")),
+			int(d.get("weekday", -1)), int(d.get("period_start", 0)),
+			str(d.get("title", ""))]
 		if not map.has(key):
 			map[key] = d
-		else:
-			var old: Dictionary = map[key]
-			if str(d.get("date", "")) > str(old.get("date", "")):
-				map[key] = d
 	var out: Array = []
 	for k in map.keys():
 		out.append(map[k])
 	out.sort_custom(func(a, b):
+		var da := str(a.get("date", ""))
+		var db := str(b.get("date", ""))
+		if da != db:
+			return da < db
 		if int(a.get("weekday", 0)) != int(b.get("weekday", 0)):
 			return int(a.get("weekday", 0)) < int(b.get("weekday", 0))
 		return int(a.get("period_start", 0)) < int(b.get("period_start", 0)))
@@ -1348,9 +1375,11 @@ func _period_index(minutes: int) -> int:
 	return clampi(idx, 1, TABLE_PERIODS)
 
 func _event_block(d: Dictionary) -> Dictionary:
-	"""有明确时刻的约定 / 自动安排 → 周表块（避免被只画课程的网格漏掉）。"""
-	if str(d.get("grade", "")) == "closed":
-		return {}
+	"""有明确时刻的约定 / 自动安排 → 周表块（避免被只画课程的网格漏掉）。
+
+    ``closed`` 只表示「不再自动重排」，不是「从历史里消失」：本周已经结束的比赛仍要
+    留在这一周的周表里（灰色「已结束」标签），否则用户会看到事项在月历里、周表里却没有。
+    """
 	if str(d.get("status", "planned")) != "planned":
 		return {}
 	var wd := _weekday_from_item(d)
@@ -1568,8 +1597,13 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 			continue
 		var merged: Dictionary = base.duplicate()
 		merged["title"] = "%d 项约定" % group.size()
-		merged["grade"] = "committed"
-		merged["grade_label"] = "已约定"
+		var any_open := false
+		for ev in group:
+			if str(ev.get("grade", "")) != "closed":
+				any_open = true
+				break
+		merged["grade"] = "committed" if any_open else "closed"
+		merged["grade_label"] = "已约定" if any_open else "已结束"
 		var whens: Array[String] = []
 		var seen_when := {}
 		var lines: Array[String] = []

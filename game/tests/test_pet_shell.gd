@@ -201,6 +201,26 @@ func _test_view() -> void:
 		 "period_end": 2, "start_time": "08:00", "end_time": "09:35"},
 	])
 	_check("同一门课跨周扫描只留一格", v._schedule_table.get_child_count() == 7 + 12 + 1)
+	v.show_week_for_date("2026-11-04")
+	_check("下一周只显示它自己的课表", v._schedule_table != null
+		and v._schedule_table.get_child_count() == 7 + 12 + 1)
+	v._calendar_month = "2026-11"
+	v.show_month()
+	await process_frame
+	await process_frame
+	var cell_1104 := false
+	var cell_1111 := false
+	for cell in v._calendar_grid.get_children():
+		if not (cell is PanelContainer):
+			continue
+		var cdate := str(cell.get_meta("calendar_date", ""))
+		var has_math := _calendar_cell_has_text(cell, "高等数学")
+		if cdate == "2026-11-04":
+			cell_1104 = has_math
+		elif cdate == "2026-11-11":
+			cell_1111 = has_math
+	_check("月历只在课程真实日期显示", cell_1104 and not cell_1111)
+	v.show_week_for_date("2026-10-26")
 	_check("自动排班 / 归档 / 清理按钮存在",
 		v._files_auto_plan != null and v._files_archive != null and v._files_cleanup != null)
 	v.show_reminder("到点了：「高等数学」，别忘了。")
@@ -280,6 +300,32 @@ func _test_view() -> void:
 		_check("悬停卡显示排班理由",
 			v._hover_label.text.contains("排班理由："))
 		v._hide_hover_card()
+	# 已经结束的星期型事件：不再自动重排，但仍应留在它所属那一周的周表里。
+	v.set_schedule_items([
+		{"id": 4, "title": "班级篮球赛",
+		 "when_text": "2026-10-29 周四 12:00-13:00", "weekday": 3, "period": "",
+		 "period_start": 0, "start_ts": 1793246400, "start_time": "12:00",
+		 "end_time": "13:00", "kind": "task", "status": "planned",
+		 "grade": "closed", "grade_label": "已结束", "location": "体育馆",
+		 "priority": 50, "duration_min": 60},
+		{"id": 5, "title": "班级足球赛",
+		 "when_text": "2026-10-29 周四 12:20-13:20", "weekday": 3, "period": "",
+		 "period_start": 0, "start_ts": 1793247600, "start_time": "12:20",
+		 "end_time": "13:20", "kind": "task", "status": "planned",
+		 "grade": "closed", "grade_label": "已结束", "location": "体育馆",
+		 "priority": 50, "duration_min": 60},
+	])
+	v.show_week_for_date("2026-10-29")
+	var closed_block = null
+	if v._schedule_table != null:
+		for c in v._schedule_table.get_children():
+			if c is Panel and c.has_meta("sched_item") \
+					and str(c.get_meta("sched_item").get("title", "")) == "2 项约定":
+				closed_block = c
+				break
+	_check("已结束的两条约定仍留在本周周表", closed_block != null)
+	_check("已结束的合并块标为已结束", closed_block != null
+		and str(closed_block.get_meta("sched_item").get("grade", "")) == "closed")
 	host.size = Vector2(544, 520)
 	await process_frame
 	await process_frame
@@ -428,6 +474,18 @@ func _test_chat_schedule_note(shell) -> void:
 	_check("聊天排程补充不抢聊天 busy", shell._chat_busy)
 	shell._chat_busy = false
 	shell.view.close_chat()
+
+## 月历日格里有没有某个文字（日格 = PanelContainer → VBox → Labels）。
+func _calendar_cell_has_text(cell, needle: String) -> bool:
+	if cell == null or cell.get_child_count() == 0:
+		return false
+	var vb = cell.get_child(0)
+	if vb == null:
+		return false
+	for lbl in vb.get_children():
+		if lbl is Label and str(lbl.text).contains(needle):
+			return true
+	return false
 
 func _test_launcher() -> void:
 	_check("默认配置开桌宠 ⇒ 桌宠外壳",
