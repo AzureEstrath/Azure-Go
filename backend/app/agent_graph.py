@@ -729,12 +729,17 @@ async def _prepare_chat(agent, data):
     try:
         lt = await asyncio.to_thread(agent._long_term, text)     # 慢 embedding 不得冻住事件循环
         profile, time_facts = await _ctx_extras(agent, data)
-        msgs = [
-            agent._sys_msg(),
-            agent._user_msg(prompts.context_block(agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True, agent.st.last_katago, agent.st.board,
-                                                  long_term=lt, events=agent.event_log.all(),
-                                                  profile=profile, time_facts=time_facts)),
-        ]
+        ctx = prompts.context_block(agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True, agent.st.last_katago, agent.st.board,
+                                    long_term=lt, events=agent.event_log.all(),
+                                    profile=profile, time_facts=time_facts)
+        # v4.2.5：聊天只负责「聊天」——日程由后台另行落库。模型不必复述/确认清单，
+        # 可以自然接住这句话，也可以从共同记忆里换个话题；同时明确禁止把 JSON 当回复。
+        ctx += ("\n\n【这一轮聊天 · 自然接话】\n"
+                "玩家提到日程或安排时，不用整理成 JSON / 清单，也不必每次都只说「记下了」。\n"
+                "可以自然接一句，然后顺着这件事聊；也可以从你们的共同记忆里挑一个相关话题继续，"
+                "或轻轻换一个话题。\n"
+                "只输出聊天文本；日程已经由系统另行记下，不需要你复述。")
+        msgs = [agent._sys_msg(), agent._user_msg(ctx)]
         hist = agent.st.chat_history
         upto = len(hist) - 1            # 最后一条是刚追加的这句，下面单独发，避免重复
         for sp in prompts.chat_windows(hist[:upto]):
@@ -1260,8 +1265,22 @@ async def _speak_analyze(agent, data, msgs):
 
 
 async def _speak_chat(agent, data, msgs):
-    """聊天台词（消息构造失败时按空回复处理，由 finalize 的兜底顶上）。"""
-    data["reply"] = await _say(agent, msgs, 400) if msgs else ""
+    """聊天台词（消息构造失败时按空回复处理，由 finalize 的兜底顶上）。
+
+    模型偶尔仍会把日程写成 JSON。此时再给它一次**短、快、明确**的机会自然重答：
+    可以只说「记下了」，也可以顺着这件事聊或换个话题；不把固定确认句当成唯一出口。
+    """
+    if not msgs:
+        data["reply"] = ""
+        return
+    raw = await _say(agent, msgs, 400, naturalize=False)
+    if actions.looks_structured(raw):
+        retry_msgs = list(msgs) + [{"role": "user", "content": (
+            "（系统提示：刚才的输出是日程 JSON，不是聊天。请用 Azure 的口吻自然回复玩家，"
+            "不要输出 JSON、不要整理清单；可以只说「记下了」，也可以顺势聊这件事，"
+            "或从你们的共同记忆里换个话题。）")}]
+        raw = await _say(agent, retry_msgs, 260, think_mode=0, naturalize=False)
+    data["reply"] = actions.naturalize(str(raw or ""))
 
 
 async def _speak_idle(agent, data, msgs):
@@ -1391,15 +1410,19 @@ async def _consume_stream(agent, msgs, max_tokens):
     return agent.clean_reply(text)
 
 
-async def _say(agent, msgs, max_tokens, think_mode=None):
+async def _say(agent, msgs, max_tokens, think_mode=None, naturalize=True):
     """speak 阶段的统一出话口：流式开着就走流式，否则与 Task 2/3/4 的 ``agent._reply`` 同一条路。
 
     ``think_mode`` 显式给值时**跳过流式**（桌宠走神/窥屏的快速档）：这类短句不该为了
     token 流多等一轮；不传时行为与旧版逐字一致。
+    ``naturalize=False`` 给聊天重答路径：先看原文是不是结构化 JSON，再决定要不要重试；
+    其余调用保持默认，行为不变。
     """
     text = None if think_mode is not None else await _streamed_text(agent, msgs, max_tokens)
     if text is None:
         text = await agent._reply(msgs, max_tokens, think_mode=think_mode)
+    if not naturalize:
+        return text
     # 结构化误输出兜底：模型偶尔会直接吐日程 JSON（聊天 / 走神都可能），把它转成人话；
     # 认不出来的 JSON 返回空串，交给调用方的兜底台词——绝不让 `[` 或字段名进气泡。
     return actions.naturalize(text)
@@ -1437,17 +1460,19 @@ async def _emit_speech(agent, text):
     ))
 
 
-async def _emit_line(agent, kind, text, move=None, epoch=None):
+async def _emit_line(agent, kind, text, move=None, epoch=None, with_speech=True):
     """发一条对外台词：先 ``message``，**紧随其后**补 ``speech``（音画同步：前端按 turn_id+seq 配对）。
 
     ``epoch``（v3.7.0）：看门狗守卫——带了它且已经不属于当前这一代时，这条台词（连同它的
     ``speech``）一条都不发。调用点从本轮 ``data`` 里传；不传（公开方法的非法手提示、空盘提示，
     以及既有单测的直接调用）时行为与以前逐字一致——那些是**新的用户动作**，不是被作废的旧一代。
+    ``with_speech=False``：只发文字（桌宠聊天预制音模式，v4.2.5），不合成、不等待 TTS。
     """
     if epoch is not None and not agent.epoch_ok(epoch):
         return
     agent._emit(events.message(kind, text, move))
-    await _emit_speech(agent, text)
+    if with_speech:
+        await _emit_speech(agent, text)
 
 
 def _log_safe(text) -> str:
@@ -1466,7 +1491,7 @@ def _log_safe(text) -> str:
         return s.encode("ascii", "replace").decode("ascii")
 
 
-async def _emit_deduped(agent, kind, text, epoch=None):
+async def _emit_deduped(agent, kind, text, epoch=None, with_speech=True):
     """发一条**非落子宣告**的 ``message`` 事件：窗口内一字不差的原话不再推给前端。
 
     只做「发事件」这一道闸门（S25/S26）：调用方的 ``memory_log`` / ``chat_history`` 写入**照常**发生；
@@ -1487,7 +1512,7 @@ async def _emit_deduped(agent, kind, text, epoch=None):
         print("[Agent] 原话去重（最近 %d 条内一字不差）已抑制：%s"
               % (AI_DEDUP_WINDOW, _log_safe(text)))
     else:
-        await _emit_line(agent, kind, text, epoch=epoch)
+        await _emit_line(agent, kind, text, epoch=epoch, with_speech=with_speech)
     agent._note_line(text)
 
 
@@ -1563,7 +1588,12 @@ async def _finalize_chat(agent, data):
         agent.st.chat_history.append({"role": "assistant", "content": stored})
         await asyncio.to_thread(agent._remember_chat_turn, str(data.get("text") or ""), stored,
                                 str(data.get("mode") or "game"))
-    await _emit_deduped(agent, events.AI, reply, epoch=data.get("epoch"))
+    # 桌宠聊天默认只用预制音（v4.2.5）：跳过 CosyVoice 合成，只发文字；
+    # 前端收到后播一句预制情绪音。CosyVoice 服务照常启动，这里只是聊天链路不调用它。
+    pet_prebuilt = (str(data.get("mode") or "game") == "pet"
+                    and bool(getattr(agent, "pet_chat_tts_prebuilt", False)))
+    await _emit_deduped(agent, events.AI, reply, epoch=data.get("epoch"),
+                        with_speech=not pet_prebuilt)
     await agent._mood_llm_refine()
 
 

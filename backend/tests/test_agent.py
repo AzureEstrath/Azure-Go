@@ -625,6 +625,85 @@ class FailSafeTest(unittest.TestCase):
             self._assert_says_something(tag, bus, events.AI)
 
 
+class _SeqLLM:
+    """按顺序返回不同文本的假 LLM：第一条装日程 JSON，第二条装自然聊天（v4.2.5 重答门卫）。"""
+
+    think_mode = 0
+    base_url = "http://localhost:8080/v1"
+
+    def __init__(self, texts):
+        self.texts = list(texts)
+        self.calls = []
+        self.think_modes = []
+
+    async def chat(self, messages, max_tokens=300, no_think=False, think_mode=None):
+        self.calls.append((list(messages), max_tokens, no_think))
+        self.think_modes.append(think_mode)
+        i = min(len(self.calls) - 1, len(self.texts) - 1)
+        return self.texts[i]
+
+
+class _FakeTTS:
+    """只记录合成请求的假 TTS：返回 ``openai`` 形态，让 ``speech`` 事件能发出来。"""
+
+    def __init__(self):
+        self.calls = []
+
+    async def speak(self, text):
+        self.calls.append(text)
+        return {"mode": "openai", "id": "chat-audio", "tone": ""}
+
+
+class PetChatTest(unittest.TestCase):
+    """v4.2.5：聊天自然接话 + 结构化重答 + 桌宠聊天只发文字（预制音在前端）。"""
+
+    def _run(self, llm, text="明天晚上有数据科学课", mode="pet", prebuilt=False):
+        async def run():
+            agent, _eng, _llm, bus = _mk()
+            agent.llm = llm
+            tts = _FakeTTS()
+            agent.tts = tts
+            agent.pet_chat_tts_prebuilt = prebuilt
+            await agent.chat(text, mode)
+            return agent, bus, tts
+
+        return asyncio.run(run())
+
+    def test_chat_context_asks_for_natural_continuation(self):
+        llm = StubLLM()
+        _agent, _bus, _tts = self._run(llm)
+        ctx = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertIn("自然接话", ctx)
+        self.assertIn("不用整理成 JSON", ctx)
+        self.assertIn("也可以从你们的共同记忆里", ctx)
+
+    def test_structured_chat_reply_retried_without_thinking(self):
+        llm = _SeqLLM([
+            '[{"date":"2026-10-30","time":"19:00","title":"数据科学"}]',
+            "嗯，明晚七点的数据科学，我记住了。你最近是不是有点累？",
+        ])
+        agent, bus, _tts = self._run(llm)
+        self.assertGreaterEqual(len(llm.calls), 2, "结构化输出后应重答一次")
+        self.assertEqual(llm.think_modes[1], 0, "重答必须是快速档（think_mode=0）")
+        self.assertIn("不要输出 JSON", llm.calls[1][0][-1]["content"])
+        reply = agent.st.chat_history[-1]["content"]
+        self.assertNotIn('"date"', reply)
+        self.assertTrue(any("数据科学" in str(e.get("text", "")) for e in bus.messages(events.AI)))
+
+    def test_pet_chat_prebuilt_skips_tts(self):
+        llm = StubLLM()
+        _agent, bus, tts = self._run(llm, prebuilt=True)
+        self.assertEqual(tts.calls, [], "桌宠聊天预制音模式不应调用 TTS 合成")
+        self.assertEqual(bus.of_type("speech"), [])
+        self.assertTrue(bus.messages(events.AI))
+
+    def test_pet_chat_can_still_use_tts_when_switched_off(self):
+        llm = StubLLM()
+        _agent, bus, tts = self._run(llm, prebuilt=False)
+        self.assertTrue(tts.calls, "开关关闭后聊天应恢复整句 TTS")
+        self.assertTrue(bus.of_type("speech"))
+
+
 class ReminderTest(unittest.TestCase):
     """事务提醒：到点把事务喂给 LLM；失败 / 无连接退回模板并照常发 ai_remind。"""
 

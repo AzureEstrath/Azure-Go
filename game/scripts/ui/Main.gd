@@ -4406,6 +4406,7 @@ func _apply_agent_settings() -> void:
 	if agent == null:
 		return
 	agent.set_tts_local_voice(cfg.tts_local_voice)  # 本地音色：后端内存立即对齐（不重启、不丢棋局）
+	agent.pet_chat_tts_prebuilt = cfg.pet_chat_tts_prebuilt  # v4.2.5：桌宠聊天只用预制音（与桌宠同一份配置）
 	agent.reply_style = cfg.reply_style           # 说话详略三档（连上后自动补发；旧版后端读 limit_len）
 	agent.think_mode = cfg.llm_think_mode         # 思考强度：运行期可改，不用重启后端
 	agent.joseki_teach = cfg.joseki_teach

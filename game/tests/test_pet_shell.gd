@@ -13,6 +13,7 @@ var _launcher_script = null
 class FakeTTS extends Node:
 	var enabled := true
 	var system_lines: Array[String] = []
+	var fillers: Array[String] = []
 
 	func set_suppress_system(_on: bool) -> void:
 		pass
@@ -23,8 +24,8 @@ class FakeTTS extends Node:
 	func play_audio(_body: PackedByteArray, _seq: int, _kind: String) -> void:
 		pass
 
-	func play_filler(_kind: String, _force: bool) -> void:
-		pass
+	func play_filler(kind: String, _force: bool) -> void:
+		fillers.append(kind)
 
 	func set_mood_pitch(_pitch: float) -> void:
 		pass
@@ -35,6 +36,9 @@ class FakeAgent extends Node:
 	func fetch_bytes(path: String, _method: int, _headers: Dictionary,
 			_callback: Callable, _timeout: float) -> void:
 		fetched.append(path)
+
+	func fetch_chat_history(_limit: int, _callback: Callable) -> void:
+		pass
 
 func _initialize() -> void:
 	_view_script = preload("res://scripts/app/PetView.gd")
@@ -92,6 +96,12 @@ func _test_view() -> void:
 	_check("菜单有可点击的薄纱背景", veil != null and veil.visible)
 	v.close_menu()
 	_check("菜单能收起", not v.is_menu_open())
+	_check("聊天面板有聊天预制音开关", v._prebuilt_check != null)
+	var toggled := [true]
+	v.prebuilt_tts_toggled.connect(func(on: bool): toggled[0] = on)
+	v.set_prebuilt_tts(true)
+	v._prebuilt_check.button_pressed = false
+	_check("预制音开关会发出信号", not toggled[0])
 
 	v.append_chat("user", "你好")
 	v.append_chat("assistant", "在呢。")
@@ -420,6 +430,9 @@ func _test_shell_instance() -> void:
 	_check("PetShell 发出启动问候", shell.view != null and shell.view._bubble.visible)
 	_check("PetShell 创建了后端客户端", shell.agent != null)
 	_check("PetShell 创建了语音客户端", shell.tts != null)
+	_check("聊天面板勾选状态跟随配置",
+		shell.view._prebuilt_check != null
+		and shell.view._prebuilt_check.button_pressed == shell.cfg.pet_chat_tts_prebuilt)
 	shell._on_mood({"energy": 0.21, "boredom": 0.81, "affinity": 0.66, "trust": 0.44, "dominance": 0.55})
 	_check("桌宠接收精力 / 无聊 / 亲密 / 信任 / 掌控感",
 		is_equal_approx(shell._energy, 0.21) and is_equal_approx(shell._boredom, 0.81)
@@ -441,6 +454,7 @@ func _test_shell_instance() -> void:
 		is_equal_approx(shell._energy, 0.33) and is_equal_approx(shell._boredom, 0.44))
 	_test_speech_policy(shell)
 	_test_chat_schedule_note(shell)
+	_test_late_chat_reply(shell)
 	shell.queue_free()
 	await process_frame
 
@@ -501,6 +515,52 @@ func _test_chat_schedule_note(shell) -> void:
 	_check("聊天排程补充不抢聊天 busy", shell._chat_busy)
 	shell._chat_busy = false
 	shell.view.close_chat()
+
+## v4.2.5：60 秒超时只解锁输入，回复仍算「在途」——迟到的这句必须直接进面板；
+## 桌宠聊天默认只播预制情绪音，不再等 CosyVoice 合成整句。
+func _test_late_chat_reply(shell) -> void:
+	var fake_tts := FakeTTS.new()
+	var fake_agent := FakeAgent.new()
+	shell.tts = fake_tts
+	shell.agent = fake_agent
+	shell.cfg.tts_enabled = true
+	shell.cfg.pet_chat_tts_prebuilt = true
+
+	shell.view.open_chat()
+	var before: int = shell.view._chat_log.get_child_count()
+	shell._chat_busy = false                 # 60 秒超时已经把忙态清掉
+	shell._chat_awaiting = true
+	shell._chat_await_since = Time.get_ticks_msec()
+	shell._on_message("ai", "记下了，明晚七点数据科学。")
+	_check("超时后迟到的聊天回复仍进入面板",
+		shell.view._chat_log.get_child_count() == before + 1)
+	_check("迟到回复到达后清掉等待态", not shell._chat_awaiting and not shell._chat_busy)
+	_check("预制音模式聊天不取回整句语音", fake_agent.fetched.is_empty())
+	_check("预制音模式聊天播一句情绪语气", fake_tts.fillers.size() == 1)
+
+	# 面板关着：迟到回复至少用气泡露面，不能悄悄只进历史。
+	shell.view.close_chat()
+	shell._chat_awaiting = true
+	shell._chat_await_since = Time.get_ticks_msec()
+	shell._on_message("ai", "面板关着也要冒泡。")
+	_check("面板关闭时迟到回复改为气泡", shell.view._bubble.visible)
+
+	# 开关关掉：恢复整句 TTS 的取回路径。
+	shell.cfg.pet_chat_tts_prebuilt = false
+	shell._chat_awaiting = true
+	shell._chat_await_since = Time.get_ticks_msec()
+	shell._on_message("ai", "关掉开关就要念出来。")
+	shell._on_speech({"mode": "openai", "id": "late1", "seq": 1})
+	_check("关闭预制音后聊天恢复整句语音",
+		fake_agent.fetched.size() == 1 and fake_agent.fetched[0] == "/api/tts/audio/late1")
+
+	shell._chat_awaiting = false
+	shell._audio_queue.clear()
+	shell._audio_busy = false
+	shell.agent = null
+	shell.tts = null
+	fake_tts.free()
+	fake_agent.free()
 
 ## 月历日格里有没有某个文字（日格 = PanelContainer → VBox → Labels）。
 func _calendar_cell_has_text(cell, needle: String) -> bool:

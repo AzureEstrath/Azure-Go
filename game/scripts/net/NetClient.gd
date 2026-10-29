@@ -70,6 +70,12 @@ var _digest_batch := false
 ## 说话详略（v3.11.1）：0 精简 / 1 适中 / 2 详细。旧字段 `limit_len` 已并入它，
 ## 推送时仍带上 `limit_len = (reply_style == 0)`，让旧版后端也读得懂「精简」。
 var tts_local_voice := ""                 # 本地音色：入树前 POST 可能失败，连上后随设置一起补发
+## v4.2.5 桌宠聊天只用预制音：true 时后端不合成聊天整句（CosyVoice 服务照常运行）。
+## 与其余运行期开关一样走 `_push_settings`；后端 `/api/config` 即时切换 agent 的开关。
+var pet_chat_tts_prebuilt := true:
+	set(v):
+		pet_chat_tts_prebuilt = v
+		_push_settings()
 var reply_style := 0:
 	set(v):
 		reply_style = v
@@ -604,7 +610,8 @@ func _flush_settings() -> void:
 		"persona_relationship_enabled": persona_relationship_enabled,
 		"persona_address_name": persona_address_name,
 		"adaptive_difficulty": adaptive_difficulty,
-		"adaptive_difficulty_base": adaptive_difficulty_base})
+		"adaptive_difficulty_base": adaptive_difficulty_base,
+		"pet_chat_tts_prebuilt": pet_chat_tts_prebuilt})
 
 ## 取一次 JSON：HTTP 2xx 且响应体是对象才算 ok；其余一律 callback(false, code, {})。
 func _fetch_json(path: String, method: int, body: Dictionary, callback: Callable,

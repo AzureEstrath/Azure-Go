@@ -24,6 +24,7 @@ signal files_review_requested
 signal schedule_feedback_requested(id: int, outcome: String, actual_min: int)
 signal go_requested
 signal size_selected(height: int)
+signal prebuilt_tts_toggled(on: bool)
 signal quit_requested
 
 const SIZE_PRESETS := [120, 160, 200, 240]
@@ -109,6 +110,7 @@ var _action_tag_re := RegEx.new()
 var _chat_open := false
 var _files_open := false
 var _menu_open := false
+var _prebuilt_check: CheckBox
 var _pet_box := Rect2()
 var _window_dragging := false
 var _drag_moved := false
@@ -310,6 +312,10 @@ func _menu_button(parent: Node, text: String, primary := false) -> Button:
 	parent.add_child(b)
 	return b
 
+func set_prebuilt_tts(on: bool) -> void:
+	if _prebuilt_check != null:
+		_prebuilt_check.set_pressed_no_signal(on)     # 只同步勾选状态，不反向触发 `prebuilt_tts_toggled`
+
 func _rule(parent: Node) -> void:
 	var r := ColorRect.new()
 	r.color = Color(GufengTheme.INK, 0.20)
@@ -361,6 +367,15 @@ func _build_chat() -> void:
 	_chat_status.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
 	_chat_status.text = ""
 	vb.add_child(_chat_status)
+
+	# v4.2.5：聊天专用语音开关（放聊天面板里，不挤右键菜单）——预制情绪音 ⇄ 整句合成。
+	_prebuilt_check = CheckBox.new()
+	_prebuilt_check.text = "聊天只用预制音"
+	_prebuilt_check.tooltip_text = "开：聊天回复只播对应情绪的预制语气（CosyVoice 服务照常启动，不合成整句，出字更快）。\n" \
+		+ "关：聊天恢复整句语音合成。改动立即写回 config.json，并对当前聊天生效。"
+	_prebuilt_check.add_theme_font_size_override("font_size", 10)
+	_prebuilt_check.toggled.connect(func(on: bool): prebuilt_tts_toggled.emit(on))
+	vb.add_child(_prebuilt_check)
 
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 4)

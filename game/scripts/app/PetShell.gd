@@ -50,6 +50,12 @@ var _pat_count := 0
 
 var _chat_busy := false
 var _chat_started_ms := 0
+## v4.2.5 迟到回复：`_chat_busy` 超时只解锁输入框，不代表这条回复作废。
+## `_chat_awaiting` 独立保留「还在等这一句」的事实，迟到的 `ai` 仍会落进聊天面板；
+## 超过 AWAIT 窗口（3 分钟）才放弃，避免把后面的主动话误认成聊天回复。
+var _chat_awaiting := false
+var _chat_await_since := 0
+const CHAT_AWAIT_MS := 180000
 var _speech_kinds: Array[Dictionary] = []
 var _audio_queue: Array[Dictionary] = []
 var _audio_busy := false
@@ -114,7 +120,9 @@ func _build_ui() -> void:
 	view.schedule_feedback_requested.connect(_feedback_schedule)
 	view.go_requested.connect(_launch_game)
 	view.size_selected.connect(_on_size_selected)
+	view.prebuilt_tts_toggled.connect(_on_prebuilt_tts_toggled)
 	view.quit_requested.connect(_on_quit)
+	view.set_prebuilt_tts(cfg.pet_chat_tts_prebuilt)
 
 func _build_services() -> void:
 	tts = TTSClientScript.new()
@@ -159,6 +167,7 @@ func _apply_agent_settings() -> void:
 	if agent == null:
 		return
 	agent.set_tts_local_voice(cfg.tts_local_voice)
+	agent.pet_chat_tts_prebuilt = cfg.pet_chat_tts_prebuilt
 	agent.reply_style = cfg.reply_style
 	agent.think_mode = cfg.llm_think_mode
 	agent.joseki_teach = cfg.joseki_teach
@@ -302,8 +311,9 @@ func _on_message(kind: String, text: String) -> void:
 	var parsed := _clean_ai(text)
 	if parsed.is_empty():
 		# 空回复 / 认不出的结构化输出：聊天要**解锁并说明**，不能把输入框一直挂在忙态。
-		if chat_like and _chat_busy:
+		if chat_like and (_chat_busy or _chat_awaiting):
 			_chat_busy = false
+			_chat_awaiting = false
 			view.set_chat_busy(false)
 			view.set_chat_status("这条回复没整理好，再说一次试试。")
 		return
@@ -328,12 +338,20 @@ func _on_message(kind: String, text: String) -> void:
 			_load_files()
 		_bump_activity()
 		return
-	if chat_like and _chat_busy:
-		# 聊天面板里的一次回复：只进面板，不冒泡；随后到达的 speech 事件对应这条
+	if chat_like and (_chat_busy or _chat_awaiting):
+		# 聊天面板里的一次回复：只进面板，不冒泡；随后到达的 speech 事件对应这条。
+		# v4.2.5：`_chat_busy` 超时被清掉也照样 append——迟到回复不能只能靠重开面板从历史里找回。
 		view.append_chat("assistant", body)
 		_chat_busy = false
+		_chat_awaiting = false
 		view.set_chat_busy(false)
-		_queue_speech("chat")
+		view.set_chat_status("")
+		if not view.is_chat_open():
+			view.show_bubble(body, 8.0)      # 面板关着：至少让桌宠说一句，别让回复悄悄进历史
+		if cfg.pet_chat_tts_prebuilt:
+			_play_tone(_tone_for_mood())     # 桌宠聊天只用预制情绪音（不再等 CosyVoice 合成整句）
+		else:
+			_queue_speech("chat")
 		return
 	if kind == "ai_idle" or kind == "ai_notice":
 		if kind != "ai_notice":
@@ -630,7 +648,9 @@ func _on_chat_submitted(text: String) -> void:
 		view.set_chat_busy(false)
 		return
 	_chat_busy = true
+	_chat_awaiting = true
 	_chat_started_ms = Time.get_ticks_msec()
+	_chat_await_since = _chat_started_ms
 	view.set_chat_busy(true)
 	_speech_kinds.clear()
 
@@ -758,7 +778,10 @@ func _process(_delta: float) -> void:
 	if _chat_busy and now - _chat_started_ms > 60000:
 		_chat_busy = false
 		view.set_chat_busy(false)
-		view.set_chat_status("这一句等太久了，稍后再试。")
+		# 只解锁输入框：回复可能还在后端生成。保留 `_chat_awaiting`，迟到的这句仍会进面板。
+		view.set_chat_status("还在想，回复到了会直接出现在这里。")
+	if _chat_awaiting and now - _chat_await_since > CHAT_AWAIT_MS:
+		_chat_awaiting = false                 # 3 分钟还没回：放弃等待，避免误认后面的主动话
 	if _game_running:
 		_tick_game(now)
 		return
@@ -1018,6 +1041,7 @@ func _launch_game() -> void:
 	_last_activity = Time.get_ticks_msec()
 	_cancel_peek()
 	_chat_busy = false
+	_chat_awaiting = false
 	view.set_chat_busy(false)
 	view.close_chat()
 	view.close_files()
@@ -1082,6 +1106,15 @@ func _restore_after_game(now := 0) -> void:
 func _on_size_selected(h: int) -> void:
 	cfg.pet_height = clampi(h, 96, 360)
 	cfg.save()
+
+## v4.2.5 桌宠聊天语音开关：预制情绪音 ⇄ 整句合成。写回配置，并即时推给后端 agent。
+func _on_prebuilt_tts_toggled(on: bool) -> void:
+	cfg.pet_chat_tts_prebuilt = on
+	cfg.save()
+	if agent != null:
+		agent.pet_chat_tts_prebuilt = on
+	view.show_bubble("聊天语音：%s。" % ("只用预制情绪音" if on else "整句合成"), 4.0)
+	_play_tone(_tone_for_mood())
 
 func _on_quit() -> void:
 	view.save_position()

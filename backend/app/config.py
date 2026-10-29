@@ -122,6 +122,9 @@ class AzureConfig:
         self.tts_volume = 1.0
         self.tts_timeout_sec = 30           # 云端单次合成超时；超时整条降级
         self.tts_long_chunk = False         # 打开后单块字数上限放宽（templates 里该键已在）
+        # 桌宠聊天语音（v4.2.5）：默认只用预制音，不调 CosyVoice 合成整句；
+        # 服务照常由启动流程拉起（这里只决定聊天这条链路是否合成）。
+        self.pet_chat_tts_prebuilt = True
         # —— 本地语音：tts_mode=local 时只走它（失败回落系统语音）；tts_mode=openai 时非空则先试它，
         #    失败再试云端 tts_base_url，最后系统语音（旧配置兼容）——
         self.tts_local_base_url = ""        # 本地 OpenAI 兼容地址（如 http://127.0.0.1:9880/v1）
@@ -316,6 +319,8 @@ class AzureConfig:
         except (TypeError, ValueError):
             self.tts_timeout_sec = 30.0
         self.tts_long_chunk = bool(d.get("tts_long_chunk", self.tts_long_chunk))
+        self.pet_chat_tts_prebuilt = bool(d.get(
+            "pet_chat_tts_prebuilt", self.pet_chat_tts_prebuilt))
         self.tts_local_base_url = str(d.get("tts_local_base_url", self.tts_local_base_url))
         self.tts_local_model = str(d.get("tts_local_model", self.tts_local_model))
         self.tts_local_api_key = str(d.get("tts_local_api_key", self.tts_local_api_key))

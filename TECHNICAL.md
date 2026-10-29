@@ -29,6 +29,9 @@
 > 聊天默认思考档位改为中等（`llm_think_mode=1`），思考扩展字段随档位启用。**
 > **v4.2.4：聊天排程不再单独播报（`ai_schedule` 只作面板刷新信号）；日程 JSON 误输出只回
 > 「嗯，记下了。」；聊天流水 / 聊天类长期记忆已清空后重启（日程事实保留）。**
+> **v4.2.5：聊天提示词加入「自然接话 / 可换话题」段；结构化 JSON 回复用 `think_mode=0`
+> 快速重答一次；前端 `_chat_awaiting` 让 60 秒超时后的迟到回复仍进面板；桌宠聊天默认跳过
+> CosyVoice 整句合成（`pet_chat_tts_prebuilt=true`，聊天面板可切回），服务照常启动。**
 > 最后更新：2026-10-29。
 
 ---
@@ -512,9 +515,15 @@ KataGo 服务（`katago_service/server.py`）：
 
 CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no audio produced`）。本地服务内部按 `cross-lingual → SFT 预设 → sherpa 轻量` 三级兜底，保证本地始终有声音；只有服务不可达或三级都失败时，后端才按 fail-closed 整条降级为系统语音。
 
+**桌宠聊天预制音（v4.2.5）**：`pet_chat_tts_prebuilt=true`（默认）时，`agent_graph._finalize_chat`
+对 `mode=pet` 的聊天回复跳过 `_emit_speech`（`_emit_line(..., with_speech=False)`），只发 `message`；
+前端 `PetShell` 收到后播一句按情绪选的预制语气音。CosyVoice 服务仍由 `dev_local.ps1` 照常拉起，
+围棋 / 试听等路径不受影响；聊天面板的「聊天只用预制音」可即时切回整句合成（写回 config.json 并
+`POST /api/config` 更新后端 agent）。
+
 ### 6.9 后端测试
 
-`backend/tests` 共 **1063** 个用例，覆盖：
+`backend/tests` 共 **1067** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；

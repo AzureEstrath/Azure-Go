@@ -434,6 +434,9 @@ class AzureAgent:
         # —— 云端语音（计划 05）：默认不接线（None）⇒ 行为与今天逐字一致（一条 speech 都不发）；
         #    由 main.py 的 lifespan 注入 TTSClient（或测试注入假 TTS）——
         self.tts = tts
+        # 桌宠聊天只用预制音（v4.2.5）：true 时聊天这条链路不合成整句，前端播一句预制情绪音；
+        # 语音服务本身仍照常启动（解耦「服务在跑」与「聊天是否调用它」）。
+        self.pet_chat_tts_prebuilt = False
 
         # —— 跨局长期记忆：默认不接线（None），由 main.py 的 lifespan 注入 MemoryService ——
         self.memory = memory

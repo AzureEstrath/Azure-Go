@@ -124,6 +124,9 @@ var tts_limit_len := true         # 限制 Azure 回复长度（点评 1 句/聊
 var tts_sync_speak := true        # 同步说话：Azure 文字等语音就绪后再一起显示（关掉则文字立即显示）
 var tts_batch_speak := false      # 整段合成：连发的多条消息合并成一段连续朗读；关=逐句（第一句播完等第二句合成）
 var tts_long_chunk := false       # 长句合并：单次 TTS 合成上限 100→160 字（首句更慢；关=100 更快出第一句）
+## v4.2.5 桌宠聊天只用预制情绪音：true 时聊天回复不再合成整句（CosyVoice 服务照常拉起，
+## 围棋/试听等路径仍可用）；false 时恢复聊天整句 TTS。默认开——聊天出字不再等语音合成。
+var pet_chat_tts_prebuilt := true
 
 var _path := ""
 var _raw: Dictionary = {}       # 原样保存读到的配置，写回时只覆盖改动项（保留相对路径等写法）
@@ -220,6 +223,7 @@ static func load_config(path := "") -> AzureConfig:
 			c.tts_sync_speak = bool(d.get("tts_sync_speak", c.tts_sync_speak))
 			c.tts_batch_speak = bool(d.get("tts_batch_speak", c.tts_batch_speak))
 			c.tts_long_chunk = bool(d.get("tts_long_chunk", c.tts_long_chunk))
+			c.pet_chat_tts_prebuilt = bool(d.get("pet_chat_tts_prebuilt", c.pet_chat_tts_prebuilt))
 			c.tts_local_base_url = str(d.get("tts_local_base_url", c.tts_local_base_url)).strip_edges()
 			c.tts_local_model = str(d.get("tts_local_model", c.tts_local_model)).strip_edges()
 			c.tts_local_voice = str(d.get("tts_local_voice", c.tts_local_voice)).strip_edges()
@@ -440,6 +444,7 @@ func save() -> bool:
 		"tts_sync_speak": tts_sync_speak,
 		"tts_batch_speak": tts_batch_speak,
 		"tts_long_chunk": tts_long_chunk,
+		"pet_chat_tts_prebuilt": pet_chat_tts_prebuilt,
 	}, true)
 	d.erase("tts_auto_start")                     # 本地语音服务拉起已删除：旧键不再写回
 	d.erase("tts_bf16")

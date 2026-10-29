@@ -46,6 +46,7 @@
   "persona_relationship_enabled": false,
   "pet_enabled": true,
   "pet_height": 160,
+  "pet_chat_tts_prebuilt": true,
   "profile_enabled": false,
   "prompt_phase_notes": {
 
