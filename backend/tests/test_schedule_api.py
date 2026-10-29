@@ -17,6 +17,7 @@ from app.agent import AzureAgent
 from app.config import AzureConfig
 from app.life import LifeStore
 from app.main import create_app
+from app.memory_service import MemoryService
 from helpers import StubEngine, StubLLM, ZeroRng
 
 
@@ -250,6 +251,61 @@ class ChatScheduleApiTest(unittest.TestCase):
                     msgs = self._wait_messages(bus)
                     self.assertTrue(any("撤掉" in str(m.get("text", "")) for m in msgs))
             finally:
+                store.close()
+
+    def test_chat_cancel_supersedes_schedule_memory(self):
+        """v4.3.0（F）：取消日程后，旧日程记忆失效，召回只能看到“已取消”的审计条。"""
+        with tempfile.TemporaryDirectory() as d:
+            store = LifeStore(os.path.join(d, "life.db"))
+            cfg = AzureConfig()
+            cfg.auto_plan_enabled = False
+            cfg.memory_enabled = True
+            cfg.memory_db_path = os.path.join(d, "memory.db")
+            mem = MemoryService(cfg)
+            tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+            llm = _ChatScheduleLLM(chat_text="好，我记着。", schedule_text=(
+                '{"schedule": true, "items": ['
+                '{"date": "%s", "time": "23:00", "title": "去拿外卖", "duration_min": 60}]}'
+                % tomorrow))
+            bus = events.RecordingBus()
+            agent = AzureAgent(StubEngine(), llm, bus, joseki_rate=1.0,
+                               joseki_rng=ZeroRng())
+            app = create_app(cfg=cfg, agent=agent, autostart=False, life=store, memory=mem)
+            try:
+                with TestClient(app) as client:
+                    self.assertTrue(client.post("/api/chat", json={
+                        "text": "明天晚上23点外卖送到，提醒我去拿", "mode": "pet"}).json()["ok"])
+                    scheduled = self._wait_items(store)
+                    self.assertEqual(len(scheduled), 1)
+                    sid = int(scheduled[0]["id"])
+                    # 等后台把日程写进长期记忆
+                    end = time.time() + 3.0
+                    while time.time() < end:
+                        hits = mem.store.recall("外卖", k=5)
+                        if hits:
+                            break
+                        time.sleep(0.05)
+                    self.assertTrue(mem.store.recall("外卖", k=5))
+
+                    self.assertTrue(client.post("/api/chat", json={
+                        "text": "我不吃了，已经退掉了", "mode": "pet"}).json()["ok"])
+                    end = time.time() + 3.0
+                    hits = []
+                    while time.time() < end:
+                        removed = sid not in [int(x["id"]) for x in store.list_schedule(50)]
+                        hits = mem.store.recall("外卖", k=10)
+                        active_sched = [h for h in hits if str(h.get("tag", "")) == "schedule"]
+                        cancelled = [h for h in hits if str(h.get("tag", "")) == "schedule:cancelled"]
+                        if removed and not active_sched and cancelled:
+                            break
+                        time.sleep(0.05)
+                    self.assertTrue(hits, "取消后应留下一条可读的“已取消”记忆")
+                    self.assertEqual([h for h in hits if str(h.get("tag", "")) == "schedule"], [],
+                                     "旧日程记忆应全部 superseded")
+                    self.assertTrue(any(str(h.get("tag", "")) == "schedule:cancelled" for h in hits),
+                                    "取消审计条应可召回")
+            finally:
+                mem.close()
                 store.close()
 
     def test_plain_chat_does_not_touch_schedule(self):

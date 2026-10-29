@@ -345,6 +345,25 @@ def long_term_note(text):
         + "只在与眼前盘面不冲突时自然参考，拿不准就按眼前这盘棋来。") % t
 
 
+def recall_note(text, continued=False):
+    """主动回忆链的单条提示（v4.3.0，D）：只是心里浮起的旧事，可以提，也可以不提。
+
+    ``text`` 为空 ⇒ 空串（提示词逐字符不变）。``continued=True`` 是同一段回忆的延续，
+    要求「补一个细节或感受、别复读原句」。措辞刻意不写成硬约束：接不上就不提。
+    """
+    t = str(text or "").strip()
+    if t == "":
+        return ""
+    if continued:
+        how = ("这是刚才那段回忆的延续：可以补一个细节或你当时的感受，别把原句再念一遍；"
+               "说够就自然收住。")
+    else:
+        how = ("如果它和眼前这句话自然接得上，可以轻轻带半句；接不上就什么都别提。")
+    return ("\n\n【此刻想起的旧事 · 可以提，也可以不提】\n%s\n%s"
+            + "不要提「记忆 / 数据库 / 记录」这类词，不要编造上面的内容；"
+            + "玩家没接这个话头就收住，别追着讲。") % (t, how)
+
+
 # ================= 事件区块（v3.8.0，设计 §6.5） =================
 #
 # **组装位置（区块表）**——这张表就是「整条提示词怎么拼」的权威说明，改区块先改这里：
@@ -980,7 +999,8 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
     return _t(block)
 
 
-def life_context_block(chat_history, long_term="", time_facts=None, profile=None, schedule_text=""):
+def life_context_block(chat_history, long_term="", time_facts=None, profile=None, schedule_text="",
+                       recall_text="", recall_continued=False):
     """聊天专用上下文（v4.2.7）：只给对话 / 长期记忆 / 时间 / 画像 / 近期真实日程，不塞棋面与棋评铁律。
 
     桌宠聊天、以及围棋窗口里「与棋无关」的闲聊都走这里——模型看不到当前盘面与 KataGo
@@ -988,16 +1008,18 @@ def life_context_block(chat_history, long_term="", time_facts=None, profile=None
     :func:`context_block`（完整盘面 + 铁律）。这是**按话题分流**，不是靠提示词压制输出。
 
     ``schedule_text``（v4.2.9）是未来 48 小时的真实日程摘要；非空时插在时间/画像块之后，
-    防止「明天不用赶早八」这类与日程冲突的判断。各空段与 ``context_block`` 同口径：
-    没有内容时不留痕；纯函数，不读全局状态。
+    防止「明天不用赶早八」这类与日程冲突的判断。
+    ``recall_text``（v4.3.0）是回忆链挑中的一条旧事：只作可选提示，不强制提；空串不留痕。
+    各空段与 ``context_block`` 同口径：没有内容时不留痕；纯函数，不读全局状态。
     """
     sched = str(schedule_text or "").strip()
     sched_block = ""
     if sched != "":
         sched_block = "\n\n【近期真实日程 · 回答时以此为准，别编造】\n%s" % sched
-    return _t("【最近的对话】\n%s%s%s%s%s" % (
+    return _t("【最近的对话】\n%s%s%s%s%s%s" % (
         chat_brief(chat_history),
         long_term_note(long_term),
+        recall_note(recall_text, recall_continued),
         time_note(time_facts),
         profile_note(profile, 0),
         sched_block,

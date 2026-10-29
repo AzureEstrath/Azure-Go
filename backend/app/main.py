@@ -252,6 +252,15 @@ async def _capture_chat_schedule(app, cfg, agent, text):
                     ok_cancel = False
                 if ok_cancel and sid in by_id:
                     cancelled.append(by_id[sid])
+                    # v4.3.0（F）：取消后让对应的旧日程记忆失效，并留一条「已取消」的审计记忆；
+                    # 召回层只认 active，所以之后不会再拿旧安排当有效事实。
+                    mem = getattr(app.state, "memory", None)
+                    if mem is not None and bool(getattr(mem, "available", False)):
+                        try:
+                            await asyncio.to_thread(mem.supersede_schedule_item, by_id[sid])
+                            await asyncio.to_thread(mem.remember_cancellation, by_id[sid])
+                        except Exception as e:      # noqa: BLE001 —— 记忆失败不影响取消
+                            print("[Schedule] 取消日程记忆更新失败（已忽略）：%s" % e)
             if cancelled:
                 line = schedule_chat.cancellation_confirmation(cancelled)
                 if line:
@@ -294,7 +303,8 @@ async def _capture_chat_schedule(app, cfg, agent, text):
             for it in rows:
                 try:
                     await asyncio.to_thread(mem.remember_fact,
-                                            schedule_mod.memory_text(it), "schedule")
+                                            schedule_mod.memory_text(it), "schedule",
+                                            schedule_mod.memory_meta(it))
                 except Exception:           # noqa: BLE001 —— 记忆失败不影响排程
                     pass
         line = schedule_chat.confirmation(rows)
@@ -1020,7 +1030,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                 for it in saved:
                     try:
                         await asyncio.to_thread(mem.remember_fact,
-                                                schedule_mod.memory_text(it), "schedule")
+                                                schedule_mod.memory_text(it), "schedule",
+                                                schedule_mod.memory_meta(it))
                         mem_written += 1
                     except Exception:       # noqa: BLE001
                         pass
@@ -1083,6 +1094,17 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             return {"ok": False, "error": "生命时间线未装配"}
         changed = await asyncio.to_thread(
             store.set_schedule_status, body.get("id"), str(body.get("status", "done")))
+        # v4.3.0（F）：手动取消也要让旧记忆失效，避免之后聊天仍把这条当成有效安排。
+        if changed and str(body.get("status", "done")) == "cancelled":
+            mem = getattr(app.state, "memory", None)
+            if mem is not None and bool(getattr(mem, "available", False)):
+                try:
+                    item = await asyncio.to_thread(store.get_schedule_item, body.get("id"))
+                    if isinstance(item, dict):
+                        await asyncio.to_thread(mem.supersede_schedule_item, item)
+                        await asyncio.to_thread(mem.remember_cancellation, item)
+                except Exception as e:          # noqa: BLE001
+                    print("[Schedule] 手动取消记忆更新失败（已忽略）：%s" % e)
         return {"ok": bool(changed), "items": _schedule_payload()}
 
     @app.post("/api/schedule/auto_plan")

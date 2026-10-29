@@ -123,6 +123,79 @@ def memory_note(streak=0) -> str:
     return ""
 
 
+# ================= 情绪 → 语言节奏（v4.3.0，C） =================
+#
+# 只把**偏离基线较多**的情绪翻译成「句子长短 / 问句多少 / 语气快慢」，
+# 基线附近一律空串：不改变提示词，也不让每句话都像在演状态。
+# 措辞始终是 Azure 自己的口吻——这是语气指令，不是另一套人格。
+
+def emotion_language_note(mood, life_fields=None) -> str:
+    """当前情绪 → 一句语言节奏提示；没有明显偏离 ⇒ ``""``（提示词逐字符不变）。
+
+    ``mood`` 认 ``v`` / ``c`` / ``a``；``life_fields`` 只用 ``energy``。
+    规则刻意保守：低落 / 明亮、活跃 / 安静、好奇三组各取最多两条，避免语气指令互相打架。
+    """
+    src = mood if isinstance(mood, dict) else {}
+    try:
+        v, c, a = float(src.get("v")), float(src.get("c")), float(src.get("a"))
+    except (TypeError, ValueError):
+        return ""
+    if not all(math.isfinite(x) for x in (v, c, a)):
+        return ""
+    f = life_fields if isinstance(life_fields, dict) else {}
+    energy = f.get("energy")
+    try:
+        energy = float(energy) if energy is not None else None
+    except (TypeError, ValueError):
+        energy = None
+
+    parts = []
+    if v <= 0.38:
+        parts.append("心里有点沉：句子短一点，先接住对方；不必急着逗笑，也别连着追问。")
+    elif v >= 0.70:
+        parts.append("心情亮一些：语气可以轻快半拍，允许一个短感叹或小玩笑，但别连着抛。")
+    if a >= 0.68:
+        parts.append("精神比较活跃：可以多说半句自己的感受，问句最多一个。")
+    elif a <= 0.24:
+        parts.append("整个人偏静：语速和句子都放慢半拍，不用为了热络硬撑。")
+    if c >= 0.68 and v >= 0.55:
+        parts.append("好奇心正盛：可以顺着对方的话追问一句「后来呢」，但只问这一件。")
+    if energy is not None and energy <= 0.28:
+        parts.append("精力不太够：别硬撑长句，说完就安静陪着。")
+    if not parts:
+        return ""
+    return ("【此刻说话的节奏 · 只影响语气与长短，不要逐条念出来】\n"
+            + "\n".join("· " + p for p in parts[:3])
+            + "\n（你仍是平时的 Azure：克制、有分寸，不卖萌也不端着；别把情绪名或数值说出口。）")
+
+
+def chat_budget(mood, life_fields=None) -> int:
+    """聊天输出预算（tokens）：情绪低落 / 没精力时收一点，明亮活跃时给多一点。
+
+    默认仍返回 400（与 v4.2.x 的聊天预算一致）；只在明显偏离时变到 340 / 440 / 460，
+    让语言长度真的跟着情绪走，而不是只写在提示词里。
+    """
+    src = mood if isinstance(mood, dict) else {}
+    try:
+        v, c, a = float(src.get("v")), float(src.get("c")), float(src.get("a"))
+    except (TypeError, ValueError):
+        return 400
+    if not all(math.isfinite(x) for x in (v, c, a)):
+        return 400
+    f = life_fields if isinstance(life_fields, dict) else {}
+    try:
+        energy = float(f.get("energy", 1.0))
+    except (TypeError, ValueError):
+        energy = 1.0
+    if v <= 0.38 or a <= 0.24 or energy <= 0.28:
+        return 340
+    if v >= 0.70 and a >= 0.55:
+        return 460
+    if c >= 0.68:
+        return 440
+    return 400
+
+
 # ================= 小目标 =================
 
 INTENTS = (

@@ -46,6 +46,9 @@
 > `prompts.life_context_block` 的【近期真实日程】段），回答不再与课表冲突；相邻同角色同文本
 > 回复不再重复成两个气泡；桌宠聊天面板新增无 / 低 / 中 / 强四档思考（`pet_chat_think_level`），
 > 按档位决定 `think_mode` / `no_think` 与出话超时。**
+> **v4.3.0：记忆写入二维情绪矩阵（`emo_v` / `emo_a` / `emo_tag`）并按当前情绪偏置召回；
+> 情绪翻译成语言节奏与聊天预算；主动回忆改为有开始 / 延续 / 终止条件的回忆链；
+> 日程事实按时间指代收窄并出话后核对；旧事实用 supersede 失效（取消 / 改时间联动记忆）。**
 > 最后更新：2026-10-29。
 
 ---
@@ -469,7 +472,7 @@ START → prepare → decide ──(需要工具且未超预算)──→ tools 
 | 情绪 | `emotion.py`、`decay.py` | 三维情绪、自然衰减、小概率偏航 |
 | 定式 | `joseki.py`、`joseki_gate.py`、`joseki_progress.py` | 识别、族计数、提示门控、教学卡片 |
 | 复盘 | `full_review.py`、`pv_lines.py`、`estimate.py` | 分段全盘复盘、预测线、点目 |
-| 记忆 | `memory.py`、`memory_service.py` | 长期记忆，可选 embedding，默认关 |
+| 记忆 | `memory.py`、`memory_service.py`、`memory_semantics.py` | 长期记忆，可选 embedding，默认关；二维情绪标签 + supersede |
 | 画像 | `profile.py`、`profile_store.py` | 棋风画像、时间感知，默认关 |
 | 人格化 | `persona.py`、`profile_store.py`（persona 表） | 关系阶段（默认关，可开关并自选称呼名）、情绪余温、今天的小心思、旧局回忆、夜間节奏；`persona_enabled=false` 时零变化 |
 | 自适应 | `adaptive.py` | 1~5 档，局内 ±spread |
@@ -537,7 +540,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 **1085** 个用例，覆盖：
+`backend/tests` 共 **1153** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -640,6 +643,30 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
   `think_level_selected` → `AzureConfig.pet_chat_think_level` 持久化 + `/api/config` 推后端；
   `_chat_think_params()` 映射 (0,no_think) / (0,False) / (1,False) / (2,False)，
   `_chat_timeout_for_level()` 为 15 / 20 / 35 / 50 秒；棋评仍走全局 `llm_think_mode`。
+16. **情绪 × 记忆 × 语言共作（v4.3.0，A/C/D/E/F）**：新增四个纯逻辑模块，存储与副作用
+   留在原处——
+   - `memory_semantics.py`（A/F）：三维 mood → 二维 `(valence, arousal)` 九格标签；
+     召回排序 `语义 × 0.75 + 情绪相似 × 0.25`；`has_change_cue` 与 `day_key` 只做规则，
+     不做 LLM 判断。`memories` 补列 `emo_v / emo_a / emo_tag / status / superseded_by /
+     superseded_ts / superseded_reason`（旧库自动 ALTER）；`recall()` 只取 `status='active'`，
+     `supersede(ids, by_id, reason)` 失效但不删除。
+   - `persona.py`（C）：`emotion_language_note` 只在明显偏离基线时给出句长 / 问句 / 快慢提示，
+     `chat_budget` 返回 340 / 400 / 440 / 460；`AzureAgent.emotion_language_note()` 并进
+     `_extra_note()`，`chat_budget()` 由 `agent_graph._prepare_chat` 写入 `data["chat_budget"]`
+     并供 `_speak_chat` 使用。基线附近两者都为空 / 400，提示词逐字符不变。
+   - `recall_chain.py`（D）：链状态 `{topic, depth, max_depth, start_ts, last_ts, mood, ids}`；
+     `should_start` 区分走神概率门与明确提旧事（短冷却、免概率），`should_continue`
+     同时检查链长、20 分钟窗口、v/a 跳变、换话题与聊天最小间隔（90 秒）；
+     `agent.idle_memory_hint()` 与新增 `agent.chat_recall_hint()` 共用同一份链状态，
+     `prompts.recall_note()` 只把选中的一条旧事作为**可选**提示。
+   - `schedule_facts.py`（E）：`time_ref` 认今天 / 明天 / 后天 / 周X / 下周X / M月D日 /
+     早上 / 中午 / 下午 / 晚上 / 八点（含中文数字）；`select` 按时间窗挑条目，窗口内为空
+     时明确给「没有安排」；`conflict` 只对否定式日程判断触发，`correction_prompt` 给模型事实、
+     `correction_sentence` 给确定性兜底。`agent_graph` 保存 `schedule_rows/ref` 供出话后核对。
+   - `memory_service.MemoryService`（F）：`remember_fact(tag='schedule', meta=...)` 写后调用
+     `supersede_schedule_conflicts`（同一天 + 同标题）；取消日程（聊天语言 / 手动状态接口）
+     调用 `supersede_schedule_item`（按 `meta.schedule_id`，旧库退化为标题 + 时刻文本匹配），
+     并写一条 `tag='schedule:cancelled'` 的审计记忆。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 

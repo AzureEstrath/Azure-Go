@@ -680,7 +680,7 @@ class PetChatTest(unittest.TestCase):
     """v4.2.5：聊天自然接话 + 结构化重答 + 桌宠聊天只发文字（预制音在前端）。"""
 
     def _run(self, llm, text="明天晚上有数据科学课", mode="pet", prebuilt=False,
-             think_level=None, life=None):
+             think_level=None, life=None, mood=None, memory=None):
         async def run():
             agent, _eng, _llm, bus = _mk()
             agent.llm = llm
@@ -691,6 +691,12 @@ class PetChatTest(unittest.TestCase):
                 agent.pet_chat_think_level = think_level
             if life is not None:
                 agent.life = life
+            if memory is not None:
+                agent.memory = memory
+            if isinstance(mood, dict):
+                agent.mood.v = float(mood.get("v", agent.mood.v))
+                agent.mood.c = float(mood.get("c", agent.mood.c))
+                agent.mood.a = float(mood.get("a", agent.mood.a))
             await agent.chat(text, mode)
             return agent, bus, tts
 
@@ -756,6 +762,105 @@ class PetChatTest(unittest.TestCase):
         _agent, bus, tts = self._run(llm, prebuilt=False)
         self.assertTrue(tts.calls, "开关关闭后聊天应恢复整句 TTS")
         self.assertTrue(bus.of_type("speech"))
+
+    def test_chat_budget_and_tone_follow_mood(self):
+        """v4.3.0（C）：低落收窄预算并给柔和语气；明亮放宽，且仍带 Azure 的人设约束。"""
+        low_llm = StubLLM()
+        _agent, _bus, _tts = self._run(
+            low_llm, text="陪我说说话吧", mood={"v": 0.25, "c": 0.35, "a": 0.20})
+        self.assertEqual(low_llm.calls[0][1], 340)
+        sys_text = str(low_llm.calls[0][0][0].get("content", ""))
+        self.assertIn("句子短一点", sys_text)
+        self.assertIn("不卖萌", sys_text)
+
+        bright_llm = StubLLM()
+        self._run(bright_llm, text="今天有什么好事吗", mood={"v": 0.85, "c": 0.70, "a": 0.75})
+        self.assertEqual(bright_llm.calls[0][1], 460)
+        self.assertIn("轻快", str(bright_llm.calls[0][0][0].get("content", "")))
+
+    def test_chat_recall_cue_and_chain_continuation(self):
+        """v4.3.0（D）：明确提旧事才回忆；链未断时可接着补一条，并带“延续”提示。"""
+        memory = _RecallMemory([
+            {"id": 1, "text": "玩家上次说喜欢雨天的棋盘。", "score": 0.9, "emo_tag": "开心"},
+            {"id": 2, "text": "你们还在雨天一起喝过茶。", "score": 0.8, "emo_tag": "惬意"},
+        ])
+        llm = StubLLM()
+        agent, _bus, _tts = self._run(
+            llm, text="你还记得上次说的雨天摆棋吗", memory=memory)
+        ctx = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertIn("此刻想起的旧事", ctx)
+        self.assertIn("喜欢雨天的棋盘", ctx)
+        self.assertEqual(agent._recall_chain.get("depth"), 1)
+
+        agent._recall_chain["last_ts"] -= 100.0        # 模拟隔了一分多钟再说回同一件事
+        llm2 = StubLLM()
+        agent.llm = llm2
+        asyncio.run(agent.chat("雨天那盘棋真的很舒服", "pet"))
+        ctx2 = "\n".join(str(m.get("content", "")) for m in llm2.calls[0][0])
+        self.assertIn("延续", ctx2)
+        self.assertIn("雨天一起喝过茶", ctx2)
+
+    def test_chat_without_memory_cue_does_not_recall(self):
+        memory = _RecallMemory([{"id": 1, "text": "玩家上次说喜欢雨天。", "score": 0.9}])
+        llm = StubLLM()
+        _agent, _bus, _tts = self._run(llm, text="今天晚饭吃什么好", memory=memory)
+        ctx = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertNotIn("此刻想起的旧事", ctx)
+
+    def test_chat_schedule_conflict_is_corrected(self):
+        """v4.3.0（E）：模型说“明天不用赶早八”时，按真实日程重说一次。"""
+        tomorrow = datetime.datetime.combine(
+            datetime.date.today() + datetime.timedelta(days=1), datetime.time(8, 0))
+        life = _ChatLife([{"id": 1, "title": "有机化学", "status": "planned",
+                           "start_ts": tomorrow.timestamp(), "start_time": "08:00"}])
+        llm = _SeqLLM([
+            "明天是周五，不用赶早八，可以慢悠悠地吃早餐~",
+            "啊对，明天八点有有机化学，还是得早起；早餐简单吃点就好。",
+        ])
+        agent, bus, _tts = self._run(llm, text="明天要不要吃早餐呢", life=life)
+        self.assertGreaterEqual(len(llm.calls), 2, "冲突时应再问一次事实")
+        self.assertIn("事实核对", str(llm.calls[1][0][-1].get("content", "")))
+        reply = agent.st.chat_history[-1]["content"]
+        self.assertIn("有机化学", reply)
+        self.assertNotIn("不用赶早八", reply)
+        self.assertTrue(any("有机化学" in str(e.get("text", "")) for e in bus.messages(events.AI)))
+
+    def test_schedule_facts_narrow_to_question_window(self):
+        tomorrow = datetime.datetime.combine(
+            datetime.date.today() + datetime.timedelta(days=1), datetime.time(8, 0))
+        life = _ChatLife([{"id": 1, "title": "有机化学", "status": "planned",
+                           "start_ts": tomorrow.timestamp(), "start_time": "08:00"}])
+        llm = StubLLM()
+        self._run(llm, text="后天要做什么", life=life)
+        ctx = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
+        self.assertIn("后天没有安排", ctx)
+
+    def test_idle_recall_chain_respects_depth_cooldown_and_topic(self):
+        """v4.3.0（D）：低情绪短链一步即收；收束后有冷却；换话题直接断链。"""
+        items = [{"id": 1, "text": "旧事一", "score": 0.9},
+                 {"id": 2, "text": "旧事二", "score": 0.8},
+                 {"id": 3, "text": "旧事三", "score": 0.7}]
+        agent, _eng, _llm, _bus = _mk()
+        agent.memory = _RecallMemory(items)
+        agent.recall_rng = FixedRng(0.0)
+        agent.mood.v = 0.30
+        agent.mood.a = 0.20
+        h1 = agent.idle_memory_hint()
+        self.assertEqual(h1["chain"]["depth"], 1)
+        self.assertEqual(h1["chain"]["max_depth"], 1)
+        h2 = agent.idle_memory_hint()
+        self.assertEqual(h2, {}, "低情绪时链只有一步")
+        h3 = agent.idle_memory_hint()
+        self.assertEqual(h3, {}, "刚收束的 10 分钟内不开新链")
+
+        agent2, _eng2, _llm2, _bus2 = _mk()
+        agent2.memory = _RecallMemory(items)
+        agent2.recall_rng = FixedRng(0.0)
+        a = agent2.idle_memory_hint()
+        self.assertTrue(a)
+        agent2.st.chat_history.append({"role": "user", "content": "我们换个话题，聊聊最近的新番动画吧"})
+        self.assertEqual(agent2.idle_memory_hint(), {}, "换话题应结束链")
+        self.assertEqual(agent2._recall_chain, {})
 
 
 class ReminderTest(unittest.TestCase):

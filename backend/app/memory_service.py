@@ -91,11 +91,12 @@ class MemoryService:
         """功能是否启用（默认关闭时为 ``False``；库本身打不开时 store 内部还会降级）。"""
         return self.store is not None
 
-    def recall_for(self, query: str, k: int | None = None) -> str:
+    def recall_for(self, query: str, k: int | None = None, mood=None) -> str:
         """召回最相关的几条记忆，拼成可注入的文本；关闭 / 无命中 / 任何故障返回 ``""``。
 
         ``k`` 缺省用 ``memory_top_k``（配置只能收紧）；召回在出话路径上，这里再兜一层
-        异常保护——绝不让记忆把这一回合的 ``busy`` 卡住。
+        异常保护——绝不让记忆把这一回合的 ``busy`` 卡住。``mood``（v4.3.0）会转给存储层，
+        让「和此刻心情更接近的旧事」稍微靠前。
         """
         if self.store is None:
             return ""
@@ -103,16 +104,18 @@ class MemoryService:
             kk = self._top_k if k is None else max(0, int(k))
             if kk == 0:
                 return ""
-            return inject_text(self.store.recall(query, kk), self._max_chars)
+            return inject_text(self.store.recall(query, kk, mood=mood), self._max_chars)
         except Exception as e:              # noqa: BLE001
             print("[Memory] 召回失败（已忽略）：%s" % e)
             return ""
 
-    def recall_items_for(self, query: str, k: int | None = None) -> list:
+    def recall_items_for(self, query: str, k: int | None = None, mood=None) -> list:
         """召回原始条目（供主动回忆选具体旧事）；关闭 / 无命中 / 故障返回 ``[]``。
 
         ``k`` 缺省用 ``memory_top_k``；主动回忆需要看到 ``id`` / ``text`` / ``score``，
         不能只拿拼好的注入字符串，否则无法去重与判断“这条是否值得提”。
+        ``mood`` / ``emo_v`` / ``emo_a`` / ``emo_tag``（v4.3.0）会一起返回，
+        让主动回忆能挑「和此刻心情相合」的那一条。
         """
         if self.store is None:
             return []
@@ -120,7 +123,7 @@ class MemoryService:
             kk = self._top_k if k is None else max(0, int(k))
             if kk == 0:
                 return []
-            rows = self.store.recall(str(query or ""), kk)
+            rows = self.store.recall(str(query or ""), kk, mood=mood)
             return list(rows or [])
         except Exception as e:              # noqa: BLE001
             print("[Memory] 主动回忆召回失败（已忽略）：%s" % e)
@@ -140,11 +143,52 @@ class MemoryService:
         if text != "":
             self.store.write(text, kind="game", tag="game")
 
-    def remember_fact(self, text: str, tag: str = "") -> int | None:
-        """写一条显式事实 /玩家偏好，返回记忆 id；关闭或写失败返回 ``None``。"""
+    def remember_fact(self, text: str, tag: str = "", meta: dict | None = None) -> int | None:
+        """写一条显式事实 /玩家偏好，返回记忆 id；关闭或写失败返回 ``None``。
+
+        ``tag='schedule'`` 且 meta 带 ``title`` / ``start_ts`` 时（v4.3.0，F）：
+        同一天、同一标题的旧日程记忆会被自动标为 superseded（改时间 / 重排），
+        新记忆成为唯一有效的那条。不同日期的同名课程不受影响。
+        """
         if self.store is None:
             return None
-        return self.store.write(text, kind="fact", tag=str(tag or ""))
+        m = meta if isinstance(meta, dict) else None
+        mid = self.store.write(text, kind="fact", tag=str(tag or ""), meta=m)
+        if mid is not None and str(tag or "") == "schedule" and m:
+            try:
+                self.store.supersede_schedule_conflicts(m, keep_id=mid)
+            except Exception as e:              # noqa: BLE001
+                print("[Memory] 日程记忆对照失败（已忽略）：%s" % e)
+        return mid
+
+    def supersede_schedule_item(self, item) -> int:
+        """日程被取消时使对应旧记忆失效（v4.3.0，F）；关闭 / 故障返回 0。"""
+        if self.store is None:
+            return 0
+        try:
+            return int(self.store.supersede_schedule_item(item) or 0)
+        except Exception as e:                  # noqa: BLE001
+            print("[Memory] 取消日程记忆失效失败（已忽略）：%s" % e)
+            return 0
+
+    def remember_cancellation(self, item) -> int | None:
+        """把「某条日程已取消」写成一条不可再被当成有效安排的记忆（tag 独立，便于审计）。"""
+        if self.store is None:
+            return None
+        it = item if isinstance(item, dict) else {}
+        title = str(it.get("title", "") or "").strip()
+        if title == "":
+            return None
+        when = str(it.get("when_text", "") or "").strip()
+        text = "日程已取消：%s%s" % (when + " " if when else "", title)
+        try:
+            return self.store.write(
+                text, kind="fact", tag="schedule:cancelled",
+                meta={"schedule_id": int(it.get("id", 0) or 0), "title": title,
+                      "start_ts": float(it.get("start_ts", 0) or 0)})
+        except Exception as e:                  # noqa: BLE001
+            print("[Memory] 取消记忆写入失败（已忽略）：%s" % e)
+            return None
 
     # —— 桌宠 / 围棋共用的事件记忆（MaiBot 式「episode + 可召回摘要」的轻量实现） ——
 

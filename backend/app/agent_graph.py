@@ -49,17 +49,15 @@
 """
 
 import asyncio
-import datetime
 import random
 import sys
-import time
 import uuid
 from typing import TypedDict
 
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from . import actions, coords, decay, estimate, events, persona, prompts, speech_text
+from . import actions, coords, decay, estimate, events, persona, prompts, recall_chain, schedule_facts, speech_text
 from .llm_chain import ThinkStream, content_of, content_text_of
 from .tools import TOOLS
 
@@ -755,54 +753,32 @@ async def _prepare_analyze(agent, data):
     )
 
 
-async def _upcoming_schedule_text(agent, hours=48, limit=8):
-    """把未来 48 小时的真实日程压成几行，给聊天模型做事实依据（v4.2.9）。
+async def _schedule_facts_for(agent, text="", now=None, hours=48, limit=8):
+    """读真实日程并按这句话的时间指代挑条目（v4.3.0，E）。
 
-    聊天里最容易出问题的不是用语，而是「明天不用赶早八」这种**和日程冲突的判断**。
-    这里只读 ``LifeStore.list_schedule``（一次同步查询走 to_thread），失败返回空串，
-    不影响聊天；条目以「今天 / 明天 / 后天 / 周X + 时刻 + 标题」呈现。
+    ``schedule_facts`` 是纯逻辑（时间窗 / 选条目 / 格式化）；这里只负责一次
+    ``life.list_schedule`` 的 to_thread 读取与失败兜底。任何故障返回空结果，
+    聊天照常进行，不因为日程读不出来而卡住。
     """
     life = getattr(agent, "life", None)
     if life is None:
-        return ""
+        return {"rows": [], "ref": None, "text": ""}
     try:
-        rows = list(await asyncio.to_thread(life.list_schedule, 200) or [])
+        rows = list(await asyncio.to_thread(life.list_schedule, 300) or [])
     except Exception as e:                  # noqa: BLE001 —— 日程读取失败绝不打挂聊天
         print("[Chat] 近期日程读取失败（已忽略）：%s" % e)
-        return ""
-    now = time.time()
-    today = datetime.date.today()
-    wd_names = "一二三四五六日"
-    lines = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        if str(r.get("status", "planned")) != "planned":
-            continue
-        try:
-            start = float(r.get("start_ts", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if start <= 0 or start < now - 60.0 or start > now + hours * 3600.0:
-            continue
-        title = str(r.get("title", "") or "").strip()
-        if title == "":
-            continue
-        d = datetime.datetime.fromtimestamp(start)
-        days = (d.date() - today).days
-        if days == 0:
-            day_label = "今天"
-        elif days == 1:
-            day_label = "明天"
-        elif days == 2:
-            day_label = "后天"
-        else:
-            day_label = "周" + wd_names[d.weekday()]
-        clock = str(r.get("start_time", "") or "").strip() or d.strftime("%H:%M")
-        lines.append("- %s（周%s）%s %s" % (day_label, wd_names[d.weekday()], clock, title))
-        if len(lines) >= limit:
-            break
-    return "\n".join(lines)
+        return {"rows": [], "ref": None, "text": ""}
+    return schedule_facts.select(rows, text, now=now, default_hours=hours, limit=limit)
+
+
+async def _upcoming_schedule_text(agent, hours=48, limit=8, text=""):
+    """兼容旧调用：只返回日程事实文本（v4.2.9 的 48 小时窗口）。
+
+    新代码请用 ``_schedule_facts_for``——它还会给出 ``rows`` / ``ref``，供出话后的
+    冲突核对（v4.3.0，E）。``text`` 为空时保持旧行为：未来 ``hours`` 小时全量条目。
+    """
+    got = await _schedule_facts_for(agent, text=text, hours=hours, limit=limit)
+    return str(got.get("text", "") or "")
 
 
 async def _prepare_chat(agent, data):
@@ -822,14 +798,34 @@ async def _prepare_chat(agent, data):
     try:
         lt = await asyncio.to_thread(agent._long_term, text)     # 慢 embedding 不得冻住事件循环
         profile, time_facts = await _ctx_extras(agent, data)
+        try:
+            data["chat_budget"] = int(agent.chat_budget())
+        except Exception:                   # noqa: BLE001 —— 预算算不出来就按旧值
+            data["chat_budget"] = 400
         if mode == "pet" or not _chat_about_go(text):
             # 当前这句会单独作为最后一条 user 消息发送，上下文里不重复它。
             hist_now = list(getattr(agent.st, "chat_history", []) or [])
-            sched_text = await _upcoming_schedule_text(agent)
+            facts = await _schedule_facts_for(agent, text=text)
+            data["schedule_rows"] = list(facts.get("rows") or [])
+            data["schedule_ref"] = facts.get("ref")
+            data["schedule_text"] = str(facts.get("text") or "")
+            hint = {}
+            hint_fn = getattr(agent, "chat_recall_hint", None)
+            if callable(hint_fn):
+                try:
+                    hint = await asyncio.to_thread(hint_fn, text) or {}
+                except Exception as e:      # noqa: BLE001 —— 回忆失败不影响聊天
+                    print("[Chat] 回忆链判断失败（已忽略）：%s" % e)
+                    hint = {}
+            hint = hint if isinstance(hint, dict) else {}
+            chain = hint.get("chain") if isinstance(hint.get("chain"), dict) else {}
             ctx = prompts.life_context_block(
                 hist_now[:-1] if hist_now else hist_now, long_term=lt,
                 time_facts=time_facts, profile=profile,
-                schedule_text=sched_text)
+                schedule_text=str(facts.get("text") or ""),
+                recall_text=str(hint.get("text") or ""),
+                recall_continued=bool(chain.get("continued")))
+            data["recall_hint"] = hint
         else:
             ctx = prompts.context_block(
                 agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True,
@@ -886,9 +882,10 @@ async def _prepare_idle(agent, data):
     hint_fn = getattr(agent, "idle_memory_hint", None)
     recall = await asyncio.to_thread(hint_fn) if callable(hint_fn) else {}
     if isinstance(recall, dict) and str(recall.get("text", "")).strip() != "":
-        prompt += (" 如果此刻自然想得起一件具体的旧事，可以轻轻接一句："
-                   "「%s」（只在真的相关时提；不要逐字复述，不要提“记忆 / 数据库”，不要编造。）"
-                   % str(recall.get("text", "")).strip())
+        chain = recall.get("chain") if isinstance(recall.get("chain"), dict) else {}
+        prompt += (" 如果此刻自然想得起一件具体的旧事，可以轻轻接一句：「%s」。%s"
+                   % (str(recall.get("text", "")).strip(),
+                      recall_chain.prompt_hint(bool(chain.get("continued")))))
     # 人格化「今天的小心思」只在这一格落地（大多数局没有，避免每局都刻意）。
     if bool(getattr(agent, "persona_enabled", False)):
         hint = persona.intent_idle_hint(getattr(agent, "_intent", None))
@@ -1395,8 +1392,12 @@ async def _speak_chat(agent, data, msgs):
     think_mode, no_think = _chat_think_params(level)
     chat_timeout = _chat_timeout_for_level(level)
     try:
+        budget = int(data.get("chat_budget") or 400)
+    except (TypeError, ValueError):
+        budget = 400
+    try:
         raw = await asyncio.wait_for(
-            _say(agent, msgs, 400, think_mode=think_mode, no_think=no_think,
+            _say(agent, msgs, budget, think_mode=think_mode, no_think=no_think,
                  naturalize=False, stream_with_think=True),
             timeout=chat_timeout)
     except asyncio.TimeoutError:
@@ -1414,6 +1415,29 @@ async def _speak_chat(agent, data, msgs):
         except asyncio.TimeoutError:
             print("[Chat] 聊天重答超时（走兜底）")
             raw = ""
+    # v4.3.0（E）：出话后核对真实日程。只在「否定式日程判断」与真实条目冲突时触发，
+    # 给模型一次按事实重说的机会；仍冲突 / 超时就用确定性事实句收口，绝不把错的判断发出去。
+    rows = list(data.get("schedule_rows") or [])
+    if raw and rows:
+        hit = schedule_facts.conflict(raw, rows, data.get("schedule_ref"))
+        if hit:
+            fix_msgs = list(msgs) + [{"role": "user", "content":
+                                      schedule_facts.correction_prompt(hit, data.get("schedule_ref"))}]
+            raw2 = ""
+            try:
+                raw2 = await asyncio.wait_for(
+                    _say(agent, fix_msgs, 240, think_mode=0, no_think=True, naturalize=False),
+                    timeout=CHAT_RETRY_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                print("[Chat] 日程核对重答超时，改用事实兜底")
+            if (raw2 and not actions.looks_structured(raw2)
+                    and schedule_facts.conflict(raw2, rows, data.get("schedule_ref")) is None):
+                raw = raw2
+            else:
+                fallback = schedule_facts.correction_sentence(hit, data.get("schedule_ref"))
+                if fallback:
+                    raw = fallback
+                print("[Chat] 聊天与真实日程冲突，已按事实纠正")
     data["reply"] = actions.naturalize(str(raw or ""))
 
 

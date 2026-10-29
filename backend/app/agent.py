@@ -16,7 +16,7 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import actions, adaptive, coords, events, joseki_gate, persona, profile, prompt_chains, prompts, pv_lines, speech_text, time_ctx
+from . import actions, adaptive, coords, events, joseki_gate, persona, profile, prompt_chains, prompts, pv_lines, recall_chain, speech_text, time_ctx
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, PHASE_PEER, build_graph, is_joseki_mistake, _emit_line,
@@ -454,6 +454,10 @@ class AzureAgent:
         self.recall_rng = recall_rng if recall_rng is not None else random.Random()
         self._recall_recent: list = []
         self._recall_lock = threading.Lock()
+        # 回忆链（v4.3.0，D）：同一条联想可延续 1~3 步；链之间与步之间都有冷却，
+        # 避免每句都“我突然想起”。
+        self._recall_chain: dict = {}
+        self._recall_chain_end_ts: float = 0.0
 
         # —— 跨局的定式族计数（T5）：默认不接线（None）⇒ 一律当作「第 1 次」、每次都上卡片；
         #    由 main.py 的 lifespan 无条件注入 JosekiProgress（没有开关，设计 §8.4）——
@@ -1196,12 +1200,19 @@ class AzureAgent:
 
     # ================= 长期记忆（跨局） =================
 
+    def _mood_axis(self) -> dict:
+        """当前三维情绪（给记忆召回 / 语言节奏用）；不触发衰减结算以外的副作用。"""
+        return {"v": float(self.mood.v), "c": float(self.mood.c), "a": float(self.mood.a)}
+
     def _long_term(self, query) -> str:
         """召回跨局长期记忆的注入文本；未接线 / 未启用 / 任何故障一律返回空串。
 
         默认不接线（``memory is None``）或 ``available == False`` 时不注入——
         关闭长期记忆时的提示词与没有这个功能时逐字符一致。召回在出话路径上，
         这里再兜一层异常保护，绝不让记忆把这一回合的 ``busy`` 卡住。
+
+        v4.3.0：把**当前三维情绪**交给召回层，让「和此刻心情相近的旧事」稍微靠前
+        （二维情绪矩阵在存储层；没有情绪标签的旧记忆按语义分排，不受影响）。
 
         本方法是**同步**的：调用点必须 ``await asyncio.to_thread(self._long_term, …)``——
         慢 embedding（最长 ``embed_timeout`` 秒）绝不能冻住事件循环（心跳与落子宣告都在这条循环上）。
@@ -1210,7 +1221,10 @@ class AzureAgent:
         if mem is None or not bool(getattr(mem, "available", False)):
             return ""
         try:
-            return str(mem.recall_for(str(query or "")) or "")
+            try:
+                return str(mem.recall_for(str(query or ""), mood=self._mood_axis()) or "")
+            except TypeError:               # 旧替身 / 旧实现只收 query
+                return str(mem.recall_for(str(query or "")) or "")
         except Exception as e:                  # noqa: BLE001
             print("[Agent] 长期记忆召回异常（已忽略）：%s" % e)
             return ""
@@ -1256,10 +1270,27 @@ class AzureAgent:
             return "上次聊到 有趣 期待 一起做的事"
         return "玩家最近聊过 喜欢 习惯 事情"
 
+    def _last_user_chat(self) -> str:
+        """最近一条玩家发言（回忆链判断「话题有没有换」用）；没有返回空串。"""
+        for h in reversed(list(getattr(self.st, "chat_history", []) or [])):
+            if isinstance(h, dict) and str(h.get("role", "")) == "user":
+                return str(h.get("content", "") or "")
+        return ""
+
+    def _end_recall_chain(self, now=None) -> None:
+        """结束回忆链并记下冷却起点（v4.3.0，D）；线程安全，重复调用无副作用。"""
+        ts = time.time() if now is None else float(now)
+        with self._recall_lock:
+            self._recall_chain = {}
+            self._recall_chain_end_ts = ts
+
     def idle_memory_hint(self) -> dict:
-        """走神时偶尔挑一条旧事（向量/关键词召回），返回 ``{id,text,score}`` 或 ``{}``。
+        """走神时偶尔挑一条旧事（向量/关键词召回），返回 ``{id,text,score,chain}`` 或 ``{}``。
 
         - 概率由 ``idle_recall_chance`` 决定；同一条 30 分钟内不重复；
+        - v4.3.0 **回忆链**：上一次提起的旧事可以在 1~3 步内接着往下说，但只要出现
+          「换话题 / 情绪大幅跳变 / 超过时间窗 / 链长到上限」就收束；链与链之间还有冷却，
+          不会每次走神都翻旧账；
         - **只返回一句短文本**，旧事原文由 ``agent_graph`` 放进提示词；
         - 记忆关闭 / 召回为空 / 任何故障 ⇒ ``{}``（提示词逐字符不变）。
         同步实现（召回可能含 embedding），调用点走 ``asyncio.to_thread``。
@@ -1267,18 +1298,36 @@ class AzureAgent:
         mem = self.memory
         if mem is None or not bool(getattr(mem, "available", False)):
             return {}
-        chance = self.idle_recall_chance()
-        if chance <= 0.0:
-            return {}
-        try:
-            with self._recall_lock:
+        now = time.time()
+        mood = self._mood_axis()
+        with self._recall_lock:
+            chain = dict(self._recall_chain) if isinstance(self._recall_chain, dict) else {}
+            chain = chain if chain else {}
+            last_end = float(self._recall_chain_end_ts or 0.0)
+            try:
                 roll = float(self.recall_rng.random())
-            if roll >= chance:
+            except Exception:                    # noqa: BLE001 —— 随机源坏了就不提
+                return {}
+        if chain:
+            if not recall_chain.should_continue(now, chain, mood, self._last_user_chat()):
+                self._end_recall_chain(now)
+                return {}
+            query = recall_chain.chain_query(chain, self.idle_memory_query())
+            continued = True
+        else:
+            chance = self.idle_recall_chance()
+            if chance <= 0.0 or not recall_chain.should_start(
+                    now, chain, last_end, mood, roll, chance):
                 return {}
             query = self.idle_memory_query()
+            continued = False
+        try:
             fn = getattr(mem, "recall_items_for", None)
             if callable(fn):
-                items = fn(query, k=5)
+                try:
+                    items = fn(query, k=5, mood=mood)
+                except TypeError:             # 旧替身只收 query / k
+                    items = fn(query, k=5)
             else:
                 text = str(mem.recall_for(query) or "").strip()
                 items = [{"id": None, "text": text, "score": 0.0}] if text else []
@@ -1287,7 +1336,6 @@ class AzureAgent:
             return {}
         if not isinstance(items, list):
             return {}
-        now = time.time()
         with self._recall_lock:
             self._recall_recent = [
                 (key, ts) for key, ts in self._recall_recent
@@ -1306,7 +1354,102 @@ class AzureAgent:
                 if len(text) > IDLE_RECALL_MAX_CHARS:
                     text = text[:IDLE_RECALL_MAX_CHARS - 1] + "…"
                 self._recall_recent.append((key, now))
-                return {"id": item.get("id"), "text": text, "score": item.get("score", 0.0)}
+                if continued:
+                    chain = recall_chain.advance(chain, now, item_id=item.get("id"))
+                else:
+                    fields = self._life_fields() or {}
+                    depth_max = recall_chain.max_depth(
+                        mood, float(fields.get("affinity", 0.35)))
+                    chain = recall_chain.start(text, now, mood,
+                                               depth_max=depth_max, source="idle")
+                    chain = recall_chain.advance(chain, now, item_id=item.get("id"))
+                self._recall_chain = chain
+                return {"id": item.get("id"), "text": text,
+                        "score": item.get("score", 0.0),
+                        "emotion": str(item.get("emo_tag", "") or ""),
+                        "chain": {"continued": continued,
+                                  "depth": int(chain.get("depth", 0)),
+                                  "max_depth": int(chain.get("max_depth", 2))}}
+        if continued:
+            self._end_recall_chain(now)        # 链还在，但已经没有可提的下一条 ⇒ 收束
+        return {}
+
+    def chat_recall_hint(self, text) -> dict:
+        """聊天里的**受控**回忆（v4.3.0，D）：只在明确提旧事、或已有链且话题未变时触发。
+
+        与走神共用一个链状态：玩家说「上次说的那盘棋」可以开链；链没断时下一句可以
+        接着补一个细节。已经在聊别的事 / 情绪跳变 / 两步之间太密 ⇒ 返回 ``{}`` 并结束链。
+        同步实现（可能含 embedding），调用点走 ``asyncio.to_thread``。
+        """
+        mem = self.memory
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return {}
+        s = " ".join(str(text or "").split())
+        if s == "":
+            return {}
+        now = time.time()
+        mood = self._mood_axis()
+        with self._recall_lock:
+            chain = dict(self._recall_chain) if isinstance(self._recall_chain, dict) else {}
+            chain = chain if chain else {}
+            last_end = float(self._recall_chain_end_ts or 0.0)
+        cue = recall_chain.memory_cue(s)
+        if chain and recall_chain.should_continue(now, chain, mood, s, min_gap=90.0):
+            query = recall_chain.chain_query(chain, s)
+            continued = True
+        elif cue and recall_chain.should_start(
+                now, chain, last_end, mood, 0.0, 0.0, cue=True):
+            query = s
+            continued = False
+        else:
+            if chain:
+                self._end_recall_chain(now)
+            return {}
+        try:
+            fn = getattr(mem, "recall_items_for", None)
+            if not callable(fn):
+                return {}
+            try:
+                items = fn(query, k=4, mood=mood)
+            except TypeError:
+                items = fn(query, k=4)
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 聊天回忆失败（已忽略）：%s" % e)
+            return {}
+        with self._recall_lock:
+            self._recall_recent = [
+                (key, ts) for key, ts in self._recall_recent
+                if now - float(ts) <= IDLE_RECALL_AVOID_SEC
+            ]
+            used = {str(i) for i in list(chain.get("ids") or [])}
+            used.update(key for key, _ts in self._recall_recent)
+            for item in list(items or []):
+                if not isinstance(item, dict):
+                    continue
+                body = " ".join(str(item.get("text", "") or "").split())
+                if body == "":
+                    continue
+                key = str(item.get("id")) if item.get("id") is not None else body
+                if key in used:
+                    continue
+                self._recall_recent.append((key, now))
+                if continued:
+                    chain = recall_chain.advance(chain, now, item_id=item.get("id"))
+                else:
+                    fields = self._life_fields() or {}
+                    depth_max = recall_chain.max_depth(
+                        mood, float(fields.get("affinity", 0.35)))
+                    chain = recall_chain.start(body, now, mood,
+                                               depth_max=depth_max, source="chat")
+                    chain = recall_chain.advance(chain, now, item_id=item.get("id"))
+                self._recall_chain = chain
+                return {"id": item.get("id"), "text": body,
+                        "emotion": str(item.get("emo_tag", "") or ""),
+                        "chain": {"continued": continued,
+                                  "depth": int(chain.get("depth", 0)),
+                                  "max_depth": int(chain.get("max_depth", 2))}}
+        if continued:
+            self._end_recall_chain(now)
         return {}
 
     def _remember_chat_turn(self, user_text, reply_text, mode=""):
@@ -2086,9 +2229,28 @@ class AzureAgent:
             self._lingering_mood = restored
 
     def _extra_note(self) -> str:
-        """系统提示词附加段：人格化 + 生命状态；两者都空 ⇒ 空串（提示词逐字符不变）。"""
-        parts = [self.persona_note(), self.life_note()]
+        """系统提示词附加段：人格化 + 生命状态 + 情绪语言节奏；都空 ⇒ 空串（提示词逐字符不变）。"""
+        parts = [self.persona_note(), self.life_note(), self.emotion_language_note()]
         return "\n\n".join(p for p in parts if p)
+
+    def emotion_language_note(self) -> str:
+        """情绪 → 语言节奏（v4.3.0，C）：只把明显偏离基线的情绪翻译成句长 / 问句 / 快慢。
+
+        基线附近返回空串（不改变系统提示词 / golden），也不会盖过人设；所有措辞都是
+        Azure 自己的语气指令，不引入第二套人格。
+        """
+        try:
+            return persona.emotion_language_note(self._mood_axis(), self._life_fields() or {})
+        except Exception as e:                  # noqa: BLE001 —— 语言节奏坏了不该影响出话
+            print("[Agent] 情绪语言节奏生成失败（已忽略）：%s" % e)
+            return ""
+
+    def chat_budget(self) -> int:
+        """聊天输出预算（v4.3.0，C）：默认 400；情绪低落 / 没精力收窄，明亮活跃放宽。"""
+        try:
+            return int(persona.chat_budget(self._mood_axis(), self._life_fields() or {}))
+        except Exception:                       # noqa: BLE001
+            return 400
 
     def persona_note(self) -> str:
         """人格化提示词附加段（关系 / 最近胜负 / 夜間语气 / 小目标 / 难度半句）。

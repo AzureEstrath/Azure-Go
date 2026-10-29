@@ -699,3 +699,24 @@ def memory_text(item):
     if notes:
         text += "（%s）" % notes
     return text.strip()
+
+
+def memory_meta(item):
+    """日程记忆的结构化 meta（v4.3.0，F）：给 supersede 判定「同一天同标题」用。
+
+    只取稳定字段；脏值按 0 / 空串，绝不因为一条日程的字段坏了而让记忆写入抛异常。
+    """
+    it = item if isinstance(item, dict) else {}
+    try:
+        sid = int(it.get("id", 0) or 0)
+    except (TypeError, ValueError):
+        sid = 0
+    try:
+        start = float(it.get("start_ts", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        start = 0.0
+    return {"schedule_id": sid,
+            "title": str(it.get("title", "") or "").strip(),
+            "start_ts": start,
+            "when_text": str(it.get("when_text", "") or "").strip(),
+            "status": str(it.get("status", "planned") or "planned")}

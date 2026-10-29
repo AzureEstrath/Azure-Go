@@ -185,6 +185,115 @@ class StoreTest(unittest.TestCase):
             store.close()
 
 
+class EmotionTagTest(unittest.TestCase):
+    """v4.3.0（A）：记忆带二维情绪矩阵 + 情绪标签，召回按当前情绪轻微偏置。"""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = MemoryStore(os.path.join(self.dir.name, "emo.db"), embed_fn=None)
+
+    def tearDown(self):
+        self.store.close()
+        self.dir.cleanup()
+
+    def test_write_stores_two_dim_matrix_and_label(self):
+        mid = self.store.write("玩家喜欢雨天摆棋", tag="t", mood={"v": 0.82, "c": 0.6, "a": 0.78})
+        hits = self.store.recall("雨天", k=1, mood={"v": 0.82, "a": 0.78})
+        self.assertEqual(hits[0]["id"], mid)
+        self.assertEqual(hits[0]["emo_tag"], "兴奋")
+        self.assertAlmostEqual(hits[0]["emo_v"], 0.82)
+        self.assertAlmostEqual(hits[0]["emo_a"], 0.78)
+        self.assertAlmostEqual(hits[0]["emo_affinity"], 1.0)
+
+    def test_unknown_mood_is_not_faked(self):
+        self.store.write("没有情绪的一条", tag="t")
+        hit = self.store.recall("情绪", k=1)[0]
+        self.assertEqual(hit["emo_tag"], "")
+        self.assertEqual(hit["emo_v"], -1.0)
+
+    def test_recall_prefers_mood_matching_memory_on_keyword_ties(self):
+        self.store.write("一起喝茶的那个下午", tag="t", mood={"v": 0.80, "a": 0.75})
+        self.store.write("一起散步的雨夜", tag="t2", mood={"v": 0.25, "a": 0.30})
+        bright = self.store.recall("一起", k=2, mood={"v": 0.85, "a": 0.80})
+        self.assertIn("喝茶", bright[0]["text"])
+        sad = self.store.recall("一起", k=2, mood={"v": 0.20, "a": 0.25})
+        self.assertIn("散步", sad[0]["text"])
+
+    def test_meta_mood_is_used_too(self):
+        self.store.write("聊天里很开心", tag="t", meta={"mood": {"v": 0.85, "c": 0.5, "a": 0.6}})
+        hit = self.store.recall("开心", k=1)[0]
+        self.assertEqual(hit["emo_tag"], "开心")
+
+
+class SupersedeTest(unittest.TestCase):
+    """v4.3.0（F）：旧事实失效但不删除；召回只认 active。"""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = MemoryStore(os.path.join(self.dir.name, "sup.db"), embed_fn=None)
+
+    def tearDown(self):
+        self.store.close()
+        self.dir.cleanup()
+
+    def test_superseded_rows_are_not_recalled(self):
+        old = self.store.write("明天下午三点开会", tag="t")
+        new = self.store.write("明天下午四点开会", tag="t2")
+        self.assertEqual(self.store.supersede([old], by_id=new, reason="updated"), 1)
+        hits = self.store.recall("开会", k=5)
+        self.assertEqual([h["id"] for h in hits], [new])
+        self.assertEqual(self.store.stats()["rows"], 2, "失效不删除，保留审计")
+
+    def test_supersede_is_idempotent(self):
+        mid = self.store.write("旧安排", tag="t")
+        self.assertEqual(self.store.supersede([mid]), 1)
+        self.assertEqual(self.store.supersede([mid]), 0)
+
+    def test_rewriting_same_fact_reactivates_it(self):
+        """同一条事实重新写回（取消后重新安排）应重新生效，而不是永远停在 superseded。"""
+        mid = self.store.write("周五 08:00 有机化学", tag="t")
+        self.assertEqual(self.store.supersede([mid]), 1)
+        again = self.store.write("周五 08:00 有机化学", tag="t")
+        self.assertEqual(again, mid)
+        self.assertEqual([h["id"] for h in self.store.recall("有机化学", k=5)], [mid])
+
+    def test_schedule_update_supersedes_same_day_same_title(self):
+        import datetime
+        day = datetime.datetime(2026, 10, 30, 8, 0).timestamp()
+        m1 = {"schedule_id": 1, "title": "有机化学", "start_ts": day}
+        i1 = self.store.write("日程：周五 08:00 有机化学", tag="schedule", meta=m1)
+        m2 = {"schedule_id": 2, "title": "有机化学", "start_ts": day + 2 * 3600}
+        i2 = self.store.write("日程：周五 10:00 有机化学", tag="schedule", meta=m2)
+        got = self.store.supersede_schedule_conflicts(m2, keep_id=i2)
+        self.assertEqual(got, 1)
+        hits = self.store.recall("有机化学", k=5)
+        self.assertEqual([h["id"] for h in hits if h["id"] == i2], [i2])
+        self.assertNotIn(i1, [h["id"] for h in hits])
+
+    def test_schedule_different_day_is_not_superseded(self):
+        import datetime
+        d1 = datetime.datetime(2026, 10, 30, 8, 0).timestamp()
+        d2 = datetime.datetime(2026, 11, 6, 8, 0).timestamp()
+        self.store.write("日程：周五 08:00 有机化学", tag="schedule",
+                         meta={"schedule_id": 1, "title": "有机化学", "start_ts": d1})
+        i2 = self.store.write("日程：下周五 08:00 有机化学", tag="schedule",
+                              meta={"schedule_id": 2, "title": "有机化学", "start_ts": d2})
+        self.assertEqual(self.store.supersede_schedule_conflicts(
+            {"title": "有机化学", "start_ts": d2}, keep_id=i2), 0)
+
+    def test_schedule_cancel_supersedes_by_id_and_falls_back_to_text(self):
+        import datetime
+        day = datetime.datetime(2026, 10, 30, 12, 0).timestamp()
+        i1 = self.store.write("日程：周五 12:00 外卖", tag="schedule",
+                              meta={"schedule_id": 7, "title": "外卖", "start_ts": day})
+        legacy = self.store.write("日程：周五 12:00 外卖（旧记录）", tag="schedule")
+        got = self.store.supersede_schedule_item({"id": 7, "title": "外卖", "start_time": "12:00"})
+        self.assertGreaterEqual(got, 1)
+        hits = self.store.recall("外卖", k=5)
+        self.assertNotIn(i1, [h["id"] for h in hits])
+        self.assertNotIn(legacy, [h["id"] for h in hits], "旧库无 meta 时按标题+时刻兜底")
+
+
 class MathTest(unittest.TestCase):
     def test_cosine_identity_and_orthogonal(self):
         self.assertAlmostEqual(cosine([1.0, 0.0], [1.0, 0.0]), 1.0, places=6)

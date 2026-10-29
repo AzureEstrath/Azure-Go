@@ -26,6 +26,8 @@ import sqlite3
 import threading
 import time
 
+from . import memory_semantics as emo_sem
+
 MEMORY_MAX_ROWS = 2000          # 库内记忆行数上限（超出按时间淘汰最旧）
 CHAT_MAX_ROWS = 1000            # 聊天原文流水上限（超出按时间淘汰最旧；与 memories 解耦）
 EPISODE_GAP_SEC = 900           # 一段 episode 的空档上限：超过 15 分钟就收束成摘要
@@ -48,7 +50,14 @@ _SCHEMA = (
         kind TEXT NOT NULL DEFAULT 'fact',
         tag TEXT NOT NULL DEFAULT '',
         text TEXT NOT NULL,
-        meta TEXT NOT NULL DEFAULT '{}'
+        meta TEXT NOT NULL DEFAULT '{}',
+        emo_v REAL NOT NULL DEFAULT -1,
+        emo_a REAL NOT NULL DEFAULT -1,
+        emo_tag TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',
+        superseded_by INTEGER NOT NULL DEFAULT 0,
+        superseded_ts REAL NOT NULL DEFAULT 0,
+        superseded_reason TEXT NOT NULL DEFAULT ''
     )""",
     """CREATE TABLE IF NOT EXISTS vectors (
         mem_id INTEGER PRIMARY KEY,
@@ -91,6 +100,14 @@ _COLUMNS = {
         "tag": "TEXT NOT NULL DEFAULT ''",
         "text": "TEXT NOT NULL DEFAULT ''",
         "meta": "TEXT NOT NULL DEFAULT '{}'",
+        # v4.3.0：二维情绪矩阵 + 标签 + supersede 状态（旧库自动补列）
+        "emo_v": "REAL NOT NULL DEFAULT -1",
+        "emo_a": "REAL NOT NULL DEFAULT -1",
+        "emo_tag": "TEXT NOT NULL DEFAULT ''",
+        "status": "TEXT NOT NULL DEFAULT 'active'",
+        "superseded_by": "INTEGER NOT NULL DEFAULT 0",
+        "superseded_ts": "REAL NOT NULL DEFAULT 0",
+        "superseded_reason": "TEXT NOT NULL DEFAULT ''",
     },
     "vectors": {"vec": "TEXT NOT NULL DEFAULT '[]'"},
     "games": {
@@ -137,6 +154,15 @@ def _json(v) -> str:
         return json.dumps(v if isinstance(v, dict) else {}, ensure_ascii=False)
     except Exception:                   # noqa: BLE001 —— 脏 meta 不值得丢一条记忆
         return "{}"
+
+
+def _loads_meta(raw) -> dict:
+    """把库里的 meta 文本解析成字典；脏值 / 非字典一律 ``{}``（不抛异常）。"""
+    try:
+        got = json.loads(str(raw or "{}"))
+    except (TypeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
 
 
 def _keywords(query: str) -> list:
@@ -317,17 +343,27 @@ class MemoryStore:
 
     # —— 对外接口 ——
 
-    def write(self, text: str, *, kind: str = "fact", tag: str = "", meta: dict | None = None) -> int | None:
+    def write(self, text: str, *, kind: str = "fact", tag: str = "", meta: dict | None = None,
+              mood=None) -> int | None:
         """写一条长期记忆，返回 id；失败返回 ``None``。
 
         规则：单条截到 ``MAX_TEXT_LEN``；同 tag + 同 text 视为重复（返回既有 id，
         不重复入库）；写入后超过 ``_max_rows`` 就淘汰最旧的。
+
+        ``mood``（或 ``meta["mood"]``）里的三维情绪会转成**二维情绪矩阵**
+        （``emo_v`` / ``emo_a`` + 九格标签）一起落库（v4.3.0）。情绪缺失时两列写 -1、
+        标签空串——「不知道当时心情」不伪造成 0。
         """
         t = _clip(str(text or "").strip(), MAX_TEXT_LEN)
         if t == "":
             return None
         tag = str(tag or "")
         kind = str(kind or "fact")
+        m = dict(meta) if isinstance(meta, dict) else {}
+        emo = emo_sem.emotion_of_mood(mood if mood is not None else m.get("mood"))
+        emo_v = float(emo["v"]) if emo else -1.0
+        emo_a = float(emo["a"]) if emo else -1.0
+        emo_tag = str(emo["tag"]) if emo else ""
         if self._conn is None:
             return None
         vec = self._embed(t)                # 网络调用放锁外，别卡住并发请求
@@ -336,13 +372,30 @@ class MemoryStore:
                 return None
             try:
                 row = self._conn.execute(
-                    "SELECT id FROM memories WHERE tag = ? AND text = ? ORDER BY id ASC LIMIT 1",
-                    (tag, t)).fetchone()
+                    "SELECT id, emo_v, status FROM memories WHERE tag = ? AND text = ? "
+                    "ORDER BY id ASC LIMIT 1", (tag, t)).fetchone()
                 if row is not None:
+                    # 旧行没有情绪、这次有：顺手补上，不另起一行（也不覆盖已有标签）。
+                    reactivated = str(row[2] or "active") != "active"
+                    if reactivated:
+                        # 同一条事实被重新写回（例如取消后又重新安排）：旧行重新生效，
+                        # 否则会一直以「已失效」的身份存在，召回永远看不到。
+                        self._conn.execute(
+                            "UPDATE memories SET status = 'active', superseded_by = 0, "
+                            "superseded_ts = 0, superseded_reason = '', meta = ?, ts = ? WHERE id = ?",
+                            (_json(m), self._now(), int(row[0])))
+                    if emo is not None and float(row[1] if row[1] is not None else -1.0) < 0.0:
+                        self._conn.execute(
+                            "UPDATE memories SET emo_v = ?, emo_a = ?, emo_tag = ? WHERE id = ?",
+                            (emo_v, emo_a, emo_tag, int(row[0])))
+                    if reactivated or (emo is not None
+                                       and float(row[1] if row[1] is not None else -1.0) < 0.0):
+                        self._conn.commit()
                     return int(row[0])
                 cur = self._conn.execute(
-                    "INSERT INTO memories(ts, kind, tag, text, meta) VALUES(?,?,?,?,?)",
-                    (self._now(), kind, tag, t, _json(meta)))
+                    "INSERT INTO memories(ts, kind, tag, text, meta, emo_v, emo_a, emo_tag) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (self._now(), kind, tag, t, _json(m), emo_v, emo_a, emo_tag))
                 mem_id = int(cur.lastrowid)
                 if vec:
                     self._conn.execute("INSERT OR REPLACE INTO vectors(mem_id, vec) VALUES(?,?)",
@@ -368,13 +421,17 @@ class MemoryStore:
                     pass
                 return None
 
-    def recall(self, query: str, k: int = 3) -> list:
+    def recall(self, query: str, k: int = 3, mood=None) -> list:
         """召回最相关的 ``k`` 条记忆，按 score 降序；任何故障返回 ``[]``。
 
-        返回 ``[{"id","ts","kind","tag","text","score"}]``：有向量时 score 是余弦相似度，
-        关键词命中固定 0.0。两级检索：向量先按余弦排序；**不足 ``k`` 条时**再用关键词从
-        尚未命中的行里补齐——混合库里没向量的行（写入时 embedding 失败 / 旧库遗留）
+        返回 ``[{"id","ts","kind","tag","text","score","emo_v","emo_a","emo_tag","emo_affinity"}]``：
+        有向量时 score 是余弦相似度，关键词命中固定 0.0。两级检索：向量先按余弦排序；**不足 ``k`` 条时**再
+        用关键词从尚未命中的行里补齐——混合库里没向量的行（写入时 embedding 失败 / 旧库遗留）
         不会被有向量的行压掉。
+
+        ``mood``（v4.3.0）：给出当前情绪时，排序分 = 语义分 × 0.75 + **二维情绪相似度** × 0.25。
+        语义仍是主项，情绪只让「和此刻心情相近的旧事」稍微靠前；不给 mood 时排序与旧版逐字一致。
+        被 supersede 的行（``status != 'active'``）不参与召回。
         """
         q = str(query or "").strip()
         k = max(0, int(k or 0))
@@ -385,13 +442,18 @@ class MemoryStore:
                 return []
             try:
                 rows = [dict(r) for r in self._conn.execute(
-                    "SELECT id, ts, kind, tag, text FROM memories ORDER BY ts DESC, id DESC")]
+                    "SELECT id, ts, kind, tag, text, emo_v, emo_a, emo_tag FROM memories "
+                    "WHERE status = 'active' ORDER BY ts DESC, id DESC")]
                 vecs = {int(r[0]): r[1] for r in self._conn.execute("SELECT mem_id, vec FROM vectors")}
             except Exception as e:          # noqa: BLE001
                 print("[Memory] 读取失败（已忽略）：%s" % e)
                 return []
         hits = []
         qv = self._embed(q)                 # 网络调用放锁外
+
+        def rank_of(row, base):
+            return emo_sem.blended_rank(base, mood, row.get("emo_v"), row.get("emo_a"))
+
         if qv:
             try:
                 scored = []
@@ -399,23 +461,137 @@ class MemoryStore:
                     raw = vecs.get(int(row["id"]))
                     if not raw:
                         continue
-                    scored.append((cosine(qv, json.loads(raw)), row))
+                    base = cosine(qv, json.loads(raw))
+                    rank, aff = rank_of(row, base)
+                    scored.append((rank, row, base, aff))
                 scored.sort(key=lambda x: (-x[0], -x[1]["id"]))
-                hits = [dict(row, score=float(s)) for s, row in scored[:k]]
+                hits = [dict(row, score=float(base), emo_affinity=aff)
+                        for _rank, row, base, aff in scored[:k]]
             except Exception as e:          # noqa: BLE001 —— 检索绝不把异常抛回编排层
                 print("[Memory] 向量检索失败（已忽略）：%s" % e)
                 hits = []
         if len(hits) < k:                   # 没向量 / 命中不够 k 条：余量退关键词补齐
             seen = {int(h["id"]) for h in hits}
             terms = _keywords(q)
+            extra = []
             for row in rows:                # rows 已按时间倒序：关键词命中给最新的
                 if int(row["id"]) in seen:  # 向量已命中的不重复计入
                     continue
                 if any(t in str(row["text"]).lower() for t in terms):
-                    hits.append(dict(row, score=0.0))
-                    if len(hits) >= k:
-                        break
-        return hits
+                    rank, aff = rank_of(row, 0.0)
+                    extra.append((rank, dict(row, score=0.0, emo_affinity=aff)))
+            if extra:
+                if mood is not None:        # 有当前情绪：情绪相近的关键词命中先上
+                    extra.sort(key=lambda x: (-x[0], -x[1]["id"]))
+                hits.extend(row for _rank, row in extra)
+        if mood is not None and len(hits) > 1:
+            # 向量命中与关键词补齐放在一起重排（只在给了 mood 时；旧路径逐字不变）
+            def _rank(h):
+                r, _a = rank_of(h, h.get("score", 0.0))
+                return (-r, -int(h.get("id", 0)))
+            hits.sort(key=_rank)
+        return hits[:k]
+
+    # —— supersede（v4.3.0）：旧事实失效，但不删除（保留审计与“当时知道什么”） ——
+
+    def supersede(self, ids, by_id=0, reason="") -> int:
+        """把指定记忆标记为失效；返回实际改动条数。已失效的行不会重复计数。"""
+        sel = [int(i) for i in (ids or [])]
+        if not sel:
+            return 0
+        with self._lock:
+            if self._conn is None:
+                return 0
+            try:
+                q = ",".join("?" * len(sel))
+                cur = self._conn.execute(
+                    "UPDATE memories SET status = 'superseded', superseded_by = ?, "
+                    "superseded_ts = ?, superseded_reason = ? "
+                    "WHERE id IN (%s) AND status = 'active'" % q,
+                    [int(by_id or 0), self._now(), str(reason or "")[:80]] + sel)
+                self._conn.commit()
+                return int(cur.rowcount or 0)
+            except Exception as e:          # noqa: BLE001
+                print("[Memory] supersede 失败（已忽略）：%s" % e)
+                try:
+                    self._conn.rollback()
+                except Exception:           # noqa: BLE001
+                    pass
+                return 0
+
+    def _active_schedule_rows(self):
+        """当前有效的 ``tag='schedule'`` 行（含解析后的 meta）；不可用时返回 ``[]``。"""
+        rows = []
+        try:
+            for r in self._conn.execute(
+                    "SELECT id, ts, text, meta FROM memories "
+                    "WHERE tag = 'schedule' AND status = 'active' ORDER BY id ASC"):
+                item = dict(r)
+                item["meta"] = _loads_meta(item.get("meta"))
+                rows.append(item)
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 日程记忆读取失败（已忽略）：%s" % e)
+        return rows
+
+    def supersede_schedule_item(self, item) -> int:
+        """日程被取消时，把对应的旧记忆标记失效（v4.3.0，F）。
+
+        两条判据，按可靠度从高到低：
+        1. ``meta.schedule_id`` 相同（新写入的日程记忆）；
+        2. 旧记忆没有 meta 时，退化为「标题 + 开始时刻」都出现在原文里（旧库兼容）。
+        只动 ``tag='schedule'`` 且仍 active 的行；课程取消不走这条（上层已挡）。
+        """
+        it = item if isinstance(item, dict) else {}
+        try:
+            sid = int(it.get("id", 0) or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        title = str(it.get("title", "") or "").strip()
+        clock = str(it.get("start_time", "") or "").strip()
+        with self._lock:
+            if self._conn is None:
+                return 0
+            try:
+                rows = self._active_schedule_rows()
+            except Exception:               # noqa: BLE001
+                return 0
+        ids = []
+        for row in rows:
+            meta = row.get("meta") or {}
+            if sid > 0 and int(meta.get("schedule_id", 0) or 0) == sid:
+                ids.append(int(row["id"]))
+                continue
+            text = str(row.get("text", ""))
+            if title and title in text and (not clock or clock in text):
+                ids.append(int(row["id"]))
+        return self.supersede(ids, by_id=0, reason="schedule:cancelled")
+
+    def supersede_schedule_conflicts(self, meta, keep_id=0) -> int:
+        """同一天、同一标题的新日程写入后，让旧的同名条目失效（改时间 / 重排场景）。
+
+        只在 ``tag='schedule'``、同一天、同标题时生效；不同日期的同名课程不受影响。
+        新行本身由 ``keep_id`` 排除。
+        """
+        m = meta if isinstance(meta, dict) else {}
+        title = str(m.get("title", "") or "").strip()
+        day = emo_sem.day_key(m.get("start_ts"))
+        if title == "" or day == "":
+            return 0
+        with self._lock:
+            if self._conn is None:
+                return 0
+            rows = self._active_schedule_rows()
+        ids = []
+        for row in rows:
+            if int(row.get("id", 0)) == int(keep_id or 0):
+                continue
+            old = row.get("meta") or {}
+            if str(old.get("title", "") or "").strip() != title:
+                continue
+            if emo_sem.day_key(old.get("start_ts")) != day:
+                continue
+            ids.append(int(row["id"]))
+        return self.supersede(ids, by_id=int(keep_id or 0), reason="schedule:updated")
 
     # —— 聊天流水（共享记忆的「最近发生了什么」；与可召回 memories 分开） ——
 

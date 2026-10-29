@@ -199,5 +199,39 @@ class PersonaStoreTest(unittest.TestCase):
             self.assertEqual(bad2.set_persona({"a": 1}), 0)
 
 
+class EmotionLanguageTest(unittest.TestCase):
+    """v4.3.0（C）：情绪只翻译成语言节奏；基线附近不改变提示词。"""
+
+    def test_baseline_is_empty(self):
+        self.assertEqual(persona.emotion_language_note({"v": 0.58, "c": 0.55, "a": 0.30}), "")
+
+    def test_low_valence_short_and_soft(self):
+        note = persona.emotion_language_note({"v": 0.30, "c": 0.40, "a": 0.20})
+        self.assertIn("句子短一点", note)
+        self.assertIn("不用为了热络硬撑", note)
+        self.assertNotIn("0.30", note)          # 不报数值
+
+    def test_bright_and_active(self):
+        note = persona.emotion_language_note({"v": 0.85, "c": 0.70, "a": 0.75})
+        self.assertIn("轻快", note)
+        self.assertIn("问句最多一个", note)
+
+    def test_dirty_values(self):
+        self.assertEqual(persona.emotion_language_note({"v": "x", "c": 0.5, "a": 0.5}), "")
+        self.assertEqual(persona.emotion_language_note(None), "")
+
+    def test_note_keeps_persona_constraints(self):
+        note = persona.emotion_language_note({"v": 0.30, "c": 0.40, "a": 0.20})
+        self.assertIn("Azure", note)
+        self.assertIn("不卖萌", note)
+
+    def test_chat_budget(self):
+        self.assertEqual(persona.chat_budget({"v": 0.58, "c": 0.55, "a": 0.30}), 400)
+        self.assertEqual(persona.chat_budget({"v": 0.30, "c": 0.40, "a": 0.20}), 340)
+        self.assertEqual(persona.chat_budget({"v": 0.85, "c": 0.70, "a": 0.75}), 460)
+        self.assertEqual(persona.chat_budget({"v": 0.60, "c": 0.80, "a": 0.40}), 440)
+        self.assertEqual(persona.chat_budget({"v": "x"}), 400)
+
+
 if __name__ == "__main__":
     unittest.main()
