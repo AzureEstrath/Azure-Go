@@ -121,7 +121,9 @@ async def extract_items(llm, text, now=None):
         "即使截图来自聊天，也必须提取；不要编造日期、教师、地点、人物。\n"
         "今天是 %s（%s）。相对日期（今天/明天/后天/下周X）请换算成真实日期。\n"
         "只输出 JSON 数组，不要解释、不要代码围栏。字段：\n"
-        '[{"date":"YYYY-MM-DD" 或 null, "weekday":"周一" 或 null, '
+        '[{"date":"YYYY-MM-DD" 或 null, "relative_date":"原文里的日期短语（明天/下周三/M月D日）或 null", '
+        '"day_part":"早上/中午/下午/晚上 或 null", '
+        '"weekday":"周一" 或 null, '
         '"period":"1-2" 或 null, "time":"HH:MM" 或 null, "end_time":"HH:MM" 或 null, '
         '"title":"课程或事项", "teacher":"可选", "location":"可选", "notes":"可选", '
         '"priority":"0-100 的整数（重要/紧急越高）", "duration_min":"预计分钟数", '
@@ -413,6 +415,13 @@ def _parse_date(raw, ref):
         return today + datetime.timedelta(days=2)
     if "明天" in s or "明日" in s:
         return today + datetime.timedelta(days=1)
+    # v4.3.1：相对周次由规则落地，不让 LLM 心算。「下周三」= 下周一 + 3；
+    # 裸「周三」仍取最近的下一个周三（今天就是周三时取下周，保持旧行为）。
+    if "下周" in s or "下个星期" in s or "下星期" in s:
+        for word, wd in _WEEKDAYS.items():
+            if word in s:
+                monday = today - datetime.timedelta(days=today.weekday())
+                return monday + datetime.timedelta(days=7 + wd)
     for word, wd in _WEEKDAYS.items():
         if word in s:
             add = (wd - today.weekday()) % 7
@@ -435,6 +444,35 @@ def _parse_date(raw, ref):
         except ValueError:
             return None
     return None
+
+
+def _day_part_of(*parts):
+    """文本里的时段词 → 早上 / 中午 / 下午 / 晚上；认不出返回空串。"""
+    for raw in parts:
+        s = str(raw or "")
+        if any(w in s for w in ("早上", "早晨", "清晨", "上午", "早八", "早起")):
+            return "早上"
+        if any(w in s for w in ("中午", "午饭", "午休")):
+            return "中午"
+        if "下午" in s:
+            return "下午"
+        if any(w in s for w in ("傍晚", "晚上", "晚饭", "夜里", "今晚", "夜间")):
+            return "晚上"
+    return ""
+
+
+def _adjust_time_for_day_part(tm, day_part):
+    """把「8:00 + 晚上」这类只有数字、没有 AM/PM 的时刻按原话时段补正。"""
+    if tm is None or day_part == "":
+        return tm
+    h, minute = tm.hour, tm.minute
+    if day_part in ("下午", "晚上") and h < 12:
+        h += 12
+    elif day_part == "中午" and h < 11:
+        h += 12
+    if h > 23:
+        return tm
+    return datetime.time(h, minute)
 
 
 def _parse_time(raw):
@@ -542,15 +580,21 @@ def _parse_item(raw, ref, source):
     location = _clip(raw.get("location", raw.get("place", raw.get("room", ""))), LOCATION_MAX)
     weekday = _parse_weekday(raw.get("weekday", raw.get("day_of_week", raw.get("week"))))
     period = _parse_period(raw.get("period", raw.get("periods", raw.get("sections"))))
-    date = _parse_date(raw.get("date", raw.get("day", raw.get("when_date", ""))), ref)
+    # v4.3.1：优先用原话日期短语由规则落地；LLM 的绝对 date 只当兜底。
+    rel_text = str(raw.get("relative_date", raw.get("when_date_text", "")) or "").strip()
+    date = _parse_date(rel_text, ref) if rel_text else None
+    if date is None:
+        date = _parse_date(raw.get("date", raw.get("day", raw.get("when_date", ""))), ref)
     raw_time = str(raw.get("time", raw.get("at", raw.get("start_time", raw.get("start", "")))) or "")
-    tm = _parse_time(raw_time)
-    end_tm = _parse_time(raw.get("end_time", raw.get("end", "")))
+    day_part = str(raw.get("day_part", "") or "").strip() or _day_part_of(
+        rel_text, raw.get("date", ""), raw_time)
+    tm = _adjust_time_for_day_part(_parse_time(raw_time), day_part)
+    end_tm = _adjust_time_for_day_part(_parse_time(raw.get("end_time", raw.get("end", ""))), day_part)
     if end_tm is None:
         # 模型有时把时间写成 "08:00-09:35"：拆开保留结束时间（周课表要显示时间跨度）。
         parts = [x for x in re.split(r"[-~～—–]", raw_time) if x.strip()]
         if len(parts) >= 2:
-            end_tm = _parse_time(parts[1])
+            end_tm = _adjust_time_for_day_part(_parse_time(parts[1]), day_part)
 
     if date is None and weekday is not None:
         add = (weekday - ref.weekday()) % 7

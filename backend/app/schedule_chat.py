@@ -159,11 +159,14 @@ async def extract(llm, text, now=None):
         '{"schedule": false}\n'
         "或\n"
         '{"schedule": true, "items": [{"date": "YYYY-MM-DD" 或 null, '
+        '"relative_date": "原话里的日期短语（明天/下周三/10月31日）或 null", '
+        '"day_part": "早上/中午/下午/晚上 或 null", '
         '"weekday": "周一" 或 null, "time": "HH:MM" 或 null, '
         '"end_time": "HH:MM" 或 null, "title": "10-30 字的事项", '
         '"location": "可选", "priority": "0-100 的整数", '
         '"duration_min": "预计分钟数", "deadline": "YYYY-MM-DD HH:MM" 或 null, '
         '"notes": "可选"}]}\n'
+        "日期和时间只按玩家原话写：有原话日期短语就填 relative_date，不要自己心算；"
         "只有日期没有时刻也可以；只说“提醒我记一下”但没给日期时间时，date/time 都写 null。\n\n"
         "玩家刚说：「%s」"
     ) % (ref.strftime("%Y-%m-%d"), "周" + "一二三四五六日"[ref.weekday()], raw_text)

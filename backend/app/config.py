@@ -25,6 +25,14 @@ def _clamp01(v, fallback):
         return float(fallback)
 
 
+def _int_clamped(v, fallback, lo, hi):
+    """整数安全取值（嵌入线程 / 批大小 / 上下文等）：脏值退回 ``fallback``。"""
+    try:
+        return max(int(lo), min(int(hi), int(v)))
+    except (TypeError, ValueError):
+        return int(fallback)
+
+
 class AzureConfig:
     def __init__(self):
         self.katago_url = "http://127.0.0.1:8100"   # KataGo 云服务地址（与 katago_service 默认端口一致）
@@ -107,12 +115,24 @@ class AzureConfig:
         # —— 长期记忆（跨局记得玩家；默认关闭，关闭时不建库、不调 embedding）——
         self.memory_enabled = False
         self.memory_db_path = ""            # 留空＝<backend>/data/memory.db（由 memory_service 决定）
-        self.embed_base_url = ""            # 云端 OpenAI 兼容 embedding 地址；三者任一为空则降级为关键词检索
-        self.embed_model = ""
-        self.embed_api_key = ""
+        # —— embedding（v4.3.1）：本地 GGUF 为本机默认路线，HTTP 兼容服务为可选项 ——
+        # embed_mode: auto / local / http / off。auto=本地模型存在就本地，否则完整 HTTP 配置就 HTTP。
+        self.embed_mode = "auto"
+        self.embed_base_url = ""            # HTTP OpenAI 兼容 embedding 地址
+        self.embed_model = ""               # HTTP 模型名 / 本地模型的向量指纹（留空=按文件名）
+        self.embed_api_key = ""             # 本机 HTTP 服务可空（占位 key 由客户端补）
+        self.embed_local_model = ""         # 本地 GGUF 路径（如 D:\KataGo\models\qwen3-Embedding.gguf）
+        self.embed_local_gpu_layers = 0     # 0=CPU（不与主 LLM 抢显存）；-1=全部层上 GPU
+        self.embed_local_threads = 8
+        self.embed_local_ctx = 512
+        self.embed_batch_size = 16          # 回填 / 批量 embedding 的单批条数
+        self.embed_backfill = True          # 启动后后台补齐缺失向量（旧库切模型时自动重建）
+        self.embed_cache_size = 512         # 单进程 embedding 文本缓存条数（0=关闭）
+        self.embed_query_prefix = ""        # 可选：Qwen3-Embedding 之类模型的查询指令前缀
         self.memory_top_k = 3               # 每次召回条数上限
         self.memory_max_inject_chars = 240  # 注入提示词的总字数上限（单条另截到 120 字）
-        self.embed_timeout = 10.0           # 单次 embedding 超时（秒）；可收紧，memory_service 用它装配云端客户端
+        self.memory_min_score = 0.45        # 向量召回的最低余弦（低于它的“语义无关”旧事不注入）
+        self.embed_timeout = 10.0           # 单次 embedding 超时（秒）；HTTP 模式用它装配客户端
         # —— 云端语音合成（后端合成 + 缓存；Task 2 起）：默认关闭、默认系统语音兜底 ——
         self.tts_enabled = False            # 关闭时零开销：不发请求、不发 speech 事件，文字照常
         self.tts_mode = "system"            # "openai"＝云端合成；"system"＝让前端用系统语音念
@@ -300,11 +320,29 @@ class AzureConfig:
         self.stream_tokens = bool(d.get("stream_tokens", self.stream_tokens))
         self.memory_enabled = bool(d.get("memory_enabled", self.memory_enabled))
         self.memory_db_path = str(d.get("memory_db_path", self.memory_db_path))
+        mode = str(d.get("embed_mode", self.embed_mode) or "auto").strip().lower()
+        self.embed_mode = mode if mode in ("auto", "local", "http", "off") else "auto"
         self.embed_base_url = str(d.get("embed_base_url", self.embed_base_url))
         self.embed_model = str(d.get("embed_model", self.embed_model))
         self.embed_api_key = str(d.get("embed_api_key", self.embed_api_key))
+        self.embed_local_model = str(d.get("embed_local_model", self.embed_local_model))
+        self.embed_query_prefix = str(d.get("embed_query_prefix", self.embed_query_prefix))
+        self.embed_local_gpu_layers = _int_clamped(
+            d.get("embed_local_gpu_layers", self.embed_local_gpu_layers), self.embed_local_gpu_layers, -1, 999)
+        self.embed_local_threads = _int_clamped(
+            d.get("embed_local_threads", self.embed_local_threads), self.embed_local_threads, 1, 64)
+        self.embed_local_ctx = _int_clamped(
+            d.get("embed_local_ctx", self.embed_local_ctx), self.embed_local_ctx, 64, 4096)
+        self.embed_batch_size = _int_clamped(
+            d.get("embed_batch_size", self.embed_batch_size), self.embed_batch_size, 1, 256)
+        self.embed_cache_size = _int_clamped(
+            d.get("embed_cache_size", self.embed_cache_size), self.embed_cache_size, 0, 4096)
+        v = d.get("embed_backfill")
+        self.embed_backfill = v if isinstance(v, bool) else self.embed_backfill
         self.memory_top_k = max(0, int(d.get("memory_top_k", self.memory_top_k)))
         self.memory_max_inject_chars = max(0, int(d.get("memory_max_inject_chars", self.memory_max_inject_chars)))
+        self.memory_min_score = _clamp01(d.get("memory_min_score", self.memory_min_score),
+                                         self.memory_min_score)
         try:
             self.embed_timeout = max(0.0, float(d.get("embed_timeout", self.embed_timeout)))
         except (TypeError, ValueError):     # 脏值退回默认：不因一个旋钮把启动搞崩

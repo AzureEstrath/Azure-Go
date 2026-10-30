@@ -294,6 +294,77 @@ class SupersedeTest(unittest.TestCase):
         self.assertNotIn(legacy, [h["id"] for h in hits], "旧库无 meta 时按标题+时刻兜底")
 
 
+class EmbeddingVectorTest(unittest.TestCase):
+    """v4.3.1：向量带模型指纹与维度，换模型后不误用旧向量；后台可回填。"""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "vec.db")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_vectors_store_model_and_dim(self):
+        store = MemoryStore(self.path, embed_fn=fake_embed, embed_model="m1")
+        try:
+            mid = store.write("玩家喜欢点三三", tag="t")
+            con = sqlite3.connect(self.path)
+            row = con.execute("SELECT model, dim FROM vectors WHERE mem_id = ?", (mid,)).fetchone()
+            con.close()
+            self.assertEqual(row[0], "m1")
+            self.assertEqual(row[1], 8)
+        finally:
+            store.close()
+
+    def test_other_model_vectors_are_not_used(self):
+        store = MemoryStore(self.path, embed_fn=fake_embed, embed_model="m1")
+        try:
+            store.write("玩家喜欢点三三", tag="t")
+        finally:
+            store.close()
+        store2 = MemoryStore(self.path, embed_fn=fake_embed, embed_model="m2")
+        try:
+            # 关键词仍可召回（score 0），但不会拿 m1 的向量冒充 m2 的语义分
+            hits = store2.recall("点三三", k=3)
+            self.assertTrue(hits)
+            self.assertEqual(hits[0]["score"], 0.0)
+        finally:
+            store2.close()
+
+    def test_backfill_vectors_for_current_model(self):
+        store = MemoryStore(self.path, embed_fn=None)
+        try:
+            store.write("玩家喜欢雨天摆棋", tag="t")
+            store.write("明天下午有组会", tag="t2")
+            self.assertEqual(store.stats()["has_vectors"], 0)
+            # 模拟「启动时还没有 embedding，后来模型接上了」
+            store._embed_fn = fake_embed
+            store._embed_model = "m1"
+            self.assertEqual(store.backfill_vectors(batch_size=2), 2)
+            self.assertEqual(store.stats()["has_vectors"], 2)
+        finally:
+            store.close()
+
+    def test_min_score_drops_semantically_irrelevant_vectors(self):
+        """v4.3.1：向量召回加余弦门槛，避免每句都翻出一条无关旧事（关键词仍可补齐）。"""
+        def vec(text):
+            # 「查询」的向量与「相关旧事」同向；「无关旧事」正交
+            if "查询" in text or "相关" in text:
+                return [1.0, 0.0]
+            return [0.0, 1.0]
+
+        store = MemoryStore(self.path, embed_fn=vec, embed_model="m")
+        try:
+            store.write("无关旧事：喜欢下雪", tag="t")
+            floor = 0.5
+            self.assertEqual(store.recall("查询天气", k=3, min_score=floor), [])
+            store.write("相关旧事：喜欢雨天摆棋", tag="t2")
+            hits = store.recall("查询天气", k=3, min_score=floor)
+            self.assertEqual([h["text"] for h in hits], ["相关旧事：喜欢雨天摆棋"])
+        finally:
+            store.close()
+
+
 class MathTest(unittest.TestCase):
     def test_cosine_identity_and_orthogonal(self):
         self.assertAlmostEqual(cosine([1.0, 0.0], [1.0, 0.0]), 1.0, places=6)

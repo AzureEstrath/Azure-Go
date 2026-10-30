@@ -5,3 +5,5 @@ httpx>=0.27
 langchain-core>=1.0,<2.0     # LCEL / 消息类型 / ChatPromptTemplate（测过的就是装到的：限定 1.x）
 langchain-openai>=1.0,<2.0   # ChatOpenAI（云端 OpenAI 兼容服务）；同上
 langgraph>=1.0,<2.0          # 回合编排状态图（StateGraph / 条件边）；同代 1.x
+# 可选：本地 GGUF embedding（llama-cpp-python>=0.3.32）。不装也能运行，记忆自动退回 HTTP / 关键词。
+# llama-cpp-python>=0.3.32

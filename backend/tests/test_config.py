@@ -126,6 +126,37 @@ class MemoryConfigTest(unittest.TestCase):
                 json.dump({"embed_timeout": "abc"}, f)
             self.assertEqual(AzureConfig.load(p).embed_timeout, 10.0)
 
+    def test_embed_local_round_trip_and_clamp(self):
+        """v4.3.1：本地 GGUF 路径 / 模式 / 线程 / 批大小都要能读回并按边界夹取。"""
+        import tempfile, json
+        cfg = AzureConfig()
+        self.assertEqual(cfg.embed_mode, "auto")
+        self.assertEqual(cfg.embed_local_gpu_layers, 0)
+        self.assertEqual(cfg.embed_local_threads, 8)
+        self.assertEqual(cfg.embed_batch_size, 16)
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({
+                    "embed_mode": "LOCAL",
+                    "embed_local_model": "D:\\models\\emb.gguf",
+                    "embed_local_gpu_layers": "all",
+                    "embed_local_threads": 999,
+                    "embed_local_ctx": 1,
+                    "embed_batch_size": 0,
+                    "embed_cache_size": -5,
+                    "embed_backfill": False,
+                }, f)
+            got = AzureConfig.load(p)
+            self.assertEqual(got.embed_mode, "local")
+            self.assertEqual(got.embed_local_model, "D:\\models\\emb.gguf")
+            self.assertEqual(got.embed_local_gpu_layers, 0, "脏值退回默认 0")
+            self.assertEqual(got.embed_local_threads, 64)
+            self.assertEqual(got.embed_local_ctx, 64)
+            self.assertEqual(got.embed_batch_size, 1)
+            self.assertEqual(got.embed_cache_size, 0)
+            self.assertFalse(got.embed_backfill)
+
 
 class PvDepthConfigTest(unittest.TestCase):
     """阶段三（v3.8.0）：``pv_max_visits`` 字段面 + ``katago_timeout_ms`` 的新代码默认。"""

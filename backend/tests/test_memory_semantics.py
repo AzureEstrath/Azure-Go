@@ -56,8 +56,18 @@ class AffinityTest(unittest.TestCase):
         self.assertIsNone(sem.emotion_affinity(self.CHAT, -1.0, 0.5))
         self.assertIsNone(sem.emotion_affinity({"v": 0.5}, 0.5, 0.5))
 
+    def test_dynamic_weight_grows_away_from_baseline(self):
+        baseline = {"v": 0.58, "a": 0.30}
+        calm = sem.state_emotion_weight(baseline)
+        low = sem.state_emotion_weight({"v": 0.20, "a": 0.10})
+        strong = sem.state_emotion_weight({"v": 0.95, "a": 0.85})
+        self.assertAlmostEqual(calm, sem.EMOTION_RANK_BASE)
+        self.assertGreater(low, calm)
+        self.assertGreater(strong, low)
+        self.assertLessEqual(strong, sem.EMOTION_RANK_MAX)
+
     def test_blended_rank_keeps_semantics_primary(self):
-        # 语义分 0.8 但情绪相反 vs 语义分 0.4 但情绪一致：语义仍是主项
+        # 语义分 0.8 但情绪相反 vs 语义分 0.4 但情绪一致：加性偏置仍让语义主导
         a, _ = sem.blended_rank(0.8, self.CHAT, 0.0, 0.0)
         b, _ = sem.blended_rank(0.4, self.CHAT, 0.8, 0.8)
         self.assertGreater(a, b)

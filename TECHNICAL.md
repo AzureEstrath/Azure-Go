@@ -49,6 +49,9 @@
 > **v4.3.0：记忆写入二维情绪矩阵（`emo_v` / `emo_a` / `emo_tag`）并按当前情绪偏置召回；
 > 情绪翻译成语言节奏与聊天预算；主动回忆改为有开始 / 延续 / 终止条件的回忆链；
 > 日程事实按时间指代收窄并出话后核对；旧事实用 supersede 失效（取消 / 改时间联动记忆）。**
+> **v4.3.1：日程提取只让 LLM 给原话日期短语，绝对日期 / 时段由 Python 规则落地；
+> 情绪召回权重随偏离基线动态放大（0.25→0.40）；本地 qwen3-Embedding GGUF 启用
+> （llama.cpp CPU、文本缓存、向量模型指纹、后台回填、余弦门槛）。**
 > 最后更新：2026-10-29。
 
 ---
@@ -304,6 +307,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | --- | --- |
 | 后端 | `backend_url`、`auto_start_services` |
 | LLM | `llm_base_url`、`llm_model`、`llm_api_key`、`llm_think_mode`、`llm_timeout_sec`、`pet_chat_think_level`、`extra_body` |
+| Embedding | `embed_mode`、`embed_local_model`、`embed_local_gpu_layers`、`embed_local_threads`、`embed_local_ctx`、`embed_batch_size`、`embed_backfill`、`embed_cache_size`、`embed_query_prefix`、`embed_base_url/model/api_key`、`memory_min_score` |
 | 棋力 | `max_visits`、`katago_url`、`katago_token`、`katago_timeout_ms` |
 | 教学 | `joseki_teach`、`joseki_rate`、`adaptive_difficulty` 系列 |
 | 情绪 | `emotion_drift`、`drift_base`、`drift_max` |
@@ -540,7 +544,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 **1153** 个用例，覆盖：
+`backend/tests` 共 **1161** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -667,6 +671,21 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
      `supersede_schedule_conflicts`（同一天 + 同标题）；取消日程（聊天语言 / 手动状态接口）
      调用 `supersede_schedule_item`（按 `meta.schedule_id`，旧库退化为标题 + 时刻文本匹配），
      并写一条 `tag='schedule:cancelled'` 的审计记忆。
+17. **确定性时间归一化与本地 embedding（v4.3.1）**：
+    - `schedule.py`：`_parse_date` 先认「下周X」（按当前周周一 + 7 + 星期索引），再认裸
+      「周X / 今天 / 明天 / 后天 / M月D日」；`_parse_item` 优先使用 LLM 的 `relative_date`
+      原话短语，`_day_part_of` 从原话 / `day_part` 识别早上 / 中午 / 下午 / 晚上，
+      `_adjust_time_for_day_part` 把「8:00 + 晚上」补成 20:00。LLM 的绝对 `date` 只作兜底。
+      提取提示词同步要求 `relative_date` / `day_part`，不再要求模型心算绝对日期。
+    - `memory_semantics.state_emotion_weight`：`w = 0.25 + 0.20 × (|v-v0| + |a-a0|)/2`，
+      上限 0.40；`blended_rank` 改为 `语义分 + affinity × w` 的**加性**偏置，保证语义差距
+      > 0.40 时语义仍主导。
+    - `memory_service`：`EmbedProvider` 统一「本地 GGUF / HTTP / 关键词」三态；
+      本地模式用 `llama_cpp.Llama(embedding=True, n_gpu_layers=0)` 懒加载，L2 归一化、
+      LRU 文本缓存、单模型调用锁、批量编码；模型指纹写进 `model_id`。
+      `MemoryStore` 的 `vectors` 表补 `model` / `dim`，召回只取同指纹且同维度的向量；
+      `backfill_vectors()` 在后台为旧记忆补齐当前模型向量；`memory_min_score` 过滤低余弦的
+      语义无关旧事（关键词命中不受影响）。HTTP 模式保持 OpenAI 兼容 `/v1/embeddings` 兼容。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 
@@ -700,7 +719,7 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
 
 | 文件 | 位置 | 内容 | 写入时机 |
 | --- | --- | --- | --- |
-| `memory.db` | `backend/data/` | 长期记忆与可选向量 | 记忆写入/局末 |
+| `memory.db` | `backend/data/` | 长期记忆与可选向量（`vectors.model` / `vectors.dim` 指纹） | 记忆写入/局末 |
 | `profile.db` | `backend/data/` | 玩家棋风画像、每局记录、人格化状态（关系 / 情绪余温 / 互动数） | `summarize()`；画像总开关关着时不写画像，人格化仍按 `persona_enabled` 写 persona 表 |
 | `games.db` | `backend/data/` | 棋谱库、逐手、总结、注记 | 局末归档 / 导入 |
 | `joseki_progress.db` | `backend/data/` | 定式族出现计数 | 定式命中时 |

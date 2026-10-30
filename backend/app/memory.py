@@ -61,7 +61,9 @@ _SCHEMA = (
     )""",
     """CREATE TABLE IF NOT EXISTS vectors (
         mem_id INTEGER PRIMARY KEY,
-        vec TEXT NOT NULL
+        vec TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT '',
+        dim INTEGER NOT NULL DEFAULT 0
     )""",
     """CREATE TABLE IF NOT EXISTS games (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +111,9 @@ _COLUMNS = {
         "superseded_ts": "REAL NOT NULL DEFAULT 0",
         "superseded_reason": "TEXT NOT NULL DEFAULT ''",
     },
-    "vectors": {"vec": "TEXT NOT NULL DEFAULT '[]'"},
+    "vectors": {"vec": "TEXT NOT NULL DEFAULT '[]'",
+                "model": "TEXT NOT NULL DEFAULT ''",
+                "dim": "INTEGER NOT NULL DEFAULT 0"},
     "games": {
         "ts": "REAL NOT NULL DEFAULT 0",
         "result": "TEXT NOT NULL DEFAULT ''",
@@ -259,10 +263,15 @@ def _valence_jump(prev_mood, mood) -> bool:
 class MemoryStore:
     """长期记忆库：一条 sqlite 连接 + 一把锁，所有操作都失败安全。"""
 
-    def __init__(self, db_path: str, embed_fn=None, now_fn=None):
-        """``embed_fn(text) -> list[float]`` 与 ``now_fn() -> float`` 都可注入（测试用假实现）。"""
+    def __init__(self, db_path: str, embed_fn=None, now_fn=None, embed_model: str = ""):
+        """``embed_fn(text, query=False) -> list[float]`` 与 ``now_fn() -> float`` 都可注入（测试用假实现）。
+
+        ``embed_model``（v4.3.1）是向量指纹：写入时连同向量一起落库，召回只认同一模型的向量；
+        换模型后旧向量不会被误用（后台回填由 ``MemoryService`` 触发）。
+        """
         self._db_path = str(db_path or "")
         self._embed_fn = embed_fn
+        self._embed_model = str(embed_model or "")
         self._now_fn = now_fn if callable(now_fn) else time.time
         self._max_rows = MEMORY_MAX_ROWS     # 测试可临时收紧，验证淘汰
         self._lock = threading.Lock()
@@ -307,16 +316,21 @@ class MemoryStore:
     def _now(self) -> float:
         return float(self._now_fn())
 
-    def _embed(self, text: str):
-        """算向量；没配 embedding、或云端报错（401/超时）时返回 ``None``。
+    def _embed(self, text: str, query: bool = False):
+        """算向量；没配 embedding、或本地 / 云端报错（401/超时）时返回 ``None``。
 
         失败只影响检索质量（降级为关键词），不影响写入；日志只在**首次**失败时打一行，
-        避免每个回合刷屏。
+        避免每个回合刷屏。``query=True`` 时若提供者支持查询前缀（Qwen3-Embedding 等），
+        由 ``EmbedProvider`` 自己加前缀；旧的一参替身直接退化为普通调用。
         """
         if not callable(self._embed_fn):
             return None
         try:
-            vec = [float(x) for x in self._embed_fn(text)]
+            try:
+                vec = self._embed_fn(text, query=query)
+            except TypeError:               # 旧替身只收一个参数
+                vec = self._embed_fn(text)
+            vec = [float(x) for x in vec]
             return vec if vec else None
         except Exception as e:              # noqa: BLE001
             if not self._embed_warned:
@@ -398,8 +412,9 @@ class MemoryStore:
                     (self._now(), kind, tag, t, _json(m), emo_v, emo_a, emo_tag))
                 mem_id = int(cur.lastrowid)
                 if vec:
-                    self._conn.execute("INSERT OR REPLACE INTO vectors(mem_id, vec) VALUES(?,?)",
-                                       (mem_id, json.dumps(vec)))
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO vectors(mem_id, vec, model, dim) VALUES(?,?,?,?)",
+                        (mem_id, json.dumps(vec), self._embed_model, len(vec)))
                 self._evict()
                 self._conn.commit()
                 return mem_id
@@ -421,7 +436,7 @@ class MemoryStore:
                     pass
                 return None
 
-    def recall(self, query: str, k: int = 3, mood=None) -> list:
+    def recall(self, query: str, k: int = 3, mood=None, min_score: float = 0.0) -> list:
         """召回最相关的 ``k`` 条记忆，按 score 降序；任何故障返回 ``[]``。
 
         返回 ``[{"id","ts","kind","tag","text","score","emo_v","emo_a","emo_tag","emo_affinity"}]``：
@@ -429,14 +444,21 @@ class MemoryStore:
         用关键词从尚未命中的行里补齐——混合库里没向量的行（写入时 embedding 失败 / 旧库遗留）
         不会被有向量的行压掉。
 
-        ``mood``（v4.3.0）：给出当前情绪时，排序分 = 语义分 × 0.75 + **二维情绪相似度** × 0.25。
-        语义仍是主项，情绪只让「和此刻心情相近的旧事」稍微靠前；不给 mood 时排序与旧版逐字一致。
-        被 supersede 的行（``status != 'active'``）不参与召回。
+        ``mood``（v4.3.0）：给出当前情绪时，排序分 = 语义分 + **二维情绪相似度 × 动态权重**
+        （基线附近 0.25，情绪越偏离基线越靠近 0.40，上限 0.40）。语义仍是主项，情绪只做
+        加性偏置；不给 mood 时排序与旧版逐字一致。被 supersede 的行不参与召回。
+
+        ``min_score``（v4.3.1）：向量余弦低于它的行不进入结果（防止「每句话都翻出一条
+        无关旧事」）；关键词命中仍可补齐，``0.0`` 保持旧行为（测试与旧调用方）。
         """
         q = str(query or "").strip()
         k = max(0, int(k or 0))
         if q == "" or k == 0:
             return []
+        try:
+            floor = max(0.0, min(1.0, float(min_score or 0.0)))
+        except (TypeError, ValueError):
+            floor = 0.0
         with self._lock:
             if self._conn is None:
                 return []
@@ -444,12 +466,17 @@ class MemoryStore:
                 rows = [dict(r) for r in self._conn.execute(
                     "SELECT id, ts, kind, tag, text, emo_v, emo_a, emo_tag FROM memories "
                     "WHERE status = 'active' ORDER BY ts DESC, id DESC")]
-                vecs = {int(r[0]): r[1] for r in self._conn.execute("SELECT mem_id, vec FROM vectors")}
+                if self._embed_model:
+                    vecs = {int(r[0]): r[1] for r in self._conn.execute(
+                        "SELECT mem_id, vec FROM vectors WHERE model = ?", (self._embed_model,))}
+                else:
+                    vecs = {int(r[0]): r[1] for r in self._conn.execute(
+                        "SELECT mem_id, vec FROM vectors")}
             except Exception as e:          # noqa: BLE001
                 print("[Memory] 读取失败（已忽略）：%s" % e)
                 return []
         hits = []
-        qv = self._embed(q)                 # 网络调用放锁外
+        qv = self._embed(q, query=True)     # 网络 / 本地模型调用放锁外；查询可带指令前缀
 
         def rank_of(row, base):
             return emo_sem.blended_rank(base, mood, row.get("emo_v"), row.get("emo_a"))
@@ -461,7 +488,12 @@ class MemoryStore:
                     raw = vecs.get(int(row["id"]))
                     if not raw:
                         continue
-                    base = cosine(qv, json.loads(raw))
+                    vec = json.loads(raw)
+                    if len(vec) != len(qv):         # 换模型后维度不一致：不跨模型比较
+                        continue
+                    base = cosine(qv, vec)
+                    if base < floor:                 # 语义无关：不占用召回名额
+                        continue
                     rank, aff = rank_of(row, base)
                     scored.append((rank, row, base, aff))
                 scored.sort(key=lambda x: (-x[0], -x[1]["id"]))
@@ -491,6 +523,68 @@ class MemoryStore:
                 return (-r, -int(h.get("id", 0)))
             hits.sort(key=_rank)
         return hits[:k]
+
+    def backfill_vectors(self, batch_size=16, limit=5000) -> int:
+        """补齐当前 embedding 模型的向量（v4.3.1，参考 MaiBot 的向量一致性 / 回填）。
+
+        - 只补 ``status='active'`` 且**当前模型还没有向量**的记忆；旧模型向量不覆盖、
+          也不参与召回（由 ``model`` 指纹隔离）。
+        - embedding 在锁外做，写回时再拿锁；任何失败返回已补条数，不抛异常。
+        - 批量优先用 ``embed_fn.batch``（本地 llama.cpp 一次编码多条）；没有就逐条。
+        """
+        if self._conn is None or not callable(self._embed_fn):
+            return 0
+        batch = max(1, int(batch_size or 16))
+        cap = max(1, int(limit or 5000))
+        with self._lock:
+            if self._conn is None:
+                return 0
+            try:
+                rows = [dict(r) for r in self._conn.execute(
+                    "SELECT m.id, m.text FROM memories m WHERE m.status = 'active' "
+                    "AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.mem_id = m.id "
+                    "AND v.model = ? AND v.dim > 0) ORDER BY m.id ASC LIMIT ?",
+                    (self._embed_model, cap))]
+            except Exception as e:              # noqa: BLE001
+                print("[Memory] 回填读取失败（已忽略）：%s" % e)
+                return 0
+        done = 0
+        for i in range(0, len(rows), batch):
+            chunk = rows[i:i + batch]
+            texts = [str(r["text"]) for r in chunk]
+            vecs = None
+            try:
+                fn = getattr(self._embed_fn, "batch", None)
+                if callable(fn):
+                    try:
+                        vecs = fn(texts, query=False)
+                    except TypeError:
+                        vecs = fn(texts)
+            except Exception as e:              # noqa: BLE001
+                print("[Memory] 批量 embedding 失败（改逐条）：%s" % e)
+            if not isinstance(vecs, list) or len(vecs) != len(texts):
+                vecs = [self._embed(t) for t in texts]
+            with self._lock:
+                if self._conn is None:
+                    break
+                try:
+                    for row, vec in zip(chunk, vecs):
+                        if not vec:
+                            continue
+                        arr = [float(x) for x in vec]
+                        self._conn.execute(
+                            "INSERT OR REPLACE INTO vectors(mem_id, vec, model, dim) VALUES(?,?,?,?)",
+                            (int(row["id"]), json.dumps(arr), self._embed_model, len(arr)))
+                        done += 1
+                    self._conn.commit()
+                except Exception as e:          # noqa: BLE001
+                    print("[Memory] 回填写入失败（已忽略）：%s" % e)
+                    try:
+                        self._conn.rollback()
+                    except Exception:           # noqa: BLE001
+                        pass
+                    break
+        return done
 
     # —— supersede（v4.3.0）：旧事实失效，但不删除（保留审计与“当时知道什么”） ——
 

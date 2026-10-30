@@ -11,7 +11,11 @@
 所有故障都不上抛：本模块只把 ``MemoryStore`` 的失败安全结果透传给编排层。
 """
 
+import hashlib
+import math
 import os
+import threading
+from collections import OrderedDict
 
 from langchain_openai import OpenAIEmbeddings
 
@@ -23,6 +27,10 @@ DEFAULT_DB_PATH = os.path.join(
 
 EMBED_TIMEOUT_SEC = 10.0        # 单次 embedding 超时（与工具层单次调用上限一致）；配置 embed_timeout 可收紧
 
+# 本地 GGUF 模型按路径缓存（同一进程只加载一次；首次加载约 1 秒 / 609MB 模型）
+_LOCAL_MODELS = {}
+_LOCAL_LOCK = threading.Lock()
+
 
 def _embed_timeout(cfg) -> float:
     """单次 embedding 超时：按 ``embed_timeout`` 收紧；缺字段 / 非正数 / 脏值退回 ``EMBED_TIMEOUT_SEC``。"""
@@ -33,21 +41,150 @@ def _embed_timeout(cfg) -> float:
     return t if t > 0.0 else EMBED_TIMEOUT_SEC
 
 
-def build_embed_fn(cfg):
-    """按配置装配云端 embedding；``embed_base_url / embed_model / embed_api_key`` 任一为空 → ``None``。
+class EmbedProvider:
+    """可调用的 embedding 提供者：``provider(text, query=False)``；可附带批量与模型指纹。
 
-    返回 ``embed_fn(text) -> list[float]``，即 ``MemoryStore`` 的注入点；装配失败（地址非法等）
-    也返回 ``None``：宁可降级成关键词检索，也不让记忆功能把服务拖垮。
-
-    三个刻意的参数：``max_retries=0`` 不让 SDK 重试拖住出话（与 ``llm_chain`` 同一理由）；
-    ``timeout`` 取 ``embed_timeout``（默认 10 秒，可收紧）；``check_embedding_ctx_length=False``
-    原样发文本、不猜 tokenizer——``embed_model`` 可能是任意 OpenAI 兼容模型名，tiktoken 认不出来。
+    ``model_id`` 写进向量表，用来防止「换了 embedding 模型仍拿旧向量召回」；
+    ``query_prefix`` 只作用于查询（Qwen3-Embedding 之类的模型需要指令前缀时用）。
     """
+
+    def __init__(self, fn, model_id="", query_prefix="", batch_fn=None, kind="http"):
+        self._fn = fn
+        self.model_id = str(model_id or "")
+        self.query_prefix = str(query_prefix or "")
+        self._batch_fn = batch_fn
+        self.kind = str(kind or "")
+
+    def __call__(self, text, query=False):
+        prefix = self.query_prefix if query and self.query_prefix else ""
+        try:
+            return self._fn(prefix + str(text), query=query)
+        except TypeError:                   # 旧替身只收一个参数
+            return self._fn(prefix + str(text))
+
+    def batch(self, texts, query=False):
+        """批量 embedding；提供者没有批量实现时逐条回退。"""
+        items = list(texts or [])
+        if not items:
+            return []
+        prefix = self.query_prefix if query and self.query_prefix else ""
+        if callable(self._batch_fn):
+            try:
+                return self._batch_fn([prefix + str(t) for t in items], query=query)
+            except TypeError:
+                return self._batch_fn([prefix + str(t) for t in items])
+        return [self(t, query=query) for t in items]
+
+
+def _make_local_provider(cfg):
+    """本地 GGUF（llama.cpp）提供者：懒加载、L2 归一化、文本缓存、单模型锁。"""
+    path = str(getattr(cfg, "embed_local_model", "") or "").strip()
+    if path == "":
+        return None
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        print("[Memory] 本地 embedding 模型不存在（%s），降级为关键词 / HTTP" % path)
+        return None
+    try:
+        from llama_cpp import Llama
+    except Exception as e:                  # noqa: BLE001 —— 未安装依赖时不影响记忆功能
+        print("[Memory] 未安装 llama-cpp-python，本地 embedding 不可用（可继续用关键词）：%s" % e)
+        return None
+
+    model_id = str(getattr(cfg, "embed_model", "") or "").strip() or (
+        "local:" + os.path.basename(path))
+    cache_size = max(0, int(getattr(cfg, "embed_cache_size", 0) or 0))
+    threads = max(1, int(getattr(cfg, "embed_local_threads", 8) or 8))
+    n_ctx = max(64, int(getattr(cfg, "embed_local_ctx", 512) or 512))
+    n_batch = max(1, int(getattr(cfg, "embed_batch_size", 16) or 16))
+    gpu_layers = int(getattr(cfg, "embed_local_gpu_layers", 0) or 0)
+
+    with _LOCAL_LOCK:
+        got = _LOCAL_MODELS.get(path)
+        if got is None:
+            try:
+                got = Llama(model_path=path, embedding=True, n_gpu_layers=gpu_layers,
+                            n_ctx=n_ctx, n_threads=threads, n_batch=n_batch, verbose=False)
+                _LOCAL_MODELS[path] = got
+                print("[Memory] 本地 embedding 已加载：%s（gpu_layers=%d）" % (path, gpu_layers))
+            except Exception as e:          # noqa: BLE001
+                print("[Memory] 本地 embedding 加载失败（降级关键词）：%s" % e)
+                return None
+    llm = got
+    call_lock = threading.Lock()
+    cache = OrderedDict()
+    cache_lock = threading.Lock()
+
+    def _norm(vec):
+        arr = [float(x) for x in vec]
+        n = math.sqrt(sum(x * x for x in arr)) or 1.0
+        return [x / n for x in arr]
+
+    def _cache_key(text):
+        return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+    def _get_cached(text):
+        if cache_size <= 0:
+            return None
+        key = _cache_key(text)
+        with cache_lock:
+            hit = cache.get(key)
+            if hit is not None:
+                cache.move_to_end(key)
+            return list(hit) if hit is not None else None
+
+    def _put_cached(text, vec):
+        if cache_size <= 0:
+            return
+        key = _cache_key(text)
+        with cache_lock:
+            cache[key] = list(vec)
+            cache.move_to_end(key)
+            while len(cache) > cache_size:
+                cache.popitem(last=False)
+
+    def _embed_one(text):
+        cached = _get_cached(text)
+        if cached is not None:
+            return cached
+        with call_lock:
+            out = llm.create_embedding(str(text))
+        vec = _norm(out["data"][0]["embedding"])
+        _put_cached(text, vec)
+        return vec
+
+    def _embed_many(texts):
+        items = [str(t) for t in texts]
+        missing = []
+        for t in items:
+            if _get_cached(t) is None and t not in missing:
+                missing.append(t)
+        if missing:
+            with call_lock:
+                out = llm.create_embedding(missing)
+            for row in out.get("data", []):
+                idx = int(row.get("index", 0))
+                if 0 <= idx < len(missing):
+                    _put_cached(missing[idx], _norm(row["embedding"]))
+        return [_get_cached(t) or _embed_one(t) for t in items]
+
+    return EmbedProvider(_embed_one, model_id=model_id,
+                         query_prefix=str(getattr(cfg, "embed_query_prefix", "") or ""),
+                         batch_fn=_embed_many, kind="local")
+
+
+def _make_http_provider(cfg):
+    """OpenAI 兼容 HTTP 提供者（也可以指向 llama-server / vLLM 的 /v1/embeddings）。"""
     url = str(getattr(cfg, "embed_base_url", "") or "").strip()
     model = str(getattr(cfg, "embed_model", "") or "").strip()
     key = str(getattr(cfg, "embed_api_key", "") or "").strip()
-    if url == "" or model == "" or key == "":
+    if url == "" or model == "":
         return None
+    if key == "":
+        host = url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return None
+        key = "sk-local"                     # 本机服务通常不校验 key，占位即可
     try:
         client = OpenAIEmbeddings(
             model=model,
@@ -61,10 +198,41 @@ def build_embed_fn(cfg):
         print("[Memory] embedding 配置不可用（降级为关键词检索）：%s" % e)
         return None
 
-    def embed(text):
+    def embed(text, query=False):
         return [float(x) for x in client.embed_query(str(text))]
 
-    return embed
+    return EmbedProvider(embed, model_id=model,
+                         query_prefix=str(getattr(cfg, "embed_query_prefix", "") or ""),
+                         kind="http")
+
+
+def build_embed_fn(cfg):
+    """按配置装配 embedding 提供者；不可用时返回 ``None``（记忆退化为关键词检索）。
+
+    模式（v4.3.1，参考 MaiBot 的「本地模型 + 可降级 + 模型一致性」思路）：
+    - ``local``：本地 GGUF（llama.cpp，默认 CPU，不抢主 LLM 显存）；
+    - ``http``：OpenAI 兼容 ``/v1/embeddings``；
+    - ``auto``：本地模型文件存在就用本地，否则完整 HTTP 配置就用 HTTP；
+    - ``off``：明确关闭向量，只走关键词。
+
+    任何装配失败都只返回 ``None`` / 降级，绝不让记忆把后端拖垮。
+    """
+    mode = str(getattr(cfg, "embed_mode", "auto") or "auto").strip().lower()
+    if mode not in ("auto", "local", "http", "off"):
+        mode = "auto"
+    if mode == "off":
+        return None
+    local_path = str(getattr(cfg, "embed_local_model", "") or "").strip()
+    can_local = local_path != "" and os.path.isfile(os.path.abspath(os.path.expanduser(local_path)))
+    if mode in ("auto", "local") and can_local:
+        got = _make_local_provider(cfg)
+        if got is not None:
+            return got
+    if mode in ("auto", "http") or (mode == "local" and can_local is False):
+        got = _make_http_provider(cfg)
+        if got is not None:
+            return got
+    return None
 
 
 class MemoryService:
@@ -73,8 +241,13 @@ class MemoryService:
     def __init__(self, cfg):
         """按配置装配；``memory_enabled=False`` 时直接返回（不建库、不调 embedding）。"""
         self.store = None                   # MemoryStore | None：Task 4 的查询 / 统计 / 删除直接用它
+        self.embed_provider = None          # EmbedProvider | None：本地 GGUF / HTTP / 关键词降级
         self._top_k = max(0, int(getattr(cfg, "memory_top_k", 0) or 0))
         self._max_chars = max(0, int(getattr(cfg, "memory_max_inject_chars", 0) or 0))
+        try:
+            self._min_score = max(0.0, min(1.0, float(getattr(cfg, "memory_min_score", 0.0) or 0.0)))
+        except (TypeError, ValueError):
+            self._min_score = 0.0
         if not bool(getattr(cfg, "memory_enabled", False)):
             return
         db = str(getattr(cfg, "memory_db_path", "") or "").strip() or DEFAULT_DB_PATH
@@ -84,12 +257,34 @@ class MemoryService:
                 os.makedirs(d, exist_ok=True)
         except Exception as e:              # noqa: BLE001 —— 目录建不出来由 MemoryStore 再兜一次
             print("[Memory] 数据目录不可用：%s" % e)
-        self.store = MemoryStore(db, embed_fn=build_embed_fn(cfg))
+        provider = build_embed_fn(cfg)
+        self.embed_provider = provider
+        model_id = str(getattr(provider, "model_id", "") or "")
+        self.store = MemoryStore(db, embed_fn=provider, embed_model=model_id)
+        # v4.3.1（参考 MaiBot 的向量一致性 / 回填思路）：切到本地模型后，
+        # 旧向量（别的模型 / 没向量）不算数；后台补齐当前模型的向量，不阻塞启动与聊天。
+        if (provider is not None and self.store is not None
+                and bool(getattr(cfg, "embed_backfill", True))):
+            batch = max(1, int(getattr(cfg, "embed_batch_size", 16) or 16))
+            t = threading.Thread(target=self._backfill_worker, args=(batch,),
+                                 name="memory-embed-backfill", daemon=True)
+            t.start()
 
     @property
     def available(self) -> bool:
         """功能是否启用（默认关闭时为 ``False``；库本身打不开时 store 内部还会降级）。"""
         return self.store is not None
+
+    def _backfill_worker(self, batch_size=16) -> None:
+        """后台补齐当前 embedding 模型的向量；只打日志，绝不把异常抛回启动/聊天路径。"""
+        if self.store is None:
+            return
+        try:
+            n = self.store.backfill_vectors(batch_size=batch_size)
+            if n:
+                print("[Memory] embedding 回填完成：%d 条" % n)
+        except Exception as e:                  # noqa: BLE001
+            print("[Memory] embedding 回填失败（已忽略，继续关键词检索）：%s" % e)
 
     def recall_for(self, query: str, k: int | None = None, mood=None) -> str:
         """召回最相关的几条记忆，拼成可注入的文本；关闭 / 无命中 / 任何故障返回 ``""``。
@@ -104,7 +299,8 @@ class MemoryService:
             kk = self._top_k if k is None else max(0, int(k))
             if kk == 0:
                 return ""
-            return inject_text(self.store.recall(query, kk, mood=mood), self._max_chars)
+            return inject_text(self.store.recall(query, kk, mood=mood, min_score=self._min_score),
+                               self._max_chars)
         except Exception as e:              # noqa: BLE001
             print("[Memory] 召回失败（已忽略）：%s" % e)
             return ""
@@ -123,7 +319,7 @@ class MemoryService:
             kk = self._top_k if k is None else max(0, int(k))
             if kk == 0:
                 return []
-            rows = self.store.recall(str(query or ""), kk, mood=mood)
+            rows = self.store.recall(str(query or ""), kk, mood=mood, min_score=self._min_score)
             return list(rows or [])
         except Exception as e:              # noqa: BLE001
             print("[Memory] 主动回忆召回失败（已忽略）：%s" % e)

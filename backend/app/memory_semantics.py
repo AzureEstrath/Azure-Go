@@ -24,7 +24,13 @@ MOOD_2D_LABELS = (
 )
 
 # 召回排序时情绪相似度的权重：语义相似度仍是主项（0.75），情绪只做偏置。
-EMOTION_RANK_WEIGHT = 0.25
+# v4.3.1：权重不再是固定 0.25，而是随「当前情绪偏离基线」放大（上限 0.40）——
+# 心境一致性效应在情绪越强时越明显，但绝不让情绪盖过语义。
+EMOTION_RANK_BASE = 0.25
+EMOTION_RANK_MAX = 0.40
+EMOTION_RANK_GAIN = 0.20          # 每 1.0 的基线偏离（两轴平均绝对差）增加的权重
+# 与 emotion.BASELINE 同一组「平静」数值（这里不 import emotion，避免纯逻辑层反向依赖）
+MOOD_BASELINE_2D = (0.58, 0.30)
 
 # 「事实变更」线索：出现这些词时，旧记忆可能与新事实冲突（供上层决定是否 supersede）
 _CHANGE_WORDS = (
@@ -106,10 +112,34 @@ def emotion_affinity(mood, emo_v, emo_a):
     return max(0.0, min(1.0, 1.0 - d))
 
 
-def blended_rank(base_score, mood, emo_v, emo_a):
-    """召回排序分：语义分 × 0.75 + 情绪相似度 × 0.25；情绪未知时退化为语义分。
+def state_emotion_weight(mood, baseline=MOOD_BASELINE_2D, max_weight=EMOTION_RANK_MAX):
+    """当前情绪偏离基线越远，情绪相似度在召回排序里的权重越大（0.25 → 上限 0.40）。
 
-    返回 ``(rank, affinity_or_None)``，调用方拿 affinity 决定要不要展示标签。
+    基线附近仍是保守的 0.25；大起大落时最多 0.40，保证语义相关性不会被情绪吃掉。
+    脏值 / 缺维一律退回基线权重。
+    """
+    cur = emotion_of_mood(mood)
+    if cur is None:
+        return EMOTION_RANK_BASE
+    try:
+        bv, ba = float(baseline[0]), float(baseline[1])
+    except (TypeError, ValueError, IndexError):
+        bv, ba = MOOD_BASELINE_2D
+    deviation = (abs(cur["v"] - bv) + abs(cur["a"] - ba)) / 2.0
+    w = EMOTION_RANK_BASE + EMOTION_RANK_GAIN * deviation
+    try:
+        cap = max(EMOTION_RANK_BASE, min(EMOTION_RANK_MAX, float(max_weight)))
+    except (TypeError, ValueError):
+        cap = EMOTION_RANK_MAX
+    return max(EMOTION_RANK_BASE, min(cap, w))
+
+
+def blended_rank(base_score, mood, emo_v, emo_a, weight=None):
+    """召回排序分：语义分 + 情绪相似度 × w（情绪只做**加性偏置**，不重写语义分）。
+
+    ``w`` 缺省由 :func:`state_emotion_weight` 按当前情绪动态给出（v4.3.1）；
+    情绪未知时退化为纯语义分。返回 ``(rank, affinity_or_None)``。
+    加性偏置保证语义差距大于 ``EMOTION_RANK_MAX`` 时，语义仍然主导排序。
     """
     try:
         base = float(base_score)
@@ -118,7 +148,12 @@ def blended_rank(base_score, mood, emo_v, emo_a):
     aff = emotion_affinity(mood, emo_v, emo_a)
     if aff is None:
         return base, None
-    return base * (1.0 - EMOTION_RANK_WEIGHT) + aff * EMOTION_RANK_WEIGHT, aff
+    try:
+        w = float(weight) if weight is not None else state_emotion_weight(mood)
+    except (TypeError, ValueError):
+        w = EMOTION_RANK_BASE
+    w = max(0.0, min(EMOTION_RANK_MAX, w))
+    return base + aff * w, aff
 
 
 def has_change_cue(text) -> bool:

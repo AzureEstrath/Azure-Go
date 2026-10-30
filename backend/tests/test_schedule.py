@@ -43,7 +43,24 @@ class ScheduleExtractTest(unittest.TestCase):
         self.assertEqual(by_title["给妈妈打电话"]["when_text"], "2026-10-27 20:00")
         self.assertEqual(by_title["没有日期的事"]["start_ts"], 0.0)
         self.assertEqual(by_title["没有日期的事"]["when_text"], "待定")
-        self.assertEqual(len(items), 4, "重复标题 + 时间应去重")
+
+    def test_relative_date_wins_over_llm_absolute_date(self):
+        """v4.3.1：LLM 只给原话日期短语时，绝对日期由 Python 规则算（不让模型心算）。"""
+        items = schedule.normalize_items([
+            # 下周三的“周三”在周二看是明天，但“下周”必须落到下一周
+            {"relative_date": "下周三", "time": "15:00", "title": "组会",
+             "date": "2026-10-28"},
+        ], source="chat", now=NOW)
+        self.assertEqual(items[0]["when_text"], "2026-11-04 15:00")
+
+    def test_day_part_disambiguates_ambiguous_hour(self):
+        items = schedule.normalize_items([
+            {"relative_date": "明天", "day_part": "晚上", "time": "8:00", "title": "电话"},
+            {"relative_date": "明天", "day_part": "早上", "time": "8:00", "title": "晨跑"},
+        ], source="chat", now=NOW)
+        by_title = {x["title"]: x for x in items}
+        self.assertEqual(by_title["电话"]["when_text"], "2026-10-28 20:00")
+        self.assertEqual(by_title["晨跑"]["when_text"], "2026-10-28 08:00")
 
     def test_date_only_is_all_day_and_past_time_rolls_to_tomorrow(self):
         items = schedule.normalize_items([

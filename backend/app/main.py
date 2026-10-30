@@ -1558,7 +1558,15 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         if store is not None:
             try:
                 q = str(body.get("query", "") or "")
-                items = list(await asyncio.to_thread(store.recall, q, mem_k(body)) or [])
+                try:
+                    floor = max(0.0, min(1.0, float(getattr(cfg, "memory_min_score", 0.0) or 0.0)))
+                except (TypeError, ValueError):
+                    floor = 0.0
+                try:
+                    items = list(await asyncio.to_thread(
+                        store.recall, q, mem_k(body), min_score=floor) or [])
+                except TypeError:               # 旧替身只收 (query, k)
+                    items = list(await asyncio.to_thread(store.recall, q, mem_k(body)) or [])
             except Exception as e:              # noqa: BLE001
                 print("[Memory] 查询失败（已忽略）：%s" % e)
                 items = []
