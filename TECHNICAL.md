@@ -56,7 +56,10 @@
 > 非课程条目、embedding 本地失败降级 HTTP、重复写入更新 meta；新增 PROJECT_FULL.md 全量文件地图。**
 > **v4.3.3：玩家私人事实守卫——出话后核对「玩家吃过晚饭 / 下班 / 睡好 / 生病」等私人经历，
 > 只认玩家原话证据；无依据先重答一次，仍编造就用确定性兜底，假事实不写历史与记忆。**
-> 最后更新：2026-10-30。
+> **v4.4.0：桌宠聊天按 A · 雾窗方案精修（头像标题条 / 本地时间 / 轻气泡 / 底部 dock /
+> 极窄适配）；记忆新增 episode 巩固-结晶与 somatic_charge 体感标记，后台任务加
+> foreground / persona / background 车道统计，不改变执行顺序。**
+> 最后更新：2026-10-31。
 
 ---
 
@@ -105,9 +108,9 @@ Azure · 围棋陪练是一个 **本地优先的 AI 围棋陪练**：
 
 | 部分 | 规模 |
 | --- | --- |
-| 后端 `backend/app` | 约 22,000 行 Python |
+| 后端 `backend/app` | 约 22,100 行 Python |
 | 前端 `game/scripts` | 约 16,900 行 GDScript |
-| 后端测试 | 1179 个用例（52 个测试文件） |
+| 后端测试 | 1188 个用例（53 个测试文件） |
 | KataGo 服务测试 | 36 个用例 |
 | 前端 headless 测试 | 20 个脚本 |
 
@@ -209,7 +212,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 │  └─ export_presets.cfg        Windows Desktop 导出预设
 ├─ backend/
 │  ├─ app/                      FastAPI 应用与全部编排逻辑
-│  ├─ tests/                    1179 个用例
+│  ├─ tests/                    1188 个用例
 │  ├─ data/                     运行产物（gitignore）：memory/profile/games/joseki_progress.db
 │  ├─ logs/                     dev_local 日志与 PID 文件（gitignore）
 │  ├─ requirements.txt
@@ -263,6 +266,22 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | `GameReport` | 局末战报：手数、胜率曲线、提子、定式统计 |
 | 复盘模式 | 上一手/下一手、只读重放、逐手注记、全盘 AI 复盘分段 |
 | `MiniBoard` | 棋谱库/复盘中的缩略图 |
+
+### 5.2.1 桌宠聊天（v4.4.0，A · 雾窗）
+
+聊天面板全部由 `PetView._build_chat` 程序化构建，不新增 `.tscn`：
+
+- 标题条：30px 圆形头像（复用 `_circle_mask_shader` 与 `azure_pet.png`）+ `Azure · 聊天` +
+  “● 在线 · 雾蓝” + 关闭；下面是 1px 分隔线。
+- 消息行：`HBox(spacer / VBox / spacer)`，AI 靠左、玩家靠右；气泡内是 `BubbleText`，
+  下方是本地 `ChatTime`（`ts<0` 用当前时间，历史无 ts 则不显示）。气泡圆角按左右分角，
+  AI 左侧 3px 青绿边、玩家右侧 3px 青绿边，阴影降到 0.04~0.045。
+- 底部 dock：`ChatDock`（浅雾底 + 顶部细线）内两层——第一层 `预制音` + 四档思考分段按钮，
+  第二层输入框 + 发送。思考档不再用下拉框，`_think_level` / `Think0..3` 是唯一状态。
+- 窄窗适配：`cw < 210` 时隐藏头像副标题与“思考”标签、预制音只留勾选框、按钮缩到 21px；
+  输入框 10px、发送最小 44px，保证 180px 宽的聊天面板仍可用。
+
+---
 
 ### 5.3 3D 棋盘（`Board3D.gd`）
 
@@ -486,6 +505,7 @@ START → prepare → decide ──(需要工具且未超预算)──→ tools 
 | 画像 | `profile.py`、`profile_store.py` | 棋风画像、时间感知，默认关 |
 | 人格化 | `persona.py`、`profile_store.py`（persona 表） | 关系阶段（默认关，可开关并自选称呼名）、情绪余温、今天的小心思、旧局回忆、夜間节奏；`persona_enabled=false` 时零变化 |
 | 事实守卫 | `personal_facts.py` | 玩家私人事实核对：只认玩家原话，防止编造吃饭 / 下班 / 睡眠 / 生病；出话后重答或确定性兜底 |
+| 车道 | `lanes.py` | `foreground / persona / background` 计数与耗时统计；只观测，不改变执行顺序 |
 | 自适应 | `adaptive.py` | 1~5 档，局内 ±spread |
 | 棋谱 | `game_store.py`、`sgf.py` | SQLite 棋谱库、SGF 导入导出 |
 | 语音 | `tts.py`、`tts_aliyun.py`、`speech_text.py` | 四档 TTS、文本清洗与分块、缓存 |
@@ -551,7 +571,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 **1179** 个用例，覆盖：
+`backend/tests` 共 **1188** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -565,6 +585,8 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 - 聊天排程：规则闸门 / JSON 解析 / 规范化 / 过去事件过滤 / 面板刷新信号 / 开关 / `ai_schedule` 事件；
 - 玩家私人事实守卫：截图场景（15:59 说刚吃完晚饭）/ 时间段合理但无原话 / 玩家原话支持 /
   反向线索 / 问句不算证据 / 重答失败兜底；
+- 记忆代谢与车道：episode 巩固分 / 高显著提升 / 低显著保留惩罚 / somatic_charge 排序 /
+  `foreground` `persona` `background` 统计与 `/api/lanes`；
 - FastAPI 端点与 WebSocket 事件。
 
 KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
@@ -708,6 +730,23 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
       一句事实核对提示重答（快速档），返回仍无依据或结构化 JSON 时用 `fallback_reply`
       确定性收口。`prompts.life_context_block` 另加【信息边界】软约束，但不依赖它兜底。
 
+19. **记忆代谢与任务车道（v4.4.0）**：
+    - **episode 巩固-结晶**：`memory._episode_salience()` 用「情绪峰值 × 0.55 + 轮数占比 × 0.30 +
+      近因 × 0.15」算 0~1 的巩固分；`episodes.meta` 记录 `peak_charge / somatic_charge / salience`。
+      收束时超过 `EPISODE_PROMOTE_SCORE=0.55` 写 `kind="episode_promoted"`，其余仍写普通
+      `episode`；两者都保留，不删除。低巩固分记忆在召回时吃 `-0.05` 的加性保留惩罚。
+    - **somatic_charge 体感标记**：`memory_semantics.somatic_charge()` 用编码时二维情绪离
+      `(0.5, 0.5)` 的绝对距离算电荷；`blended_rank()` 变为「语义 + 情绪 × 动态权重 +
+      电荷 × 0.10」。电荷权重上限 0.12，保证语义差距大时仍由语义主导。旧记忆没有
+      `meta.somatic_charge` 时按 `emo_v / emo_a` 现算。
+    - **任务车道**：新增纯标准库模块 `lanes.py`，`foreground` 覆盖 `AzureAgent.chat` 的整段
+      生成，`persona` 覆盖情绪精修，`background` 覆盖 embedding 回填；只累计 count / total_ms /
+      max_ms / last_ms，不排队、不改变执行顺序。`GET /api/lanes` 暴露只读快照。
+    - **前端 A · 雾窗**：`PetView._build_chat` 改成「头像标题条 → 细线 → 聊天滚动区 → 状态 →
+      雾色 dock」；消息行从「单气泡」变为「气泡 + 本地时间」，气泡圆角按 AI/玩家左右分角；
+      思考档从 `OptionButton` 改为 4 个 `apply_seg_button` 分段按钮；`_layout` 在
+      `cw < 210` 时收起预制音文字与“思考”标签、缩小按钮，保证极窄视口输入 / 发送不越界。
+
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 
 ---
@@ -813,7 +852,7 @@ Godot --path game                  → 客户端
 
 ```powershell
 cd backend
-python -m unittest discover -s tests        # 1179 个用例
+python -m unittest discover -s tests        # 1188 个用例
 ```
 
 ### 10.2 KataGo 服务

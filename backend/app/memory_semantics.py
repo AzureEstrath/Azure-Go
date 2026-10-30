@@ -32,6 +32,15 @@ EMOTION_RANK_GAIN = 0.20          # 每 1.0 的基线偏离（两轴平均绝对
 # 与 emotion.BASELINE 同一组「平静」数值（这里不 import emotion，避免纯逻辑层反向依赖）
 MOOD_BASELINE_2D = (0.58, 0.30)
 
+# v4.4.0（参考 MATE 的 somatic marker）：编码时的情感电荷是记忆自身的属性，
+# 与「当前情绪是否相似」分开。它只作为第三项弱信号，权重远小于语义与情绪。
+SOMATIC_RANK_WEIGHT = 0.10
+SOMATIC_WEIGHT_MAX = 0.12
+SOMATIC_BASE = (0.50, 0.50)       # 电荷零点：二维情绪中点的「无标记」状态
+# 巩固分低于该阈值的记忆仍可召回，但会吃一个很小的保留惩罚（不删除）。
+RETENTION_LOW = 0.35
+RETENTION_PENALTY = 0.05
+
 # 「事实变更」线索：出现这些词时，旧记忆可能与新事实冲突（供上层决定是否 supersede）
 _CHANGE_WORDS = (
     "取消", "撤掉", "删掉", "去掉", "退掉", "退了", "不去了", "不吃了", "不做了",
@@ -134,12 +143,45 @@ def state_emotion_weight(mood, baseline=MOOD_BASELINE_2D, max_weight=EMOTION_RAN
     return max(EMOTION_RANK_BASE, min(cap, w))
 
 
-def blended_rank(base_score, mood, emo_v, emo_a, weight=None):
-    """召回排序分：语义分 + 情绪相似度 × w（情绪只做**加性偏置**，不重写语义分）。
+def somatic_charge(emo_v, emo_a, base=SOMATIC_BASE):
+    """编码时的情感电荷（0~1）：二维情绪离「无标记中点」越远，记忆越重。
 
-    ``w`` 缺省由 :func:`state_emotion_weight` 按当前情绪动态给出（v4.3.1）；
-    情绪未知时退化为纯语义分。返回 ``(rank, affinity_or_None)``。
-    加性偏置保证语义差距大于 ``EMOTION_RANK_MAX`` 时，语义仍然主导排序。
+    MATE / Damasio 的 somatic marker 思路：这是记忆**自身**的属性，不依赖当前心情。
+    未知情绪（``-1`` / 脏值）返回 0.0——「不知道当时感受」不伪造成强烈电荷。
+    """
+    v = _clamp01(emo_v)
+    a = _clamp01(emo_a)
+    if v is None or a is None or v < 0.0 or a < 0.0:
+        return 0.0
+    try:
+        bv, ba = float(base[0]), float(base[1])
+    except (TypeError, ValueError, IndexError):
+        bv, ba = SOMATIC_BASE
+    return max(0.0, min(1.0, abs(v - bv) + abs(a - ba)))
+
+
+def retention_penalty(meta):
+    """低巩固分记忆的召回惩罚（加性、很小）；没有 ``salience`` 的旧记忆不罚。"""
+    if not isinstance(meta, dict) or "salience" not in meta:
+        return 0.0
+    try:
+        s = float(meta.get("salience"))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(s) or s < 0.0 or s > 1.0:
+        return 0.0
+    return -RETENTION_PENALTY if s < RETENTION_LOW else 0.0
+
+
+def blended_rank(base_score, mood, emo_v, emo_a, weight=None, somatic=None,
+                 somatic_weight=None):
+    """召回排序分：语义分 + 情绪相似度 × w + 情感电荷 × w_s。
+
+    - ``w`` 缺省由 :func:`state_emotion_weight` 按当前情绪动态给出（v4.3.1）；
+      没有当前情绪时情绪项为 0，但**情感电荷仍然生效**（v4.4.0）；
+    - ``somatic`` 缺省由 :func:`somatic_charge` 从记忆自身的二维情绪算；
+    - 电荷权重是小项（默认 0.10，上限 0.12），保证语义差距远大于它时语义仍主导。
+    返回 ``(rank, affinity_or_None)``。
     """
     try:
         base = float(base_score)
@@ -147,13 +189,23 @@ def blended_rank(base_score, mood, emo_v, emo_a, weight=None):
         base = 0.0
     aff = emotion_affinity(mood, emo_v, emo_a)
     if aff is None:
-        return base, None
+        emotion_part = 0.0
+    else:
+        try:
+            w = float(weight) if weight is not None else state_emotion_weight(mood)
+        except (TypeError, ValueError):
+            w = EMOTION_RANK_BASE
+        w = max(0.0, min(EMOTION_RANK_MAX, w))
+        emotion_part = aff * w
+    charge = somatic_charge(emo_v, emo_a) if somatic is None else _clamp01(somatic)
+    if charge is None:
+        charge = 0.0
     try:
-        w = float(weight) if weight is not None else state_emotion_weight(mood)
+        sw = float(somatic_weight) if somatic_weight is not None else SOMATIC_RANK_WEIGHT
     except (TypeError, ValueError):
-        w = EMOTION_RANK_BASE
-    w = max(0.0, min(EMOTION_RANK_MAX, w))
-    return base + aff * w, aff
+        sw = SOMATIC_RANK_WEIGHT
+    sw = max(0.0, min(SOMATIC_WEIGHT_MAX, sw))
+    return base + emotion_part + charge * sw, aff
 
 
 def has_change_cue(text) -> bool:

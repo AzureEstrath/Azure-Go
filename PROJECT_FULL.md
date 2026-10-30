@@ -1,4 +1,4 @@
-# Azure · 全量项目文档（v4.3.3）
+# Azure · 全量项目文档（v4.4.0）
 
 > 本文件是**完整项目地图**：系统架构、人格化 / 日程 / 记忆三条主通路、代码量审计结果、
 > 每个第一方文件的作用、配置与测试入口、维护约定。
@@ -192,9 +192,20 @@ FastAPI 后端（backend/app，端口 8000）
 - 检测范围：吃饭（早 / 午 / 晚 / 夜宵）、下班 / 忙完 / 到家、睡眠、感冒 / 不舒服。
 - 失败开放：读聊天流水失败只退回内存历史，核对异常不影响正常出话。
 
+### 4.5 记忆代谢与任务车道（v4.4.0）
+
+- **episode 巩固-结晶**：收束时按「情绪峰值 × 0.55 + 轮数占比 × 0.30 + 近因 × 0.15」
+  算巩固分；超过 0.55 写成 `episode_promoted`，普通聊天仍写 `episode`，都不删除。
+- **低显著保留惩罚**：`salience < 0.35` 的旧摘要召回排序减 0.05，仍可被召回，但让位给
+  更高显著的记忆。
+- **somatic_charge**：编码时二维情绪离 `(0.5, 0.5)` 的绝对距离；召回排序第三项，
+  权重 0.10（上限 0.12），不依赖当前心情。
+- **任务车道**：`foreground / persona / background` 只计数与耗时，不排队、不改变顺序；
+  `GET /api/lanes` 返回只读快照。
+
 ---
 
-## 5. 代码量与结构审计（v4.3.3）
+## 5. 代码量与结构审计（v4.4.0）
 
 ### 5.1 体量最大的文件
 
@@ -203,15 +214,20 @@ FastAPI 后端（backend/app，端口 8000）
 | ~6291 | `game/scripts/ui/Main.gd` | 围棋窗口 UI / 设置 / 服务状态 / 窥屏 / TTS 播放 |
 | ~3442 | `backend/app/agent.py` | 公开动作、情绪、记忆、工具、看板、TTS 桥接 |
 | ~3056 | `backend/tests/test_agent.py` | Agent 全链路回归 |
-| ~2410 | `game/scripts/app/PetView.gd` | 桌宠视图、聊天面板、月历 / 周表 |
+| ~2520 | `game/scripts/app/PetView.gd` | 桌宠视图、聊天面板、月历 / 周表 |
 | ~1918 | `backend/app/agent_graph.py` | LangGraph 六节点编排与全部提示词装配 |
 | ~1668 | `backend/app/main.py` | FastAPI 生命周期 / REST / WS / 日程后台任务 |
 | ~1297 | `backend/app/life.py` | 生命时间线 / 慢变量 / 日程持久化 |
 | ~1133 | `game/scripts/app/PetShell.gd` | 桌宠外壳、服务拉起、聊天 / 窥屏 / 情绪同步 |
-| ~287 | `backend/app/personal_facts.py` | 玩家私人事实守卫（纯逻辑） |
+| ~300 | `backend/app/personal_facts.py` | 玩家私人事实守卫（纯逻辑） |
+| ~70 | `backend/app/lanes.py` | 任务车道统计（纯标准库） |
 
 ### 5.2 已做的收敛
 
+- v4.4.0 把「记忆代谢」集中到 `memory.py` 的 episode 收束边界与 `memory_semantics.py`
+  的排序纯函数；没有新增表、没有新增 LLM 调用。
+- v4.4.0 聊天面板只在 `PetView` / `GufengTheme` 内重构，窗口尺寸、拖动、面板互斥与
+  `PetShell` 服务生命周期保持不动。
 - v4.3.3 把「玩家私人事实」核对拆成独立纯逻辑模块 `personal_facts.py`，不读库、不调模型，
   `agent_graph` 只负责收集证据与重答；兜底句不依赖 LLM。
 - v4.3.2 删除了情绪语言提示里与 `life_note` 重复的「精力不足」段（一处提示只由
@@ -279,6 +295,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `joseki.py` | 定式识别、分支、族命名与讲解素材 |
 | `joseki_gate.py` | 定式提示门控：技能 / 情绪 / 冷却 / 概率 |
 | `joseki_progress.py` | 定式族出现计数与复习优先级 |
+| `lanes.py` | 任务车道统计：`foreground` / `persona` / `background` 计数与耗时，只观测 |
 | `life.py` | 生命时间线：慢变量、情绪快照、事件、日程、类别耗时、统计 |
 | `llm.py` | `LLMClient`：LangChain 链、按调用思考档 / `no_think`、超时、失败映射 |
 | `llm_chain.py` | ChatOpenAI 装配、`extra_body` 合并、流式、content / think 剥离 |
@@ -336,9 +353,10 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_game_store.py` / `test_games_api.py` / `test_sgf.py` | 棋谱库、API、SGF |
 | `test_joseki*.py` | 定式识别 / 提取 / 门控 / 族计数 |
 | `test_life.py` | 生命时间线与日程持久化 |
+| `test_lanes.py` | 任务车道统计 / 未知车道安全 / 重置 |
 | `test_llm.py` / `test_llm_chain.py` | LLM 客户端、思考档、流式、降级 |
 | `test_main.py` | FastAPI 端点 / 生命周期 / 运行期配置 / 记忆 API |
-| `test_memory.py` / `test_memory_semantics.py` | 记忆存储、向量指纹、回填、阈值、情绪矩阵、supersede |
+| `test_memory.py` / `test_memory_semantics.py` | 记忆存储、向量指纹、回填、阈值、情绪矩阵、supersede、巩固分、somatic_charge |
 | `test_mood_delta.py` | 情绪小调用解析与限频 |
 | `test_persona.py` / `test_profile*.py` | 人格化、画像、画像库 |
 | `test_personal_facts.py` | 玩家私人事实守卫：截图晚饭场景、原话证据、反向线索、问句、兜底句 |
@@ -351,7 +369,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_timetable.py` | 课表几何还原 |
 | `test_tools.py` | 发言侧工具 |
 | `test_tts*.py` | TTS 文本 / 缓存 / 阿里云 / 链路 |
-| `test_agent_graph.py` / `test_agent.py` 中的 v4.3.x 用例 | 回忆链、日程事实、动态情绪权重、embedding、私人事实重答 |
+| `test_agent_graph.py` / `test_agent.py` 中的 v4.4.x 用例 | 回忆链、日程事实、动态情绪权重、embedding、私人事实重答、聊天 UI 适配 |
 
 ### 6.4 `game/scripts/`
 
@@ -359,7 +377,7 @@ FastAPI 后端（backend/app，端口 8000）
 | --- | --- |
 | `app/Launcher.gd` | 启动分流：桌宠 / 围棋 / 命令行覆盖 |
 | `app/PetShell.gd` | 桌宠外壳：服务拉起、窗口拖动、聊天 / 窥屏 / 情绪 / TTS 状态 |
-| `app/PetView.gd` | 桌宠视图：圆形头像、聊天气泡、思考档、资料 / 月历 / 周表 |
+| `app/PetView.gd` | 桌宠视图：圆形头像、聊天气泡 / 时间 / 分段思考、资料 / 月历 / 周表 |
 | `core/AzureConfig.gd` | 前端配置读写（保留未知后端键，`_raw` 原样写回） |
 | `core/Coords.gd` | 前端坐标换算 |
 | `core/GameReplay.gd` | 棋谱重放 |
@@ -430,6 +448,7 @@ FastAPI 后端（backend/app，端口 8000）
 
 `docs/plans/` 与 `docs/superpowers/` 保存历史设计与实施计划（远程化、KataGo 云服务、
 LangChain / LangGraph、长期记忆、TTS、聊天队列、定式 / 画像 / 事件 / UX）。
+`frontend-redesign-options.html` 是 v4.4.0 的 A/B/C/D 四案可视预览（A · 雾窗已落地）。
 这些是**历史设计记录**，不是当前行为契约；当前契约以 README / TECHNICAL / 测试为准。
 
 ### 6.10 `server/`（CosyVoice，第三方）
@@ -470,7 +489,7 @@ LangChain / LangGraph、长期记忆、TTS、聊天队列、定式 / 画像 / �
 ## 8. 测试与运行
 
 ```powershell
-# 后端全量（当前 1179 tests OK）
+# 后端全量（当前 1188 tests OK）
 cd backend
 python -m unittest discover -s tests -q
 

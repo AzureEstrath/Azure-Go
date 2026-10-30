@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure · 前端重构四案</title>
+<style>
+  :root{
+    --paper:#eaf3f8; --paper-2:#f8fcfd; --paper-3:#dceef4;
+    --ink:#1e3a46; --ink-soft:#5e7783; --ink-faint:#8aa4ae;
+    --accent:#2e7d73; --accent-2:#4fd1c5; --line:#c6dde7;
+    --deep:#0e2830; --night:#0b1114; --night-2:#101c20;
+    --serif:"Noto Serif SC","Source Han Serif SC","Songti SC","STSong","SimSun",serif;
+    --sans:"Noto Sans SC","Source Han Sans SC","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0; min-height:100vh; color:var(--paper); font-family:var(--sans);
+    background:
+      radial-gradient(900px 520px at 8% -6%, rgba(79,209,197,.16), transparent 70%),
+      radial-gradient(1100px 640px at 96% 8%, rgba(126,179,199,.13), transparent 72%),
+      radial-gradient(800px 600px at 50% 110%, rgba(46,125,115,.16), transparent 70%),
+      #0c181c;
+    overflow-x:hidden;
+  }
+  body::before{
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:0; opacity:.32;
+    background-image:
+      linear-gradient(rgba(234,243,248,.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(234,243,248,.045) 1px, transparent 1px);
+    background-size:34px 34px;
+    mask-image:radial-gradient(circle at 50% 20%, #000 0%, transparent 78%);
+  }
+  body::after{
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:0; opacity:.18;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.82' numOctaves='3' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)' opacity='.35'/></svg>");
+    mix-blend-mode:soft-light;
+  }
+  .wrap{position:relative; z-index:1; width:min(1480px, calc(100% - 48px)); margin:0 auto;}
+  .masthead{padding:64px 0 34px; display:grid; grid-template-columns:minmax(0,1.15fr) minmax(300px,.85fr); gap:44px; align-items:end; border-bottom:1px solid rgba(198,221,231,.22);}
+  .eyebrow{font-size:11px; letter-spacing:.28em; text-transform:uppercase; color:#8fb9c0; margin-bottom:20px;}
+  .eyebrow b{color:#d6f5ef; font-weight:500;}
+  h1{
+    margin:0; font-family:var(--serif); font-weight:600; font-size:clamp(52px,6.4vw,92px);
+    line-height:.98; letter-spacing:.055em; color:#effafc; text-shadow:0 0 60px rgba(79,209,197,.14);
+  }
+  h1 span{display:block; color:#83d9ce; font-size:.72em; letter-spacing:.18em; margin-top:12px;}
+  .lede{max-width:560px; margin:0 0 4px; color:#a9c5cc; font-size:14px; line-height:1.95;}
+  .lede strong{color:#e3f7f4; font-weight:500;}
+  .baseline{display:flex; flex-wrap:wrap; gap:10px; margin-top:24px;}
+  .chip{display:inline-flex; align-items:center; gap:8px; padding:8px 11px; border:1px solid rgba(198,221,231,.22); border-radius:999px; background:rgba(234,243,248,.04); color:#b9d3d8; font-size:11px; letter-spacing:.06em;}
+  .chip i{width:11px; height:11px; border-radius:50%; display:inline-block;}
+  .chip code{font-family:var(--sans); color:#eaf3f8; font-size:10px; letter-spacing:.04em;}
+  .palette-note{margin-top:20px; font-size:11px; color:#7c9ca3; line-height:1.8;}
+  .palette-note em{font-style:normal; color:#cfe8e7;}
+
+  .board{padding:36px 0 12px; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:28px;}
+  .option{
+    position:relative; display:flex; flex-direction:column; min-height:880px; padding:26px 26px 20px;
+    border-radius:22px; border:1px solid rgba(198,221,231,.28); background:
+      linear-gradient(180deg, rgba(248,252,253,.99), rgba(232,244,248,.97));
+    color:var(--ink); box-shadow:0 26px 70px rgba(0,0,0,.30), inset 0 1px 0 rgba(255,255,255,.8);
+    cursor:pointer; transition:transform .35s cubic-bezier(.2,.7,.2,1), box-shadow .35s, border-color .35s;
+    outline:none;
+  }
+  .option:hover{transform:translateY(-5px); box-shadow:0 34px 86px rgba(0,0,0,.36), inset 0 1px 0 rgba(255,255,255,.9);}
+  .option:focus-visible{border-color:var(--accent-2);}
+  .option.is-picked{border-color:#3fc4b6; box-shadow:0 0 0 3px rgba(63,196,182,.18), 0 34px 86px rgba(0,0,0,.36);}
+  .option.is-picked::after{content:"已选"; position:absolute; top:18px; right:18px; z-index:3; padding:6px 10px; border-radius:999px; background:#1f7e72; color:#f2fffd; font-size:10px; letter-spacing:.14em; box-shadow:0 6px 18px rgba(31,126,114,.35);}
+  .option-head{display:grid; grid-template-columns:56px 1fr; gap:16px; align-items:start; padding-bottom:18px; border-bottom:1px solid rgba(30,58,70,.12);}
+  .idx{font-family:var(--serif); font-size:40px; line-height:1; color:#2e7d73; letter-spacing:.04em;}
+  .option-head h2{margin:0; font-family:var(--serif); font-size:26px; font-weight:600; letter-spacing:.04em; color:var(--ink);}
+  .option-head .en{display:block; margin-top:4px; color:#78949c; font-size:10px; letter-spacing:.22em; text-transform:uppercase;}
+  .option-head p{margin:10px 0 0; color:#4e6c76; font-size:12.5px; line-height:1.9; max-width:560px;}
+  .tags{display:flex; flex-wrap:wrap; gap:6px; margin-top:12px;}
+  .tag{padding:5px 9px; border-radius:999px; border:1px solid rgba(46,125,115,.2); background:rgba(46,125,115,.07); color:#2c6f68; font-size:10px; letter-spacing:.06em;}
+  .tag.hot{background:rgba(193,127,49,.1); border-color:rgba(193,127,49,.26); color:#8c5d23;}
+
+  .stage{
+    position:relative; margin-top:18px; padding:24px 18px; border-radius:16px; overflow:hidden;
+    background:
+      radial-gradient(520px 280px at 50% 0%, rgba(255,255,255,.9), transparent 68%),
+      linear-gradient(160deg,#d8eaf1,#c9e1ea 58%,#dceef3);
+    border:1px solid rgba(30,58,70,.10);
+  }
+  .stage::before{
+    content:""; position:absolute; inset:0; pointer-events:none; opacity:.5;
+    background-image:linear-gradient(rgba(30,58,70,.055) 1px, transparent 1px),linear-gradient(90deg, rgba(30,58,70,.055) 1px, transparent 1px);
+    background-size:22px 22px;
+    mask-image:linear-gradient(180deg,#000,transparent 88%);
+  }
+  .stage-label{position:absolute; top:12px; left:16px; z-index:2; font-size:9px; letter-spacing:.24em; color:#6b8b94; text-transform:uppercase;}
+  .stage-label b{color:#2e7d73; font-weight:500;}
+  .dock-caption{position:relative; z-index:2; display:flex; justify-content:center; margin-bottom:12px;}
+  .dock-caption span{font-size:9px; letter-spacing:.2em; color:#62838c; background:rgba(255,255,255,.62); border:1px solid rgba(30,58,70,.1); border-radius:999px; padding:5px 9px;}
+
+  /* ——— app shell common ——— */
+  .app{
+    position:relative; z-index:1; width:min(370px,100%); min-height:532px; margin:16px auto 0;
+    display:flex; flex-direction:column; overflow:hidden; border-radius:16px;
+    background:rgba(248,252,253,.94); border:1px solid rgba(30,58,70,.16);
+    box-shadow:0 20px 44px rgba(33,72,82,.18), 0 2px 0 rgba(255,255,255,.7) inset;
+    transition:transform .35s;
+  }
+  .option:hover .app{transform:translateY(-2px);}
+  .app-head{display:flex; align-items:center; gap:10px; padding:12px 14px; border-bottom:1px solid rgba(30,58,70,.10); background:linear-gradient(180deg,rgba(255,255,255,.7),rgba(234,243,248,.4));}
+  .avatar{width:34px; height:34px; flex:0 0 34px; border-radius:50%; overflow:hidden; position:relative; background:radial-gradient(circle at 50% 40%,#f7fdff,#cfe6ee); box-shadow:0 0 0 2px rgba(46,125,115,.18),0 0 0 5px rgba(255,255,255,.55);}
+  .avatar img{width:100%; height:100%; object-fit:cover; object-position:50% 8%; display:block;}
+  .who{min-width:0; flex:1;}
+  .who strong{display:block; font-family:var(--serif); font-size:13px; letter-spacing:.06em; color:var(--ink); line-height:1.2;}
+  .who small{display:flex; align-items:center; gap:5px; margin-top:3px; font-size:8.5px; letter-spacing:.08em; color:#78949c;}
+  .dot{width:5px; height:5px; border-radius:50%; background:#2e7d73; box-shadow:0 0 0 3px rgba(46,125,115,.11);}
+  .icon{width:22px; height:22px; border:0; background:transparent; color:#8aa4ae; font-size:16px; line-height:1; cursor:pointer;}
+  .icon:hover{color:#2e7d73;}
+
+  .chat{flex:1; min-height:0; padding:14px 13px 6px; display:flex; flex-direction:column; gap:10px; overflow:hidden;}
+  .msg{display:flex; flex-direction:column; gap:4px; max-width:88%;}
+  .msg.user{margin-left:auto; align-items:flex-end;}
+  .bubble{padding:9px 11px; border-radius:10px; font-size:11.3px; line-height:1.75; letter-spacing:.01em; color:#21414c; background:#f9fdfe; border:1px solid rgba(30,58,70,.10); box-shadow:0 2px 8px rgba(30,58,70,.05);}
+  .msg.ai .bubble{border-left:2px solid rgba(46,125,115,.72); border-radius:3px 10px 10px 10px;}
+  .msg.user .bubble{background:#dff2ee; border-color:rgba(46,125,115,.18); border-right:2px solid rgba(46,125,115,.72); border-radius:10px 3px 10px 10px;}
+  .msg .meta{font-size:8px; letter-spacing:.1em; color:#9ab2ba; padding:0 3px;}
+  .typing{display:flex; align-items:center; gap:4px; padding:8px 10px; width:max-content; border-radius:10px; background:rgba(255,255,255,.65); border:1px dashed rgba(46,125,115,.3);}
+  .typing i{width:4px; height:4px; border-radius:50%; background:#2e7d73; opacity:.5; animation:pulse 1.4s infinite;}
+  .typing i:nth-child(2){animation-delay:.2s;} .typing i:nth-child(3){animation-delay:.4s;}
+  @keyframes pulse{0%,80%,100%{transform:translateY(0);opacity:.35}40%{transform:translateY(-2px);opacity:.9}}
+
+  .composer-wrap{margin-top:auto; padding:8px 12px 12px; border-top:1px solid rgba(30,58,70,.08);}
+  .control-line{display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:7px;}
+  .mini-toggle{display:flex; align-items:center; gap:6px; font-size:8.5px; color:#617f88; white-space:nowrap;}
+  .switch{width:22px; height:12px; border-radius:99px; background:#2e7d73; position:relative; box-shadow:inset 0 0 0 1px rgba(0,0,0,.05);}
+  .switch::after{content:""; position:absolute; top:2px; right:2px; width:8px; height:8px; border-radius:50%; background:#f8fcfd;}
+  .seg{display:flex; gap:2px; padding:2px; border-radius:999px; background:rgba(30,58,70,.06);}
+  .seg span{padding:3px 7px; border-radius:999px; font-size:8px; color:#6d8c95; letter-spacing:.06em;}
+  .seg span.on{background:#2e7d73; color:#f4fffd; box-shadow:0 2px 5px rgba(46,125,115,.2);}
+  .composer{display:flex; align-items:center; gap:6px;}
+  .composer input{flex:1; min-width:0; height:32px; border-radius:10px; border:1px solid rgba(30,58,70,.14); background:#f4fbfd; padding:0 10px; font-family:var(--sans); font-size:10px; color:#21414c; outline:none;}
+  .composer input::placeholder{color:#9ab2ba;}
+  .composer input:focus{border-color:rgba(46,125,115,.55); box-shadow:0 0 0 3px rgba(46,125,115,.08);}
+  .send{height:32px; padding:0 13px; border:0; border-radius:10px; background:#2e7d73; color:#f4fffd; font-family:var(--sans); font-size:10px; letter-spacing:.08em; cursor:pointer; box-shadow:0 4px 10px rgba(46,125,115,.22);}
+  .send:hover{background:#276f66;}
+
+  /* ——— A: 雾窗 ——— */
+  .scheme-a .app{background:rgba(248,252,253,.96);}
+  .scheme-a .app-head{padding:14px 15px 12px;}
+  .scheme-a .chat{padding-top:16px;}
+  .scheme-a .msg.ai .bubble{background:rgba(248,252,253,.9); border-left-width:3px;}
+  .scheme-a .msg.user .bubble{background:rgba(223,242,238,.85);}
+  .scheme-a .composer-wrap{padding:9px 12px 12px; background:linear-gradient(180deg,rgba(234,243,248,.2),rgba(234,243,248,.65));}
+
+  /* ——— B: 双栏 ——— */
+  .scheme-b .app{width:min(382px,100%);}
+  .scheme-b .app-body{display:flex; flex:1; min-height:0;}
+  .scheme-b .chat{padding:12px 10px 6px; gap:9px;}
+  .scheme-b .msg{max-width:94%;}
+  .scheme-b .bubble{font-size:10.6px; padding:8px 9px; line-height:1.7;}
+  .rail{width:102px; flex:0 0 102px; border-left:1px solid rgba(30,58,70,.09); background:rgba(234,243,248,.58); padding:11px 9px; display:flex; flex-direction:column; gap:12px;}
+  .rail-block label{display:block; font-size:7.5px; letter-spacing:.2em; color:#8aa4ae; margin-bottom:5px; text-transform:uppercase;}
+  .mood-name{font-family:var(--serif); font-size:14px; color:#2e7d73; letter-spacing:.08em;}
+  .mood-bars{display:flex; gap:3px; margin-top:6px;}
+  .mood-bars i{height:4px; flex:1; border-radius:99px; background:rgba(46,125,115,.18);}
+  .mood-bars i.on{background:#2e7d73;}
+  .rail-card{border:1px solid rgba(30,58,70,.1); border-radius:7px; background:rgba(255,255,255,.55); padding:7px; font-size:9px; line-height:1.55; color:#3f606a;}
+  .rail-card b{display:block; font-family:var(--serif); font-size:11px; color:#1e3a46; font-weight:600; margin-bottom:2px;}
+  .rail-memory{border-left:2px solid rgba(46,125,115,.55); padding-left:7px; font-size:9px; line-height:1.6; color:#4f6f78;}
+  .scheme-b .composer-wrap{padding:7px 9px 10px;}
+  .scheme-b .control-line{gap:5px;}
+  .scheme-b .mini-toggle{font-size:7.5px;}
+  .scheme-b .seg span{padding:3px 5px; font-size:7px;}
+  .scheme-b .composer input{font-size:9px;}
+
+  /* ——— C: 时间卷轴 ——— */
+  .scheme-c .app{background:linear-gradient(180deg,#fbfdfd,#f1f8fa);}
+  .scheme-c .app-head{padding:13px 15px;}
+  .scheme-c .who strong{font-size:12px;}
+  .scheme-c .date-seal{margin-left:auto; text-align:right; font-family:var(--serif); font-size:9px; color:#7c989f; line-height:1.35; letter-spacing:.04em;}
+  .scheme-c .date-seal b{display:block; color:#2e7d73; font-size:12px; font-weight:500;}
+  .scheme-c .chat{padding:14px 12px 6px; position:relative;}
+  .scheme-c .chat::before{content:""; position:absolute; top:16px; bottom:14px; left:51px; width:1px; background:linear-gradient(180deg,rgba(46,125,115,.35),rgba(46,125,115,.08));}
+  .tl-row{position:relative; display:grid; grid-template-columns:38px 1fr; gap:8px; align-items:start;}
+  .tl-time{position:relative; padding-top:4px; text-align:right; font-family:var(--serif); font-size:7.5px; color:#93aeb6; letter-spacing:.06em;}
+  .tl-time::after{content:""; position:absolute; right:-8px; top:8px; width:5px; height:5px; border-radius:50%; background:#2e7d73; box-shadow:0 0 0 3px rgba(46,125,115,.1);}
+  .tl-row.user .tl-time::after{background:#c47a3a; box-shadow:0 0 0 3px rgba(196,122,58,.1);}
+  .tl-body{display:flex;}
+  .tl-row.user .tl-body{justify-content:flex-end;}
+  .scheme-c .msg{max-width:100%;}
+  .scheme-c .bubble{background:rgba(255,255,255,.8); border:1px solid rgba(30,58,70,.09); border-left:0; border-radius:8px; box-shadow:0 2px 6px rgba(30,58,70,.04);}
+  .scheme-c .msg.ai .bubble{background:rgba(246,252,253,.92);}
+  .scheme-c .msg.user .bubble{background:rgba(223,242,238,.72); border-right:2px solid rgba(46,125,115,.55);}
+  .scheme-c .msg .meta{font-family:var(--serif); color:#9ab2ba;}
+  .scheme-c .composer-wrap{border-top:1px dashed rgba(46,125,115,.22); padding:8px 12px 12px; background:transparent;}
+  .scheme-c .seal-line{display:flex; align-items:center; gap:7px; margin-bottom:6px; color:#7c989f; font-family:var(--serif); font-size:8px; letter-spacing:.1em;}
+  .scheme-c .seal-line i{width:16px; height:16px; border-radius:3px; background:#2e7d73; display:inline-flex; align-items:center; justify-content:center; color:#f4fffd; font-style:normal; font-size:8px;}
+
+  /* ——— D: 夜航 ——— */
+  .scheme-d .app{background:linear-gradient(180deg,#101d21,#0b1215); border-color:rgba(79,209,197,.26); box-shadow:0 20px 54px rgba(0,0,0,.5), 0 0 0 1px rgba(79,209,197,.06) inset;}
+  .scheme-d .app-head{background:linear-gradient(180deg,rgba(79,209,197,.08),rgba(11,18,21,.2)); border-bottom-color:rgba(79,209,197,.14);}
+  .scheme-d .avatar{background:radial-gradient(circle at 50% 40%,#15343a,#0c1b1f); box-shadow:0 0 0 2px rgba(79,209,197,.45),0 0 18px rgba(79,209,197,.28);}
+  .scheme-d .who strong{color:#e1f6f3;}
+  .scheme-d .who small{color:#75a4a8;}
+  .scheme-d .dot{background:#4fd1c5; box-shadow:0 0 8px rgba(79,209,197,.65);}
+  .scheme-d .icon{color:#6d969b;}
+  .scheme-d .chat{background:radial-gradient(420px 280px at 50% 0%,rgba(79,209,197,.05),transparent 70%);}
+  .scheme-d .msg.ai .bubble{background:rgba(255,255,255,.045); border-color:rgba(79,209,197,.22); border-left-color:rgba(79,209,197,.7); color:#cfe3e2;}
+  .scheme-d .msg.user .bubble{background:rgba(79,209,197,.10); border-color:rgba(79,209,197,.22); border-right-color:rgba(79,209,197,.7); color:#d9f2ee;}
+  .scheme-d .msg .meta{color:#567b80;}
+  .scheme-d .typing{background:rgba(255,255,255,.04); border-color:rgba(79,209,197,.24);}
+  .scheme-d .typing i{background:#4fd1c5;}
+  .scheme-d .composer-wrap{background:linear-gradient(180deg,rgba(79,209,197,.03),rgba(0,0,0,.18)); border-top-color:rgba(79,209,197,.14);}
+  .scheme-d .mini-toggle{color:#7ba3a7;}
+  .scheme-d .switch{background:#4fd1c5;}
+  .scheme-d .seg{background:rgba(255,255,255,.06);}
+  .scheme-d .seg span{color:#7ba3a7;}
+  .scheme-d .seg span.on{background:#4fd1c5; color:#062024;}
+  .scheme-d .composer input{background:rgba(255,255,255,.045); border-color:rgba(79,209,197,.18); color:#d8efed;}
+  .scheme-d .composer input::placeholder{color:#5c8287;}
+  .scheme-d .composer input:focus{border-color:rgba(79,209,197,.55); box-shadow:0 0 0 3px rgba(79,209,197,.08);}
+  .scheme-d .send{background:#4fd1c5; color:#062024; box-shadow:0 4px 14px rgba(79,209,197,.18);}
+  .scheme-d .send:hover{background:#66e2d6;}
+
+  .meta{margin-top:16px; border-top:1px solid rgba(30,58,70,.10); padding-top:14px; display:grid; grid-template-columns:1fr 1fr; gap:12px;}
+  .meta-block{padding:10px 11px; border-radius:9px; background:rgba(255,255,255,.42); border:1px solid rgba(30,58,70,.07);}
+  .meta-block label{display:block; font-size:8px; letter-spacing:.2em; color:#8aa4ae; margin-bottom:5px;}
+  .meta-block p{margin:0; font-size:10.5px; line-height:1.7; color:#486872;}
+  .meta-block p b{color:#1e3a46; font-weight:600;}
+  .meta-block.wide{grid-column:1/-1;}
+
+  .plan{position:relative; z-index:1; width:min(1180px,calc(100% - 48px)); margin:24px auto 0; padding:40px 0 72px;}
+  .plan-head{display:flex; align-items:baseline; justify-content:space-between; gap:20px; padding-bottom:18px; border-bottom:1px solid rgba(198,221,231,.22);}
+  .plan-head h3{margin:0; font-family:var(--serif); font-size:30px; letter-spacing:.08em; color:#e8f7f4; font-weight:500;}
+  .plan-head span{font-size:10px; letter-spacing:.22em; color:#7fa4ad; text-transform:uppercase;}
+  .steps{display:grid; grid-template-columns:repeat(3,1fr); gap:0; margin-top:26px; border-top:1px solid rgba(198,221,231,.16);}
+  .step{padding:22px 26px 6px 0; border-right:1px solid rgba(198,221,231,.14);}
+  .step:last-child{border-right:0;}
+  .step-num{font-family:var(--serif); font-size:11px; letter-spacing:.2em; color:#79cfc5;}
+  .step h4{margin:12px 0 8px; font-family:var(--serif); font-size:20px; letter-spacing:.05em; color:#e7f5f2; font-weight:500;}
+  .step p{margin:0; max-width:320px; font-size:11.5px; line-height:1.95; color:#9dbac1;}
+  .step p b{color:#d4eee9; font-weight:500;}
+  .persona{margin-top:32px; padding:22px 24px; border:1px solid rgba(79,209,197,.16); border-radius:14px; background:rgba(79,209,197,.035);}
+  .persona-head{display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin-bottom:14px;}
+  .persona-head h4{margin:0; font-family:var(--serif); font-size:18px; color:#dcf4ef; letter-spacing:.06em; font-weight:500;}
+  .persona-head span{font-size:9px; letter-spacing:.18em; color:#73a3a8; text-transform:uppercase;}
+  .persona-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:10px;}
+  .p-card{padding:13px 14px; border-radius:9px; background:rgba(234,243,248,.04); border:1px solid rgba(198,221,231,.12);}
+  .p-card b{display:block; font-size:11px; color:#b8e8df; letter-spacing:.04em; margin-bottom:5px;}
+  .p-card p{margin:0; font-size:10.5px; line-height:1.8; color:#91adb3;}
+
+  .selectbar{position:sticky; bottom:18px; z-index:5; margin:28px auto 0; width:min(780px,calc(100% - 36px)); padding:10px 12px; display:flex; align-items:center; justify-content:space-between; gap:14px; border-radius:999px; border:1px solid rgba(198,221,231,.22); background:rgba(12,24,28,.82); backdrop-filter:blur(18px); box-shadow:0 18px 40px rgba(0,0,0,.28);}
+  .selectbar .state{font-size:10.5px; letter-spacing:.08em; color:#9dbac1; padding-left:8px;}
+  .selectbar .state b{color:#a9f0e6; font-weight:500;}
+  .choices{display:flex; gap:4px;}
+  .choice{width:32px; height:27px; border-radius:16px; border:1px solid rgba(198,221,231,.2); background:transparent; color:#9dbac1; font-size:10px; cursor:pointer; transition:.2s;}
+  .choice:hover{border-color:#5dc6ba; color:#e8faf6;}
+  .choice.on{background:#2e7d73; border-color:#2e7d73; color:#f4fffd;}
+  .copy{border:1px solid rgba(79,209,197,.28); background:rgba(79,209,197,.1); color:#bff4ec; font-size:10px; letter-spacing:.08em; padding:7px 12px; border-radius:999px; cursor:pointer;}
+  .copy:hover{background:rgba(79,209,197,.18);}
+
+  @media (max-width:980px){
+    .masthead{grid-template-columns:1fr; gap:24px; padding-top:40px;}
+    .board{grid-template-columns:1fr;}
+    .option{min-height:0;}
+    .steps{grid-template-columns:1fr;}
+    .step{border-right:0; border-bottom:1px solid rgba(198,221,231,.14); padding:20px 0;}
+    .persona-grid{grid-template-columns:1fr;}
+  }
+  @media (max-width:560px){
+    .wrap,.plan{width:calc(100% - 28px);}
+    .masthead{padding-top:30px;}
+    h1{font-size:44px;}
+    .option{padding:18px;}
+    .option-head{grid-template-columns:40px 1fr; gap:11px;}
+    .idx{font-size:30px;}
+    .option-head h2{font-size:22px;}
+    .stage{padding:18px 10px;}
+    .selectbar{width:calc(100% - 20px); bottom:10px;}
+    .selectbar .state{display:none;}
+    .meta{grid-template-columns:1fr;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <div>
+      <div class="eyebrow">AZURE · FRONTEND DIRECTIONS <b>/ v4.3.3</b></div>
+      <h1>四种<span>靠近她的方式</span></h1>
+    </div>
+    <div>
+      <p class="lede">不改她的底色，只换她坐到你面前的方式。四案都以现有<strong>雾蓝清透</strong>为基准：同样的墨青、青绿、圆角与细边框，只在信息层级、空间结构和时间感上分叉。</p>
+      <div class="baseline">
+        <span class="chip"><i style="background:#eaf3f8"></i>雾纸 <code>#EAF3F8</code></span>
+        <span class="chip"><i style="background:#1e3a46"></i>墨青 <code>#1E3A46</code></span>
+        <span class="chip"><i style="background:#2e7d73"></i>青绿 <code>#2E7D73</code></span>
+        <span class="chip"><i style="background:#c6dde7"></i>细边 <code>1px</code></span>
+      </div>
+      <p class="palette-note">基准保留：<em>14px 圆角、3px 侧边气泡线、圆形头像、轻阴影、短句节奏</em>。四案不引入新的视觉语言，只重新分配注意力。</p>
+    </div>
+  </header>
+
+  <main class="board">
+    <!-- A -->
+    <article class="option" data-option="A" tabindex="0" role="button" aria-label="方案 A 雾窗精修单栏">
+      <div class="option-head">
+        <div class="idx">01</div>
+        <div>
+          <h2>雾窗 · 精修单栏</h2>
+          <span class="en">Mist Window / Refined Single Column</span>
+          <p>把现在这一版做深，而不是做大。标题收成一张小名片，气泡更轻，底部三个控件收进一条 dock；聊天的纵向节奏更像呼吸，而不是表单。</p>
+          <div class="tags"><span class="tag">改动低</span><span class="tag">风险低</span><span class="tag">100% 基准</span><span class="tag hot">稳健推荐</span></div>
+        </div>
+      </div>
+      <div class="stage scheme-a">
+        <div class="stage-label"><b>01</b> / MIST WINDOW</div>
+        <div class="dock-caption"><span>精修重点：标题 / 间距 / 底部工具</span></div>
+        <div class="app">
+          <div class="app-head">
+            <div class="avatar"><img src="../game/assets/azure_pet.png" alt="Azure"></div>
+            <div class="who"><strong>Azure · 聊天</strong><small><span class="dot"></span>在线 · 雾蓝</small></div>
+            <button class="icon" aria-label="关闭">×</button>
+          </div>
+          <div class="chat">
+            <div class="msg user"><div class="bubble">今晚几点吃饭合适？</div><div class="meta">15:58</div></div>
+            <div class="msg ai"><div class="bubble">六点半到七点比较合适；要是饿了，先垫一点水果。</div><div class="meta">15:59 · Azure</div></div>
+            <div class="msg user"><div class="bubble">吃完陪我复盘一盘？</div><div class="meta">16:00</div></div>
+            <div class="msg ai"><div class="bubble">好呀，想先看布局还是官子？</div><div class="meta">16:00 · Azure</div></div>
+            <div class="typing" aria-label="Azure 正在输入"><i></i><i></i><i></i></div>
+          </div>
+          <div class="composer-wrap">
+            <div class="control-line">
+              <div class="mini-toggle"><span class="switch"></span>只用预制音</div>
+              <div class="seg"><span>无</span><span class="on">低</span><span>中</span><span>强</span></div>
+            </div>
+            <div class="composer"><input placeholder="和 Azure 说点什么…" aria-label="输入"><button class="send">发送</button></div>
+          </div>
+        </div>
+      </div>
+      <div class="meta">
+        <div class="meta-block"><label>气质</label><p>安静、清透、像一扇没有多余装饰的窗。改动集中在<b>字号层级、留白、工具栏</b>。</p></div>
+        <div class="meta-block"><label>最适合</label><p>先稳住日常聊天体验；不动窗口尺寸策略，<b>回归风险最低</b>。</p></div>
+        <div class="meta-block wide"><label>需要动到的文件</label><p><b>PetView.gd</b> 的聊天构建与气泡行；<b>GufengTheme.gd</b> 的气泡 / 按钮 / 输入框样式。不碰 PetShell 的窗口与拖动。</p></div>
+      </div>
+    </article>
+
+    <!-- B -->
+    <article class="option" data-option="B" tabindex="0" role="button" aria-label="方案 B 双栏工作台">
+      <div class="option-head">
+        <div class="idx">02</div>
+        <div>
+          <h2>双栏 · 工作台</h2>
+          <span class="en">Two Columns / Atelier</span>
+          <p>聊天是主线，右岸留一条很窄的上下文栏：此刻的情绪、下一件日程、她刚刚想起的旧事。信息不抢话，但让“她记得你”变得看得见。</p>
+          <div class="tags"><span class="tag">结构升级</span><span class="tag">窄窗需折叠</span><span class="tag">人格可视化</span><span class="tag hot">最像助手</span></div>
+        </div>
+      </div>
+      <div class="stage scheme-b">
+        <div class="stage-label"><b>02</b> / TWO COLUMNS</div>
+        <div class="dock-caption"><span>精修重点：聊天主线 + 右岸上下文</span></div>
+        <div class="app">
+          <div class="app-head">
+            <div class="avatar"><img src="../game/assets/azure_pet.png" alt="Azure"></div>
+            <div class="who"><strong>Azure · 聊天</strong><small><span class="dot"></span>在线 · 平静 / 低唤醒</small></div>
+            <button class="icon" aria-label="关闭">×</button>
+          </div>
+          <div class="app-body">
+            <div class="chat">
+              <div class="msg user"><div class="bubble">今晚几点吃饭合适？</div></div>
+              <div class="msg ai"><div class="bubble">六点半到七点比较合适；要是饿了，先垫一点水果。</div></div>
+              <div class="msg user"><div class="bubble">吃完陪我复盘一盘？</div></div>
+              <div class="msg ai"><div class="bubble">好呀，想先看布局还是官子？</div></div>
+            </div>
+            <aside class="rail">
+              <div class="rail-block">
+                <label>此刻</label>
+                <div class="mood-name">平静</div>
+                <div class="mood-bars"><i class="on"></i><i class="on"></i><i></i><i></i><i></i></div>
+              </div>
+              <div class="rail-block">
+                <label>下一件</label>
+                <div class="rail-card"><b>读书会</b>明天 20:00<br>线上</div>
+              </div>
+              <div class="rail-block">
+                <label>她想起</label>
+                <div class="rail-memory">雨天摆棋 · 上次你说喜欢雨声</div>
+              </div>
+              <div class="rail-block" style="margin-top:auto;">
+                <label>关系</label>
+                <div class="rail-card" style="border:0;background:transparent;padding:0;color:#78949c;">熟悉 · 信任 0.81</div>
+              </div>
+            </aside>
+          </div>
+          <div class="composer-wrap">
+            <div class="control-line">
+              <div class="mini-toggle"><span class="switch"></span>预制音</div>
+              <div class="seg"><span>无</span><span>低</span><span class="on">中</span><span>强</span></div>
+            </div>
+            <div class="composer"><input placeholder="和 Azure 说点什么…" aria-label="输入"><button class="send">发送</button></div>
+          </div>
+        </div>
+      </div>
+      <div class="meta">
+        <div class="meta-block"><label>气质</label><p>像一张安静的工作台：聊天在左，记忆与日程在右。信息有层级，<b>不是把功能堆上去</b>。</p></div>
+        <div class="meta-block"><label>最适合</label><p>希望 Azure 更像“有连续性的助手”，而不是只会回话的聊天框。</p></div>
+        <div class="meta-block wide"><label>实现要点</label><p>窗口宽度不足时，右栏自动折到聊天下方的一行胶囊（情绪 / 下一件 / 记忆）；<b>不改变现有窄窗折叠策略</b>，只多一个可折叠断点。</p></div>
+      </div>
+    </article>
+
+    <!-- C -->
+    <article class="option" data-option="C" tabindex="0" role="button" aria-label="方案 C 时间卷轴手帐">
+      <div class="option-head">
+        <div class="idx">03</div>
+        <div>
+          <h2>时间卷轴 · 手帐</h2>
+          <span class="en">Time Scroll / Journal</span>
+          <p>把每一句话落到一条时间线上。左侧是时刻与圆点，右侧是话；像她一直在同一页纸上接着写，而不是每句话都重新开一个气泡。</p>
+          <div class="tags"><span class="tag">时间感</span><span class="tag">陪伴感</span><span class="tag">改动中</span></div>
+        </div>
+      </div>
+      <div class="stage scheme-c">
+        <div class="stage-label"><b>03</b> / TIME SCROLL</div>
+        <div class="dock-caption"><span>精修重点：时间刻度 / 纸面 / 连续感</span></div>
+        <div class="app">
+          <div class="app-head">
+            <div class="avatar"><img src="../game/assets/azure_pet.png" alt="Azure"></div>
+            <div class="who"><strong>Azure · 聊天</strong><small><span class="dot"></span>在线 · 今天的第 4 页</small></div>
+            <div class="date-seal"><b>10 / 30</b>周五 · 晴</div>
+            <button class="icon" aria-label="关闭">×</button>
+          </div>
+          <div class="chat">
+            <div class="tl-row user"><div class="tl-time">15:58</div><div class="tl-body"><div class="msg user"><div class="bubble">今晚几点吃饭合适？</div></div></div></div>
+            <div class="tl-row"><div class="tl-time">15:59</div><div class="tl-body"><div class="msg ai"><div class="bubble">六点半到七点比较合适；要是饿了，先垫一点水果。</div></div></div></div>
+            <div class="tl-row user"><div class="tl-time">16:00</div><div class="tl-body"><div class="msg user"><div class="bubble">吃完陪我复盘一盘？</div></div></div></div>
+            <div class="tl-row"><div class="tl-time">16:01</div><div class="tl-body"><div class="msg ai"><div class="bubble">好呀，想先看布局还是官子？</div></div></div></div>
+          </div>
+          <div class="composer-wrap">
+            <div class="seal-line"><i>Az</i>今日未完 · 写下一句</div>
+            <div class="composer"><input placeholder="和 Azure 说点什么…" aria-label="输入"><button class="send">落笔</button></div>
+          </div>
+        </div>
+      </div>
+      <div class="meta">
+        <div class="meta-block"><label>气质</label><p>更慢、更有“在一起过日子”的感觉。适合把回忆链与日程事实的连续性露出来。</p></div>
+        <div class="meta-block"><label>风险</label><p>时间线需要拿到每轮时间戳；历史消息只有顺序，<b>需要前端补本地时间</b>，不能假装有精确时刻。</p></div>
+        <div class="meta-block wide"><label>实现要点</label><p>不新建数据表；<b>PetView.gd</b> 的聊天行改成 `time + rail + bubble` 三列，窄窗隐藏时间列。滚动条与“正在想”状态保留。</p></div>
+      </div>
+    </article>
+
+    <!-- D -->
+    <article class="option" data-option="D" tabindex="0" role="button" aria-label="方案 D 夜航深色">
+      <div class="option-head">
+        <div class="idx">04</div>
+        <div>
+          <h2>夜航 · 深色</h2>
+          <span class="en">Night Passage / Dark</span>
+          <p>结构不动，只换光。把雾蓝收进夜色，青绿变成一点航灯；头像有微光，气泡像薄玻璃。它是可切换的夜间主题，而不是替换默认。</p>
+          <div class="tags"><span class="tag">夜间模式</span><span class="tag">主题层</span><span class="tag">低风险</span></div>
+        </div>
+      </div>
+      <div class="stage scheme-d">
+        <div class="stage-label"><b>04</b> / NIGHT PASSAGE</div>
+        <div class="dock-caption"><span>精修重点：明暗 / 玻璃 / 航灯</span></div>
+        <div class="app">
+          <div class="app-head">
+            <div class="avatar"><img src="../game/assets/azure_pet.png" alt="Azure"></div>
+            <div class="who"><strong>Azure · 夜航</strong><small><span class="dot"></span>在线 · 夜间 / 低唤醒</small></div>
+            <button class="icon" aria-label="关闭">×</button>
+          </div>
+          <div class="chat">
+            <div class="msg user"><div class="bubble">今晚几点吃饭合适？</div><div class="meta">15:58</div></div>
+            <div class="msg ai"><div class="bubble">六点半到七点比较合适；要是饿了，先垫一点水果。</div><div class="meta">15:59 · Azure</div></div>
+            <div class="msg user"><div class="bubble">吃完陪我复盘一盘？</div><div class="meta">16:00</div></div>
+            <div class="msg ai"><div class="bubble">好呀，想先看布局还是官子？</div><div class="meta">16:00 · Azure</div></div>
+            <div class="typing" aria-label="Azure 正在输入"><i></i><i></i><i></i></div>
+          </div>
+          <div class="composer-wrap">
+            <div class="control-line">
+              <div class="mini-toggle"><span class="switch"></span>只用预制音</div>
+              <div class="seg"><span>无</span><span class="on">低</span><span>中</span><span>强</span></div>
+            </div>
+            <div class="composer"><input placeholder="和 Azure 说点什么…" aria-label="输入"><button class="send">发送</button></div>
+          </div>
+        </div>
+      </div>
+      <div class="meta">
+        <div class="meta-block"><label>气质</label><p>不喧哗的夜。青绿只做航灯与焦点，大面积为墨色，适合夜间长时间陪伴。</p></div>
+        <div class="meta-block"><label>最适合</label><p>作为<b>第四套主题</b>并入现有 `ui_theme`，默认仍保留雾蓝。</p></div>
+        <div class="meta-block wide"><label>实现要点</label><p>主要改 <b>GufengTheme.gd</b> 的 `dark` 预设与少量气泡透明度；<b>不改布局</b>，因此可与 A / B / C 任一结构方案叠加。</p></div>
+      </div>
+    </article>
+  </main>
+
+  <section class="plan">
+    <div class="plan-head">
+      <h3>总体计划 · 三个阶段</h3>
+      <span>Three Stages / No Rush</span>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">STAGE 01</div>
+        <h4>选型</h4>
+        <p>你先从四案里选一个主结构（A / B / C / D）。我只交付<b>可视样例与差异说明</b>，不碰生产代码。若选 B，再确认右栏要显示哪三块信息。</p>
+      </div>
+      <div class="step">
+        <div class="step-num">STAGE 02</div>
+        <h4>实施</h4>
+        <p>前端落到 Godot：按选定方案重构 <b>PetView / GufengTheme</b>，保留窄窗折叠、四档尺寸、拖动与聊天排队。同步做人格化结构优化（右栏的 P0 记忆巩固 + P1 体感标记）。</p>
+      </div>
+      <div class="step">
+        <div class="step-num">STAGE 03</div>
+        <h4>验收</h4>
+        <p>全量回归：<b>后端 1179 tests</b>、<b>20 个 Godot headless 脚本</b>、窄窗 / 大窗口截图、聊天与日程实机。通过后更新 README / TECHNICAL / PROJECT_FULL 并推送。</p>
+      </div>
+    </div>
+
+    <div class="persona">
+      <div class="persona-head">
+        <h4>阶段二附带 · 人格化结构优化</h4>
+        <span>Based on DeepSeek Literature Review</span>
+      </div>
+      <div class="persona-grid">
+        <div class="p-card"><b>P0 · episode → memory 巩固</b><p>高情绪峰值或高重复的聊天片段自动提升为长期记忆；低显著性不删除，只在召回中降权。</p></div>
+        <div class="p-card"><b>P1 · somatic_charge 体感标记</b><p>写入时记录情感电荷，召回时作为第三项弱信号（0.08–0.12），让“很重的事”更容易被想起。</p></div>
+        <div class="p-card"><b>P1 · 车道预埋</b><p>给前台聊天、人格化、后台任务打 lane 标签；当前行为不变，先获得可观测的排队与耗时。</p></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="selectbar">
+  <div class="state">当前选择：<b id="picked-label">还没有选</b></div>
+  <div class="choices">
+    <button class="choice" data-choice="A">A</button>
+    <button class="choice" data-choice="B">B</button>
+    <button class="choice" data-choice="C">C</button>
+    <button class="choice" data-choice="D">D</button>
+    <button class="copy" id="copy-choice">复制选择</button>
+  </div>
+</div>
+
+<script>
+  const names = {
+    A: "方案 A · 雾窗精修单栏",
+    B: "方案 B · 双栏工作台",
+    C: "方案 C · 时间卷轴手帐",
+    D: "方案 D · 夜航深色"
+  };
+  let picked = "";
+  const label = document.getElementById("picked-label");
+  const copy = document.getElementById("copy-choice");
+
+  function pick(id){
+    picked = id;
+    label.textContent = names[id];
+    document.querySelectorAll(".option").forEach(el => el.classList.toggle("is-picked", el.dataset.option === id));
+    document.querySelectorAll(".choice").forEach(el => el.classList.toggle("on", el.dataset.choice === id));
+  }
+
+  document.querySelectorAll(".option").forEach(el => {
+    el.addEventListener("click", () => pick(el.dataset.option));
+    el.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(el.dataset.option); }
+    });
+  });
+  document.querySelectorAll(".choice").forEach(el => el.addEventListener("click", e => { e.stopPropagation(); pick(el.dataset.choice); }));
+
+  copy.addEventListener("click", async () => {
+    if (!picked) { copy.textContent = "先选一个"; setTimeout(() => copy.textContent = "复制选择", 1600); return; }
+    const text = `我选 ${names[picked]}。`;
+    try { await navigator.clipboard.writeText(text); copy.textContent = "已复制"; }
+    catch { copy.textContent = "请手动选择"; }
+    setTimeout(() => copy.textContent = "复制选择", 1600);
+  });
+</script>
+</body>
+</html>

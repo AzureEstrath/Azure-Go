@@ -102,10 +102,11 @@ func _test_view() -> void:
 	v.close_menu()
 	_check("菜单能收起", not v.is_menu_open())
 	_check("聊天面板有聊天预制音开关", v._prebuilt_check != null)
-	_check("聊天面板有思考档选项（无/低/中/强）",
-		v._think_opt != null and v._think_opt.item_count == 4)
+	_check("聊天面板有思考档选项（无/低/中/强）", v._think_buttons.size() == 4)
 	v.set_think_level(2)
-	_check("思考档能同步配置", v._think_opt.selected == 2)
+	_check("思考档能同步配置", v._think_level == 2)
+	_check("聊天标题条有圆形头像", v._chat_avatar != null
+		and v._chat_avatar.material is ShaderMaterial)
 	var toggled := [true]
 	v.prebuilt_tts_toggled.connect(func(on: bool): toggled[0] = on)
 	v.set_prebuilt_tts(true)
@@ -126,16 +127,39 @@ func _test_view() -> void:
 	var rows = log.get_children()
 	_check("聊天有两行", rows.size() == 2)
 	if rows.size() == 2:
-		var user_bubble = rows[0].get_child(rows[0].get_child_count() - 1)
-		var ai_bubble = rows[1].get_child(0)
-		_check("玩家消息在右、Azure 在左", user_bubble.position.x > ai_bubble.position.x)
+		var user_bubble: Control = rows[0].find_child("Bubble", true, false)
+		var ai_bubble: Control = rows[1].find_child("Bubble", true, false)
+		_check("玩家消息在右、Azure 在左",
+			user_bubble.get_global_rect().position.x > ai_bubble.get_global_rect().position.x)
+		_check("聊天消息带本地时间", rows[1].find_child("ChatTime", true, false) != null)
 	v.close_chat()
 	await process_frame
 	_check("聊天面板能收起", not v.is_chat_open())
 	_check("聊天记录保留在面板里", log.get_child_count() == 2)
+
+	# v4.4.0：极窄视口也要保住输入 / 发送；头像、副标题与“思考”文字让位。
+	var narrow_host := Control.new()
+	narrow_host.size = Vector2(200, 260)
+	root.add_child(narrow_host)
+	var narrow = _view_script.new()
+	narrow.pet_height = 160
+	narrow_host.add_child(narrow)
+	await process_frame
+	await process_frame
+	narrow.open_chat()
+	await process_frame
+	await process_frame
+	var narrow_rect := Rect2(narrow._chat.position, narrow._chat.size)
+	_check("极窄窗口聊天面板仍在视口内",
+		narrow_rect.end.x <= narrow.size.x + 0.5 and narrow_rect.end.y <= narrow.size.y + 0.5)
+	_check("极窄窗口让位思考文字与预制音文字",
+		not narrow._think_label.visible and narrow._prebuilt_check.text == "")
+	_check("极窄窗口四个思考档仍完整", narrow._think_buttons.size() == 4)
+	narrow.close_chat()
+	narrow_host.queue_free()
 	v.append_chat("assistant", "[[tone:proud]] {轻轻点头} 记着呢")
 	var last_row = log.get_child(log.get_child_count() - 1)
-	var last_text: Label = last_row.get_child(0).get_child(0)
+	var last_text: Label = last_row.find_child("BubbleText", true, false)
 	_check("聊天气泡不显示语气 / 动作标记",
 		last_text.text.contains("记着呢") and not last_text.text.contains("tone")
 		and not last_text.text.contains("轻轻点头"))
@@ -500,8 +524,8 @@ func _test_shell_instance() -> void:
 		shell.view._prebuilt_check != null
 		and shell.view._prebuilt_check.button_pressed == shell.cfg.pet_chat_tts_prebuilt)
 	_check("聊天思考档跟随配置",
-		shell.view._think_opt != null
-		and shell.view._think_opt.selected == shell.cfg.pet_chat_think_level)
+		shell.view._think_buttons.size() == 4
+		and shell.view._think_level == shell.cfg.pet_chat_think_level)
 	shell._on_mood({"energy": 0.21, "boredom": 0.81, "affinity": 0.66, "trust": 0.44, "dominance": 0.55})
 	_check("桌宠接收精力 / 无聊 / 亲密 / 信任 / 掌控感",
 		is_equal_approx(shell._energy, 0.21) and is_equal_approx(shell._boredom, 0.81)

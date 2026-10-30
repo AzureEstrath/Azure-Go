@@ -238,15 +238,82 @@ static func header() -> StyleBoxFlat:
 static func slip(bg := PANEL_SOFT, pad := 12) -> StyleBoxFlat:
 	return _panel_box(bg, BORDER_SOFT, 10, pad, false)
 
+# ================= 聊天面板（v4.4.0 · 方案 A） =================
+
+static func chat_header() -> StyleBoxFlat:
+	"""聊天标题条：浅雾纸、一条很细的青绿底线；不抢正文。"""
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(PAPER_WARM, 0.58)
+	sb.border_color = Color(ACCENT, 0.22)
+	sb.border_width_bottom = 1
+	sb.corner_radius_top_left = 12
+	sb.corner_radius_top_right = 12
+	sb.corner_radius_bottom_left = 0
+	sb.corner_radius_bottom_right = 0
+	sb.content_margin_left = 10
+	sb.content_margin_right = 8
+	sb.content_margin_top = 9
+	sb.content_margin_bottom = 8
+	return sb
+
+static func chat_dock() -> StyleBoxFlat:
+	"""底部工具托盘：很淡的雾色，和聊天正文隔开但不另外做成一张卡。"""
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(PAPER_TONE, 0.38)
+	sb.border_color = Color(ACCENT, 0.16)
+	sb.border_width_top = 1
+	sb.corner_radius_bottom_left = 10
+	sb.corner_radius_bottom_right = 10
+	sb.content_margin_left = 8
+	sb.content_margin_right = 8
+	sb.content_margin_top = 7
+	sb.content_margin_bottom = 8
+	return sb
+
+static func seg_box(on: bool, hover := false) -> StyleBoxFlat:
+	"""思考档的分段按钮：选中是青绿实心，未选中是半透明雾色。"""
+	var sb := StyleBoxFlat.new()
+	if on:
+		sb.bg_color = ACCENT.lightened(0.06) if hover else ACCENT
+		sb.border_color = Color(ON_ACCENT, 0.20)
+	else:
+		sb.bg_color = Color(PANEL_SOFT, 0.55 if not hover else 0.86)
+		sb.border_color = Color(ACCENT, 0.16 if not hover else 0.38)
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(8)
+	sb.content_margin_left = 7
+	sb.content_margin_right = 7
+	sb.content_margin_top = 4
+	sb.content_margin_bottom = 4
+	return sb
+
+static func apply_seg_button(b: Button, on: bool) -> void:
+	b.add_theme_stylebox_override("normal", seg_box(on, false))
+	b.add_theme_stylebox_override("hover", seg_box(on, true))
+	b.add_theme_stylebox_override("pressed", seg_box(true, false))
+	b.add_theme_stylebox_override("focus", seg_box(on, true))
+	var fg := ON_ACCENT if on else INK_SOFT
+	b.add_theme_color_override("font_color", fg)
+	b.add_theme_color_override("font_hover_color", fg)
+	b.add_theme_color_override("font_pressed_color", ON_ACCENT)
+	b.add_theme_color_override("font_focus_color", fg)
+
 # ================= 对话气泡 =================
 
 static func bubble_ai() -> StyleBoxFlat:
-	var sb := slip(PANEL_SOFT, 10)
-	sb.border_color = Color(ACCENT, 0.70)
+	var sb := slip(PANEL_SOFT, 9)
+	sb.border_color = Color(ACCENT, 0.58)
 	sb.border_width_left = 3
 	sb.border_width_right = 0
 	sb.border_width_top = 0
 	sb.border_width_bottom = 0
+	sb.corner_radius_top_left = 3
+	sb.corner_radius_top_right = 11
+	sb.corner_radius_bottom_right = 11
+	sb.corner_radius_bottom_left = 11
+	sb.shadow_color = Color(0, 0, 0, 0.045)
+	sb.shadow_size = 4
+	sb.shadow_offset = Vector2(0, 2)
 	return sb
 
 static func bubble_sys() -> StyleBoxFlat:
@@ -255,12 +322,19 @@ static func bubble_sys() -> StyleBoxFlat:
 	return sb
 
 static func bubble_user() -> StyleBoxFlat:
-	var sb := slip(BUBBLE_USER_BG, 10)
-	sb.border_color = Color(ACCENT, 0.85)
+	var sb := slip(BUBBLE_USER_BG, 9)
+	sb.border_color = Color(ACCENT, 0.72)
 	sb.border_width_left = 0
 	sb.border_width_right = 3
 	sb.border_width_top = 0
 	sb.border_width_bottom = 0
+	sb.corner_radius_top_left = 11
+	sb.corner_radius_top_right = 3
+	sb.corner_radius_bottom_right = 11
+	sb.corner_radius_bottom_left = 11
+	sb.shadow_color = Color(0, 0, 0, 0.04)
+	sb.shadow_size = 4
+	sb.shadow_offset = Vector2(0, 2)
 	return sb
 
 static func seal(pad := 10) -> StyleBoxFlat:

@@ -70,6 +70,12 @@ var _chat_scroll: ScrollContainer
 var _chat_input: LineEdit
 var _chat_send: Button
 var _chat_status: Label
+var _chat_avatar: TextureRect
+var _chat_sub: Label
+var _chat_dock: PanelContainer
+var _think_label: Label
+var _think_buttons: Array[Button] = []
+var _think_level := 1
 ## 聊天面板的内存流水（v4.2.6）：后端历史只做「合并」，空响应绝不清空当前会话。
 var _chat_items: Array[Dictionary] = []
 var _chat_rebuilding := false
@@ -329,8 +335,15 @@ func set_prebuilt_tts(on: bool) -> void:
 		_prebuilt_check.set_pressed_no_signal(on)     # 只同步勾选状态，不反向触发 `prebuilt_tts_toggled`
 
 func set_think_level(level: int) -> void:
-	if _think_opt != null:
-		_think_opt.select(clampi(level, 0, 3))       # `select` 不会触发 item_selected
+	_think_level = clampi(level, 0, 3)
+	for i in _think_buttons.size():
+		GufengTheme.apply_seg_button(_think_buttons[i], i == _think_level)
+
+func _on_think_pick(level: int) -> void:
+	_think_level = clampi(level, 0, 3)
+	for i in _think_buttons.size():
+		GufengTheme.apply_seg_button(_think_buttons[i], i == _think_level)
+	think_level_selected.emit(_think_level)
 
 func _rule(parent: Node) -> void:
 	var r := ColorRect.new()
@@ -348,20 +361,51 @@ func _build_chat() -> void:
 	add_child(_chat)
 
 	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", 6)
+	vb.add_theme_constant_override("separation", 0)
 	_chat.add_child(vb)
 
+	# v4.4.0（方案 A · 雾窗）：标题条是一张很小的名片，头像 / 状态 / 关闭都在这里。
+	var head_panel := PanelContainer.new()
+	head_panel.name = "ChatHeader"
+	head_panel.add_theme_stylebox_override("panel", GufengTheme.chat_header())
+	vb.add_child(head_panel)
 	var head := HBoxContainer.new()
-	vb.add_child(head)
+	head.add_theme_constant_override("separation", 8)
+	head_panel.add_child(head)
+
+	_chat_avatar = TextureRect.new()
+	_chat_avatar.name = "ChatAvatar"
+	_chat_avatar.custom_minimum_size = Vector2(30, 30)
+	_chat_avatar.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_chat_avatar.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_chat_avatar.texture = _tex
+	_chat_avatar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var avatar_mat := ShaderMaterial.new()
+	avatar_mat.shader = _circle_mask_shader()
+	avatar_mat.set_shader_parameter("bg_color", Color(GufengTheme.PANEL_SOFT, 0.96))
+	avatar_mat.set_shader_parameter("ring_color", Color(GufengTheme.ACCENT, 0.80))
+	avatar_mat.set_shader_parameter("ring_width", 0.05)
+	_chat_avatar.material = avatar_mat
+	head.add_child(_chat_avatar)
+
+	var who := VBoxContainer.new()
+	who.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	who.add_theme_constant_override("separation", 0)
 	var title := Label.new()
 	title.text = "Azure · 聊天"
-	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	title.add_theme_font_size_override("font_size", 13)
+	title.add_theme_font_size_override("font_size", 14)
 	title.add_theme_color_override("font_color", GufengTheme.INK)
-	head.add_child(title)
+	who.add_child(title)
+	_chat_sub = Label.new()
+	_chat_sub.text = "● 在线 · 雾蓝"
+	_chat_sub.add_theme_font_size_override("font_size", 9)
+	_chat_sub.add_theme_color_override("font_color", Color(GufengTheme.ACCENT, 0.82))
+	who.add_child(_chat_sub)
+	head.add_child(who)
+
 	var close := Button.new()
 	close.text = "×"
-	close.custom_minimum_size = Vector2(24, 24)
+	close.custom_minimum_size = Vector2(22, 22)
 	GufengTheme.apply_bare_button(close)
 	close.pressed.connect(close_chat)
 	head.add_child(close)
@@ -369,62 +413,81 @@ func _build_chat() -> void:
 	_rule(vb)
 
 	_chat_scroll = ScrollContainer.new()
+	_chat_scroll.name = "ChatScroll"
 	_chat_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_chat_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	vb.add_child(_chat_scroll)
 	_chat_log = VBoxContainer.new()
+	_chat_log.name = "ChatLog"
 	_chat_log.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_chat_log.custom_minimum_size = Vector2(CHAT_W - 34, 0)  # ScrollContainer 不会自动把子项拉到视口宽
-	_chat_log.add_theme_constant_override("separation", 5)
+	_chat_log.add_theme_constant_override("separation", 9)
 	_chat_scroll.add_child(_chat_log)
 
 	_chat_status = Label.new()
 	_chat_status.add_theme_font_size_override("font_size", 10)
-	_chat_status.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
+	_chat_status.add_theme_color_override("font_color", Color(GufengTheme.ACCENT, 0.9))
+	_chat_status.custom_minimum_size = Vector2(0, 13)
 	_chat_status.text = ""
 	vb.add_child(_chat_status)
 
-	# v4.2.5：聊天专用语音开关（放聊天面板里，不挤右键菜单）——预制情绪音 ⇄ 整句合成。
+	# 底部工具托盘：预制音 / 四档思考 / 输入，收进一块很淡的雾色里。
+	_chat_dock = PanelContainer.new()
+	_chat_dock.name = "ChatDock"
+	_chat_dock.add_theme_stylebox_override("panel", GufengTheme.chat_dock())
+	vb.add_child(_chat_dock)
+	var dock := VBoxContainer.new()
+	dock.add_theme_constant_override("separation", 6)
+	_chat_dock.add_child(dock)
+
+	var tools := HBoxContainer.new()
+	tools.add_theme_constant_override("separation", 3)
+	dock.add_child(tools)
 	_prebuilt_check = CheckBox.new()
-	_prebuilt_check.text = "聊天只用预制音"
+	_prebuilt_check.text = "预制音"
 	_prebuilt_check.tooltip_text = "开：聊天回复只播对应情绪的预制语气（CosyVoice 服务照常启动，不合成整句，出字更快）。\n" \
 		+ "关：聊天恢复整句语音合成。改动立即写回 config.json，并对当前聊天生效。"
 	_prebuilt_check.add_theme_font_size_override("font_size", 10)
 	_prebuilt_check.toggled.connect(func(on: bool): prebuilt_tts_toggled.emit(on))
-	vb.add_child(_prebuilt_check)
-
-	# v4.2.9：桌宠聊天思考档（无 / 低 / 中 / 强）——只影响聊天，棋评仍走全局档位。
-	var think_row := HBoxContainer.new()
-	think_row.add_theme_constant_override("separation", 4)
-	var think_lbl := Label.new()
-	think_lbl.text = "思考"
-	think_lbl.add_theme_font_size_override("font_size", 10)
-	think_lbl.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
-	think_row.add_child(think_lbl)
-	_think_opt = OptionButton.new()
-	_think_opt.add_item("无", 0)
-	_think_opt.add_item("低", 1)
-	_think_opt.add_item("中", 2)
-	_think_opt.add_item("强", 3)
-	_think_opt.selected = 1
-	_think_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_think_opt.tooltip_text = "聊天思考强度：无 = 直接回答（最快）；低 = 快速档（默认）；\n" \
-		+ "中 = 中等推理；强 = 更完整的推理（更慢）。只影响聊天，棋评不受影响。"
-	_think_opt.item_selected.connect(func(idx: int): think_level_selected.emit(idx))
-	think_row.add_child(_think_opt)
-	vb.add_child(think_row)
+	tools.add_child(_prebuilt_check)
+	var spacer := Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tools.add_child(spacer)
+	_think_label = Label.new()
+	_think_label.text = "思考"
+	_think_label.add_theme_font_size_override("font_size", 9)
+	_think_label.add_theme_color_override("font_color", GufengTheme.INK_SOFT)
+	tools.add_child(_think_label)
+	var seg := HBoxContainer.new()
+	seg.add_theme_constant_override("separation", 2)
+	tools.add_child(seg)
+	var think_labels := ["无", "低", "中", "强"]
+	for i in think_labels.size():
+		var b := Button.new()
+		b.name = "Think%d" % i
+		b.text = think_labels[i]
+		b.custom_minimum_size = Vector2(25, 22)
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		b.tooltip_text = "聊天思考强度：无 = 直接回答（最快）；低 = 快速档（默认）；\n" \
+			+ "中 = 中等推理；强 = 更完整的推理（更慢）。只影响聊天，棋评不受影响。"
+		GufengTheme.apply_seg_button(b, i == _think_level)
+		b.pressed.connect(_on_think_pick.bind(i))
+		seg.add_child(b)
+		_think_buttons.append(b)
 
 	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 4)
-	vb.add_child(row)
+	row.add_theme_constant_override("separation", 5)
+	dock.add_child(row)
 	_chat_input = LineEdit.new()
 	_chat_input.placeholder_text = "和 Azure 说点什么…"
 	_chat_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_chat_input.custom_minimum_size = Vector2(0, 32)
+	_chat_input.add_theme_font_size_override("font_size", 10)
 	_chat_input.text_submitted.connect(func(_t: String): _submit_chat())
 	row.add_child(_chat_input)
 	_chat_send = Button.new()
 	_chat_send.text = "发送"
-	_chat_send.custom_minimum_size = Vector2(48, 28)
+	_chat_send.custom_minimum_size = Vector2(50, 32)
 	GufengTheme.apply_seal_button(_chat_send, false)
 	_chat_send.pressed.connect(_submit_chat)
 	row.add_child(_chat_send)
@@ -798,6 +861,24 @@ func _layout() -> void:
 		_chat.position = Vector2(MARGIN, MARGIN)
 		_chat.size = Vector2(cw, maxf(80.0, s.y - MARGIN * 2.0))
 		_chat.visible = _chat_open
+		# v4.4.0：窄窗优先保住输入与发送；头像 / 副标题 / “思考”两个字让位。
+		var tight := cw < 210.0
+		if _chat_avatar != null:
+			_chat_avatar.visible = cw >= 168.0
+		if _chat_sub != null:
+			_chat_sub.visible = cw >= 196.0
+		if _prebuilt_check != null:
+			_prebuilt_check.text = "" if tight else "预制音"
+			_prebuilt_check.add_theme_font_size_override("font_size", 9 if tight else 10)
+		if _think_label != null:
+			_think_label.visible = not tight
+		for b in _think_buttons:
+			b.custom_minimum_size = Vector2(21 if tight else 25, 22)
+			b.add_theme_font_size_override("font_size", 9 if tight else 10)
+		if _chat_send != null:
+			_chat_send.custom_minimum_size = Vector2(44 if tight else 50, 32)
+		if _chat_log != null:
+			_chat_log.custom_minimum_size = Vector2(maxf(120.0, cw - 34.0), 0)
 	if _files != null:
 		# 面板宽度跟着**实际视口**走：小屏 / 内嵌窗口也不把关闭按钮挤出屏幕。
 		var fw := minf(FILES_W, maxf(200.0, s.x - MARGIN * 2.0))
@@ -2246,7 +2327,7 @@ func _spawn_ripple(pos: Vector2, radius: float) -> void:
 
 # ================= 聊天面板 =================
 
-func append_chat(role: String, text: String) -> void:
+func append_chat(role: String, text: String, ts: float = -1.0) -> void:
 	if _chat_log == null:
 		return
 	var clean := _clean_chat_text(role, text)
@@ -2259,8 +2340,19 @@ func append_chat(role: String, text: String) -> void:
 		if str(last.get("role", "")) == role and str(last.get("text", "")) == clean:
 			return
 	if not _chat_rebuilding:
-		_chat_items.append({"role": role, "text": clean})
-	_append_chat_row(role, clean)
+		if ts < 0.0:
+			ts = Time.get_unix_time_from_system()   # 让内存流水也有稳定时刻，重建历史时不漂移
+		_chat_items.append({"role": role, "text": clean, "ts": ts})
+	_append_chat_row(role, clean, ts)
+
+func _chat_clock(ts: float = -1.0) -> String:
+	"""把消息时间戳转成本地 HH:MM；``ts < 0`` 用当前时间，``ts <= 0`` 表示历史没有时刻。"""
+	var unix := Time.get_unix_time_from_system() if ts < 0.0 else ts
+	if unix <= 0.0:
+		return ""
+	var bias := int(Time.get_time_zone_from_system().get("bias", 0))
+	var dt := Time.get_datetime_dict_from_unix_time(int(unix) + bias * 60)
+	return "%02d:%02d" % [int(dt.get("hour", 0)), int(dt.get("minute", 0))]
 
 func _clean_chat_text(role: String, text: String) -> String:
 	var clean := str(text).strip_edges()
@@ -2270,28 +2362,45 @@ func _clean_chat_text(role: String, text: String) -> String:
 		clean = _action_tag_re.sub(clean, "", true).strip_edges()
 	return clean
 
-func _append_chat_row(role: String, clean: String) -> void:
+func _append_chat_row(role: String, clean: String, ts: float = -1.0) -> void:
 	var row := HBoxContainer.new()
+	row.name = "UserRow" if role == "user" else "AiRow"
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var col := VBoxContainer.new()
+	col.name = "MessageColumn"
+	col.add_theme_constant_override("separation", 3)
+	col.size_flags_horizontal = Control.SIZE_SHRINK_END if role == "user" else Control.SIZE_SHRINK_BEGIN
 	var bubble := PanelContainer.new()
+	bubble.name = "Bubble"
 	if role == "user":
 		bubble.add_theme_stylebox_override("panel", GufengTheme.bubble_user())
 	else:
 		bubble.add_theme_stylebox_override("panel", GufengTheme.bubble_ai())
 	bubble.size_flags_horizontal = Control.SIZE_SHRINK_END if role == "user" else Control.SIZE_SHRINK_BEGIN
-	bubble.custom_minimum_size = Vector2(150, 0)
+	bubble.custom_minimum_size = Vector2(130, 0)
+	var lbl := Label.new()
+	lbl.name = "BubbleText"
+	lbl.text = clean
+	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	lbl.custom_minimum_size = Vector2(130, 0)
+	lbl.add_theme_font_size_override("font_size", 12)
+	lbl.add_theme_color_override("font_color", GufengTheme.INK)
+	bubble.add_child(lbl)
+	col.add_child(bubble)
+	var clock := _chat_clock(ts)
+	if clock != "":
+		var meta := Label.new()
+		meta.name = "ChatTime"
+		meta.text = clock
+		meta.add_theme_font_size_override("font_size", 8)
+		meta.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.72))
+		meta.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT if role == "user" else HORIZONTAL_ALIGNMENT_LEFT
+		col.add_child(meta)
 	if role == "user":
 		var spacer := Control.new()
 		spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		row.add_child(spacer)
-	var lbl := Label.new()
-	lbl.text = clean
-	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	lbl.custom_minimum_size = Vector2(150, 0)
-	lbl.add_theme_font_size_override("font_size", 12)
-	lbl.add_theme_color_override("font_color", GufengTheme.INK)
-	bubble.add_child(lbl)
-	row.add_child(bubble)
+	row.add_child(col)
 	if role != "user":
 		var spacer2 := Control.new()
 		spacer2.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -2315,10 +2424,14 @@ func set_chat_history(items: Array) -> void:
 		var d: Dictionary = it
 		var u := _clean_chat_text("user", str(d.get("user_text", "")))
 		var a := _clean_chat_text("assistant", str(d.get("reply_text", "")))
+		var ts := 0.0
+		var raw_ts = d.get("ts", 0.0)
+		if typeof(raw_ts) == TYPE_INT or typeof(raw_ts) == TYPE_FLOAT:
+			ts = float(raw_ts)
 		if u != "":
-			incoming.append({"role": "user", "text": u})
+			incoming.append({"role": "user", "text": u, "ts": ts})
 		if a != "":
-			incoming.append({"role": "assistant", "text": a})
+			incoming.append({"role": "assistant", "text": a, "ts": ts})
 	if incoming.is_empty():
 		return
 	# 现有会话里「历史还没包含」的那部分接在后面（计数去重，不吞合法的重复句）。
@@ -2341,7 +2454,7 @@ func set_chat_history(items: Array) -> void:
 		_chat_log.remove_child(c)
 		c.queue_free()
 	for d in _chat_items:
-		_append_chat_row(str(d.get("role", "")), str(d.get("text", "")))
+		_append_chat_row(str(d.get("role", "")), str(d.get("text", "")), float(d.get("ts", 0.0)))
 	_chat_rebuilding = false
 	_scroll_chat()
 

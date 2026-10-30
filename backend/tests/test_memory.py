@@ -1,6 +1,7 @@
 """长期记忆：写入/检索/降级/上限，全部用假 embedding，不触网。"""
 
 import math
+import json
 import os
 import sqlite3
 import sys
@@ -195,6 +196,36 @@ class EmotionTagTest(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         self.dir.cleanup()
+
+    def test_episode_salience_promotes_strong_and_keeps_calm_low(self):
+        """v4.4.0：高情绪峰值 / 多轮的 episode 提升为 episode_promoted，平淡的仍是 episode。"""
+        for i in range(6):
+            self.store.append_episode_turn("pet", "第%d句" % i, "回应%d" % i,
+                                           mood={"v": 0.10, "c": 0.6, "a": 0.90})
+        self.store.append_episode_turn("pet", "第7句", "回应7",
+                                       mood={"v": 0.10, "c": 0.6, "a": 0.90})
+        rows = [dict(r) for r in self.store._conn.execute(
+            "SELECT kind, meta FROM memories WHERE tag = 'episode:pet' ORDER BY id DESC LIMIT 1")]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "episode_promoted")
+        self.assertGreaterEqual(float(json.loads(rows[0]["meta"]).get("salience", 0)), 0.55)
+
+        self.store.append_episode_turn("game", "在吗", "在呢")
+        self.store.close_episode("game")
+        rows2 = [dict(r) for r in self.store._conn.execute(
+            "SELECT kind, meta FROM memories WHERE tag = 'episode:game' ORDER BY id DESC LIMIT 1")]
+        self.assertEqual(len(rows2), 1)
+        self.assertEqual(rows2[0]["kind"], "episode")
+        self.assertLess(float(json.loads(rows2[0]["meta"]).get("salience", 0)), 0.55)
+
+    def test_low_salience_memory_ranks_below_high_salience_tie(self):
+        """同等语义时，低巩固分的旧摘要仍可召回，但让位给更高显著的记忆。"""
+        self.store.write("雨天摆棋的约定", tag="low", meta={"salience": 0.10})
+        self.store.write("雨天摆棋的约定", tag="high", meta={"salience": 0.90})
+        hits = self.store.recall("雨天摆棋", k=2)
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[0]["tag"], "high")
+        self.assertEqual(hits[1]["tag"], "low")
 
     def test_write_stores_two_dim_matrix_and_label(self):
         mid = self.store.write("玩家喜欢雨天摆棋", tag="t", mood={"v": 0.82, "c": 0.6, "a": 0.78})

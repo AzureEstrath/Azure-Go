@@ -185,10 +185,11 @@ class ChatScheduleApiTest(unittest.TestCase):
             store = LifeStore(os.path.join(d, "life.db"))
             cfg = AzureConfig()
             cfg.auto_plan_enabled = False
+            tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
             llm = _ChatScheduleLLM(schedule_text=(
                 '{"schedule": true, "items": ['
-                '{"date": "2026-10-30", "time": "15:00", "title": "组会",'
-                ' "duration_min": 60}]}'))
+                '{"date": "%s", "time": "15:00", "title": "组会",'
+                ' "duration_min": 60}]}' % tomorrow))
             bus = events.RecordingBus()
             agent = AzureAgent(StubEngine(), llm, bus, joseki_rate=1.0,
                                joseki_rng=ZeroRng())

@@ -22,6 +22,7 @@ from collections import OrderedDict
 
 from langchain_openai import OpenAIEmbeddings
 
+from . import lanes
 from .memory import MemoryStore, inject_text
 
 # 默认库路径：<backend>/data/memory.db（backend/data/ 已 gitignore，属运行产物）
@@ -284,7 +285,8 @@ class MemoryService:
         if self.store is None:
             return
         try:
-            n = self.store.backfill_vectors(batch_size=batch_size)
+            with lanes.track(lanes.LANE_BACKGROUND):
+                n = self.store.backfill_vectors(batch_size=batch_size)
             if n:
                 print("[Memory] embedding 回填完成：%d 条" % n)
         except Exception as e:                  # noqa: BLE001

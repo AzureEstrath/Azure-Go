@@ -16,7 +16,7 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import actions, adaptive, coords, events, joseki_gate, persona, profile, prompt_chains, prompts, pv_lines, recall_chain, speech_text, time_ctx
+from . import actions, adaptive, coords, events, joseki_gate, lanes, persona, profile, prompt_chains, prompts, pv_lines, recall_chain, speech_text, time_ctx
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, PHASE_PEER, build_graph, is_joseki_mistake, _emit_line,
@@ -1801,17 +1801,18 @@ class AzureAgent:
         self._mood_ms = now
         desc = self._mood_desc
         self._mood_desc = ""
-        try:
-            d = await asyncio.wait_for(
-                self._mood_delta((self.mood.v, self.mood.c, self.mood.a), desc),
-                timeout=MOOD_LLM_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            print("[Agent] 情绪小调用超时（跳过，不占用下一句）")
-            return
-        if d is None:
-            return
-        self.mood.apply_delta(d[0], d[1], d[2])
-        self.sync_mood(False)
+        with lanes.track(lanes.LANE_PERSONA):
+            try:
+                d = await asyncio.wait_for(
+                    self._mood_delta((self.mood.v, self.mood.c, self.mood.a), desc),
+                    timeout=MOOD_LLM_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                print("[Agent] 情绪小调用超时（跳过，不占用下一句）")
+                return
+            if d is None:
+                return
+            self.mood.apply_delta(d[0], d[1], d[2])
+            self.sync_mood(False)
 
     def cancel_background_llm(self):
         """取消后台情绪精修（v4.2.8）：新聊天到达时先让出单槽位生成锁。
@@ -3121,12 +3122,14 @@ class AzureAgent:
         owner = self._set_busy(True)
         self._new_turn()
         token = self.begin_epoch()
+        lane_started = lanes.begin(lanes.LANE_FOREGROUND)
         try:
             await self._turn_guard(self._turn(PHASE_CHAT, {"text": text, "mode": str(mode or "game")}), token)
         except Exception as e:                      # 意外抛出：按失败处理，别让棋盘锁死
             print("[Agent] 聊天异常：%s" % e)
         finally:
             self._clear_busy(owner)
+            lanes.end(lanes.LANE_FOREGROUND, lane_started)
         # 她回复完之后：把这轮聊天按主题写进事件表（规则式、零 LLM；事件原文永不进台词）。
         # 代际守卫：看门狗刚超时 / 本回合被新调用作废时，这一代不再写事件。
         if self.epoch_ok(token):

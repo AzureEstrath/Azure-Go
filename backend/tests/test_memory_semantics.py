@@ -77,6 +77,34 @@ class AffinityTest(unittest.TestCase):
         self.assertGreater(b2, a2)
 
 
+class SomaticTest(unittest.TestCase):
+    """v4.4.0：编码时的情感电荷与低巩固分保留惩罚。"""
+
+    def test_charge_is_absolute_and_unknown_is_zero(self):
+        calm = sem.somatic_charge(0.5, 0.5)
+        strong = sem.somatic_charge(0.1, 0.9)
+        self.assertAlmostEqual(calm, 0.0)
+        self.assertGreater(strong, 0.5)
+        self.assertEqual(sem.somatic_charge(-1.0, 0.5), 0.0)
+        self.assertEqual(sem.somatic_charge(None, 0.5), 0.0)
+
+    def test_charge_can_raise_rank_without_current_mood(self):
+        low, _ = sem.blended_rank(0.5, None, 0.5, 0.5)
+        high, _ = sem.blended_rank(0.5, None, 0.1, 0.9)
+        self.assertGreater(high, low)
+
+    def test_charge_does_not_override_a_large_semantic_gap(self):
+        semantic, _ = sem.blended_rank(0.8, None, 0.5, 0.5)
+        charged, _ = sem.blended_rank(0.4, None, 0.1, 0.9)
+        self.assertGreater(semantic, charged)
+
+    def test_retention_penalty_only_for_low_salience(self):
+        self.assertLess(sem.retention_penalty({"salience": 0.2}), 0.0)
+        self.assertEqual(sem.retention_penalty({"salience": 0.8}), 0.0)
+        self.assertEqual(sem.retention_penalty({}), 0.0)
+        self.assertEqual(sem.retention_penalty(None), 0.0)
+
+
 class ChangeCueTest(unittest.TestCase):
     def test_change_words(self):
         self.assertTrue(sem.has_change_cue("我不吃了，已经退掉了"))

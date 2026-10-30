@@ -35,6 +35,13 @@ EPISODE_GAP_SEC = 900           # 一段 episode 的空档上限：超过 15 分
 EPISODE_MAX_TURNS = 6           # 一段 episode 最多几轮对话（MaiBot 式 episode，不无限长）
 EPISODE_MAX_CHARS = 620         # 一段 episode 的摘要上限（超了先收束，另起一段）
 EPISODE_VALENCE_JUMP = 0.30     # 情绪效价跳变边界：同一段聊天里大起大落时另起一段
+# v4.4.0（参考 ZifaMem 的 session summary → episodic 提升）：
+# 巩固分 = 情绪峰值 × 0.55 + 轮数占比 × 0.30 + 近因 × 0.15。
+# 超过阈值才标成 episode_promoted（更强的长期记忆）；其余仍保留摘要，但召回吃很小的保留惩罚。
+EPISODE_PROMOTE_SCORE = 0.55
+EPISODE_SCORE_PEAK = 0.55
+EPISODE_SCORE_TURNS = 0.30
+EPISODE_SCORE_RECENCY = 0.15
 MAX_TEXT_LEN = 200              # 单条记忆写入时的字数上限
 MAX_CHAT_USER_LEN = 240          # 聊天流水：玩家单句上限
 MAX_CHAT_REPLY_LEN = 360         # 聊天流水：Azure 单句上限
@@ -269,6 +276,53 @@ def _valence_jump(prev_mood, mood) -> bool:
     return abs(a - b) >= EPISODE_VALENCE_JUMP
 
 
+def _mood_charge(mood) -> float:
+    """当前一轮聊天的情感电荷（0~1）；情绪未知返回 0.0（不知道就不算重）。"""
+    emo = emo_sem.emotion_of_mood(mood)
+    if emo is None:
+        return 0.0
+    return emo_sem.somatic_charge(emo["v"], emo["a"])
+
+
+def _episode_salience(turns, peak_charge, recency=1.0) -> float:
+    """episode 的巩固分（0~1）：情绪峰值为主，轮数为辅，近因为弱信号。
+
+    纯函数、零 LLM；轮数取「本段轮数 / 上限」，避免长聊天把普通闲聊也抬成高显著。
+    """
+    try:
+        n = max(1.0, float(turns))
+    except (TypeError, ValueError):
+        n = 1.0
+    try:
+        peak = max(0.0, min(1.0, float(peak_charge)))
+    except (TypeError, ValueError):
+        peak = 0.0
+    try:
+        recent = max(0.0, min(1.0, float(recency)))
+    except (TypeError, ValueError):
+        recent = 1.0
+    turns_part = min(1.0, n / float(EPISODE_MAX_TURNS))
+    return max(0.0, min(1.0,
+                         EPISODE_SCORE_PEAK * peak
+                         + EPISODE_SCORE_TURNS * turns_part
+                         + EPISODE_SCORE_RECENCY * recent))
+
+
+def _episode_meta(prev_meta, mood, turns):
+    """把本轮的电荷并进 episode meta；只保留峰值与巩固分，不堆每轮明细。"""
+    meta = dict(prev_meta) if isinstance(prev_meta, dict) else {}
+    charge = _mood_charge(mood)
+    try:
+        peak = max(float(meta.get("peak_charge", 0.0) or 0.0), charge)
+    except (TypeError, ValueError):
+        peak = charge
+    meta["peak_charge"] = round(peak, 4)
+    meta["somatic_charge"] = round(peak, 4)
+    meta["salience"] = round(_episode_salience(turns, peak), 4)
+    meta["promoted"] = bool(float(meta["salience"]) >= EPISODE_PROMOTE_SCORE)
+    return meta
+
+
 class MemoryStore:
     """长期记忆库：一条 sqlite 连接 + 一把锁，所有操作都失败安全。"""
 
@@ -387,6 +441,9 @@ class MemoryStore:
         emo_v = float(emo["v"]) if emo else -1.0
         emo_a = float(emo["a"]) if emo else -1.0
         emo_tag = str(emo["tag"]) if emo else ""
+        if emo is not None and "somatic_charge" not in m:
+            # v4.4.0：情感电荷跟着记忆一起落库（旧行没有时由召回时按二维情绪补算）。
+            m["somatic_charge"] = round(emo_sem.somatic_charge(emo_v, emo_a), 4)
         if self._conn is None:
             return None
         vec = self._embed(t)                # 网络调用放锁外，别卡住并发请求
@@ -482,8 +539,14 @@ class MemoryStore:
                 return []
             try:
                 rows = [dict(r) for r in self._conn.execute(
-                    "SELECT id, ts, kind, tag, text, emo_v, emo_a, emo_tag FROM memories "
+                    "SELECT id, ts, kind, tag, text, meta, emo_v, emo_a, emo_tag FROM memories "
                     "WHERE status = 'active' ORDER BY ts DESC, id DESC")]
+                for row in rows:
+                    row["meta"] = _loads_meta(row.get("meta"))
+                    charge = row["meta"].get("somatic_charge")
+                    if charge is None:
+                        charge = emo_sem.somatic_charge(row.get("emo_v"), row.get("emo_a"))
+                    row["somatic_charge"] = float(charge or 0.0)
                 if self._embed_model:
                     vecs = {int(r[0]): r[1] for r in self._conn.execute(
                         "SELECT mem_id, vec FROM vectors WHERE model = ?", (self._embed_model,))}
@@ -497,7 +560,21 @@ class MemoryStore:
         qv = self._embed(q, query=True)     # 网络 / 本地模型调用放锁外；查询可带指令前缀
 
         def rank_of(row, base):
-            return emo_sem.blended_rank(base, mood, row.get("emo_v"), row.get("emo_a"))
+            rank, aff = emo_sem.blended_rank(
+                base, mood, row.get("emo_v"), row.get("emo_a"),
+                somatic=row.get("somatic_charge"))
+            # v4.4.0：低巩固分的旧摘要仍可召回，但比高显著记忆轻一点（不删除）。
+            return rank + emo_sem.retention_penalty(row.get("meta")), aff
+
+        def hit_of(row, base, aff):
+            """对外只保留既有字段（API 契约不变）；meta / 电荷 / priority 只在内部排序用。"""
+            return {
+                "id": row.get("id"), "ts": row.get("ts"), "kind": row.get("kind"),
+                "tag": row.get("tag"), "text": row.get("text"),
+                "emo_v": row.get("emo_v"), "emo_a": row.get("emo_a"),
+                "emo_tag": row.get("emo_tag"), "score": float(base),
+                "emo_affinity": aff,
+            }
 
         if qv:
             try:
@@ -515,8 +592,7 @@ class MemoryStore:
                     rank, aff = rank_of(row, base)
                     scored.append((rank, row, base, aff))
                 scored.sort(key=lambda x: (-x[0], -x[1]["id"]))
-                hits = [dict(row, score=float(base), emo_affinity=aff)
-                        for _rank, row, base, aff in scored[:k]]
+                hits = [hit_of(row, base, aff) for _rank, row, base, aff in scored[:k]]
             except Exception as e:          # noqa: BLE001 —— 检索绝不把异常抛回编排层
                 print("[Memory] 向量检索失败（已忽略）：%s" % e)
                 hits = []
@@ -535,7 +611,7 @@ class MemoryStore:
                 matched = sum(1 for t in term_set if t in body)
                 if matched >= need:
                     rank, aff = rank_of(row, 0.0)
-                    extra.append((rank, dict(row, score=0.0, emo_affinity=aff)))
+                    extra.append((rank, hit_of(row, 0.0, aff)))
             if extra:
                 if mood is not None:        # 有当前情绪：情绪相近的关键词命中先上
                     extra.sort(key=lambda x: (-x[0], -x[1]["id"]))
@@ -777,12 +853,26 @@ class MemoryStore:
 
     # —— Episode：把一段连续聊天收束成可召回摘要（参考 MaiBot 的 episode 思路） ——
 
+    def _write_episode_summary(self, src, summary, meta, mood, turns):
+        """把收束的 episode 写成长期记忆：高巩固分提升为 ``episode_promoted``。"""
+        if not str(summary or "").strip():
+            return
+        m = dict(meta) if isinstance(meta, dict) else {}
+        score = _episode_salience(turns, m.get("peak_charge", 0.0))
+        promoted = score >= EPISODE_PROMOTE_SCORE
+        m["salience"] = round(score, 4)
+        m["promoted"] = bool(promoted)
+        m["source"] = str(src or "")
+        self.write("最近聊天摘要（%s）：%s" % (src or "共享", summary),
+                   kind="episode_promoted" if promoted else "episode",
+                   tag="episode:%s" % src, meta=m, mood=mood)
+
     def append_episode_turn(self, source: str, user_text: str, reply_text: str,
                             mood=None) -> int | None:
         """把一轮聊天并进当前 episode；满 6 轮 / 超 620 字 / 空档 15 分钟就收束。
 
-        收束时写一条 ``kind=episode`` 的可召回记忆（前缀「最近聊天摘要」），
-        以便围棋与桌宠在之后的提示词里都能召回这段相处的上下文。
+        收束时按 v4.4.0 的巩固分写一条可召回摘要：情绪峰值高 / 轮数多 → ``episode_promoted``；
+        普通闲聊仍是 ``episode``，保留但召回时吃一个很小的保留惩罚。
         """
         src = str(source or "")[:16]
         u = _clip(" ".join(str(user_text or "").split()), MAX_CHAT_USER_LEN)
@@ -798,8 +888,9 @@ class MemoryStore:
                 return None
             try:
                 row = self._conn.execute(
-                    "SELECT id, ts, turns, summary, mood FROM episodes "
+                    "SELECT id, ts, turns, summary, mood, meta FROM episodes "
                     "WHERE source = ? AND ended_ts = 0 ORDER BY id DESC LIMIT 1", (src,)).fetchone()
+                prev_meta = _loads_meta(row["meta"]) if row is not None else {}
                 if row is not None:
                     summary = str(row["summary"] or "")
                     full = (now - float(row["ts"])) > EPISODE_GAP_SEC \
@@ -810,19 +901,26 @@ class MemoryStore:
                         self._conn.execute(
                             "UPDATE episodes SET ended_ts = ?, ts = ? WHERE id = ?",
                             (float(row["ts"]), now, int(row["id"])))
-                        closed.append((src, summary))
+                        closed.append((src, summary, prev_meta, row["mood"], int(row["turns"])))
                         row = None
+                        prev_meta = {}
                 if row is None:
+                    meta = _episode_meta({}, mood, 1)
                     cur = self._conn.execute(
-                        "INSERT INTO episodes(ts, source, started_ts, ended_ts, turns, summary, mood) "
-                        "VALUES(?,?,?,0,1,?,?)",
-                        (now, src, now, piece, _json(mood if isinstance(mood, dict) else {})))
+                        "INSERT INTO episodes(ts, source, started_ts, ended_ts, turns, summary, mood, meta) "
+                        "VALUES(?,?,?,0,1,?,?,?)",
+                        (now, src, now, piece, _json(mood if isinstance(mood, dict) else {}),
+                         _json(meta)))
                     new_id = int(cur.lastrowid)
                 else:
+                    turns2 = int(row["turns"]) + 1
                     summary2 = summary + ("\n" if summary else "") + piece
+                    meta2 = _episode_meta(prev_meta, mood, turns2)
                     self._conn.execute(
-                        "UPDATE episodes SET ts = ?, turns = turns + 1, summary = ?, mood = ? WHERE id = ?",
-                        (now, summary2, _json(mood if isinstance(mood, dict) else {}), int(row["id"])))
+                        "UPDATE episodes SET ts = ?, turns = turns + 1, summary = ?, mood = ?, meta = ? "
+                        "WHERE id = ?",
+                        (now, summary2, _json(mood if isinstance(mood, dict) else {}),
+                         _json(meta2), int(row["id"])))
                     new_id = int(row["id"])
                 self._conn.commit()
             except Exception as e:          # noqa: BLE001
@@ -833,11 +931,8 @@ class MemoryStore:
                     pass
                 return None
         # 收束后的摘要写成可召回记忆（锁外 write，避免嵌套锁 / 慢 embedding）
-        for src2, summary in closed:
-            if summary.strip():
-                self.write("最近聊天摘要（%s）：%s" % (src2 or "共享", summary),
-                           kind="episode", tag="episode:%s" % src2,
-                           meta={"source": src2})
+        for src2, summary, meta2, mood2, turns2 in closed:
+            self._write_episode_summary(src2, summary, meta2, mood2, turns2)
         return new_id
 
     def close_episode(self, source: str = "") -> None:
@@ -848,7 +943,7 @@ class MemoryStore:
             if self._conn is None:
                 return
             try:
-                q = "SELECT id, ts, summary FROM episodes WHERE ended_ts = 0"
+                q = "SELECT id, ts, source, summary, mood, meta, turns FROM episodes WHERE ended_ts = 0"
                 args = ()
                 if src:
                     q += " AND source = ?"
@@ -859,13 +954,13 @@ class MemoryStore:
                         "UPDATE episodes SET ended_ts = ?, ts = ? WHERE id = ?",
                         (float(row["ts"]), self._now(), int(row["id"])))
                     if str(row["summary"] or "").strip():
-                        closed.append(str(row["summary"]))
+                        closed.append((str(row["source"] or src or ""), str(row["summary"]),
+                                       _loads_meta(row["meta"]), row["mood"], int(row["turns"])))
                 self._conn.commit()
             except Exception as e:          # noqa: BLE001
                 print("[Memory] episode 收束失败（已忽略）：%s" % e)
-        for summary in closed:
-            self.write("最近聊天摘要（%s）：%s" % (src or "共享", summary),
-                       kind="episode", tag="episode:%s" % src, meta={"source": src})
+        for src2, summary, meta2, mood2, turns2 in closed:
+            self._write_episode_summary(src2, summary, meta2, mood2, turns2)
 
     def recent_episodes(self, limit: int = 3) -> list:
         """最近收束 / 进行中的 episode 摘要（启动 continuity 用）。"""

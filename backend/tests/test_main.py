@@ -38,6 +38,13 @@ class RestTest(unittest.TestCase):
             self.assertEqual(set(r.json()),
                              {"ok", "katago_dead", "katago_error", "katago_url", "llm_url", "memory_rows"})
 
+            lanes = client.get("/api/lanes").json()
+            self.assertTrue(lanes["ok"])
+            for lane in ("foreground", "persona", "background"):
+                self.assertIn(lane, lanes["lanes"])
+                self.assertIn("count", lanes["lanes"][lane])
+                self.assertIn("total_ms", lanes["lanes"][lane])
+
             self.assertEqual(client.get("/api/state").json()["move_count"], 0)
 
             r = client.post("/api/move", json={"x": 3, "y": 3})

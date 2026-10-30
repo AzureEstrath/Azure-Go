@@ -65,7 +65,7 @@ from fastapi.responses import JSONResponse, Response
 from . import actions
 from . import auto_plan
 from . import config as config_mod
-from . import coords, events, persona, prompts, sgf
+from . import coords, events, lanes, persona, prompts, sgf
 from . import file_service
 from . import full_review
 from . import schedule as schedule_mod
@@ -620,6 +620,11 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             "llm_url": s.llm.base_url,
             "memory_rows": memory_rows(),
         }
+
+    @app.get("/api/lanes")
+    async def lane_state():
+        """任务车道可观测指标（v4.4.0）：只读统计，不改变任何执行顺序。"""
+        return {"ok": True, "lanes": lanes.snapshot()}
 
     @app.get("/api/state")
     async def get_state():
