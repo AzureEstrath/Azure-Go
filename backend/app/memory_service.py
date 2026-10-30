@@ -2,9 +2,12 @@
 
 职责边界：
 - ``memory_enabled=False`` 时**零开销**：不建数据库文件、不调任何接口（构造期直接返回）；
-- 云端 embedding 由 ``build_embed_fn`` 按配置装配，三个字段任一为空就返回 ``None``——
-  ``MemoryStore`` 随即降级为关键词检索；401 / 超时同样只影响检索质量，不影响出话；
+- embedding 由 ``build_embed_fn`` 按配置装配：**本地 GGUF（llama.cpp）/ OpenAI 兼容 HTTP /
+  关闭**三态；本地加载失败可降级 HTTP，全部不可用则退回关键词检索（401 / 超时同样只影响
+  检索质量，不影响出话）；
 - ``recall_for`` 返回可直接注入提示词的文本（包装措辞在 ``prompts.long_term_note``）；
+- ``EmbedProvider`` 带模型指纹、查询指令前缀、LRU 缓存与批量编码；``MemoryStore`` 的
+  ``vectors`` 表按指纹隔离，启动后台回填当前模型向量；
 - 数据库默认落在 ``<backend>/data/memory.db``（``backend/data/`` 已 gitignore，属运行产物），
   目录按需创建；路径留空也走这个默认值。
 
@@ -228,10 +231,11 @@ def build_embed_fn(cfg):
         got = _make_local_provider(cfg)
         if got is not None:
             return got
-    if mode in ("auto", "http") or (mode == "local" and can_local is False):
-        got = _make_http_provider(cfg)
-        if got is not None:
-            return got
+    # local 模式加载失败 / 模型文件缺失时，只要 HTTP 三件套可用也允许降级；
+    # 这样“配置写 local、实际没装 llama.cpp”不会把记忆直接退回关键词。
+    got = _make_http_provider(cfg)
+    if got is not None:
+        return got
     return None
 
 

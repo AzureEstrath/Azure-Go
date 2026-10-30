@@ -458,6 +458,7 @@ class AzureAgent:
         # 避免每句都“我突然想起”。
         self._recall_chain: dict = {}
         self._recall_chain_end_ts: float = 0.0
+        self._chat_seq: int = 0             # 玩家聊天序号：回忆链只在“链开始后确实又聊过”时检查换题
 
         # —— 跨局的定式族计数（T5）：默认不接线（None）⇒ 一律当作「第 1 次」、每次都上卡片；
         #    由 main.py 的 lifespan 无条件注入 JosekiProgress（没有开关，设计 §8.4）——
@@ -1309,7 +1310,11 @@ class AzureAgent:
             except Exception:                    # noqa: BLE001 —— 随机源坏了就不提
                 return {}
         if chain:
-            if not recall_chain.should_continue(now, chain, mood, self._last_user_chat()):
+            # 只有链开始后玩家**确实又发过新消息**，才用那句话判换题；
+            # 否则拿链开始前的旧消息会把刚开的链误判成“换话题”。
+            new_chat = self._chat_seq > int(chain.get("chat_seq", 0) or 0)
+            last_user = self._last_user_chat() if new_chat else ""
+            if not recall_chain.should_continue(now, chain, mood, last_user):
                 self._end_recall_chain(now)
                 return {}
             query = recall_chain.chain_query(chain, self.idle_memory_query())
@@ -1362,6 +1367,7 @@ class AzureAgent:
                         mood, float(fields.get("affinity", 0.35)))
                     chain = recall_chain.start(text, now, mood,
                                                depth_max=depth_max, source="idle")
+                    chain["chat_seq"] = int(self._chat_seq)
                     chain = recall_chain.advance(chain, now, item_id=item.get("id"))
                 self._recall_chain = chain
                 return {"id": item.get("id"), "text": text,
@@ -1392,19 +1398,23 @@ class AzureAgent:
         with self._recall_lock:
             chain = dict(self._recall_chain) if isinstance(self._recall_chain, dict) else {}
             chain = chain if chain else {}
-            last_end = float(self._recall_chain_end_ts or 0.0)
         cue = recall_chain.memory_cue(s)
-        if chain and recall_chain.should_continue(now, chain, mood, s, min_gap=90.0):
+        if chain and recall_chain.should_continue(
+                now, chain, mood, s, min_gap=90.0, check_topic=not cue):
             query = recall_chain.chain_query(chain, s)
             continued = True
-        elif cue and recall_chain.should_start(
-                now, chain, last_end, mood, 0.0, 0.0, cue=True):
-            query = s
-            continued = False
         else:
             if chain:
+                # 链已经走完 / 换了话题。玩家明确问旧事时允许**当场另起一条**新链，
+                # 不再被旧链的 cooldown 卡住；只是普通换题就收束。
                 self._end_recall_chain(now)
-            return {}
+                chain = {}
+            if cue and recall_chain.should_start(
+                    now, {}, 0.0, mood, 0.0, 0.0, cue=True):
+                query = s
+                continued = False
+            else:
+                return {}
         try:
             fn = getattr(mem, "recall_items_for", None)
             if not callable(fn):
@@ -1441,6 +1451,7 @@ class AzureAgent:
                         mood, float(fields.get("affinity", 0.35)))
                     chain = recall_chain.start(body, now, mood,
                                                depth_max=depth_max, source="chat")
+                    chain["chat_seq"] = int(self._chat_seq)
                     chain = recall_chain.advance(chain, now, item_id=item.get("id"))
                 self._recall_chain = chain
                 return {"id": item.get("id"), "text": body,
@@ -2240,7 +2251,7 @@ class AzureAgent:
         Azure 自己的语气指令，不引入第二套人格。
         """
         try:
-            return persona.emotion_language_note(self._mood_axis(), self._life_fields() or {})
+            return persona.emotion_language_note(self._mood_axis())
         except Exception as e:                  # noqa: BLE001 —— 语言节奏坏了不该影响出话
             print("[Agent] 情绪语言节奏生成失败（已忽略）：%s" % e)
             return ""
@@ -3096,6 +3107,7 @@ class AzureAgent:
         if text is None or text.strip() == "":
             return
         self._life_touch("chat", source=mode, summary=text)
+        self._chat_seq += 1
         self.st.chat_history.append({"role": "user", "content": text})
         # 自适应难度：玩家明确说「太难 / 认真点」时立刻调一档（受 4 手冷却与基线 ±1 约束）
         if self.adaptive.enabled and self.adaptive.note_chat(text, len(self.st.moves)):

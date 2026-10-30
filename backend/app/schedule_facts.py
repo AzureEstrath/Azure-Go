@@ -38,6 +38,22 @@ _SCHEDULE_WORDS = re.compile(
     r"(今天|今日|明天|明日|后天|周[一二三四五六日天]|星期[一二三四五六日天]|"
     r"下周|本周|这周|早上|上午|中午|下午|晚上|今晚|早八|早起|课|上班|开会|安排|日程|有空|没事)")
 
+# 「没有课」这类否定只和课程类条目比，不能把晚上的电影 / 聚会也算成“有课”。
+_CLASS_TITLE_WORDS = (
+    "化学", "数学", "物理", "英语", "语文", "历史", "地理", "生物", "政治",
+    "导论", "图学", "体育", "实验", "原理", "概论", "课", "讲座", "考试",
+)
+
+
+def _class_like(item) -> bool:
+    """条目是否像课程（kind=course 或标题含学科词）；拿不准按“不是课”处理。"""
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("kind", "") or "") == "course":
+        return True
+    title = str(item.get("title", "") or "")
+    return any(w in title for w in _CLASS_TITLE_WORDS)
+
 
 def _as_ts(v):
     try:
@@ -301,7 +317,10 @@ def conflict(reply, items, ref=None):
     if not (_NEG_RE.search(s) or _FREE_RE.search(s)):
         return None
     bucket = _bucket(s)
+    class_claim = ("课" in s) and bucket == ""
     for it in items:
+        if class_claim and not _class_like(it):
+            continue
         h = _clock_hour(it)
         if bucket == "morning" and h >= 12:
             continue

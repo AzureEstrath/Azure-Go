@@ -337,7 +337,7 @@ class FlowTest(unittest.TestCase):
             cfg.memory_max_inject_chars = 240
             mem = MemoryService(cfg)
             try:
-                mem.remember_fact("玩家上次说雨天摆棋很开心", tag="test")
+                mem.remember_fact("玩家最近说喜欢雨天摆棋", tag="test")
                 agent, _eng, _llm, _bus = _mk()
                 agent.memory = mem
                 agent.mood.v = 0.90
@@ -858,6 +858,7 @@ class PetChatTest(unittest.TestCase):
         agent2.recall_rng = FixedRng(0.0)
         a = agent2.idle_memory_hint()
         self.assertTrue(a)
+        agent2._chat_seq += 1               # 模拟玩家在链开始后**又发了一句**新消息
         agent2.st.chat_history.append({"role": "user", "content": "我们换个话题，聊聊最近的新番动画吧"})
         self.assertEqual(agent2.idle_memory_hint(), {}, "换话题应结束链")
         self.assertEqual(agent2._recall_chain, {})

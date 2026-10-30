@@ -187,11 +187,12 @@ def should_start(now, chain, last_end_ts, mood, roll, chance, *, cue=False) -> b
     return 0.0 <= roll_f < p
 
 
-def should_continue(now, chain, mood, text="", min_gap=0.0) -> bool:
+def should_continue(now, chain, mood, text="", min_gap=0.0, check_topic=True) -> bool:
     """这条链能否接着往下回忆（话题 / 情绪 / 长度 / 间隔 / 时间五道门）。
 
     ``min_gap`` 给聊天用（默认 90 秒）：玩家连发两句时不必每句都再翻一页回忆；
-    走神调用保持 0（它本来就隔了几分钟）。
+    走神调用保持 0（它本来就隔了几分钟）。``check_topic=False`` 用于玩家**明确提旧事**
+    （「你还记得……」）：此时不必因为这句话的字面话题和链不同就断链。
     """
     if not chain:
         return False
@@ -209,7 +210,7 @@ def should_continue(now, chain, mood, text="", min_gap=0.0) -> bool:
         return False
     if mood_shifted(chain.get("mood"), mood):
         return False
-    if text and topic_shifted(text, chain.get("topic", "")):
+    if check_topic and text and topic_shifted(text, chain.get("topic", "")):
         return False
     return True
 

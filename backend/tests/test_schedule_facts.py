@@ -111,6 +111,12 @@ class ConflictTest(unittest.TestCase):
         hit = sf.conflict("明天没有课，可以睡懒觉。", ROWS)
         self.assertIsNotNone(hit)
 
+    def test_no_class_claim_does_not_match_a_movie(self):
+        movie = _row("看电影", 1, 19, 0)
+        movie["kind"] = "task"
+        self.assertIsNone(sf.conflict("明天没有课，可以睡懒觉。", [movie]),
+                          "晚上是电影不是课，不能误判成冲突")
+
     def test_plain_chat_is_not_conflict(self):
         self.assertIsNone(sf.conflict("今天有点累，想早点睡了。", ROWS))
         self.assertIsNone(sf.conflict("我不太喜欢吃早餐。", ROWS))

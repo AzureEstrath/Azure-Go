@@ -129,11 +129,12 @@ def memory_note(streak=0) -> str:
 # 基线附近一律空串：不改变提示词，也不让每句话都像在演状态。
 # 措辞始终是 Azure 自己的口吻——这是语气指令，不是另一套人格。
 
-def emotion_language_note(mood, life_fields=None) -> str:
+def emotion_language_note(mood) -> str:
     """当前情绪 → 一句语言节奏提示；没有明显偏离 ⇒ ``""``（提示词逐字符不变）。
 
-    ``mood`` 认 ``v`` / ``c`` / ``a``；``life_fields`` 只用 ``energy``。
-    规则刻意保守：低落 / 明亮、活跃 / 安静、好奇三组各取最多两条，避免语气指令互相打架。
+    ``mood`` 认 ``v`` / ``c`` / ``a``。规则刻意保守：低落 / 明亮、活跃 / 安静、好奇
+    三组各取最多两条，避免语气指令互相打架。体力（energy）由 ``AzureAgent.life_note``
+    单独负责，这里不重复写“累了”的提示。
     """
     src = mood if isinstance(mood, dict) else {}
     try:
@@ -142,12 +143,6 @@ def emotion_language_note(mood, life_fields=None) -> str:
         return ""
     if not all(math.isfinite(x) for x in (v, c, a)):
         return ""
-    f = life_fields if isinstance(life_fields, dict) else {}
-    energy = f.get("energy")
-    try:
-        energy = float(energy) if energy is not None else None
-    except (TypeError, ValueError):
-        energy = None
 
     parts = []
     if v <= 0.38:
@@ -160,8 +155,6 @@ def emotion_language_note(mood, life_fields=None) -> str:
         parts.append("整个人偏静：语速和句子都放慢半拍，不用为了热络硬撑。")
     if c >= 0.68 and v >= 0.55:
         parts.append("好奇心正盛：可以顺着对方的话追问一句「后来呢」，但只问这一件。")
-    if energy is not None and energy <= 0.28:
-        parts.append("精力不太够：别硬撑长句，说完就安静陪着。")
     if not parts:
         return ""
     return ("【此刻说话的节奏 · 只影响语气与长短，不要逐条念出来】\n"

@@ -81,6 +81,14 @@ class ContinueTest(unittest.TestCase):
         self.assertFalse(rc.should_continue(1030, chain, MOOD, "雨天", min_gap=90))
         self.assertTrue(rc.should_continue(1100, chain, MOOD, "雨天", min_gap=90))
 
+    def test_explicit_memory_cue_skips_topic_check(self):
+        """玩家明确提旧事时，不因为这句话字面换了话题就断链。"""
+        chain = rc.start("雨天摆棋", 1000, MOOD, depth_max=2)
+        chain = rc.advance(chain, 1000, item_id=1)
+        text = "你还记得上次那件事吗"
+        self.assertFalse(rc.should_continue(1100, chain, MOOD, text))
+        self.assertTrue(rc.should_continue(1100, chain, MOOD, text, check_topic=False))
+
 
 class TopicTest(unittest.TestCase):
     def test_cue_and_shift(self):

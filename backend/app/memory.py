@@ -8,8 +8,9 @@
   不引入 numpy / chroma / faiss——记忆规模上限 2000 条，这点计算量不值得加依赖。
 - **检索两级**：配了 ``embed_fn`` 就按余弦相似度排序；**向量命中不足 ``k`` 条时，余量用关键词
   从尚未命中的行里补齐**（混合库：写入时 embedding 失败或旧库遗留的无向量行，不会被有向量的
-  行压掉）；没配 ``embed_fn``、或云端 embedding 报错（401 / 超时）时整段降级为关键词匹配
-  （score 固定 0.0，不伪造相似度）。
+  行压掉）；没配 ``embed_fn``、或本地 / 云端 embedding 报错（401 / 超时）时整段降级为关键词匹配
+  （score 固定 0.0，不伪造相似度）。v4.3.1 起向量带 ``model`` 指纹 + ``dim``，换模型后旧向量
+  不会跨模型比较；v4.3.2 起关键词查询过滤通用词，多词查询至少命中两个不同词。
 - **一切故障都不影响对局**：DB 打不开 / 不可写、embedding 抛异常都只打日志，
   写失败返回 ``None``、检索返回 ``[]``，绝不把异常抛回编排层。
 - **写入有硬上限**：单条 ``MAX_TEXT_LEN`` 字、同 tag + 同 text 去重、
@@ -42,6 +43,13 @@ MAX_INJECT_ITEM_CHARS = 120     # 注入提示词时单条记忆的字数上限
 # 关键词检索的切分：ASCII 按词、CJK 按二元组（中文没空格，整串匹配对不上自然问句）
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 _WORD_RE = re.compile(r"[0-9a-z_]+")
+# 查询侧通用词：几乎每条聊天记忆都有，留在关键词里会让“任何一句都命中所有记忆”。
+# 只过滤**查询**的词，记忆原文不动；过滤后为空则不走关键词召回。
+_QUERY_STOP_TERMS = {
+    "玩家", "我们", "你们", "这个", "那个", "什么", "怎么", "就是", "还是",
+    "可以", "现在", "时候", "今天", "明天", "昨天", "最近", "事情", "东西",
+    "有点", "已经", "然后", "因为",
+}
 
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS memories (
@@ -174,6 +182,8 @@ def _keywords(query: str) -> list:
 
     整串匹配对不上自然问句（「讲讲定式」对不上「定式讲解」），二元组是纯标准库里
     最省事又够用的切法；命中的词越多越靠前不在关键词模式里体现（score 固定 0.0）。
+    v4.3.2：过滤「玩家 / 喜欢 / 最近」这类每条记忆都有的通用词，避免一句“玩家最近……”
+    把整个库都关键词命中。过滤后没有有效词 ⇒ 返回空列表（没把握就不召回）。
     """
     q = str(query or "").strip().lower()
     if q == "":
@@ -184,8 +194,7 @@ def _keywords(query: str) -> list:
             terms.append(run)
         else:
             terms.extend(run[i:i + 2] for i in range(len(run) - 1))
-    if not terms:
-        terms.append(q)
+    terms = [t for t in terms if t not in _QUERY_STOP_TERMS]
     return terms
 
 
@@ -386,11 +395,12 @@ class MemoryStore:
                 return None
             try:
                 row = self._conn.execute(
-                    "SELECT id, emo_v, status FROM memories WHERE tag = ? AND text = ? "
+                    "SELECT id, status FROM memories WHERE tag = ? AND text = ? "
                     "ORDER BY id ASC LIMIT 1", (tag, t)).fetchone()
                 if row is not None:
-                    # 旧行没有情绪、这次有：顺手补上，不另起一行（也不覆盖已有标签）。
-                    reactivated = str(row[2] or "active") != "active"
+                    # 重复写入：复用同一行，必要时重新激活并更新 meta / 情绪标签。
+                    reactivated = str(row[1] or "active") != "active"
+                    changed = False
                     if reactivated:
                         # 同一条事实被重新写回（例如取消后又重新安排）：旧行重新生效，
                         # 否则会一直以「已失效」的身份存在，召回永远看不到。
@@ -398,12 +408,20 @@ class MemoryStore:
                             "UPDATE memories SET status = 'active', superseded_by = 0, "
                             "superseded_ts = 0, superseded_reason = '', meta = ?, ts = ? WHERE id = ?",
                             (_json(m), self._now(), int(row[0])))
-                    if emo is not None and float(row[1] if row[1] is not None else -1.0) < 0.0:
+                        changed = True
+                    elif m:
+                        # 仍有效的旧行：把结构化 meta 更新为这次写入的值（日程 id 在重扫后会变，
+                        # 不更新的话取消日程按 id 就找不到它，只能靠标题+时刻兜底）。
+                        self._conn.execute("UPDATE memories SET meta = ? WHERE id = ?",
+                                           (_json(m), int(row[0])))
+                        changed = True
+                    if emo is not None:
+                        # 与 meta 里的 mood 保持一致：重复写入带了新情绪时，标签跟着更新。
                         self._conn.execute(
                             "UPDATE memories SET emo_v = ?, emo_a = ?, emo_tag = ? WHERE id = ?",
                             (emo_v, emo_a, emo_tag, int(row[0])))
-                    if reactivated or (emo is not None
-                                       and float(row[1] if row[1] is not None else -1.0) < 0.0):
+                        changed = True
+                    if changed:
                         self._conn.commit()
                     return int(row[0])
                 cur = self._conn.execute(
@@ -505,11 +523,17 @@ class MemoryStore:
         if len(hits) < k:                   # 没向量 / 命中不够 k 条：余量退关键词补齐
             seen = {int(h["id"]) for h in hits}
             terms = _keywords(q)
+            term_set = set(terms)
+            # 有 embedding 时关键词只作补齐：查询词多时至少命中两个不同词，
+            # 防止「玩家 / 喜欢 / 最近」这类通用词或单个偶然词把无关记忆带进来。
+            need = 2 if (callable(self._embed_fn) and floor > 0.0 and len(term_set) >= 3) else 1
             extra = []
             for row in rows:                # rows 已按时间倒序：关键词命中给最新的
                 if int(row["id"]) in seen:  # 向量已命中的不重复计入
                     continue
-                if any(t in str(row["text"]).lower() for t in terms):
+                body = str(row["text"]).lower()
+                matched = sum(1 for t in term_set if t in body)
+                if matched >= need:
                     rank, aff = rank_of(row, 0.0)
                     extra.append((rank, dict(row, score=0.0, emo_affinity=aff)))
             if extra:
