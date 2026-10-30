@@ -51,13 +51,15 @@
 import asyncio
 import random
 import sys
+import time
 import uuid
 from typing import TypedDict
 
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from . import actions, coords, decay, estimate, events, persona, prompts, recall_chain, schedule_facts, speech_text
+from . import (actions, coords, decay, estimate, events, persona, personal_facts,
+               prompts, recall_chain, schedule_facts, speech_text)
 from .llm_chain import ThinkStream, content_of, content_text_of
 from .tools import TOOLS
 
@@ -781,6 +783,25 @@ async def _upcoming_schedule_text(agent, hours=48, limit=8, text=""):
     return str(got.get("text", "") or "")
 
 
+async def _personal_evidence_for(agent, hist, text):
+    """聊天用的玩家私人事实证据（v4.3.3）。
+
+    **只收玩家亲口说过的话**：内存里的 ``chat_history``（user 角色）+ 共享聊天流水里的
+    ``user_text`` + 当前这句。助手的旧回复一律不进来——否则「她上次说过，于是这次接着编」
+    会自我强化。读流水失败就用内存历史，绝不影响出话。
+    """
+    rows = []
+    mem = getattr(agent, "memory", None)
+    store = getattr(mem, "store", None) if mem is not None else None
+    if store is not None:
+        try:
+            rows = list(await asyncio.to_thread(store.recent_chats, 40) or [])
+        except Exception as e:              # noqa: BLE001 —— 证据读不到就退化为内存历史
+            print("[Chat] 玩家原话流水读取失败（已忽略）：%s" % e)
+            rows = []
+    return personal_facts.collect_evidence(hist, rows, text, now=time.time())
+
+
 async def _prepare_chat(agent, data):
     """聊天：长期记忆召回 → 上下文块 + 历史窗口 + 这一句。
 
@@ -826,6 +847,7 @@ async def _prepare_chat(agent, data):
                 recall_text=str(hint.get("text") or ""),
                 recall_continued=bool(chain.get("continued")))
             data["recall_hint"] = hint
+            data["personal_evidence"] = await _personal_evidence_for(agent, hist_now, text)
         else:
             ctx = prompts.context_block(
                 agent.st.moves, agent.st.memory_log, agent.st.chat_history, "chat", True,
@@ -1373,6 +1395,39 @@ async def _speak_analyze(agent, data, msgs):
     data["reply"] = msg
 
 
+async def _fix_personal_claim(agent, data, msgs, raw):
+    """出话后核对「玩家私人事实」（v4.3.3）。
+
+    模型很容易把「吃饭 / 饿了 / 外卖」拼成「你刚吃完晚饭」这种贴心但没有依据的肯定句。
+    这里只做一件事：**没有玩家原话支持就不允许当成已知**。核对失败先给模型一次按事实
+    重说的机会；仍编造就用确定性兜底句收口，避免假事实写进聊天历史与长期记忆。
+
+    与日程核对（v4.3.0）分开：那条管「明天有没有课」，这条管「你吃没吃饭 / 下没下班」；
+    两者都只在检测到问题时才多发一次请求。
+    """
+    ev = data.get("personal_evidence")
+    if not raw or not isinstance(ev, dict):
+        return raw
+    claim = personal_facts.unsupported(raw, ev)
+    if claim is None:
+        return raw
+    fix_msgs = list(msgs) + [{"role": "user", "content":
+                              personal_facts.correction_prompt(claim, ev)}]
+    raw2 = ""
+    try:
+        raw2 = await asyncio.wait_for(
+            _say(agent, fix_msgs, 240, think_mode=0, no_think=True, naturalize=False),
+            timeout=CHAT_RETRY_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        print("[Chat] 玩家事实核对重答超时，改用确定性兜底")
+    if (raw2 and not actions.looks_structured(raw2)
+            and personal_facts.unsupported(raw2, ev) is None):
+        return raw2
+    fallback = personal_facts.fallback_reply(claim, ev)
+    print("[Chat] 出现没有依据的玩家私人事实，已按事实收口")
+    return fallback or raw
+
+
 async def _speak_chat(agent, data, msgs):
     """聊天台词（消息构造失败时按空回复处理，由 finalize 的兜底顶上）。
 
@@ -1438,6 +1493,9 @@ async def _speak_chat(agent, data, msgs):
                 if fallback:
                     raw = fallback
                 print("[Chat] 聊天与真实日程冲突，已按事实纠正")
+    # v4.3.3：玩家私人事实核对（吃没吃饭 / 下没下班 / 睡没睡好）。放在日程核对之后，
+    # 因为日程冲突重答可能已经产生一句新的、需要再核对的台词。
+    raw = await _fix_personal_claim(agent, data, msgs, raw)
     data["reply"] = actions.naturalize(str(raw or ""))
 
 

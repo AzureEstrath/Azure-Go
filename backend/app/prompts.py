@@ -1016,13 +1016,19 @@ def life_context_block(chat_history, long_term="", time_facts=None, profile=None
     sched_block = ""
     if sched != "":
         sched_block = "\n\n【近期真实日程 · 回答时以此为准，别编造】\n%s" % sched
-    return _t("【最近的对话】\n%s%s%s%s%s%s" % (
+    # v4.3.3 信息边界：聊天里最容易出的错不是语气，而是替玩家编造私人经历
+    # （「你刚吃完晚饭」「你刚下班」）。这里只给一条边界，不写具体话术；
+    # 出话后还有 personal_facts 的逻辑核对兜底。
+    scope = ("\n\n【信息边界】\n你只知道玩家亲口说过、或日程 / 画像里写明的事；"
+             "没提到的私人经历不要替他编造，不确定就自然问一句。")
+    return _t("【最近的对话】\n%s%s%s%s%s%s%s" % (
         chat_brief(chat_history),
         long_term_note(long_term),
         recall_note(recall_text, recall_continued),
         time_note(time_facts),
         profile_note(profile, 0),
         sched_block,
+        scope,
     ))
 
 

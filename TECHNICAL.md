@@ -54,7 +54,9 @@
 > （llama.cpp CPU、文本缓存、向量模型指纹、后台回填、余弦门槛）。**
 > **v4.3.2：全量审计——记忆关键词停用词与多词命中、回忆链旧消息误判、`没有课` 不误判
 > 非课程条目、embedding 本地失败降级 HTTP、重复写入更新 meta；新增 PROJECT_FULL.md 全量文件地图。**
-> 最后更新：2026-10-29。
+> **v4.3.3：玩家私人事实守卫——出话后核对「玩家吃过晚饭 / 下班 / 睡好 / 生病」等私人经历，
+> 只认玩家原话证据；无依据先重答一次，仍编造就用确定性兜底，假事实不写历史与记忆。**
+> 最后更新：2026-10-30。
 
 ---
 
@@ -103,11 +105,11 @@ Azure · 围棋陪练是一个 **本地优先的 AI 围棋陪练**：
 
 | 部分 | 规模 |
 | --- | --- |
-| 后端 `backend/app` | 约 11,565 行 Python |
-| 前端 `game/scripts` | 约 9,554 行 GDScript |
-| 后端测试 | 897 个用例（40 个测试文件） |
+| 后端 `backend/app` | 约 22,000 行 Python |
+| 前端 `game/scripts` | 约 16,900 行 GDScript |
+| 后端测试 | 1179 个用例（52 个测试文件） |
 | KataGo 服务测试 | 36 个用例 |
-| 前端 headless 测试 | 18 个脚本 |
+| 前端 headless 测试 | 20 个脚本 |
 
 ---
 
@@ -202,12 +204,12 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 │  │  └─ net/                   NetClient / ChatQueue
 │  ├─ assets/                   voice（27 个 wav）、sfx（棋子/提子/终局/虚着）
 │  ├─ data/thinking_lines.json  思考短句解析工具的数据（当前运行路径不轮播）
-│  ├─ tests/                    18 个 headless 测试脚本
+│  ├─ tests/                    20 个 headless 测试脚本
 │  ├─ config.json               客户端配置模板（前后端共读）
 │  └─ export_presets.cfg        Windows Desktop 导出预设
 ├─ backend/
 │  ├─ app/                      FastAPI 应用与全部编排逻辑
-│  ├─ tests/                    897 个用例
+│  ├─ tests/                    1179 个用例
 │  ├─ data/                     运行产物（gitignore）：memory/profile/games/joseki_progress.db
 │  ├─ logs/                     dev_local 日志与 PID 文件（gitignore）
 │  ├─ requirements.txt
@@ -483,6 +485,7 @@ START → prepare → decide ──(需要工具且未超预算)──→ tools 
 | 记忆 | `memory.py`、`memory_service.py`、`memory_semantics.py` | 长期记忆，可选 embedding，默认关；二维情绪标签 + supersede |
 | 画像 | `profile.py`、`profile_store.py` | 棋风画像、时间感知，默认关 |
 | 人格化 | `persona.py`、`profile_store.py`（persona 表） | 关系阶段（默认关，可开关并自选称呼名）、情绪余温、今天的小心思、旧局回忆、夜間节奏；`persona_enabled=false` 时零变化 |
+| 事实守卫 | `personal_facts.py` | 玩家私人事实核对：只认玩家原话，防止编造吃饭 / 下班 / 睡眠 / 生病；出话后重答或确定性兜底 |
 | 自适应 | `adaptive.py` | 1~5 档，局内 ±spread |
 | 棋谱 | `game_store.py`、`sgf.py` | SQLite 棋谱库、SGF 导入导出 |
 | 语音 | `tts.py`、`tts_aliyun.py`、`speech_text.py` | 四档 TTS、文本清洗与分块、缓存 |
@@ -548,7 +551,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 **1163** 个用例，覆盖：
+`backend/tests` 共 **1179** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -560,6 +563,8 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 - TTS 文本、缓存、阿里云协议、语音链路；
 - 动态日程：James-Stein / EWMA / 变更点 / 机会约束 / 缓冲 / 锁定窗口 / 触发闸门 / 反馈与复盘；
 - 聊天排程：规则闸门 / JSON 解析 / 规范化 / 过去事件过滤 / 面板刷新信号 / 开关 / `ai_schedule` 事件；
+- 玩家私人事实守卫：截图场景（15:59 说刚吃完晚饭）/ 时间段合理但无原话 / 玩家原话支持 /
+  反向线索 / 问句不算证据 / 重答失败兜底；
 - FastAPI 端点与 WebSocket 事件。
 
 KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
@@ -690,6 +695,18 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
       `MemoryStore` 的 `vectors` 表补 `model` / `dim`，召回只取同指纹且同维度的向量；
       `backfill_vectors()` 在后台为旧记忆补齐当前模型向量；`memory_min_score` 过滤低余弦的
       语义无关旧事（关键词命中不受影响）。HTTP 模式保持 OpenAI 兼容 `/v1/embeddings` 兼容。
+18. **玩家私人事实守卫（v4.3.3）**：`personal_facts.py` 是纯逻辑模块（不读库、不调模型）。
+    - **证据只认玩家原话**：`collect_evidence` 收 `chat_history` 的 `role=user`、共享聊天流水的
+      `user_text` 与当前这句；助手旧回复不进证据，避免「她上次说过，于是这次接着编」。
+      问句（“我吃过了吗”）不算证据。
+    - **三类判定**：餐次（早饭 / 午饭 / 晚饭 / 夜宵）、工作（下班 / 忙完 / 到家）、
+      睡眠 / 身体（睡醒 / 感冒 / 不舒服）。只核对**动词之前**的主语，避免把句末反问
+      「你呢」当成对玩家的断言；「我刚吃完」是 Azure 自己，不触发。
+    - **reason**：`negative`（玩家刚说饿了 / 没吃 / 外卖退掉）优先于 `time`（当前时刻不在
+      该餐次窗口，如 15:59 不是晚饭时间）优先于 `no_source`；时间只加权，不证明。
+    - **出话后处理**：`agent_graph._fix_personal_claim` 在日程冲突核对之后调用；先让模型带
+      一句事实核对提示重答（快速档），返回仍无依据或结构化 JSON 时用 `fallback_reply`
+      确定性收口。`prompts.life_context_block` 另加【信息边界】软约束，但不依赖它兜底。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 
@@ -796,7 +813,7 @@ Godot --path game                  → 客户端
 
 ```powershell
 cd backend
-python -m unittest discover -s tests        # 897 个用例
+python -m unittest discover -s tests        # 1179 个用例
 ```
 
 ### 10.2 KataGo 服务
@@ -812,7 +829,7 @@ python -m unittest discover -s tests        # 36 个用例，假引擎
 godot --path game --headless --script res://tests/test_config.gd
 ```
 
-或直接 `run_test_env.bat tests`，它会依次跑后端全量、KataGo 服务全量、18 个前端脚本，并做 `--headless --quit` 自检，最后还原 `game/project.godot`。
+或直接 `run_test_env.bat tests`，它会依次跑后端全量、KataGo 服务全量、20 个前端脚本，并做 `--headless --quit` 自检，最后还原 `game/project.godot`。
 
 > 测试脚本可能使用 Godot 4.7.1 运行并改写 `project.godot` 的 `config/features`；`run_test_env.bat tests` 会自动还原，手动跑脚本后如发现工程版本被改，执行 `run_test_env.bat restore`。
 

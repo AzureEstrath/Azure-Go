@@ -1,4 +1,4 @@
-# Azure · 全量项目文档（v4.3.2）
+# Azure · 全量项目文档（v4.3.3）
 
 > 本文件是**完整项目地图**：系统架构、人格化 / 日程 / 记忆三条主通路、代码量审计结果、
 > 每个第一方文件的作用、配置与测试入口、维护约定。
@@ -136,6 +136,20 @@ FastAPI 后端（backend/app，端口 8000）
    - 「没有课」只与课程类条目比较，避免把晚上的电影误判成课；
    - 冲突时给模型一次按事实重说的机会，仍失败用确定性事实句收口。
 
+### 3.4 玩家私人事实（v4.3.3）
+
+1. `agent_graph._prepare_chat` 的非棋话题分支收集证据：
+   - `agent.st.chat_history` 中 `role=user` 的原话；
+   - `MemoryStore.recent_chats()` 里的 `user_text`；
+   - 当前这句。
+   助手旧回复**不进证据**，时间只用来判断合不合理。
+2. 出话后 `personal_facts.unsupported(reply, evidence)` 逐句检查餐次 / 工作 / 睡眠 / 身体：
+   - 只认动词之前的主语；「你呢」这类句末反问不算对玩家的断言；
+   - 玩家问「我吃过了吗」不算证据；
+   - 反向线索（饿了 / 没吃 / 外卖退掉）优先判定错误。
+3. 命中后 `_fix_personal_claim` 让模型带一句事实核对重答一次；仍无依据或返回 JSON 时用
+   `fallback_reply` 确定性收口，假事实不写聊天历史 / 长期记忆。
+
 ---
 
 ## 4. 记忆逻辑通路
@@ -169,25 +183,37 @@ FastAPI 后端（backend/app，端口 8000）
 - 日程取消 → 按 `schedule_id` 失效；旧库无 meta 时按标题 + 时刻文本兜底；
 - 重新写回同一条事实 → 自动重新激活，不会永远停在失效状态。
 
+### 4.4 玩家私人事实守卫（v4.3.3）
+
+- 只把玩家原话当证据；助手旧回复不算，避免长期记忆里「Azure 说她刚吃完晚饭」反过来
+  证明这件事。
+- 时间判断只用于合理性：15:59 说「刚吃完晚饭」按 `time` 处理；即使到了晚饭点，没有原话
+  仍然按 `no_source` 处理。
+- 检测范围：吃饭（早 / 午 / 晚 / 夜宵）、下班 / 忙完 / 到家、睡眠、感冒 / 不舒服。
+- 失败开放：读聊天流水失败只退回内存历史，核对异常不影响正常出话。
+
 ---
 
-## 5. 代码量与结构审计（v4.3.2）
+## 5. 代码量与结构审计（v4.3.3）
 
 ### 5.1 体量最大的文件
 
 | 行数 | 文件 | 说明 |
 | --- | --- | --- |
-| ~5892 | `game/scripts/ui/Main.gd` | 围棋窗口 UI / 设置 / 服务状态 / 窥屏 / TTS 播放 |
-| ~3061 | `backend/app/agent.py` | 公开动作、情绪、记忆、工具、看板、TTS 桥接 |
-| ~2468 | `backend/tests/test_agent.py` | Agent 全链路回归 |
-| ~2229 | `game/scripts/app/PetView.gd` | 桌宠视图、聊天面板、月历 / 周表 |
-| ~1630 | `backend/app/agent_graph.py` | LangGraph 六节点编排与全部提示词装配 |
-| ~1532 | `backend/app/main.py` | FastAPI 生命周期 / REST / WS / 日程后台任务 |
-| ~1198 | `backend/app/life.py` | 生命时间线 / 慢变量 / 日程持久化 |
-| ~1051 | `game/scripts/app/PetShell.gd` | 桌宠外壳、服务拉起、聊天 / 窥屏 / 情绪同步 |
+| ~6291 | `game/scripts/ui/Main.gd` | 围棋窗口 UI / 设置 / 服务状态 / 窥屏 / TTS 播放 |
+| ~3442 | `backend/app/agent.py` | 公开动作、情绪、记忆、工具、看板、TTS 桥接 |
+| ~3056 | `backend/tests/test_agent.py` | Agent 全链路回归 |
+| ~2410 | `game/scripts/app/PetView.gd` | 桌宠视图、聊天面板、月历 / 周表 |
+| ~1918 | `backend/app/agent_graph.py` | LangGraph 六节点编排与全部提示词装配 |
+| ~1668 | `backend/app/main.py` | FastAPI 生命周期 / REST / WS / 日程后台任务 |
+| ~1297 | `backend/app/life.py` | 生命时间线 / 慢变量 / 日程持久化 |
+| ~1133 | `game/scripts/app/PetShell.gd` | 桌宠外壳、服务拉起、聊天 / 窥屏 / 情绪同步 |
+| ~287 | `backend/app/personal_facts.py` | 玩家私人事实守卫（纯逻辑） |
 
 ### 5.2 已做的收敛
 
+- v4.3.3 把「玩家私人事实」核对拆成独立纯逻辑模块 `personal_facts.py`，不读库、不调模型，
+  `agent_graph` 只负责收集证据与重答；兜底句不依赖 LLM。
 - v4.3.2 删除了情绪语言提示里与 `life_note` 重复的「精力不足」段（一处提示只由
   一个模块负责），并同步简化 `persona.emotion_language_note` 参数。
 - 记忆关键词检索增加查询侧停用词与多词命中门槛，减少无效召回，减少注入长度。
@@ -261,6 +287,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `memory_semantics.py` | 记忆二维情绪矩阵、九格标签、情绪相似度、动态权重、变更线索 |
 | `memory_service.py` | 记忆门面：`MemoryStore` + `EmbedProvider`（本地 GGUF / HTTP）+ 回填 |
 | `persona.py` | 人格化纯逻辑：关系阶段、情绪余温、小目标、旧局回忆、情绪语言节奏、聊天预算 |
+| `personal_facts.py` | 玩家私人事实守卫：只认玩家原话，核对吃饭 / 下班 / 睡眠 / 身体，出话后重答或兜底 |
 | `profile.py` | 棋风画像计算与文本化（布局 / 战斗 / 官子 / 薄弱方位） |
 | `profile_store.py` | 画像库与 persona 表持久化 |
 | `prompt_chains.py` | 七阶段提示链（ChatPromptTemplate + RunnableBranch） |
@@ -314,6 +341,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_memory.py` / `test_memory_semantics.py` | 记忆存储、向量指纹、回填、阈值、情绪矩阵、supersede |
 | `test_mood_delta.py` | 情绪小调用解析与限频 |
 | `test_persona.py` / `test_profile*.py` | 人格化、画像、画像库 |
+| `test_personal_facts.py` | 玩家私人事实守卫：截图晚饭场景、原话证据、反向线索、问句、兜底句 |
 | `test_prompt_chains.py` / `test_prompts.py` / `test_prompts_long_term.py` | 提示链、黄金提示词、注入段 |
 | `test_recall_chain.py` | 回忆链开始 / 延续 / 终止 |
 | `test_schedule*.py` | 日程抽取、归一化、聊天排程、取消、API、学习 |
@@ -323,7 +351,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_timetable.py` | 课表几何还原 |
 | `test_tools.py` | 发言侧工具 |
 | `test_tts*.py` | TTS 文本 / 缓存 / 阿里云 / 链路 |
-| `test_agent_graph.py` / `test_agent.py` 中的 v4.3.x 用例 | 回忆链、日程事实、动态情绪权重、embedding |
+| `test_agent_graph.py` / `test_agent.py` 中的 v4.3.x 用例 | 回忆链、日程事实、动态情绪权重、embedding、私人事实重答 |
 
 ### 6.4 `game/scripts/`
 
@@ -442,7 +470,7 @@ LangChain / LangGraph、长期记忆、TTS、聊天队列、定式 / 画像 / �
 ## 8. 测试与运行
 
 ```powershell
-# 后端全量（当前 1163 tests OK）
+# 后端全量（当前 1179 tests OK）
 cd backend
 python -m unittest discover -s tests -q
 

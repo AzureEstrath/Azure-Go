@@ -680,7 +680,7 @@ class PetChatTest(unittest.TestCase):
     """v4.2.5：聊天自然接话 + 结构化重答 + 桌宠聊天只发文字（预制音在前端）。"""
 
     def _run(self, llm, text="明天晚上有数据科学课", mode="pet", prebuilt=False,
-             think_level=None, life=None, mood=None, memory=None):
+             think_level=None, life=None, mood=None, memory=None, history=None):
         async def run():
             agent, _eng, _llm, bus = _mk()
             agent.llm = llm
@@ -693,6 +693,8 @@ class PetChatTest(unittest.TestCase):
                 agent.life = life
             if memory is not None:
                 agent.memory = memory
+            if history is not None:
+                agent.st.chat_history = list(history)
             if isinstance(mood, dict):
                 agent.mood.v = float(mood.get("v", agent.mood.v))
                 agent.mood.c = float(mood.get("c", agent.mood.c))
@@ -834,6 +836,47 @@ class PetChatTest(unittest.TestCase):
         self._run(llm, text="后天要做什么", life=life)
         ctx = "\n".join(str(m.get("content", "")) for m in llm.calls[0][0])
         self.assertIn("后天没有安排", ctx)
+
+    def test_chat_does_not_invent_players_meal(self):
+        """v4.3.3：没有玩家原话时，“刚吃完晚饭”必须按事实重说。"""
+        llm = _SeqLLM([
+            "刚吃完晚饭没多久吧……要是还饿，吃点水果或者喝杯热牛奶就好啦。",
+            "现在离晚饭还早呢。六点半到七点吃比较合适；要是饿了，先垫一点水果或热牛奶。",
+        ])
+        agent, bus, _tts = self._run(llm, text="今天几点吃饭合适啊Azure")
+        self.assertGreaterEqual(len(llm.calls), 2, "无依据的玩家私人事实应触发一次事实重答")
+        fix = str(llm.calls[1][0][-1].get("content", ""))
+        self.assertIn("事实核对", fix)
+        self.assertIn("没有说过", fix)
+        reply = agent.st.chat_history[-1]["content"]
+        self.assertNotIn("刚吃完", reply)
+        self.assertIn("晚饭", reply)
+        texts = [str(e.get("text", "")) for e in bus.messages(events.AI)]
+        self.assertFalse(any("刚吃完" in t for t in texts), texts)
+
+    def test_chat_personal_fact_falls_back_when_retry_still_invents(self):
+        """重答仍在编造时用确定性兜底，绝不让假事实写进聊天历史 / 台词。"""
+        llm = _SeqLLM([
+            "刚吃完晚饭没多久吧……",
+            "你刚吃完晚饭，别撑着。",
+        ])
+        agent, bus, _tts = self._run(llm, text="今天几点吃饭合适啊Azure")
+        self.assertGreaterEqual(len(llm.calls), 2)
+        reply = agent.st.chat_history[-1]["content"]
+        self.assertTrue(reply)
+        self.assertNotIn("刚吃完", reply)
+        self.assertFalse(any("刚吃完" in str(e.get("text", "")) for e in bus.messages(events.AI)))
+
+    def test_chat_personal_fact_supported_by_user_words(self):
+        """玩家亲口说过「我六点吃完晚饭」时，模型复述事实不应触发重答。"""
+        llm = StubLLM(text="刚吃完晚饭没多久吧……那今晚就清淡一点。")
+        agent, _bus, _tts = self._run(
+            llm, text="今天几点吃饭合适啊Azure",
+            history=[{"role": "user", "content": "我今天六点就吃完晚饭了"}])
+        self.assertFalse(
+            any("事实核对" in str(c[0][-1].get("content", "")) for c in llm.calls[1:]),
+            "有玩家原话支持时不应再发事实核对请求")
+        self.assertIn("刚吃完", agent.st.chat_history[-1]["content"])
 
     def test_idle_recall_chain_respects_depth_cooldown_and_topic(self):
         """v4.3.0（D）：低情绪短链一步即收；收束后有冷却；换话题直接断链。"""
