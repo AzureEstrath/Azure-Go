@@ -32,6 +32,8 @@ class FakeTTS extends Node:
 
 class FakeAgent extends Node:
 	var fetched: Array[String] = []
+	var reset_calls := 0
+	var reset_callback = null
 
 	func fetch_bytes(path: String, _method: int, _headers: Dictionary,
 			_callback: Callable, _timeout: float) -> void:
@@ -39,6 +41,10 @@ class FakeAgent extends Node:
 
 	func fetch_chat_history(_limit: int, _callback: Callable) -> void:
 		pass
+
+	func reset_test_data(callback: Callable) -> void:
+		reset_calls += 1
+		reset_callback = callback
 
 func _initialize() -> void:
 	_view_script = preload("res://scripts/app/PetView.gd")
@@ -107,6 +113,16 @@ func _test_view() -> void:
 	_check("思考档能同步配置", v._think_level == 2)
 	_check("聊天标题条有圆形头像", v._chat_avatar != null
 		and v._chat_avatar.material is ShaderMaterial)
+	var clear_btn: Button = menu.find_child("ClearTestData", true, false)
+	_check("右键菜单有测试数据清理按钮", clear_btn != null)
+	_check("菜单遮罩不再压黑背景", v._menu_veil.color.a <= 0.01)
+	var reset_calls := [0]
+	v.test_reset_requested.connect(func(): reset_calls[0] += 1)
+	v._on_clear_data_pressed()
+	_check("清理按钮第一次点击进入确认", clear_btn != null
+		and clear_btn.text == "再点一次确认")
+	v._on_clear_data_pressed()
+	_check("清理按钮第二次点击发出请求", reset_calls[0] == 1 and not v.is_menu_open())
 	var toggled := [true]
 	v.prebuilt_tts_toggled.connect(func(on: bool): toggled[0] = on)
 	v.set_prebuilt_tts(true)
@@ -180,6 +196,10 @@ func _test_view() -> void:
 	v.append_chat("assistant", "重复测试")
 	_check("紧邻同角色同文本回复不重复",
 		dup_one == dup_n + 1 and log.get_child_count() == dup_one)
+
+	v.clear_chat()
+	_check("测试清理能强制清空聊天面板",
+		log.get_child_count() == 0 and v._chat_items.is_empty())
 
 	v.open_files()
 	await process_frame
@@ -548,8 +568,34 @@ func _test_shell_instance() -> void:
 	_test_speech_policy(shell)
 	_test_chat_schedule_note(shell)
 	_test_late_chat_reply(shell)
+	_test_test_reset(shell)
 	shell.queue_free()
 	await process_frame
+
+## v4.4.2 测试清理：请求到达后端后，聊天面板清空、busy 归位、情绪回基线。
+func _test_test_reset(shell) -> void:
+	var fake_agent := FakeAgent.new()
+	shell.agent = fake_agent
+	shell._chat_busy = true
+	shell._chat_awaiting = true
+	shell.view.append_chat("user", "清理前的聊天")
+	var before: int = shell.view._chat_log.get_child_count()
+	shell.view.test_reset_requested.emit()
+	_check("测试清理请求到达后端", fake_agent.reset_calls == 1)
+	fake_agent.reset_callback.call(true, 200, {
+		"ok": true, "removed": 3,
+		"mood": {"v": 0.58, "c": 0.55, "a": 0.30, "name": "平静"}})
+	_check("清理后聊天面板为空", before > 0
+		and shell.view._chat_log.get_child_count() == 0
+		and shell.view._chat_items.is_empty())
+	_check("清理后聊天 busy / awaiting 归位",
+		not shell._chat_busy and not shell._chat_awaiting)
+	_check("清理后情绪回到平静基线",
+		is_equal_approx(shell._mood_v, 0.58)
+		and is_equal_approx(shell._mood_c, 0.55)
+		and is_equal_approx(shell._mood_a, 0.30))
+	shell.agent = null
+	fake_agent.free()
 
 ## 待机 / 窥屏只允许气泡 + 预制语气；只有聊天面板这一条可以走完整语音。
 func _test_speech_policy(shell) -> void:

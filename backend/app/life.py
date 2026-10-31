@@ -427,6 +427,27 @@ class LifeStore:
                 pass
         return out
 
+    def reset_chat_state(self, now=None) -> dict:
+        """测试数据清理：删掉对话类事件，并把慢变量 / 情绪回到默认基线。
+
+        只动 ``life_events`` 里的 chat / idle / peer / greet 与 ``life_state``；
+        **不删除日程、课程、棋谱或画像**。返回删掉的事件条数与新状态副本。
+        """
+        now = _as_ts(now) or time.time()
+        removed = 0
+        with self._lock:
+            if self._db is not None:
+                try:
+                    cur = self._db.execute(
+                        "DELETE FROM life_events WHERE kind IN ('chat', 'idle', 'peer', 'greet')")
+                    self._db.commit()
+                    removed = int(cur.rowcount or 0)
+                except Exception as e:          # noqa: BLE001
+                    print("[Life] 清理对话事件失败（已忽略）：%s" % e)
+            self._state = _default_state(now)
+            self._persist_state_locked()
+            return {"events": removed, "state": self._copy_state_locked()}
+
     def recent_events(self, limit=20):
         """最近事件（新 → 旧）；库不可用返回 ``[]``。"""
         try:

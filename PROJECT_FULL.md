@@ -1,4 +1,4 @@
-# Azure · 全量项目文档（v4.4.1）
+# Azure · 全量项目文档（v4.4.2）
 
 > 本文件是**完整项目地图**：系统架构、人格化 / 日程 / 记忆三条主通路、代码量审计结果、
 > 每个第一方文件的作用、配置与测试入口、维护约定。
@@ -213,9 +213,18 @@ FastAPI 后端（backend/app，端口 8000）
 - **多事项提取**：同一句话里多个带时间的安排（“有活动”+“我打算先去某处”）分别输出，
   不再只保留其中一个；实测可同时得到 08:00 文创摊位与 09:50-11:25 心理团辅。
 
+### 4.7 测试数据清理（v4.4.2）
+
+- 右键菜单「清理测试」：第一次点击进入确认，4 秒内第二次点击才发请求。
+- `POST /api/testing/reset` 清空 memories / vectors / chat_history / episodes、内存聊天历史、
+  回忆链与聊天序号；取消后台情绪与聊天排程任务；`busy` 时拒绝执行。
+- `life.reset_chat_state()` 删除 chat/idle/peer/greet 生命事件，并把慢变量与情绪时间戳
+  重置到默认；`agent.mood.reset()` 后强推一次 `mood` 事件。
+- 不删除日程、课程、棋谱与画像；菜单黑色压暗层与 Godot 默认黑底 tooltip 一并移除。
+
 ---
 
-## 5. 代码量与结构审计（v4.4.1）
+## 5. 代码量与结构审计（v4.4.2）
 
 ### 5.1 体量最大的文件
 
@@ -234,6 +243,8 @@ FastAPI 后端（backend/app，端口 8000）
 
 ### 5.2 已做的收敛
 
+- v4.4.2 测试清理只做「删对话 / 回基线」，日程、课程、棋谱与画像保持不动；菜单按钮
+  二次确认，避免误触。
 - v4.4.1 强思考只换请求超时，不换模型 / 预算 / 提示词；排程优先只取消后台情绪任务，
   不改变聊天本身的出话链路。
 - v4.4.0 把「记忆代谢」集中到 `memory.py` 的 episode 收束边界与 `memory_semantics.py`
@@ -308,7 +319,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `joseki_gate.py` | 定式提示门控：技能 / 情绪 / 冷却 / 概率 |
 | `joseki_progress.py` | 定式族出现计数与复习优先级 |
 | `lanes.py` | 任务车道统计：`foreground` / `persona` / `background` 计数与耗时，只观测 |
-| `life.py` | 生命时间线：慢变量、情绪快照、事件、日程、类别耗时、统计 |
+| `life.py` | 生命时间线：慢变量、情绪快照、事件、日程、类别耗时、统计、测试清理基线 |
 | `llm.py` | `LLMClient`：LangChain 链、按调用思考档 / `no_think`、超时、失败映射 |
 | `llm_chain.py` | ChatOpenAI 装配、`extra_body` 合并、流式、content / think 剥离 |
 | `main.py` | FastAPI：生命周期、REST、WebSocket、聊天排程、提醒循环、记忆 API |
@@ -364,10 +375,10 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_full_review.py` / `test_full_review_api.py` | 全盘复盘与 API |
 | `test_game_store.py` / `test_games_api.py` / `test_sgf.py` | 棋谱库、API、SGF |
 | `test_joseki*.py` | 定式识别 / 提取 / 门控 / 族计数 |
-| `test_life.py` | 生命时间线与日程持久化 |
+| `test_life.py` | 生命时间线与日程持久化、测试清理基线 |
 | `test_lanes.py` | 任务车道统计 / 未知车道安全 / 重置 |
 | `test_llm.py` / `test_llm_chain.py` | LLM 客户端、思考档、流式、降级 |
-| `test_main.py` | FastAPI 端点 / 生命周期 / 运行期配置 / 记忆 API |
+| `test_main.py` | FastAPI 端点 / 生命周期 / 运行期配置 / 记忆 API / 测试清理 |
 | `test_memory.py` / `test_memory_semantics.py` | 记忆存储、向量指纹、回填、阈值、情绪矩阵、supersede、巩固分、somatic_charge |
 | `test_mood_delta.py` | 情绪小调用解析与限频 |
 | `test_persona.py` / `test_profile*.py` | 人格化、画像、画像库 |
@@ -394,7 +405,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `core/Coords.gd` | 前端坐标换算 |
 | `core/GameReplay.gd` | 棋谱重放 |
 | `net/ChatQueue.gd` | busy 时聊天排队 |
-| `net/NetClient.gd` | REST / WS 客户端、设置推送、聊天 / 记忆 / 日程接口 |
+| `net/NetClient.gd` | REST / WS 客户端、设置推送、聊天 / 记忆 / 日程接口、测试清理请求 |
 | `services/SfxPlayer.gd` | 落子 / 提子 / 终局音效 |
 | `services/SpeechPairing.gd` | `turn_id + seq` 语音与气泡配对 |
 | `services/TTSClient.gd` | 前端 TTS 播放（系统 / 后端音频） |
@@ -501,7 +512,7 @@ LangChain / LangGraph、长期记忆、TTS、聊天队列、定式 / 画像 / �
 ## 8. 测试与运行
 
 ```powershell
-# 后端全量（当前 1190 tests OK）
+# 后端全量（当前 1192 tests OK）
 cd backend
 python -m unittest discover -s tests -q
 

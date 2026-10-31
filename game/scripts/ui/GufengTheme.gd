@@ -406,6 +406,20 @@ static func apply_bare_button(b: Button) -> void:
 	b.add_theme_color_override("font_hover_color", ACCENT)
 	b.add_theme_color_override("font_pressed_color", ACCENT)
 
+# ================= 测试清理（v4.4.2） =================
+
+static func apply_danger_button(b: Button) -> void:
+	"""危险操作按钮：低饱和朱砂描边，只有 hover / pressed 才加重。"""
+	b.add_theme_font_size_override("font_size", 13)
+	b.add_theme_stylebox_override("normal", _btn_box(Color(PANEL_SOFT, 0.72), Color(CINNABAR, 0.30), false))
+	b.add_theme_stylebox_override("hover", _btn_box(Color(CINNABAR, 0.09), Color(CINNABAR, 0.62), false))
+	b.add_theme_stylebox_override("pressed", _btn_box(Color(CINNABAR, 0.88), Color(CINNABAR, 0.88), true))
+	b.add_theme_stylebox_override("focus", _btn_box(Color(0, 0, 0, 0), Color(CINNABAR, 0.45), false))
+	b.add_theme_color_override("font_color", CINNABAR)
+	b.add_theme_color_override("font_hover_color", CINNABAR.darkened(0.10))
+	b.add_theme_color_override("font_pressed_color", ON_ACCENT)
+	b.add_theme_color_override("font_focus_color", CINNABAR)
+
 static func seal_char(ch: String) -> Control:
 	var p := PanelContainer.new()
 	p.custom_minimum_size = Vector2(30, 30)
@@ -467,6 +481,10 @@ static func build_theme(f: Font) -> Theme:
 	th.set_stylebox("grabber", "VScrollBar", _scroll_grabber(Color(ACCENT, 0.35), 3))
 	th.set_stylebox("grabber_highlight", "VScrollBar", _scroll_grabber(Color(ACCENT, 0.55), 3))
 	th.set_stylebox("grabber_pressed", "VScrollBar", _scroll_grabber(Color(ACCENT, 0.75), 3))
+	# v4.4.2：Godot 默认 tooltip 是黑底白字，与雾蓝界面割裂；这里统一成浅雾纸卡片。
+	th.set_stylebox("panel", "TooltipPanel", _panel_box(PANEL_BG, BORDER, 8, 7, true))
+	th.set_color("font_color", "TooltipLabel", INK)
+	th.set_font_size("font_size", "TooltipLabel", 11)
 	return th
 
 static func _empty_box() -> StyleBoxEmpty:

@@ -122,6 +122,7 @@ func _build_ui() -> void:
 	view.size_selected.connect(_on_size_selected)
 	view.prebuilt_tts_toggled.connect(_on_prebuilt_tts_toggled)
 	view.think_level_selected.connect(_on_think_level_selected)
+	view.test_reset_requested.connect(_on_test_reset_requested)
 	view.quit_requested.connect(_on_quit)
 	view.set_prebuilt_tts(cfg.pet_chat_tts_prebuilt)
 	view.set_think_level(cfg.pet_chat_think_level)
@@ -1127,6 +1128,31 @@ func _on_think_level_selected(level: int) -> void:
 		agent.pet_chat_think_level = cfg.pet_chat_think_level
 	var labels := ["无", "低", "中", "强"]
 	view.show_bubble("聊天思考：%s。" % labels[cfg.pet_chat_think_level], 4.0)
+
+func _on_test_reset_requested() -> void:
+	"""v4.4.2 测试清理：清空聊天 / 记忆 / episode，情绪与慢变量回到基线。"""
+	if agent == null:
+		view.set_chat_status("后端还没连上，稍后再清理。")
+		return
+	view.set_chat_status("正在清理测试数据…")
+	agent.reset_test_data(func(ok: bool, _code: int, d: Dictionary):
+		if not ok:
+			view.set_chat_status("清理失败：后端没有响应。")
+			return
+		if not bool(d.get("ok", false)):
+			view.set_chat_status("Azure 正在回复，等这轮结束再清理。")
+			return
+		_chat_busy = false
+		_chat_awaiting = false
+		view.set_chat_busy(false)
+		view.clear_chat()
+		var mood = d.get("mood", {})
+		if typeof(mood) == TYPE_DICTIONARY and not mood.is_empty():
+			_on_mood(mood)
+		var n := int(d.get("removed", 0) or 0)
+		view.set_chat_status("测试数据已清理 · 情绪回到平静")
+		view.show_bubble("测试数据已清理（%d 条记忆），Azure 回到平静。" % n, 4.5)
+		_play_tone(_tone_for_mood()))
 
 func _on_quit() -> void:
 	view.save_position()

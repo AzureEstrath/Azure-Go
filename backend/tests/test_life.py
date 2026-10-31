@@ -55,6 +55,23 @@ class LifeStoreTest(unittest.TestCase):
         self.assertAlmostEqual(s3["last_proactive_ts"], T0 + 60)
         self.assertEqual([e["kind"] for e in self.store.recent_events(5)], ["idle", "chat"])
 
+    def test_reset_chat_state_clears_conversation_and_returns_baseline(self):
+        """v4.4.2 测试清理：删对话类事件 + 慢变量/情绪回默认，但保留棋局事件。"""
+        self.store.touch("chat", summary="旧聊天", now=T0)
+        self.store.touch("idle", now=T0 + 60)
+        self.store.touch("game_end", summary="一盘棋", now=T0 + 120)
+        self.store.save_mood({"v": 0.90, "c": 0.80, "a": 0.70, "name": "开心"}, now=T0 + 180)
+        out = self.store.reset_chat_state(now=T0 + 3600)
+        self.assertEqual(out["events"], 2)
+        kinds = [e["kind"] for e in self.store.recent_events(5)]
+        self.assertEqual(kinds, ["game_end"])
+        s = self.store.state
+        self.assertEqual(s["mood"], {})
+        self.assertAlmostEqual(s["last_chat_ts"], 0.0)
+        self.assertAlmostEqual(s["last_interaction_ts"], 0.0)
+        self.assertAlmostEqual(s["energy"], life.LIFE_ENERGY_BASE)
+        self.assertAlmostEqual(s["affinity"], life.LIFE_AFFINITY_BASE)
+
     def test_touch_without_event_only_moves_timestamps(self):
         self.store.touch("game_move", now=T0, event=False)
         self.assertEqual(self.store.recent_events(5), [])

@@ -26,6 +26,7 @@ signal go_requested
 signal size_selected(height: int)
 signal prebuilt_tts_toggled(on: bool)
 signal think_level_selected(level: int)
+signal test_reset_requested
 signal quit_requested
 
 const SIZE_PRESETS := [120, 160, 200, 240]
@@ -64,6 +65,9 @@ var _bubble_label: Label
 var _bubble_until := 0
 var _menu: PanelContainer
 var _menu_veil: ColorRect
+var _clear_data_btn: Button
+var _clear_data_timer: Timer
+var _clear_data_armed_until := 0
 var _chat: PanelContainer
 var _chat_log: VBoxContainer
 var _chat_scroll: ScrollContainer
@@ -221,7 +225,8 @@ func _build_menu() -> void:
 	# 菜单打开时的薄纱：既压暗背景，也让「点空白处收起菜单」在透明窗上可靠命中
 	_menu_veil = ColorRect.new()
 	_menu_veil.name = "PetMenuVeil"
-	_menu_veil.color = Color(0.04, 0.10, 0.10, 0.10)
+	# 只做「点空白收起菜单」的透明命中层；不再压暗背景（v4.4.2：去掉菜单黑色底）。
+	_menu_veil.color = Color(0, 0, 0, 0)
 	_menu_veil.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_menu_veil.mouse_filter = Control.MOUSE_FILTER_STOP
 	_menu_veil.visible = false
@@ -302,11 +307,38 @@ func _build_menu() -> void:
 
 	_rule(vb)
 
-	var quit := _menu_button(vb, "退出桌宠")
+	# 底部一行：测试清理（两次确认） + 退出。放在同一行，不额外撑高小窗菜单。
+	var bottom_row := HBoxContainer.new()
+	bottom_row.add_theme_constant_override("separation", 4)
+	vb.add_child(bottom_row)
+	_clear_data_btn = Button.new()
+	_clear_data_btn.name = "ClearTestData"
+	_clear_data_btn.text = "清理测试"
+	_clear_data_btn.custom_minimum_size = Vector2(0, 30)
+	_clear_data_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_clear_data_btn.tooltip_text = "测试专用：清空全部聊天记录、长期记忆与 episode，\n" \
+		+ "并让情绪与慢变量回到平静基线。不会删除日程、课程、棋谱与画像。\n" \
+		+ "第一次点击后需在 4 秒内再点一次确认。"
+	GufengTheme.apply_danger_button(_clear_data_btn)
+	_clear_data_btn.pressed.connect(_on_clear_data_pressed)
+	bottom_row.add_child(_clear_data_btn)
+
+	var quit := Button.new()
+	quit.text = "退出桌宠"
+	quit.custom_minimum_size = Vector2(0, 30)
+	quit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	quit.tooltip_text = "真正退出程序"
+	GufengTheme.apply_button(quit)
 	quit.pressed.connect(func():
 		close_menu()
 		quit_requested.emit())
+	bottom_row.add_child(quit)
+
+	_clear_data_timer = Timer.new()
+	_clear_data_timer.one_shot = true
+	_clear_data_timer.wait_time = 4.0
+	_clear_data_timer.timeout.connect(_disarm_clear_data)
+	add_child(_clear_data_timer)
 
 	var hint := Label.new()
 	hint.text = "左键摸摸 · 拖动悬浮球 · 右键菜单"
@@ -329,6 +361,38 @@ func _menu_button(parent: Node, text: String, primary := false) -> Button:
 		GufengTheme.apply_button(b)
 	parent.add_child(b)
 	return b
+
+func _on_clear_data_pressed() -> void:
+	var now := Time.get_ticks_msec()
+	if _clear_data_armed_until <= 0 or now > _clear_data_armed_until:
+		_clear_data_armed_until = now + 4000
+		if _clear_data_btn != null:
+			_clear_data_btn.text = "再点一次确认"
+		if _clear_data_timer != null:
+			_clear_data_timer.start()
+		return
+	_disarm_clear_data()
+	close_menu()
+	test_reset_requested.emit()
+
+func _disarm_clear_data() -> void:
+	_clear_data_armed_until = 0
+	if _clear_data_timer != null:
+		_clear_data_timer.stop()
+	if _clear_data_btn != null:
+		_clear_data_btn.text = "清理测试"
+
+func clear_chat() -> void:
+	"""测试清理后强制清空聊天面板（后端空历史本身不会清屏，所以这里单独走一条）。"""
+	_chat_items.clear()
+	_chat_rebuilding = false
+	if _chat_log != null:
+		for c in _chat_log.get_children():
+			_chat_log.remove_child(c)
+			c.queue_free()
+	if _chat_status != null:
+		_chat_status.text = ""
+	_scroll_chat()
 
 func set_prebuilt_tts(on: bool) -> void:
 	if _prebuilt_check != null:
@@ -2080,6 +2144,7 @@ func _bubble_ttl(text: String) -> float:
 func open_menu(pos: Vector2) -> void:
 	if _menu == null:
 		return
+	_disarm_clear_data()
 	_menu_veil.visible = true
 	_menu.visible = true
 	_menu_open = true
@@ -2095,6 +2160,7 @@ func close_menu() -> void:
 	if _menu_veil != null:
 		_menu_veil.visible = false
 	_menu_open = false
+	_disarm_clear_data()
 
 func is_menu_open() -> bool:
 	return _menu_open

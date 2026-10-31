@@ -61,6 +61,8 @@
 > foreground / persona / background 车道统计，不改变执行顺序。**
 > **v4.4.1：强思考使用单独的长超时链（90 秒起，出话等待 95 秒）；聊天排程先取消后台
 > 情绪小调用，后台日程判断上限放宽到 20 秒，避免本地单槽模型忙时“思路断了 / 漏记日程”。**
+> **v4.4.2：右键菜单加入测试数据清理（二次确认），清空聊天 / 记忆 / episode / 对话类生命事件
+> 并让情绪与慢变量回基线；去掉菜单黑色压暗层，tooltip 改为雾纸卡片。**
 > 最后更新：2026-10-31。
 
 ---
@@ -112,7 +114,7 @@ Azure · 围棋陪练是一个 **本地优先的 AI 围棋陪练**：
 | --- | --- |
 | 后端 `backend/app` | 约 22,100 行 Python |
 | 前端 `game/scripts` | 约 16,900 行 GDScript |
-| 后端测试 | 1190 个用例（53 个测试文件） |
+| 后端测试 | 1192 个用例（53 个测试文件） |
 | KataGo 服务测试 | 36 个用例 |
 | 前端 headless 测试 | 20 个脚本 |
 
@@ -214,7 +216,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 │  └─ export_presets.cfg        Windows Desktop 导出预设
 ├─ backend/
 │  ├─ app/                      FastAPI 应用与全部编排逻辑
-│  ├─ tests/                    1190 个用例
+│  ├─ tests/                    1192 个用例
 │  ├─ data/                     运行产物（gitignore）：memory/profile/games/joseki_progress.db
 │  ├─ logs/                     dev_local 日志与 PID 文件（gitignore）
 │  ├─ requirements.txt
@@ -576,7 +578,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 **1190** 个用例，覆盖：
+`backend/tests` 共 **1192** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -765,6 +767,17 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
     - 日程提取提示词要求「同一句话里有多个日期 / 时刻事项时分别输出」，并把
       “明天有 X 活动”与“我打算先去某处”一起列出；实测原话可同时得到 08:00 文创摊位
       与 09:50-11:25 心理团辅两条。
+21. **测试数据清理与菜单视觉（v4.4.2）**：
+    - `POST /api/testing/reset`：`MemoryStore.forget(all=True)` 清空 memories / vectors /
+      chat_history / episodes；清空 `agent.st.chat_history`、回忆链与聊天序号；取消后台
+      情绪任务与聊天排程任务；拒绝在 `busy` 时执行，避免旧回合写回清理后的库。
+    - `LifeStore.reset_chat_state()`：删除 `kind in (chat/idle/peer/greet)` 的生命事件，
+      把 `life_state`（精力 / 无聊 / 亲密 / 信任 / 掌控感 / 情绪 / 时间戳）重置为默认基线；
+      不删除日程、课程、棋谱、画像。`agent.mood.reset()` 后强推一次 `mood` 事件。
+    - 桌宠右键菜单：`PetMenuVeil` 改为全透明命中层（只负责点空白收起，不再压黑背景）；
+      `TooltipPanel/TooltipLabel` 主题改为雾纸卡片，替代 Godot 默认黑底 tooltip。
+    - “清理测试 / 退出桌宠”同一行，按钮第一次点击变为「再点一次确认」，4 秒内第二次点击
+      才发请求；`PetView.clear_chat()` 强制清空面板（后端空历史本身不会清屏）。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 
@@ -871,7 +884,7 @@ Godot --path game                  → 客户端
 
 ```powershell
 cd backend
-python -m unittest discover -s tests        # 1190 个用例
+python -m unittest discover -s tests        # 1192 个用例
 ```
 
 ### 10.2 KataGo 服务

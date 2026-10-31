@@ -1627,6 +1627,76 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                 "has_vectors": _int(st.get("has_vectors"), 0),
                 "db": str(st.get("db", "") or "")}
 
+    @app.post("/api/testing/reset")
+    async def testing_reset():
+        """测试专用：清空聊天 / 长期记忆 / episode，情绪与慢变量回到基线。
+
+        不删除日程、课程、棋谱与画像；聊天正在生成时拒绝执行，避免旧回合写回清理后的库。
+        """
+        s = a()
+        if bool(getattr(s, "busy", False)):
+            return {"ok": False, "busy": True}
+        # 先取消还在排队 / 正在跑的后台感情小调用与聊天排程任务，防止它们补写记忆。
+        try:
+            cancel = getattr(s, "cancel_background_llm", None)
+            if callable(cancel):
+                cancel()
+        except Exception:                   # noqa: BLE001
+            pass
+        for task in list(getattr(app.state, "chat_capture_tasks", set()) or []):
+            try:
+                task.cancel()
+            except Exception:               # noqa: BLE001
+                pass
+        removed = 0
+        store = mem_store()
+        if store is not None:
+            try:
+                removed = int(store.forget(all=True) or 0)
+            except Exception as e:          # noqa: BLE001
+                print("[Memory] 测试清理失败（已忽略）：%s" % e)
+        hist = getattr(getattr(s, "st", None), "chat_history", None)
+        if isinstance(hist, list):
+            hist.clear()
+        # 清掉回忆链与聊天序号：下一句不会接着已删除的旧事。
+        try:
+            s._recall_chain = {}
+            s._recall_chain_end_ts = 0.0
+            s._chat_seq = 0
+        except Exception:                   # noqa: BLE001
+            pass
+        life = getattr(app.state, "life", None)
+        life_info = {}
+        if life is not None:
+            try:
+                life_info = life.reset_chat_state() or {}
+            except Exception as e:          # noqa: BLE001
+                print("[Life] 测试清理失败（已忽略）：%s" % e)
+        try:
+            s.mood.reset()
+            s._lingering_mood = None
+            s._mood_reason = ""
+            s._mood_reason_until = -1
+            s._mood_desc = ""
+            s._soft_note = ""
+            s._soft_note_turns = 0
+            s.sync_mood(True)
+            save_life = getattr(s, "save_life", None)
+            if callable(save_life):
+                save_life()
+        except Exception as e:              # noqa: BLE001
+            print("[Agent] 测试清理情绪失败（已忽略）：%s" % e)
+        try:
+            mood = s.mood_payload()
+        except Exception:                   # noqa: BLE001
+            mood = {}
+        return {
+            "ok": True,
+            "removed": removed,
+            "chat_events": int((life_info or {}).get("events", 0) or 0),
+            "mood": mood,
+        }
+
     @app.post("/api/memory/forget")
     async def memory_forget(body: dict):
         """忘掉长期记忆 → ``{"ok": True, "removed": int}``（``{ids:[…]}`` 或 ``{all:true}``）。"""

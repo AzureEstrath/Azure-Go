@@ -470,6 +470,30 @@ class MemoryApiEnabledTest(unittest.TestCase):
                 self.assertTrue(q["items"])
                 self.assertTrue(any("今天有点累" in i["text"] for i in q["items"]))
 
+    def test_testing_reset_clears_chat_memory_and_mood(self):
+        """v4.4.2：测试清理清空聊天/记忆/episode，并把情绪拉回平静基线。"""
+        with tempfile.TemporaryDirectory() as d:
+            app = self._app(d)
+            with TestClient(app) as client:
+                self.assertTrue(client.post(
+                    "/api/chat", json={"text": "我今天有点累", "mode": "pet"}).json()["ok"])
+                self.assertEqual(len(client.get("/api/chat/history?limit=10").json()["items"]), 1)
+                self.assertGreaterEqual(client.get("/api/memory/stats").json()["rows"], 1)
+                agent = app.state.agent
+                agent.mood.v, agent.mood.c, agent.mood.a = 0.95, 0.85, 0.80
+                r = client.post("/api/testing/reset").json()
+                self.assertTrue(r["ok"])
+                self.assertGreaterEqual(r["removed"], 1)
+                self.assertEqual(r["chat_events"], 0)
+                mood = r["mood"]
+                self.assertAlmostEqual(mood["v"], 0.58)
+                self.assertAlmostEqual(mood["c"], 0.55)
+                self.assertAlmostEqual(mood["a"], 0.30)
+                self.assertEqual(mood["name"], "平静")
+                self.assertEqual(client.get("/api/chat/history?limit=10").json()["items"], [])
+                self.assertEqual(client.get("/api/memory/stats").json()["rows"], 0)
+                self.assertEqual(agent.st.chat_history, [])
+
     def test_duplicate_write_and_query_k(self):
         with tempfile.TemporaryDirectory() as d:
             with TestClient(self._app(d)) as client:

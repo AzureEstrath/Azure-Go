@@ -502,6 +502,10 @@ func fetch_chat_history(limit: int, callback: Callable) -> void:
 	_fetch_json("/api/chat/history?limit=%d" % clampi(limit, 1, 200),
 		HTTPClient.METHOD_GET, {}, callback)
 
+## 测试清理：清空聊天 / 长期记忆 / episode，并把情绪与慢变量回到基线。
+func reset_test_data(callback: Callable) -> void:
+	_fetch_json("/api/testing/reset", HTTPClient.METHOD_POST, {}, callback, 20.0)
+
 ## 权威棋盘快照（从桌宠切回正式界面时补一次，防止后台走了几手而前端还停在旧盘面）。
 func fetch_state(callback: Callable) -> void:
 	_fetch_json("/api/state", HTTPClient.METHOD_GET, {}, callback)
