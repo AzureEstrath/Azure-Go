@@ -738,6 +738,9 @@ class PetChatTest(unittest.TestCase):
             self._run(llm, think_level=level)
             self.assertEqual(llm.think_modes[0], think_mode, "level=%d" % level)
             self.assertEqual(llm.calls[0][2], no_think, "level=%d no_think" % level)
+        from app.agent_graph import _chat_timeout_for_level
+        self.assertGreaterEqual(_chat_timeout_for_level(3), 90.0,
+                                "强思考的出话等待必须覆盖 LLM 的 90 秒长超时链")
 
     def test_structured_chat_reply_retried_without_thinking(self):
         llm = _SeqLLM([

@@ -54,7 +54,7 @@
   "persona_address_name": "",
   "persona_enabled": true,
   "persona_relationship_enabled": false,
-  "pet_chat_think_level": 3,
+  "pet_chat_think_level": 1,
   "pet_chat_tts_prebuilt": true,
   "pet_enabled": true,
   "pet_height": 160,

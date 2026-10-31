@@ -430,6 +430,14 @@ class ChainTest(unittest.TestCase):
         c = _client(lambda req: httpx.Response(200, json=_reply("好")), timeout_sec=7.5)
         self.assertEqual(c.chain.request_timeout, 7.5)
 
+    def test_strong_thinking_has_a_longer_timeout_chain(self):
+        """v4.4.1：强思考不再被普通请求的 45 秒超时打断。"""
+        c = _client(lambda req: httpx.Response(200, json=_reply("好")), timeout_sec=7.5)
+        self.assertEqual(c._sync_long_chain().request_timeout, 90.0)
+        c.timeout_sec = 120.0
+        c._built_long_extra_body = None
+        self.assertEqual(c._sync_long_chain().request_timeout, 120.0)
+
     def test_extra_body_wired_at_construction(self):
         seen = []
 

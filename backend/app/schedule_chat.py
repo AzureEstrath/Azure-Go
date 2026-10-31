@@ -24,7 +24,7 @@ MAX_ITEMS = 4
 TITLE_MAX = 32
 # 后台日程判断的单次 LLM 上限（v4.2.8）：本地单槽位模型偶尔会卡在长输出上，
 # 超时就放弃这一轮，绝不占着生成锁拖慢下一句聊天。
-LLM_TIMEOUT_SEC = 10.0
+LLM_TIMEOUT_SEC = 20.0          # 聊天排程是后台任务，宁可多等一会儿，也不要静默漏记
 
 # 时间线索：只要出现一个就值得让模型判断（不是「一定排」）。
 _TIME_CUE = re.compile(
@@ -167,7 +167,10 @@ async def extract(llm, text, now=None):
         '"duration_min": "预计分钟数", "deadline": "YYYY-MM-DD HH:MM" 或 null, '
         '"notes": "可选"}]}\n'
         "日期和时间只按玩家原话写：有原话日期短语就填 relative_date，不要自己心算；"
-        "只有日期没有时刻也可以；只说“提醒我记一下”但没给日期时间时，date/time 都写 null。\n\n"
+        "只有日期没有时刻也可以；只说“提醒我记一下”但没给日期时间时，date/time 都写 null。\n"
+        "同一句话里有多个不同的日期 / 时刻事项时，分别输出多个 item，不要只保留其中一个；"
+        "“明天早上有 X 活动 / 课程 / 会议”这种带明确时间的固定安排，也算玩家的安排，"
+        "与“我打算 / 我要去”的个人计划一起列出。\n\n"
         "玩家刚说：「%s」"
     ) % (ref.strftime("%Y-%m-%d"), "周" + "一二三四五六日"[ref.weekday()], raw_text)
     msgs = [{"role": "user", "content": prompt}]
@@ -179,7 +182,7 @@ async def extract(llm, text, now=None):
             out = await asyncio.wait_for(
                 llm.chat(msgs, 500), timeout=LLM_TIMEOUT_SEC)
     except Exception as e:                  # noqa: BLE001 —— 聊天排程绝不打挂聊天
-        print("[Schedule] 聊天日程判断失败（已忽略）：%s" % e)
+        print("[Schedule] 聊天日程判断失败（已忽略）：%s" % (str(e) or type(e).__name__))
         return []
     data = _json_object(out)
     raw_items = _pick_items(data)
@@ -357,7 +360,7 @@ async def extract_cancellations(llm, text, context_text, items, now=None):
                 llm.chat([{"role": "user", "content": prompt}], 200),
                 timeout=LLM_TIMEOUT_SEC)
     except Exception as e:                  # noqa: BLE001 —— 取消判断失败不影响聊天
-        print("[Schedule] 取消日程判断失败（已忽略）：%s" % e)
+        print("[Schedule] 取消日程判断失败（已忽略）：%s" % (str(e) or type(e).__name__))
         return []
     data = _json_object(out)
     valid = {int(it.get("id", 0) or 0) for it in candidates}

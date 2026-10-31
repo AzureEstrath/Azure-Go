@@ -36,6 +36,9 @@ REASON_BUDGET_STRONG = 800      # 思考档位 2（强思考）：推理段的�
 # 直接返回 finish_reason=length + 空 content（台词退化成兜底句，v3.9.1 修复）。长尾由 chat() 的
 # 「去掉上限重试一次」兜底。
 REASON_HEADROOM_DEFAULT = 4096
+# v4.4.1：强思考（档位 2）在本地 35B 模型上实测一次可超过 45 秒；普通请求超时会把整句
+# 变成「思路断了」。给强思考单独一条更长超时的链（只在档位 2 使用），普通快问快答不受影响。
+STRONG_TIMEOUT_FLOOR = 90.0
 
 
 class MoodDelta(BaseModel):
@@ -101,6 +104,9 @@ class LLMClient:
         self._http = http_client                    # 同步路径（invoke）：langchain-openai 1.x 只认它
         self._http_async = http_async_client        # 异步路径（ainvoke）：只认它，测试注入假客户端用
         self._built_extra_body = None
+        # 强思考专用链（v4.4.1）：同样的扩展字段，更长的请求超时；只在 think_mode>=2 使用。
+        self._long_chain = None
+        self._built_long_extra_body = None
         # 本机 llama-server 常常只有一个生成槽位（`-np 1`）。资料扫描的日程提取与聊天 / 情绪
         # 小调用共用同一个客户端时，两条请求并发会把槽位状态搅在一起（实测聊天拿到日程 JSON）。
         # 所有真正发请求的路径排成一队：单次最长约几十秒，宁可让聊天多等一会儿，也不串台。
@@ -153,15 +159,31 @@ class LLMClient:
         self._built_extra_body = want
         return self.chain
 
+    def _sync_long_chain(self):
+        """强思考专用链：字段与普通链相同，只把请求超时抬到 ``STRONG_TIMEOUT_FLOOR`` 以上。"""
+        want = dict(self.extra_body or {})
+        if self._long_chain is not None and self._built_long_extra_body == want:
+            return self._long_chain
+        try:
+            base = float(self.timeout_sec)
+        except (TypeError, ValueError):
+            base = 0.0
+        timeout = max(base, STRONG_TIMEOUT_FLOOR)
+        self._long_chain = build_chat_model(_ChainCfg(self, want), http_client=self._http,
+                                            http_async_client=self._http_async, timeout=timeout)
+        self._built_long_extra_body = want
+        return self._long_chain
+
     async def close(self):
         """关闭链持有的异步连接（与旧实现的 ``close()`` 对应）；失败一律忽略。"""
-        client = getattr(self.chain, "root_async_client", None)
-        if client is None:
-            return
-        try:
-            await client.close()
-        except Exception:                           # noqa: BLE001
-            pass
+        for chain in (self.chain, self._long_chain):
+            client = getattr(chain, "root_async_client", None)
+            if client is None:
+                continue
+            try:
+                await client.close()
+            except Exception:                           # noqa: BLE001
+                pass
 
     # ================= 文本清洗 =================
 
@@ -244,9 +266,23 @@ class LLMClient:
             body["max_tokens"] = budget
         return body
 
+    def _mode_of(self, think_mode=None, no_think=False) -> int:
+        """本次调用真正生效的档位（0~2）；``no_think`` 恒为 0。"""
+        if no_think:
+            return 0
+        try:
+            mode = int(self.think_mode if think_mode is None else think_mode)
+        except (TypeError, ValueError):
+            mode = int(self.think_mode or 0)
+        return max(0, min(2, mode))
+
     async def _call(self, messages, budget, think_mode=None, no_think=False):
-        """发一次请求：按调用把扩展字段与输出上限合并后 bind 到链上（不重建模型）。"""
-        return await self._sync_chain().bind(
+        """发一次请求：按调用把扩展字段与输出上限合并后 bind 到链上（不重建模型）。
+
+        档位 2（强思考）走专用长超时链（v4.4.1）；其余仍走普通链，行为不变。
+        """
+        chain = self._sync_long_chain() if self._mode_of(think_mode, no_think) >= 2 else self._sync_chain()
+        return await chain.bind(
             extra_body=self._extra_for(budget, think_mode, no_think)).ainvoke(messages)
 
     def _strip_on_reject(self, e) -> bool:

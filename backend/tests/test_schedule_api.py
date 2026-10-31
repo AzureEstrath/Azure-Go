@@ -193,6 +193,9 @@ class ChatScheduleApiTest(unittest.TestCase):
             bus = events.RecordingBus()
             agent = AzureAgent(StubEngine(), llm, bus, joseki_rate=1.0,
                                joseki_rng=ZeroRng())
+            cancelled = []
+            original_cancel = agent.cancel_background_llm
+            agent.cancel_background_llm = lambda: (cancelled.append(1), original_cancel())[1]
             app = create_app(cfg=cfg, agent=agent, autostart=False, life=store)
             try:
                 with TestClient(app) as client:
@@ -203,6 +206,7 @@ class ChatScheduleApiTest(unittest.TestCase):
                     self.assertEqual(len(items), 1)
                     self.assertEqual(items[0]["title"], "组会")
                     self.assertEqual(items[0]["start_time"], "15:00")
+                    self.assertTrue(cancelled, "排程判断前应先让出后台情绪小调用")
                     self.assertTrue(any("组会" in str(c[0]) for c in llm.calls
                                         if c and c[0]))
                     msgs = self._wait_messages(bus)

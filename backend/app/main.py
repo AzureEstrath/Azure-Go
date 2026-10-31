@@ -226,6 +226,14 @@ async def _capture_chat_schedule(app, cfg, agent, text):
     llm = getattr(agent, "llm", None)
     if life is None or llm is None:
         return
+    # v4.4.1：日程判断是用户能看见的结果，优先于后台情绪精修。后者若已占住本地单槽
+    # LLM，排程判断会直接超时（实测「这次没计入日程」）。
+    try:
+        cancel = getattr(agent, "cancel_background_llm", None)
+        if callable(cancel):
+            cancel()
+    except Exception as e:              # noqa: BLE001 —— 取消失败不影响排程
+        print("[Schedule] 让出后台 LLM 失败（已忽略）：%s" % e)
     lock = getattr(app.state, "chat_capture_lock", None)
     if lock is None:
         lock = asyncio.Lock()

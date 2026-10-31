@@ -36,6 +36,15 @@ class ExtractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await schedule_chat.extract(llm, "明天好忙", now=NOW), [])
         self.assertEqual(len(llm.calls), 1)
 
+    async def test_prompt_asks_for_all_time_bearing_items(self):
+        """v4.4.1：一句话里同时有「有活动」和「我打算去」时，不能只保留一个。"""
+        llm = StubLLM(text='{"schedule": false}')
+        await schedule_chat.extract(
+            llm, "明天早上九点半有活动，但我打算八点先去食堂看看", now=NOW)
+        prompt = str(llm.calls[0][0][-1].get("content", ""))
+        self.assertIn("多个不同的日期", prompt)
+        self.assertIn("固定安排", prompt)
+
     async def test_timed_item_is_normalized(self):
         llm = StubLLM(text=(
             '```json\n{"schedule": true, "items": ['

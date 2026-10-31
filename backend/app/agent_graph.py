@@ -103,7 +103,7 @@ def _chat_timeout_for_level(level):
         lv = max(0, min(3, int(level)))
     except (TypeError, ValueError):
         lv = 1
-    return {0: 15.0, 1: CHAT_LLM_TIMEOUT_SEC, 2: 35.0, 3: 50.0}[lv]
+    return {0: 15.0, 1: CHAT_LLM_TIMEOUT_SEC, 2: 50.0, 3: 95.0}[lv]
 
 # —— 阶段：一次 graph.ainvoke 处理一个 ——
 PHASE_AFTER_PLAYER = "after_player"     # 玩家落子：引擎分析 + 落子 + 定式 + 情绪 + 点评
@@ -1451,9 +1451,12 @@ async def _speak_chat(agent, data, msgs):
     except (TypeError, ValueError):
         budget = 400
     try:
+        # v4.4.1：强思考（档位 3）不走流式——流式路径用的是普通链的超时；强思考改走
+        # LLMClient 的 90 秒长超时链，宁可少一点 token 动画，也不能在 45 秒被切断。
+        stream_ok = level < 3
         raw = await asyncio.wait_for(
             _say(agent, msgs, budget, think_mode=think_mode, no_think=no_think,
-                 naturalize=False, stream_with_think=True),
+                 naturalize=False, stream_with_think=stream_ok),
             timeout=chat_timeout)
     except asyncio.TimeoutError:
         print("[Chat] 聊天出话超时（%.0f 秒），走兜底" % chat_timeout)
@@ -1633,7 +1636,8 @@ async def _say(agent, msgs, max_tokens, think_mode=None, naturalize=True, stream
     ``think_mode`` 显式给值时**跳过流式**（桌宠走神/窥屏的快速档）：这类短句不该为了
     token 流多等一轮；不传时行为与旧版逐字一致。
     ``stream_with_think=True``（v4.2.7 聊天）例外：流式通道仍可走，档位提示只作用于
-    非流式回落路径；默认关闭，既有快速档调用行为不变。
+    非流式回落路径；强思考（v4.4.1）由调用方显式关闭流式，改用 LLMClient 的长超时链。
+    默认关闭，既有快速档调用行为不变。
     ``no_think=True``（v4.2.9 桌宠「无思考」档）连推理预算也不给，并且不走流式。
     ``naturalize=False`` 给聊天重答路径：先看原文是不是结构化 JSON，再决定要不要重试；
     其余调用保持默认，行为不变。

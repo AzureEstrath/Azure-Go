@@ -59,6 +59,8 @@
 > **v4.4.0：桌宠聊天按 A · 雾窗方案精修（头像标题条 / 本地时间 / 轻气泡 / 底部 dock /
 > 极窄适配）；记忆新增 episode 巩固-结晶与 somatic_charge 体感标记，后台任务加
 > foreground / persona / background 车道统计，不改变执行顺序。**
+> **v4.4.1：强思考使用单独的长超时链（90 秒起，出话等待 95 秒）；聊天排程先取消后台
+> 情绪小调用，后台日程判断上限放宽到 20 秒，避免本地单槽模型忙时“思路断了 / 漏记日程”。**
 > 最后更新：2026-10-31。
 
 ---
@@ -110,7 +112,7 @@ Azure · 围棋陪练是一个 **本地优先的 AI 围棋陪练**：
 | --- | --- |
 | 后端 `backend/app` | 约 22,100 行 Python |
 | 前端 `game/scripts` | 约 16,900 行 GDScript |
-| 后端测试 | 1188 个用例（53 个测试文件） |
+| 后端测试 | 1190 个用例（53 个测试文件） |
 | KataGo 服务测试 | 36 个用例 |
 | 前端 headless 测试 | 20 个脚本 |
 
@@ -212,7 +214,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 │  └─ export_presets.cfg        Windows Desktop 导出预设
 ├─ backend/
 │  ├─ app/                      FastAPI 应用与全部编排逻辑
-│  ├─ tests/                    1188 个用例
+│  ├─ tests/                    1190 个用例
 │  ├─ data/                     运行产物（gitignore）：memory/profile/games/joseki_progress.db
 │  ├─ logs/                     dev_local 日志与 PID 文件（gitignore）
 │  ├─ requirements.txt
@@ -516,6 +518,9 @@ START → prepare → decide ──(需要工具且未超预算)──→ tools 
 - `llm_chain.py`：用 LangChain `ChatOpenAI` 装配模型，合并 `extra_body`，解析内容；
 - `llm.py`：`chat()` 薄适配器，负责输出预算、错误中文化、参数被拒后的降级重试；
 - 思考档位：0 快速 / 1 中等（+160 token 推理预算）/ 2 强思考（+800），另有 4096 常态推理余量；
+- 强思考请求走单独的长超时链（`STRONG_TIMEOUT_FLOOR=90` 秒，普通链仍是 `llm_timeout_sec`）；
+  档位 3 同时关闭 token 流式（流式路径用普通链），改走非流式长链；
+  `agent_graph._chat_timeout_for_level(3)=95` 秒，保证 35B 本地模型的强思考不会在 45 秒被切断；
 - 推理段永不显示给玩家，只取 `content`；
 - 支持流式 `astream`（`stream_tokens` 默认关）；
 - 情绪增量用结构化输出 `MoodDelta`，超界裁剪、NaN 归零；
@@ -571,7 +576,7 @@ CosyVoice3 的 zero-shot 对个别短句可能产出空音频（服务端 `no au
 
 ### 6.9 后端测试
 
-`backend/tests` 共 **1188** 个用例，覆盖：
+`backend/tests` 共 **1190** 个用例，覆盖：
 
 - 配置、事件、引擎、棋盘、坐标、状态；
 - Agent 与 LangGraph 各阶段、工具循环、看门狗、忙闲；
@@ -747,6 +752,20 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
       思考档从 `OptionButton` 改为 4 个 `apply_seg_button` 分段按钮；`_layout` 在
       `cw < 210` 时收起预制音文字与“思考”标签、缩小按钮，保证极窄视口输入 / 发送不越界。
 
+20. **强思考长超时与排程优先（v4.4.1）**：
+    - `LLMClient._sync_long_chain()` 只在档位 2 使用，超时为 `max(llm_timeout_sec, 90)` 秒；
+      档位 0/1 仍用普通链，快问快答不会被长超时拖慢；档位 3 的聊天同时关闭 token 流式，
+      避免流式路径继续用普通链的 45 秒超时。
+    - `_chat_timeout_for_level(3)` 提到 95 秒；实测本地 35B 强思考一次约 43~52 秒，原 45 秒
+      请求超时会把整句变成「唔…思路断了」。
+    - `main._capture_chat_schedule` 在判断前调用 `agent.cancel_background_llm()`：日程写入是
+      用户能看见的结果，优先于后台情绪精修，避免单槽模型被小调用占住后静默漏记。
+    - `schedule_chat.LLM_TIMEOUT_SEC` 从 10 秒放宽到 20 秒；实测空闲时约 3.4 秒完成，
+      20 秒只作为忙时的安全余量。
+    - 日程提取提示词要求「同一句话里有多个日期 / 时刻事项时分别输出」，并把
+      “明天有 X 活动”与“我打算先去某处”一起列出；实测原话可同时得到 08:00 文创摊位
+      与 09:50-11:25 心理团辅两条。
+
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 
 ---
@@ -852,7 +871,7 @@ Godot --path game                  → 客户端
 
 ```powershell
 cd backend
-python -m unittest discover -s tests        # 1188 个用例
+python -m unittest discover -s tests        # 1190 个用例
 ```
 
 ### 10.2 KataGo 服务
