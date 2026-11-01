@@ -1,4 +1,4 @@
-# Azure · 全量项目文档（v4.5.3）
+# Azure · 全量项目文档（v4.5.4）
 
 > 本文件是**完整项目地图**：系统架构、人格化 / 日程 / 记忆三条主通路、代码量审计结果、
 > 每个第一方文件的作用、配置与测试入口、维护约定。
@@ -286,9 +286,25 @@ FastAPI 后端（backend/app，端口 8000）
   允许 ≤24 字的短补充（「心理课 / 参加心理课」）进入抽取；没有候选时保持原闸门，
   避免为普通闲聊多发 LLM 调用。
 
+### 4.12 资料扫描数据清洗（v4.5.4）
+
+- **VLM 闸门**：`azure_files._ocr_is_rich` 判定 OCR 正文足够（≥80 字且含日期 / 时间 / 活动词）
+  时不再调用本地 VLM；VLM API 失败也只为「OCR 读不出内容」的图回退 CPU，避免整批卡 300 秒。
+- **公告重建**：`schedule._event_from_text` 把 OCR 的换行先拼回整段再解析——标题按
+  「【公告标题】→ 日期与时间之间的短句 → 日期前最后一句」取，地点支持「地点：/ 在…举行 / 到…参观」，
+  只有「下午 / 晚上」时用默认时段；已经过去的公告不再新建。
+- **日期对齐 / 去重**：`reconcile_source_dates` 按标题片段对齐源文件里的明确日期（修正
+  「本周六 → 下周」、11-04/11-05 这类误读）；`collapse_group_items` 把「第一小组…第九小组」
+  的分批到场时间合并成一条主活动；`merge_event_fallback` 命中同一事件时补时间 / 地点 /
+  备注，并把过长引文标题换回公告短标题。
+- **过期过滤**：`drop_past_events` 只挡过期普通条目，课程表条目照常保留（补看过去几天的课）。
+- **课程名清洗**：`_cell_parts` / `_clean_course_title` 归一全半角括号、去掉截图省略号与
+  混进课程名的教师姓氏（「体育足球（男孙)」+ 孙峰 → 「体育足球（男）」）；
+  `_merge_courses` 合并同日期 + 同节次 + 同名的重复课程块并补齐缺失字段。
+
 ---
 
-## 5. 代码量与结构审计（v4.5.3）
+## 5. 代码量与结构审计（v4.5.4）
 
 ### 5.1 体量最大的文件
 
@@ -313,6 +329,9 @@ FastAPI 后端（backend/app，端口 8000）
 - v4.5.0 提速走「同一条链路少等一次」：点评语音延后到后台合成、落子宣告走 `no_think`
   快速档、前端只有揭示棋子与保序才等语音——三句分工、去重窗口、`message → speech`
   顺序一条没动。
+- v4.5.4 资料扫描只改「读图 → 提取 → 入库」之间的清洗：OCR 足够时不调 VLM、
+  公告按去换行整段重建、日期对回源文件、分组时间折叠、过期条目过滤；
+  不新增表、不新增常驻 LLM 调用，课程表仍按 OCR 坐标直接入库。
 - v4.5.3 只改规则层：未答问题判定、主动开口记账、日程闸门，不新增表、不新增常驻 LLM 调用；
   只有「存在待定条目 + 短补充」时才多一次后台抽取。
 - v4.5.2 周表恢复原分节网格（撤销真实时间轴与分栏），只重排表上方的清单：
@@ -387,7 +406,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `estimate.py` | 点目与形势估算 |
 | `event_log.py` | 局内事件表（好手 / 坏手 / 偏航 / 定式），供情绪与提示词 |
 | `events.py` | WebSocket 事件构造与录制总线 |
-| `file_service.py` | 资料箱扫描、VLM 拉起、文件列表编排 |
+| `file_service.py` | 资料箱扫描、VLM 拉起、文件列表编排；OCR 正文足够时跳过 VLM |
 | `full_review.py` | 全盘复盘：分段、逐段讲解、语音出口 |
 | `game_store.py` | 棋谱库：归档、查询、导入导出、逐手 / 总结 / 注记 |
 | `joseki.py` | 定式识别、分支、族命名与讲解素材 |
@@ -397,7 +416,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `life.py` | 生命时间线：慢变量、情绪快照、事件、日程（含 `refine_id` 原地细化）、类别耗时、统计、测试清理基线 |
 | `llm.py` | `LLMClient`：LangChain 链、按调用思考档 / `no_think`、超时、失败映射 |
 | `llm_chain.py` | ChatOpenAI 装配、`extra_body` 合并、流式、content / think 剥离 |
-| `main.py` | FastAPI：生命周期、REST、WebSocket、聊天排程（带最近对话与细化候选）、提醒循环、记忆 API |
+| `main.py` | FastAPI：生命周期、REST、WebSocket、聊天排程（带最近对话与细化候选）、资料扫描清洗、提醒循环、记忆 API |
 | `memory.py` | 长期记忆存储：聊天流水 / episode / 记忆 / 向量 / supersede / 回填 |
 | `memory_semantics.py` | 记忆二维情绪矩阵、九格标签、情绪相似度、动态权重、变更线索 |
 | `memory_service.py` | 记忆门面：`MemoryStore` + `EmbedProvider`（本地 GGUF / HTTP）+ 回填 |
@@ -409,7 +428,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `prompts.py` | 全部提示词：人设、上下文、长期记忆、回忆、日程、画像、时间、定式 |
 | `pv_lines.py` | 预测线 A / B / C 提取与胜率差 |
 | `recall_chain.py` | 主动回忆链：开始 / 延续 / 终止条件、话题与情绪门 |
-| `schedule.py` | 日程 / 课表抽取、确定性日期归一化、无日期占位（`when_text="待定"`）、`refine_id` 细化、去重、任务分类、记忆文本 / meta |
+| `schedule.py` | 日程 / 课表抽取、确定性日期归一化、无日期占位（`when_text="待定"`）、`refine_id` 细化、公告日期对齐 / 分组折叠 / 过期过滤、去重、任务分类、记忆文本 / meta |
 | `schedule_chat.py` | 聊天日程判断（带最近对话与 `refine_candidates`）、取消规则 + LLM fallback、JSON 解析 |
 | `schedule_facts.py` | 日程事实：时间指代、窗口选条、格式化、出话冲突核对 |
 | `schedule_learning.py` | 类别 EWMA 时长、变更点、偏好、反馈与复盘 |
@@ -460,11 +479,11 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_personal_facts.py` | 玩家私人事实守卫：截图晚饭场景、原话证据、反向线索、问句、兜底句 |
 | `test_prompt_chains.py` / `test_prompts.py` / `test_prompts_long_term.py` | 提示链、黄金提示词、注入段 |
 | `test_recall_chain.py` | 回忆链开始 / 延续 / 终止 |
-| `test_schedule*.py` | 日程抽取（无日期占位 / 细化候选 / 细化 id 校验 / 短补充放行）、归一化、聊天排程、取消、API（含原地细化）、学习 |
+| `test_schedule*.py` | 日程抽取（无日期占位 / 细化候选 / 细化 id 校验 / 短补充放行）、公告多行重建 / 日期对齐 / 分组折叠 / 过期过滤、消息合并去重、归一化、聊天排程、取消、API（含原地细化）、学习 |
 | `test_speech_text.py` | 语气标记 |
 | `test_state.py` | 对局状态 |
 | `test_time_ctx.py` | 时间事实 |
-| `test_timetable.py` | 课表几何还原 |
+| `test_timetable.py` | 课表几何还原、课程名清洗（括号 / 省略号 / 教师姓氏残片） |
 | `test_tools.py` | 发言侧工具 |
 | `test_tts*.py` | TTS 文本 / 缓存 / 阿里云 / 链路 |
 | `test_agent_graph.py` / `test_agent.py` 中的 v4.4.x / v4.5.0 用例 | 回忆链、日程事实、动态情绪权重、embedding、私人事实重答、聊天 UI 适配、情绪方向、隐式日程、延后语音顺序、`no_think` 三阶段、主动提问记账 |
@@ -531,7 +550,7 @@ FastAPI 后端（backend/app，端口 8000）
 
 | 文件 | 作用 |
 | --- | --- |
-| `azure_files.py` | 资料箱图片 / PDF：OCR、VLM、课表几何还原 |
+| `azure_files.py` | 资料箱图片 / PDF：OCR、VLM（OCR 正文足够时跳过）、课表几何还原、课程名清洗与同格合并 |
 | `azure_peek.py` | 窥屏：截图、隐私过滤、OCR / VLM 描述 |
 | `start_vlm_server.py` | 本地 llama-server VLM 拉起（Qwen2.5-VL） |
 
@@ -588,7 +607,7 @@ LangChain / LangGraph、长期记忆、TTS、聊天队列、定式 / 画像 / �
 ## 8. 测试与运行
 
 ```powershell
-# 后端全量（当前 1215 tests OK）
+# 后端全量（当前 1225 tests OK）
 cd backend
 python -m unittest discover -s tests -q
 

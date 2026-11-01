@@ -133,9 +133,9 @@ def _cell_parts(lines):
     teacher = ""
     # 只有「课程名 + 人名」两行以上时，最后一行才当教师；单独一行 2-3 字仍是课程名。
     if len(head) >= 2 and _CJK_NAME_RE.match(head[-1]):
-        teacher = head[-1]
+        teacher = _clean_person(head[-1])
         head = head[:-1]
-    title = _join_lines(head).strip()
+    title = _clean_course_title(_join_lines(head), teacher)
     location = ""
     notes = ""
     if tail:
@@ -145,8 +145,58 @@ def _cell_parts(lines):
         if m and len(loc) > len(m.group(1)):
             notes = "第%s周" % m.group(1)
             loc = loc[:m.start(1)].strip()
-        location = loc
+        location = _clean_location(loc)
     return title, teacher, location, notes
+
+
+def _clean_person(text):
+    s = re.sub(r"[\s()（）【】\[\]·,，.。:：\-—/、]+", "", str(text or ""))
+    return s.strip()
+
+
+def _clean_location(text):
+    s = str(text or "").strip()
+    s = re.sub(r"^(?:地点|场地|地址|位置)\s*[:：]\s*", "", s)
+    s = re.sub(r"(?:举行|举办|开展|进行|集合|参观)$", "", s).strip()
+    s = re.sub(r"[\s.。;；,，]+", "", s)
+    return s[:30]
+
+
+def _clean_course_title(text, teacher=""):
+    """课程名清洗：补齐全/半角括号、去掉截图省略号与教师残片。
+
+    例：``高等数学（基础)`` → ``高等数学（基础）``；
+    ``体育足球（男孙)`` + 教师 ``孙峰`` → ``体育足球（男）``（末尾的「孙」是 OCR 把教师姓
+    误并进课程名；保留「男」这类真实限定词）。
+    """
+    s = str(text or "").strip()
+    s = s.replace("(", "（").replace(")", "）")
+    s = re.sub(r"[…]{1,}|\.{2,}", "", s)
+    s = re.sub(r"[\s·•,，。:：;；]+", " ", s).strip()
+    if teacher:
+        sur = str(teacher).strip()[:1]
+        if sur:
+            # 「（男孙）」→「（男）」：只去掉紧贴右括号、且正好是教师姓氏的残片。
+            s = re.sub(r"(（[^（）]*?)%s）$" % re.escape(sur), r"\1）", s)
+    if s.count("（") > s.count("）"):
+        s += "）"
+    elif s.count("）") > s.count("（"):
+        s = re.sub(r"）", "", s, count=1)
+    return s.strip()
+
+
+def _ocr_is_rich(text):
+    """OCR 已经读出足够正文时不再调 VLM：本地小 VLM 很慢（单张可达数分钟），
+    而公告类截图 OCR 已能给出日期 / 时间 / 地点，VLM 只是重复一遍。"""
+    s = str(text or "")
+    if len(s) < 80:
+        return False
+    if re.search(r"\d{1,2}\s*月\s*\d{1,2}\s*日", s):
+        return True
+    if re.search(r"\d{1,2}\s*[:：]\s*\d{2}", s):
+        return True
+    return any(w in s for w in ("活动", "考试", "通知", "报名", "讲座", "比赛",
+                                "会议", "上课", "安排", "集合"))
 
 
 def timetable_from_ocr(items, ref=None):
@@ -290,6 +340,31 @@ def timetable_from_ocr(items, ref=None):
                 "start_time": p0["start"], "end_time": p1["end"],
                 "source": "",
             })
+    return _merge_courses(out)
+
+
+def _merge_courses(items):
+    """同一张表里重复 / 残缺的课程块合并：同一日期 + 节次 + 课程名只留一条，
+    缺教师 / 地点的用另一条补齐（OCR 偶尔把同一格拆成两块）。"""
+    out = []
+    by_key = {}
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title", "")).strip()
+        if len(title) < 2:
+            continue
+        key = (str(it.get("date", "")), int(it.get("period_start", 0)),
+               int(it.get("period_end", 0)),
+               re.sub(r"[\s()（）·,，.。:：;；]+", "", title).lower())
+        old = by_key.get(key)
+        if old is None:
+            by_key[key] = it
+            out.append(it)
+            continue
+        for field in ("teacher", "location", "notes"):
+            if not str(old.get(field, "")).strip() and str(it.get(field, "")).strip():
+                old[field] = it[field]
     return out
 
 
@@ -458,15 +533,18 @@ def _image_text(img, args, ocr_engine):
         except Exception as e:  # noqa: BLE001
             out["ocr_error"] = repr(e)
     # 已经还原出课程表时不再调 VLM：小 VLM 往往只读到一格，反而把噪声带进提取。
-    if args.vlm_url and not out["table"]:
+    # v4.5.4：OCR 已经读出足够正文（公告类截图常见）时也不调 VLM——本地 VLM 单张可达数分钟，
+    # 会把整批资料卡到 300 秒超时；OCR 文本已够规则 / LLM 提取日期、时间与地点。
+    if args.vlm_url and not out["table"] and not _ocr_is_rich(out.get("ocr", "")):
         try:
             out["vlm"] = azure_peek.run_vlm_api(
                 img, max(1280, int(args.max_side)), args.vlm_url, timeout=args.vlm_timeout,
                 prompt=FILE_VLM_PROMPT, max_tokens=900, system=FILE_VLM_SYSTEM)
         except Exception as e:  # noqa: BLE001
             out["vlm_error"] = repr(e)
-            # 只有本地权重存在时才回退 CPU，避免每条都卡在导入/加载
-            if azure_peek.VLM_GGUF.exists():
+            # 只有本地权重存在、且 OCR 确实读不出内容时才回退 CPU；
+            # 公告类截图不再为了重复一遍 OCR 文本多等几分钟。
+            if azure_peek.VLM_GGUF.exists() and not _ocr_is_rich(out.get("ocr", "")):
                 try:
                     out["vlm"] = azure_peek.run_vlm_cpu(
                         img, max(1280, int(args.max_side)), prompt=FILE_VLM_PROMPT, max_tokens=900)

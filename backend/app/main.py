@@ -1008,6 +1008,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                         "schedule": _schedule_payload()}
             text = schedule_mod.scan_text(scan)
             raw = await schedule_mod.extract_items(s.llm, text, now=time.time()) if text else []
+            # v4.5.4：LLM 的日期对回源文件里的明确日期（防止把「10月31日（本周六）」算成下周）。
+            raw = schedule_mod.reconcile_source_dates(raw, scan, now=time.time())
             # LLM 超时 / 漏掉聊天里的活动公告时，用规则补抽日期 + 时间 + 标题明确的条目。
             fallback = schedule_mod.fallback_event_items(scan, now=time.time())
             if fallback:
@@ -1015,6 +1017,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                 raw = schedule_mod.merge_event_fallback(raw, fallback)
                 if len(raw) > before:
                     print("[Schedule] 规则补抽 %d 条活动公告" % (len(raw) - before))
+            # 分组 / 分批到场时间合并回主活动，避免「第一小组…第九小组」占 9 条日程。
+            raw = schedule_mod.collapse_group_items(raw)
             # 扫描器从 OCR 坐标直接还原出的课程表条目（星期 / 节次 / 教师 / 地点）：
             # 比 LLM 猜结构可靠，必须并入同一份日程；LLM 抽到的普通日程照常保留。
             table_items = []
@@ -1031,6 +1035,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             source = source[:200]
             # 顺序：几何还原的课程在前，LLM 的普通日程在后——同一格冲突时保留更可靠的课程表条目。
             items = schedule_mod.normalize_items(table_items + raw, source=source, now=time.time())
+            # v4.5.4：过期公告（旧截图里昨天的活动）不再新建；课程表条目照常保留。
+            items = schedule_mod.drop_past_events(items, now=time.time())
             life_store = getattr(app.state, "life", None)
             if life_store is not None and items:
                 # 重扫同一批资料：先清掉这份来源的旧行（旧版本只存了文本日程），

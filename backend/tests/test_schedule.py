@@ -134,6 +134,145 @@ class ScheduleExtractTest(unittest.TestCase):
         self.assertEqual(it["location"], "篮球场")
         self.assertEqual(it["task_type"], "exercise")
 
+    def test_fallback_reads_wrapped_exam_notice(self):
+        """v4.5.4：截图把「考试时间 / 地点」拆成多行时，仍要拼回标题、时间与地点。"""
+        scan = {"files": [{
+            "name": "exam.jpg", "kind": "image", "table": [],
+            "ocr": "16:24 | 97 | 第77期党校初级班全体成员群(158） | 李姿睿 | "
+                   "【结业考试通知】 | 各位77期党校初级班本科生、研究 | 生： | "
+                   "77期党校初级班结业考试安排如 | 下: | 【考核形式】：线下闭卷 | "
+                   "【考试时间）：11月8日（周 | 日）晚19：00-20：30。 | "
+                   "【考试地点】：二教101-105 | 【考试范围】：入党誓词、党 | "
+                   "章、党史、长征胜利九十周年相关内容 | 【注意事项】：请所有同学携带 | "
+                   "好学生证或者身份证以备核查。",
+        }]}
+        raws = schedule.fallback_event_items(scan, now=NOW)
+        self.assertEqual(len(raws), 1, raws)
+        raw = raws[0]
+        self.assertEqual(raw["title"], "结业考试通知")
+        self.assertEqual(raw["date"], "2026-11-08")
+        self.assertEqual(raw["time"], "19:00")
+        self.assertEqual(raw["end_time"], "20:30")
+        self.assertEqual(raw["location"], "二教101-105")
+        self.assertIn("线下闭卷", raw["notes"])
+
+    def test_fallback_reads_practice_notice_and_skips_past(self):
+        """实践活动公告：标题从「日期前最后一句」重建；已经过去的公告不再新建。"""
+        scan = {"files": [{
+            "name": "practice.jpg", "kind": "image", "table": [],
+            "ocr": "各位本科生小组长： | 大家好！ | 77期党校初级班实践活动第 | "
+                   "一次审核将于10月31日（本周 | 六）晚18：00在森工楼316举 | 行。 | "
+                   "各小组答辩到场时间如下： | 第一小组18:00 | 第九小组19:20 | "
+                   "请大家提前做好准备，按时 | 定位到聊天位置>",
+        }]}
+        raws = schedule.fallback_event_items(scan, now=NOW)
+        self.assertEqual(len(raws), 1, raws)
+        raw = raws[0]
+        self.assertEqual(raw["title"], "77期党校初级班实践活动第一次审核")
+        self.assertEqual(raw["date"], "2026-10-31")
+        self.assertEqual(raw["time"], "18:00")
+        self.assertEqual(raw["location"], "森工楼316")
+        # 换到活动当天之后再扫同一张图：过期公告不写。
+        later = schedule.fallback_event_items(
+            scan, now=datetime.datetime(2026, 11, 1, 10, 0).timestamp())
+        self.assertEqual(later, [])
+
+    def test_fallback_day_part_event(self):
+        """只有「11月5日下午」没有钟点时：用下午默认窗口，并保留展览标题与地点。"""
+        scan = {"files": [{
+            "name": "exhibition.jpg", "kind": "image", "table": [],
+            "ocr": "安安顺顺 | 【长征主题展览参观报名】 | 我校拟于11月5日下午到中国 | "
+                   "人民革命军事博物馆，参观“伟大的远征——纪 | "
+                   "念中国工农红军长征胜利90周年主题展览”。现以党支 | "
+                   "部为单位开放参观报名，学校统一 | 安排往返交通。",
+        }]}
+        raws = schedule.fallback_event_items(scan, now=NOW)
+        self.assertEqual(len(raws), 1, raws)
+        raw = raws[0]
+        self.assertEqual(raw["title"], "长征主题展览参观报名")
+        self.assertEqual(raw["date"], "2026-11-05")
+        self.assertEqual(raw["time"], "14:00")
+        self.assertEqual(raw["end_time"], "17:00")
+        self.assertEqual(raw["location"], "中国人民革命军事博物馆")
+
+    def test_merge_fallback_merges_rewritten_title(self):
+        """LLM 与规则补抽对同一场考试用了不同说法：同日期 + 同时刻 + 共同关键词 → 一条。"""
+        fb = [{"date": "2026-11-08", "time": "19:00", "end_time": "20:30",
+               "title": "结业考试通知", "location": "二教101-105"}]
+        llm_raw = [{"date": "2026-11-08", "relative_date": "11月8日",
+                    "time": "19:00", "end_time": "20:30",
+                    "title": "77期党校初级班结业考试", "location": "二教101-105"}]
+        merged = schedule.merge_event_fallback(llm_raw, fb)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["title"], "77期党校初级班结业考试")
+
+    def test_merge_fallback_fills_missing_daypart_time(self):
+        """LLM 只写「下午」时，补抽读出的 14:00-17:00 与地点要补进同一条。"""
+        fb = [{"date": "2026-11-05", "time": "14:00", "end_time": "17:00",
+               "title": "长征主题展览参观报名", "location": "中国人民革命军事博物馆"}]
+        llm_raw = [{"date": "2026-11-05", "day_part": "下午",
+                    "title": "长征主题展览参观报名"}]
+        merged = schedule.merge_event_fallback(llm_raw, fb)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["time"], "14:00")
+        self.assertEqual(merged[0]["end_time"], "17:00")
+        self.assertEqual(merged[0]["location"], "中国人民革命军事博物馆")
+
+    def test_drop_past_events_keeps_courses(self):
+        """旧公告不再新建；课程表条目（包括过去几天的课）照常保留。"""
+        now = datetime.datetime(2026, 11, 1, 10, 0).timestamp()
+        items = [
+            {"kind": "task", "start_ts": now - 86400.0, "title": "昨天的活动",
+             "start_time": "18:00", "date": "2026-10-31"},
+            {"kind": "task", "start_ts": 0.0, "title": "昨天只有日期",
+             "date": "2026-10-31"},
+            {"kind": "task", "start_ts": now + 86400.0, "title": "明天的活动",
+             "start_time": "18:00", "date": "2026-11-02"},
+            {"kind": "course", "start_ts": now - 86400.0, "title": "高等数学",
+             "start_time": "08:00", "date": "2026-10-31"},
+        ]
+        kept = schedule.drop_past_events(items, now=now)
+        self.assertEqual([x["title"] for x in kept], ["明天的活动", "高等数学"])
+
+    def test_reconcile_source_dates_uses_explicit_date(self):
+        """模型把「10月31日（本周六）」算成下一个周六时，按源文件的明确日期改回来。"""
+        scan = {"files": [{
+            "name": "practice.jpg", "kind": "image", "table": [],
+            "ocr": "77期党校初级班实践活动第 | 一次审核将于10月31日（本周 | "
+                   "六）晚18：00在森工楼316举 | 行。",
+        }]}
+        items = [{"title": "77期党校初级班实践活动第一次审核",
+                  "date": "2026-11-07", "time": "18:00"}]
+        got = schedule.reconcile_source_dates(items, scan, now=NOW)
+        self.assertEqual(got[0]["date"], "2026-10-31")
+
+    def test_collapse_group_items_merges_subtimes(self):
+        """第一小组…第九小组的到场时间合并成一条主活动，分段时间进备注。"""
+        rows = [
+            {"title": "77期党校初级班实践活动第一次审核（第%s小组答辩）" % cn,
+             "date": "2026-11-07", "time": tm, "location": "森工楼316"}
+            for cn, tm in zip("一二三四五六七八九",
+                              ["18:00", "18:10", "18:20", "18:30", "18:40",
+                               "18:50", "19:00", "19:10", "19:20"])
+        ]
+        got = schedule.collapse_group_items(rows)
+        self.assertEqual(len(got), 1, got)
+        it = got[0]
+        self.assertEqual(it["title"], "77期党校初级班实践活动第一次审核")
+        self.assertEqual(it["time"], "18:00")
+        self.assertEqual(it["end_time"], "19:30")
+        self.assertIn("第一小组 18:00", it["notes"])
+        self.assertIn("第九小组 19:20", it["notes"])
+
+    def test_merge_fallback_uses_concise_announcement_title(self):
+        """LLM 标题是一长段引文时，用规则补抽的短公告标题。"""
+        fb = [{"date": "2026-11-05", "time": "14:00", "title": "长征主题展览参观报名"}]
+        llm_raw = [{"date": "2026-11-05", "title":
+                    "参观‘伟大纪念中国工农红军长征的胜利90周年主题展览’"}]
+        merged = schedule.merge_event_fallback(llm_raw, fb)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["title"], "长征主题展览参观报名")
+
     def test_fallback_ignores_plain_chat(self):
         scan = {"files": [{
             "name": "chat.jpg", "kind": "image", "table": [],
@@ -289,15 +428,16 @@ class FilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             inbox = os.path.join(tmp, "inbox")
             os.makedirs(inbox)
+            future = (datetime.date.today() + datetime.timedelta(days=7)).isoformat()
             with open(os.path.join(inbox, "meeting.txt"), "w", encoding="utf-8") as f:
-                f.write("2026-10-28 15:30 项目评审，带上电脑。")
+                f.write("%s 15:30 项目评审，带上电脑。" % future)
             store = life.LifeStore(os.path.join(tmp, "life.db"), now=NOW)
             try:
                 cfg = AzureConfig()
                 cfg.assistant_inbox = inbox
                 cfg.vlm_auto_start = False
-                llm = StubLLM(text='[{"date":"2026-10-28","time":"15:30",'
-                                  '"title":"项目评审","notes":"带电脑"}]')
+                llm = StubLLM(text='[{"date":"%s","time":"15:30",'
+                                  '"title":"项目评审","notes":"带电脑"}]' % future)
                 app = create_app(cfg=cfg, engine=StubEngine(), llm=llm,
                                  autostart=False, life=store)
                 with TestClient(app) as client:

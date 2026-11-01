@@ -59,6 +59,12 @@ class TimetableTest(unittest.TestCase):
             _box("08:00", 50, 200), _box("08:45", 50, 220), _box("随便什么", 150, 160),
         ]), [])
 
+    def test_course_title_cleaning(self):
+        """v4.5.4：截图省略号、半角括号与混进课程名的教师姓氏都要清掉。"""
+        self.assertEqual(azure_files._clean_course_title("高等数学（基础)", ""), "高等数学（基础）")
+        self.assertEqual(azure_files._clean_course_title("体育足球（男孙)", "孙峰"), "体育足球（男）")
+        self.assertEqual(azure_files._clean_course_title("生物技术与我们的...", ""), "生物技术与我们的")
+
 
 if __name__ == "__main__":
     unittest.main()

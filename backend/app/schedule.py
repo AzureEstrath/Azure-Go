@@ -39,13 +39,33 @@ _EN_WEEKDAYS = {
 _EVENT_WORDS = (
     "赛", "比赛", "活动", "讲座", "会议", "开会", "演出", "考试", "面试", "培训",
     "聚会", "典礼", "报名", "签到", "分享", "宣讲", "班会", "团建", "招聘",
-    "双选", "志愿", "沙龙", "论坛",
+    "双选", "志愿", "沙龙", "论坛", "答辩", "审核", "参观", "展览", "导览",
+    "观影", "运动会", "路演", "义诊", "公开课",
 )
 _TIME_RANGE_RE = re.compile(
     r"(?<!\d)(\d{1,2})\s*[:：]\s*(\d{2})\s*[-~～—–至到]\s*(\d{1,2})\s*[:：]\s*(\d{2})")
+_SINGLE_TIME_RE = re.compile(r"(?<!\d)(\d{1,2})\s*[:：]\s*(\d{2})(?!\s*[:：])")
 _DATE_MD_RE = re.compile(r"(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*日")
-_LOCATION_RE = re.compile(r"(?:地点|场地|地址|位置)\s*[:：]\s*(.{1,40})")
+_LOCATION_RE = re.compile(
+    r"(?:考试|活动|集合|上课|会议)?(?:地点|场地|地址|位置)(?:】|]）)?\s*[:：]\s*([^【】。；\n]{1,40})")
+_LOCATION_IN_RE = re.compile(
+    r"(?:在|到|前往)\s*([^，。；:：\s]{2,30})[，,]?(?:举行|举办|开展|进行|集合|参观)")
 _CLOCK_ONLY_RE = re.compile(r"^\s*\d{1,2}\s*[:：]\s*\d{2}\s*$")
+_HEADING_RE = re.compile("【([^】]{2,30})】")
+_SECTION_HEADS = {
+    "考试时间", "考试地点", "考试范围", "考核形式", "注意事项",
+    "活动时间", "活动地点", "报名方式", "集合地点", "时间", "地点",
+}
+_DAY_PART_RE = re.compile("(凌晨|上午|中午|下午|傍晚|晚上|夜里)")
+_DAY_PART_WINDOW = {
+    "凌晨": (0, 5 * 60), "上午": (9 * 60, 11 * 60 + 30), "中午": (12 * 60, 13 * 60 + 30),
+    "下午": (14 * 60, 17 * 60), "傍晚": (17 * 60 + 30, 19 * 60),
+    "晚上": (19 * 60, 21 * 60), "夜里": (21 * 60, 23 * 60),
+}
+_SECTION_LINE_RE = re.compile(
+    r"^【(考试时间|活动时间|时间|考试地点|活动地点|地点)】?[:：]?")
+_GROUP_NOISE_RE = re.compile(
+    r"(全体成员群|定位到聊天位置|本人课表|课表刷新|教务账号|查看$|切换$)")
 _SENDER_RE = re.compile(
     r"^[\u4e00-\u9fa5]{1,10}(委员|老师|同学|学长|学姐|部长|主任|班长)$")
 
@@ -119,6 +139,13 @@ async def extract_items(llm, text, now=None):
         "寒暄、表情、没有日期 / 时间 / 地点的普通闲聊不要提取；"
         "但群通知、公告、聊天记录里明确写出日期、时间、活动或地点的（如比赛、讲座、聚会、开会），"
         "即使截图来自聊天，也必须提取；不要编造日期、教师、地点、人物。\n"
+        "同一活动里的分组 / 分批到场时间（「第一小组18:00」「第二小组18:10」…）只写进主活动备注，"
+        "不要每个小组各输出一条；主活动只保留一条。\n"
+        "原文同时给出具体日期和「本周六」等相对说法时，以具体日期为准"
+        "（如「10月31日（本周六）」按 10 月 31 日）；已经过去的日期不要输出。\n"
+        "只有「11月5日下午」这类时段时，date 写具体日期、day_part 写「下午」、time 留 null，"
+        "不要自己猜钟点。\n"
+        "标题用公告里的活动名（如「长征主题展览参观报名」），不要用「参观‘…’」这种长引文。\n"
         "今天是 %s（%s）。相对日期（今天/明天/后天/下周X）优先填 relative_date 原话短语，"
         "不要自己心算绝对日期；date 可留 null。\n"
         "只输出 JSON 数组，不要解释、不要代码围栏。字段：\n"
@@ -209,70 +236,198 @@ def _event_noise_line(line):
     s = str(line or "").strip()
     if s == "" or _CLOCK_ONLY_RE.match(s):
         return True
-    if len(s) <= 16 and re.search(r"(委员|老师|同学|学长|学姐|部长|主任|班长)", s):
+    if _GROUP_NOISE_RE.search(s) or re.match(r"^\d{1,3}$", s):
         return True
-    if _LOCATION_RE.search(s):
+    # 纯姓名 / 群昵称（「李姿睿」「体育委员许宇晨」）；带【】的注意事项不在此列。
+    if re.match(r"^[\u4e00-\u9fa5]{2,3}$", s) or _SENDER_RE.match(s):
+        return True
+    if re.match(r"^[\u4e00-\u9fa5]{1,6}(委员|老师|同学|学长|学姐|部长|主任|班长)", s):
+        return True
+    if _LOCATION_RE.search(s) or _SECTION_LINE_RE.search(s):
+        return True
+    # 只带时间的碎片（「日）晚19：00-20：30。」「第一小组18:00」）不进备注。
+    if len(s) <= 20 and (_TIME_RANGE_RE.search(s) or _SINGLE_TIME_RE.search(s)):
         return True
     t = _DATE_MD_RE.sub("", s)
     for w in _WEEKDAYS:
         t = t.replace(w, "")
-    t = re.sub(r"[\s()（）【】\[\]·,，.。:：\-—/]", "", t)
+    t = _DAY_PART_RE.sub("", t)
+    t = _TIME_RANGE_RE.sub("", t)
+    t = _SINGLE_TIME_RE.sub("", t)
+    t = re.sub(r"[\s()（）【】\[\]·,，.。:：\-—/、]", "", t)
     return t == ""
 
 
+def _clean_event_title(text):
+    s = str(text or "").strip()
+    s = re.sub(r"【[^】]*】", "", s)
+    s = _DATE_MD_RE.sub("", s)
+    for w in _WEEKDAYS:
+        s = s.replace(w, "")
+    s = _DAY_PART_RE.sub("", s)
+    s = _TIME_RANGE_RE.sub("", s)
+    s = _SINGLE_TIME_RE.sub("", s)
+    s = re.sub(r"(将于|定于|拟于|计划于|安排在|预计在)", "", s)
+    s = re.sub(r"^[：:，,、\s]+|[\s：:，,、。；;]+$", "", s)
+    s = re.sub(r"[\s()（）·•,，.。:：;；\-—/]", "", s)
+    return s.strip()
+
+
+def _is_event_title(title, text, allow_generic=False):
+    if title == "" or len(title) < 2 or len(title) > 40:
+        return False
+    if any(w in title for w in _EVENT_WORDS):
+        return True
+    # 公告标题（【…】）允许不带活动词；正文片段必须有实际内容且不是「本晚」这类碎词。
+    return bool(allow_generic) and len(title) >= 4
+
+
+def _clean_event_location(text):
+    s = str(text or "").strip()
+    s = re.sub(r"^(?:地点|场地|地址|位置)\s*[:：]\s*", "", s)
+    s = re.sub(r"(?:举行|举办|开展|进行|集合|参观)$", "", s).strip()
+    s = re.sub(r"[\s.。;；,，【】]+", "", s)
+    return s[:30]
+
+
+def _event_location(lines, flat):
+    # 先按 OCR 行读「地点：篮球场」——行尾天然断开，不会把下一句并进地点。
+    for line in lines:
+        m = _LOCATION_RE.search(str(line or ""))
+        if m:
+            loc = _clean_event_location(m.group(1))
+            if loc:
+                return loc
+    m = _LOCATION_IN_RE.search(flat)
+    if m:
+        return _clean_event_location(m.group(1))
+    return ""
+
+
+def _event_time_window(flat, date_end):
+    """日期之后的一小段窗口里找时间：先整段，再单个钟点，最后退「下午 / 晚上」的默认时段。
+
+    返回 ``(开始分钟, 结束分钟, 时间在 flat 里的位置或 None)``；找不到返回 ``None``。
+    """
+    start_at = max(0, date_end - 5) if date_end else 0
+    window = flat[start_at:start_at + 240] if date_end else flat[:300]
+    tr = _event_time_range(window)
+    if tr is not None:
+        start, end, m = tr
+        return start, end, start_at + m.start()
+    m = _SINGLE_TIME_RE.search(window)
+    if m:
+        try:
+            hh, mm = int(m.group(1)), int(m.group(2))
+        except (TypeError, ValueError):
+            hh, mm = -1, -1
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            start = hh * 60 + mm
+            ctx = window[max(0, m.start() - 4):m.start()]
+            if any(x in ctx for x in ("下午", "傍晚", "晚上", "夜里")) and start < 12 * 60:
+                start += 12 * 60
+            elif "中午" in ctx and start < 11 * 60:
+                start += 12 * 60
+            return start, min(24 * 60, start + 90), start_at + m.start()
+    part = _DAY_PART_RE.search(window)
+    if part:
+        start, end = _DAY_PART_WINDOW.get(part.group(1), (9 * 60, 11 * 60))
+        return start, end, None
+    return None
+
+
+def _event_title(flat, date_start, date_end, time_start):
+    limit = time_start if time_start is not None else min(len(flat), date_end + 140)
+    # ① 群公告的【标题】（跳过「【考试时间】」这类字段名）。
+    for m in _HEADING_RE.finditer(flat[:limit]):
+        name = m.group(1).strip()
+        if name in _SECTION_HEADS:
+            continue
+        cand = _clean_event_title(name)
+        if _is_event_title(cand, flat, allow_generic=True):
+            return cand
+    # ② 日期与时间之间的那一段（篮球赛那种「日期 → 标题 → 时间」的写法）。
+    seg = flat[date_end:limit] if date_end else ""
+    if not _SECTION_LINE_RE.search(seg):
+        cand = _clean_event_title(seg)
+        if _is_event_title(cand, flat):
+            return cand
+    # ③ 日期前最后一句（「77期…实践活动第一次审核将于」这种公告正文）。
+    pre = flat[max(0, date_start - 200):date_start] if date_start else ""
+    parts = re.split(r"[。！？；]", pre)
+    cand = _clean_event_title(parts[-1] if parts else pre)
+    if _is_event_title(cand, flat):
+        return cand
+    return ""
+
+
+def _event_notes(lines, title, location):
+    out, seen = [], set()
+    first_heading = next((i for i, x in enumerate(lines) if "【" in str(x or "")),
+                         len(lines))
+    for idx, line in enumerate(lines):
+        s = str(line or "").strip()
+        if s == "" or _event_noise_line(s):
+            continue
+        # 公告标题之前的纯昵称 / 发送人名（「安安顺顺」）不进备注。
+        if idx < first_heading and re.match(r"^[\u4e00-\u9fa5]{2,4}$", s):
+            continue
+        if title and title in _clean_event_title(s):
+            continue
+        if _HEADING_RE.search(s) and (_clean_event_title(s) == "" or title in s):
+            continue
+        if title and len(_clean_event_title(s)) >= 4 and title.startswith(_clean_event_title(s)):
+            continue
+        if location and location in s:
+            continue
+        if _DATE_MD_RE.search(s) or _TIME_RANGE_RE.search(s) or _SINGLE_TIME_RE.search(s):
+            continue
+        if (re.match(r"^[：:，,、\s]*(各位|大家|同学们)", s)
+                or s.startswith("请")):
+            continue
+        if re.search(r"(安排如|如下)", s) or re.search(r"第[一二三四五六七八九十]+小组", s):
+            continue
+        if len(s) <= 3 or s in seen:
+            continue
+        seen.add(s)
+        # 换行被截图切断的同一段（「入党誓词、党」+「章…」）拼回去；【…】另起一段。
+        if out and not s.startswith("【") and not out[-1].endswith(("。", "！", "？", "；")):
+            out[-1] += s
+        else:
+            out.append(s)
+    return _clip(" | ".join(out), NOTES_MAX)
+
+
 def _event_from_text(text, ref):
-    """从聊天公告 / OCR 文本里规则抽一条明确活动；抽不出返回 None。"""
+    """从聊天公告 / OCR 文本里规则抽一条明确活动；抽不出返回 None。
+
+    v4.5.4 数据清洗：先按「去换行后的整段」重建日期、时间、标题与地点——截图 OCR 常把
+    「将于 / 举行 / 地点」拆到两行；标题优先取【公告标题】，其次日期与时间之间的短句，
+    最后日期前最后一句。已经过去的公告不再新建条目。
+    """
     lines = _event_lines(text)
     if not lines:
         return None
-    time_idx = -1
-    tr = None
-    for i, line in enumerate(lines):
-        got = _event_time_range(line)
-        if got is not None:
-            time_idx = i
-            tr = got
-            break
-    if tr is None:
+    flat = "".join(lines)
+    date = _event_date(flat, ref)
+    if date is None or date < ref.date():
         return None
-    date = _event_date(text, ref)
-    if date is None:
+    dm = _DATE_MD_RE.search(flat)
+    date_start = dm.start() if dm else 0
+    date_end = dm.end() if dm else 0
+    got = _event_time_window(flat, date_end)
+    if got is None:
         return None
-
-    title = ""
-    title_idx = -1
-    for i in range(time_idx - 1, -1, -1):
-        if _event_noise_line(lines[i]):
-            continue
-        cand = _DATE_MD_RE.sub("", lines[i])
-        for w in _WEEKDAYS:
-            cand = cand.replace(w, "")
-        cand = _TIME_RANGE_RE.sub("", cand)
-        cand = re.sub(r"^[\s\-–—·•]+|[\s\-–—·•]+$", "", cand).strip()
-        if 2 <= len(cand) <= TITLE_MAX:
-            title = cand
-            title_idx = i
-            break
+    start, end, time_start = got
+    title = _event_title(flat, date_start, date_end, time_start)
     if title == "":
         return None
     if not (any(w in title for w in _EVENT_WORDS)
-            or any(k in text for k in ("签到", "报名", "举行", "举办", "集合"))):
+            or any(k in flat for k in ("签到", "报名", "举行", "举办", "集合", "参观"))):
         return None
 
-    location = ""
-    for line in lines:
-        m = _LOCATION_RE.search(line)
-        if m:
-            location = _clip(m.group(1).strip(" .,;，。"), LOCATION_MAX)
-            break
-
-    notes_parts = []
-    for i, line in enumerate(lines):
-        if i == time_idx or i == title_idx or _event_noise_line(line):
-            continue
-        notes_parts.append(line)
-    notes = _clip(" | ".join(notes_parts), NOTES_MAX)
-    start, end, _m = tr
+    location = _event_location(lines, flat)
+    notes = _event_notes(lines, title, location)
     duration = max(5, min(24 * 60, end - start))
 
     def _clock(minutes):
@@ -319,30 +474,238 @@ def fallback_event_items(scan, now=None):
     return out
 
 
+def _norm_event_key(title):
+    s = str(title or "")
+    s = re.sub(r"【[^】]*】", "", s)
+    s = re.sub(r"(通知|公告|报名|安排|关于)", "", s)
+    s = re.sub(r"[\s()（）·,，.。:：;；\-—/]", "", s)
+    return s
+
+
+def _title_grams(title):
+    s = _norm_event_key(title)
+    return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else set()
+
+
 def _raw_same_event(a, b):
-    ta, tb = _norm_title(a.get("title", "")), _norm_title(b.get("title", ""))
+    ta, tb = _norm_event_key(a.get("title", "")), _norm_event_key(b.get("title", ""))
     ad, bd = str(a.get("date") or ""), str(b.get("date") or "")
-    if ta and tb and (ta == tb or ta in tb or tb in ta):
-        return not ad or not bd or ad == bd
+    same_date = not ad or not bd or ad == bd
     at, bt = _parse_time(a.get("time")), _parse_time(b.get("time"))
-    if at is not None and bt is not None and \
-            abs(at.hour * 60 + at.minute - bt.hour * 60 - bt.minute) <= 5:
-        return (not ad or not bd or ad == bd) and (not ta or not tb)
+    same_clock = (at is not None and bt is not None
+                  and abs(at.hour * 60 + at.minute - bt.hour * 60 - bt.minute) <= 5)
+    if ta and tb:
+        if (ta == tb or ta in tb or tb in ta) and same_date:
+            return True
+        # 同一时刻、标题换了个说法（「结业考试」vs「结业考试通知」/「77期…结业考试」）：
+        # 看内容二元组是否有足够的公共片段，避免把「篮球赛 / 足球赛」误并。
+        # 一方没给时间（如 LLM 只写「11月5日下午」）时，也允许合并并把时间补进来。
+        overlap = _title_grams(ta) & _title_grams(tb)
+        if same_date and len(overlap) >= 2 and (at is None or bt is None or same_clock):
+            return True
+        la = str(a.get("location") or "").strip()
+        lb = str(b.get("location") or "").strip()
+        if same_date and same_clock and la and lb and la == lb:
+            return True
+        return False
+    if at is not None and bt is not None:
+        return same_date and same_clock and (not ta or not tb)
     return False
 
 
 def merge_event_fallback(raw_items, fallback_items):
-    """把规则补抽结果并入 LLM 结果；同日期 + 同标题 / 同时刻的不重复添加。"""
+    """把规则补抽结果并入 LLM 结果；同日期 + 同标题 / 同时刻的不重复添加。
+
+    v4.5.4：命中同一件事时不整条丢弃补抽——把它多出来的时间 / 地点 / 备注补进 LLM 条目。
+    （典型场景：LLM 只写「11月5日下午」，规则补抽读出了 14:00-17:00 与博物馆地点。）
+    """
     out = [dict(x) for x in raw_items or [] if isinstance(x, dict)]
     for fb in fallback_items or []:
         if not isinstance(fb, dict):
             continue
-        if any(_raw_same_event(x, fb) for x in out):
+        hit = next((x for x in out if _raw_same_event(x, fb)), None)
+        if hit is not None:
+            # LLM 把标题写成「参观‘伟大…’」这类长引文时，换回公告里的短标题。
+            if (len(str(hit.get("title", ""))) > 24
+                    and 0 < len(str(fb.get("title", ""))) <= 18):
+                hit["title"] = str(fb["title"])
+            for field in ("date", "time", "end_time", "location", "notes",
+                          "duration_min", "priority"):
+                if not hit.get(field) and fb.get(field):
+                    hit[field] = fb[field]
             continue
         out.append(dict(fb))
         if len(out) >= MAX_ITEMS:
             break
     return out
+
+
+def drop_past_events(items, now=None):
+    """资料扫描的过期清理：已经开始超过 2 小时、且没有截止时间的普通条目不再新建。
+
+    课程表是「这一周的固定安排」照常保留（学生可能补看过去几天的课）；
+    只挡聊天公告里的过期活动，避免把昨天 / 上周的截图又写进日程。
+    """
+    try:
+        ref = float(time.time() if now is None else now)
+    except (TypeError, ValueError, OverflowError):
+        ref = time.time()
+    out = []
+    ref_date = datetime.datetime.fromtimestamp(ref).date()
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("kind", "")) == "course":
+            out.append(it)
+            continue
+        try:
+            start = float(it.get("start_ts", 0) or 0)
+            deadline = float(it.get("deadline_ts", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            start, deadline = 0.0, 0.0
+        # 只有日期没有时刻的旧公告（10月29日「篮球赛」）也要挡掉：按 date 字段比较。
+        date_text = str(it.get("date") or it.get("date_text") or "").strip()[:10]
+        if deadline <= 0.0 and date_text:
+            try:
+                if datetime.date.fromisoformat(date_text) < ref_date:
+                    continue
+            except ValueError:
+                pass
+        if start > 0.0 and start <= ref - 7200.0 and deadline <= 0.0:
+            continue
+        out.append(it)
+    return out
+
+
+_GROUP_ITEM_RE = re.compile(r"(?:^|（|\()第[一二三四五六七八九十]+(?:小组|组)(?:答辩)?(?:）|\))")
+_GROUP_LABEL_RE = re.compile(r"(第[一二三四五六七八九十]+(?:小组|组))")
+
+
+def _item_title_tokens(title):
+    """标题里用于「对齐源文件日期」的内容二元组（去掉公告 / 报名这类通用词）。"""
+    s = _norm_event_key(title)
+    grams = {s[i:i + 2] for i in range(len(s) - 1)}
+    stop = {"活动", "通知", "公告", "报名", "考试", "主题", "参观", "小组", "答辩",
+            "第一", "第二", "第三", "第四", "第五", "第六", "第七", "第八", "第九"}
+    return {g for g in grams if g not in stop}
+
+
+def _scan_file_texts(scan):
+    """每个资料文件的整段文本；已经有结构化课程表的文件跳过（课程单独入库）。"""
+    out = []
+    for f in (scan or {}).get("files", []) if isinstance(scan, dict) else []:
+        if not isinstance(f, dict):
+            continue
+        if isinstance(f.get("table"), list) and f.get("table"):
+            continue
+        text = "".join(str(f.get(k, "") or "").strip() for k in ("text", "ocr", "vlm"))
+        if text:
+            out.append((str(f.get("name", "")), text))
+    return out
+
+
+def _date_near_text(text, tokens, ref):
+    """标题片段附近（±320 字）的明确日期；没有就把文件里唯一的日期当锚点。"""
+    matches = list(_DATE_MD_RE.finditer(text))
+    if not matches:
+        return None
+    spots = [p for p in (text.find(t) for t in tokens) if p >= 0]
+    if spots:
+        p = min(spots)
+        best = min(matches, key=lambda m: abs(m.start() - p))
+        if abs(best.start() - p) <= 320:
+            return _event_date(best.group(0), ref)
+    dates = {d for d in (_event_date(m.group(0), ref) for m in matches) if d is not None}
+    return dates.pop() if len(dates) == 1 else None
+
+
+def reconcile_source_dates(items, scan, now=None):
+    """把 LLM 条目的日期对回源文件里的明确日期（v4.5.4）。
+
+    模型偶尔会把「10月31日（本周六）」解析成下一个周六，或把「11月5日」写成 11-04。
+    这里按标题内容片段找到最匹配的文件，再取标题附近（或该文件唯一）的明确日期覆盖；
+    只在源文件里真的写了日期时才覆盖，不改无日期条目。
+    """
+    try:
+        ref = datetime.datetime.fromtimestamp(time.time() if now is None else float(now))
+    except (TypeError, ValueError, OverflowError):
+        ref = datetime.datetime.now()
+    files = _scan_file_texts(scan)
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        d = dict(it)
+        tokens = _item_title_tokens(d.get("title", ""))
+        best_text, best_score = "", 0
+        for _name, text in files:
+            score = sum(1 for t in tokens if t in text)
+            if score > best_score:
+                best_text, best_score = text, score
+        if tokens and best_score > 0:
+            near = _date_near_text(best_text, tokens, ref)
+            if near is not None and str(d.get("date") or "") != near.isoformat():
+                d["date"] = near.isoformat()
+                d["relative_date"] = None
+                d["weekday"] = None
+        out.append(d)
+    return out
+
+
+def collapse_group_items(items):
+    """把「第一小组18:00 / 第二小组18:10 …」合并回一条主活动（v4.5.4）。
+
+    分组到场时间属于同一场答辩 / 活动的子细节，不该在日程里占 N 条；
+    合并后主条目的开始取最早、结束取最晚，原始分段时间写进备注。
+    """
+    keep, groups = [], {}
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title", "")).strip()
+        m = _GROUP_ITEM_RE.search(title)
+        if m is None:
+            keep.append(dict(it))
+            continue
+        prefix = title[:m.start()].strip(" （）()")
+        if prefix == "":
+            prefix = "活动"
+        key = (prefix, str(it.get("date", "")), str(it.get("location", "")))
+        groups.setdefault(key, []).append(dict(it))
+    for (prefix, date, loc), rows in groups.items():
+        if len(rows) == 1:
+            keep.append(rows[0])
+            continue
+        times = [x for x in (_parse_time(r.get("time")) for r in rows) if x is not None]
+        ends = [x for x in (_parse_time(r.get("end_time")) for r in rows) if x is not None]
+        main = next((x for x in keep
+                     if str(x.get("title", "")).strip() == prefix
+                     and str(x.get("date", "")) == date), None)
+        if main is None:
+            main = dict(rows[0])
+            main["title"] = prefix
+            keep.append(main)
+        if times:
+            start = min(t.hour * 60 + t.minute for t in times)
+            end = (max(t.hour * 60 + t.minute for t in ends) if ends
+                   else max(t.hour * 60 + t.minute for t in times) + 10)
+            if end <= start:
+                end = max(t.hour * 60 + t.minute for t in times) + 10
+            main["time"] = "%02d:%02d" % (start // 60, start % 60)
+            main["end_time"] = "%02d:%02d" % (end // 60, end % 60)
+            main["duration_min"] = max(10, end - start)
+        labels = []
+        for r in rows:
+            lm = _GROUP_LABEL_RE.search(str(r.get("title", "")))
+            if lm and r.get("time"):
+                labels.append("%s %s" % (lm.group(1), r["time"]))
+        if labels:
+            note = "各组时间：" + "、".join(labels)
+            main["notes"] = _clip(" | ".join(
+                [x for x in (str(main.get("notes", "")).strip(), note) if x]), NOTES_MAX)
+        if not main.get("location") and loc:
+            main["location"] = loc
+    return keep
 
 
 def _int_cn(v):
