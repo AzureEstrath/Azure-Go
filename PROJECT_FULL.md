@@ -1,4 +1,4 @@
-# Azure · 全量项目文档（v4.5.0）
+# Azure · 全量项目文档（v4.5.1）
 
 > 本文件是**完整项目地图**：系统架构、人格化 / 日程 / 记忆三条主通路、代码量审计结果、
 > 每个第一方文件的作用、配置与测试入口、维护约定。
@@ -132,6 +132,8 @@ FastAPI 后端（backend/app，端口 8000）
    - **隐式记录 / 原地细化**：玩家提到「有活动 / 要卖东西」但没给时间时，先写一条
      `when_text="待定"`、`start_ts=0` 的占位，不编造时刻；之后补充「活动是心理课」，
      模型用 `refine_id` 指回同一条，`upsert_schedule` 只补标题 / 备注 / 时间，不新建重复条目。
+     细化目标只认本轮给模型看过的候选 id（`extract` 会把编造的 id 归零）；
+     `upsert_schedule` 的细化查询还排除课程行——宁可新建，也不改课表。
 5. 同一标题 + 同一天的新日程会让旧记忆 `supersede`（不删除，保留审计）。
 
 ### 3.3 聊天时的日程事实
@@ -242,6 +244,8 @@ FastAPI 后端（backend/app，端口 8000）
 - **未答问题压力**：`agent._open_questions` 逐轮按 `0.45 + 0.35*ask` 衰减；
   换说法再问乘 `_REASK_SATIATION=0.5`；低于 `_REASK_FLOOR=0.18` 自动移出。
   已答的问题临时过滤，不会在同一回合被重复带回。
+- **细化防误伤**：`schedule_chat.extract` 只接受候选列表里的 `refine_id`（模型编造的 id
+  归零当新建）；`life.upsert_schedule` 的细化查询排除课程行，聊天补充永远不会改写课表。
 - **语音提速**：`agent_graph._finalize_after_player` 的点评语音用 `defer_speech=True`
   丢到后台合成，与 own_turn 的引擎分析 / 模型出话重叠；下一处 `_emit_line` 在发
   `message` 之前 `_flush_pending_speech`，保证 `message → speech` 顺序与 `seq` 不错位；
@@ -256,9 +260,18 @@ FastAPI 后端（backend/app，端口 8000）
   （`lane / lanes`，块宽 = 列宽 / 簇内栏数），不再合并成「N 项约定」；块内只显示标题，
   教师 / 地点 / 分级 / 排班理由放进悬停卡；今日列高亮并画当前时间线。
 
+### 4.9 细化防误伤（v4.5.1）
+
+- **只认候选 id**：`schedule_chat.extract` 把模型给的 `refine_id` 限定在本轮
+  `refine_candidates` 里（空候选就全部归零）；编造的 id 当新建，不会改到别的日程。
+- **课程只读**：`life.upsert_schedule` 的细化查询排除 `kind=course / period` 的行，
+  聊天补充永远不改课表；目标查不到时退回普通插入（宁可多一条，不误伤课表）。
+- **端到端用例**：先写「有个活动 / 卖东西」两条待定占位，再补充「活动是参加心理课」，
+  断言同一条 id 被细化、总数仍为 2、`start_ts` 仍为 0。
+
 ---
 
-## 5. 代码量与结构审计（v4.5.0）
+## 5. 代码量与结构审计（v4.5.1）
 
 ### 5.1 体量最大的文件
 
@@ -427,7 +440,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_personal_facts.py` | 玩家私人事实守卫：截图晚饭场景、原话证据、反向线索、问句、兜底句 |
 | `test_prompt_chains.py` / `test_prompts.py` / `test_prompts_long_term.py` | 提示链、黄金提示词、注入段 |
 | `test_recall_chain.py` | 回忆链开始 / 延续 / 终止 |
-| `test_schedule*.py` | 日程抽取（无日期占位 / 细化候选）、归一化、聊天排程、取消、API、学习 |
+| `test_schedule*.py` | 日程抽取（无日期占位 / 细化候选 / 细化 id 校验）、归一化、聊天排程、取消、API（含原地细化）、学习 |
 | `test_speech_text.py` | 语气标记 |
 | `test_state.py` | 对局状态 |
 | `test_time_ctx.py` | 时间事实 |
@@ -555,7 +568,7 @@ LangChain / LangGraph、长期记忆、TTS、聊天队列、定式 / 画像 / �
 ## 8. 测试与运行
 
 ```powershell
-# 后端全量（当前 1208 tests OK）
+# 后端全量（当前 1212 tests OK）
 cd backend
 python -m unittest discover -s tests -q
 

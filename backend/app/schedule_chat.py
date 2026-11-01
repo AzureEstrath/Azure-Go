@@ -140,7 +140,8 @@ async def extract(llm, text, now=None, context_text="", candidates=None):
     """判断并抽取聊天里的日程；返回 ``schedule.normalize_items`` 形状的列表。
 
     - ``candidates``：现有可细化的日程（``refine_candidates`` 的输出）。给进提示词后，
-      玩家补充「活动是参加心理课」时模型能填 ``refine_id`` 而不是另建一条；
+      玩家补充「活动是参加心理课」时模型能填 ``refine_id`` 而不是另建一条；**只认这份候选里的
+      id**，模型编出来的其它 id 一律当新建（避免误改无关条目甚至课程）；
     - ``context_text``：最近几轮对话（帮模型理解「这个 / 那个」指什么，可空）；
     - 玩家只说了「有个活动 / 要卖个东西」、还没给时间 ⇒ 也排成占位条目（date/time 为 null）。
 
@@ -152,6 +153,7 @@ async def extract(llm, text, now=None, context_text="", candidates=None):
         return []
     ref = datetime.datetime.fromtimestamp(time.time() if now is None else float(now))
     cand_rows = []
+    allowed_ids = set()
     for it in candidates or []:
         if not isinstance(it, dict):
             continue
@@ -162,6 +164,7 @@ async def extract(llm, text, now=None, context_text="", candidates=None):
         title = _clip(it.get("title", ""), TITLE_MAX)
         if sid <= 0 or title == "":
             continue
+        allowed_ids.add(sid)
         cand_rows.append("- id=%d | %s | %s" % (
             sid, str(it.get("when_text", "") or "待定").strip(), title))
     cand_block = ""
@@ -222,6 +225,20 @@ async def extract(llm, text, now=None, context_text="", candidates=None):
     raw_items = _pick_items(data)
     if not raw_items:
         return []
+    # 细化目标必须在这份候选里（``candidates is None`` 表示调用方没提供候选、旧口径不校验）。
+    # 模型偶尔会把别的日程 id / 课程 id 抄进 refine_id，若直接落库会改错条目——这里先归零。
+    if candidates is not None:
+        for it in raw_items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                rid = int(it.get("refine_id", it.get("update_id", it.get("target_id", 0)) or 0))
+            except (TypeError, ValueError, OverflowError):
+                rid = 0
+            if rid not in allowed_ids:
+                for key in ("refine_id", "update_id", "target_id"):
+                    if key in it:
+                        it[key] = 0
     items = schedule.normalize_items(raw_items, source="chat", now=ref.timestamp())
     return _drop_past(items, ref.timestamp())[:MAX_ITEMS]
 

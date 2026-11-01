@@ -180,6 +180,58 @@ class ChatScheduleApiTest(unittest.TestCase):
             time.sleep(0.05)
         return bus.messages(events.AI_SCHEDULE)
 
+    def _wait_title(self, store, title, timeout=3.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            items = store.list_schedule(50)
+            if any(str(x.get("title", "")) == title for x in items):
+                return items
+            time.sleep(0.05)
+        return store.list_schedule(50)
+
+    def test_chat_supplement_refines_the_same_placeholder(self):
+        """v4.5.0：先记「待定」占位；玩家补充「活动是参加心理课」⇒ 原地细化同一条。"""
+        with tempfile.TemporaryDirectory() as d:
+            store = LifeStore(os.path.join(d, "life.db"))
+            cfg = AzureConfig()
+            cfg.auto_plan_enabled = False
+            llm = _ChatScheduleLLM(schedule_text=(
+                '{"schedule": true, "items": ['
+                '{"title": "有个活动"}, {"title": "卖东西"}]}'))
+            bus = events.RecordingBus()
+            agent = AzureAgent(StubEngine(), llm, bus, joseki_rate=1.0,
+                               joseki_rng=ZeroRng())
+            app = create_app(cfg=cfg, agent=agent, autostart=False, life=store)
+            try:
+                with TestClient(app) as client:
+                    r = client.post("/api/chat", json={
+                        "text": "我最近有个活动，还要卖点东西", "mode": "pet"})
+                    self.assertTrue(r.json()["ok"])
+                    first = self._wait_items(store)
+                    self.assertEqual(len(first), 2)
+                    rows = {x["title"]: x for x in first}
+                    self.assertIn("有个活动", rows)
+                    self.assertIn("卖东西", rows)
+                    activity = rows["有个活动"]
+                    self.assertEqual(activity["start_ts"], 0.0)
+                    self.assertEqual(activity["when_text"], "待定")
+
+                    llm.schedule_text = (
+                        '{"schedule": true, "items": ['
+                        '{"title": "参加心理课", "refine_id": %d}]}' % activity["id"])
+                    r = client.post("/api/chat", json={
+                        "text": "活动是参加心理课", "mode": "pet"})
+                    self.assertTrue(r.json()["ok"])
+                    refined = self._wait_title(store, "参加心理课")
+                    self.assertEqual(len(refined), 2, "补充信息不应多出一条重复日程")
+                    rows = {x["title"]: x for x in refined}
+                    self.assertEqual(rows["参加心理课"]["id"], activity["id"])
+                    self.assertEqual(rows["参加心理课"]["start_ts"], 0.0)
+                    self.assertEqual(rows["参加心理课"]["when_text"], "待定")
+                    self.assertIn("卖东西", rows)
+            finally:
+                store.close()
+
     def test_chat_schedules_and_emits_ai_schedule(self):
         with tempfile.TemporaryDirectory() as d:
             store = LifeStore(os.path.join(d, "life.db"))

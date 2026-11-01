@@ -68,6 +68,8 @@
 > 围棋链路提速（点评语音延后合成 + 落子宣告 `no_think`，前端只对揭示棋子与保序等语音）；
 > 聊天里没说时间的安排先留「待定」占位，补充信息按 `refine_id` 原地细化；
 > 周表改为连续真实时间轴、重叠块分栏与悬停卡。**
+> **v4.5.1：细化防误伤——`refine_id` 只认本轮候选（编造的 id 当新建），课程行不被聊天细化
+> 改写；新增「先记待定占位 → 补充心理课」的端到端用例。**
 > 最后更新：2026-11-01。
 
 ---
@@ -799,12 +801,20 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
     - 前端 `SpeechPairing.should_wait_voice(sync, env, reveal)` 只在 `reveal` 或
       `has_pending()` 时为真；`turn_active` 仅用于 `release_stale`。
     - 日程：`schedule_chat.extract(..., context_text, candidates)` 带最近对话与
-      `refine_candidates`；`schedule._parse_item` 输出 `refine_id`，无日期写
-      `when_text="待定"`、`start_ts=0`；`life.upsert_schedule` 按 `refine_id` 原地细化，
-      保留旧时间 / 状态 / `auto_planned`。
+      `refine_candidates`；`refine_id` **只认候选列表里给模型看过的 id**（编造的 id 归零当新建）；
+      `schedule._parse_item` 输出 `refine_id`，无日期写 `when_text="待定"`、`start_ts=0`；
+      `life.upsert_schedule` 按 `refine_id` 原地细化，保留旧时间 / 状态 / `auto_planned`，
+      且细化查询排除 `kind=course / period`，课程不会被聊天改写（宁可新建也不动课表）。
     - 周表：`PetView._build_timetable` 改为连续真实时间轴（默认 08:00–22:00，半小时 14px），
       `_assign_lanes` 对同一天重叠的块贪心分栏；块内只显示标题，教师 / 地点 / 分级 / 排班理由
       进悬停卡；整点实线 + 半点虚线 + 今日当前时间线。
+23. **细化防误伤（v4.5.1）**：
+    - `schedule_chat.extract` 的 `refine_id` 只认本轮 `refine_candidates` 里的 id
+      （`candidates=[]` ⇒ 全部归零），模型编造的 id 当新建，不会改到别的日程。
+    - `life.upsert_schedule` 的细化查询排除 `kind=course / period` 的行，课程表始终只读；
+      目标查不到时退回普通插入。
+    - 新增端到端用例：先记「有个活动 / 卖东西」两条待定占位 → 再补充「活动是参加心理课」，
+      断言同一条 id 被细化、总数仍为 2、`start_ts` 仍为 0。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 

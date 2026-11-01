@@ -254,6 +254,27 @@ class LifeStoreTest(unittest.TestCase):
         self.assertEqual(len(ghost), 1)
         self.assertEqual(ghost[0]["title"], "另外一件事")
 
+    def test_schedule_refine_never_rewrites_a_course(self):
+        """v4.5.0 加固：模型把课程 id 填进 refine_id 时，课表原样保留，这句话退回普通插入。"""
+        course = self.store.upsert_schedule([{
+            "start_ts": T0 + 3600.0, "when_text": "2026-10-28 周三 第1-2节 08:00-09:35",
+            "title": "高等数学", "notes": "", "source": "课表.png",
+            "date": "2026-10-28", "weekday": 2, "period": "1-2",
+            "period_start": 1, "period_end": 2, "start_time": "08:00",
+            "end_time": "09:35", "teacher": "张老师", "location": "综合楼101",
+        }], source="课表.png", now=T0)
+        self.assertEqual(len(course), 1)
+        cid = course[0]["id"]
+        out = self.store.upsert_schedule([
+            {"refine_id": cid, "start_ts": 0.0, "when_text": "待定",
+             "title": "参加心理课", "source": "chat"},
+        ], source="chat", now=T0 + 60)
+        self.assertEqual(len(out), 1)
+        self.assertNotEqual(out[0]["id"], cid)
+        rows = {r["id"]: r for r in self.store.list_schedule(20)}
+        self.assertEqual(rows[cid]["title"], "高等数学")
+        self.assertEqual(rows[cid]["period"], "1-2")
+
     def test_schedule_course_fields_and_dedupe(self):
         """课程条目带星期 / 节次 / 教师 / 地点；同一门课重复扫描按日期+节次+标题更新而不是新增。"""
         saved = self.store.upsert_schedule([{

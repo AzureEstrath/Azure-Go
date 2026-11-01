@@ -124,6 +124,22 @@ class ExtractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0]["refine_id"], 42)
         self.assertEqual(items[1]["refine_id"], 0)
 
+    async def test_refine_id_is_limited_to_given_candidates(self):
+        """v4.5.0 加固：只认候选里给模型看过的 id，编出来的 id 一律当新建。"""
+        llm = StubLLM(text=(
+            '{"schedule": true, "items": ['
+            '{"title": "心理课", "refine_id": 9},'
+            '{"title": "摆摊", "refine_id": 7}]}'))
+        items = await schedule_chat.extract(
+            llm, "活动是参加心理课，还要摆摊", now=NOW,
+            candidates=[{"id": 7, "title": "卖东西", "when_text": "待定"}])
+        self.assertEqual([it["refine_id"] for it in items], [0, 7])
+        # 候选为空（没有可细化的条目）时也不许凭空指一个 id。
+        llm2 = StubLLM(text='{"schedule": true, "items": [{"title": "心理课", "refine_id": 7}]}')
+        items2 = await schedule_chat.extract(
+            llm2, "活动是参加心理课", now=NOW, candidates=[])
+        self.assertEqual(items2[0]["refine_id"], 0)
+
     def test_refine_candidates_skip_courses_and_closed(self):
         rows = [
             {"id": 42, "title": "活动", "when_text": "待定", "status": "planned",

@@ -611,8 +611,11 @@ class LifeStore:
                     # status / created_ts / 完成记录一律不动（不把「已排好」打回「待定」）。
                     refine_id = _safe_int(it.get("refine_id"), 0)
                     if refine_id > 0:
+                        # 课程来自课表文件，不接受聊天细化：即使模型把课程 id 抄进 refine_id，
+                        # 也不能改写它（查不到就退回普通插入，宁可多一条也不动课表）。
                         old_row = self._db.execute(
                             "SELECT %s FROM schedule_items WHERE id = ? AND archived = 0"
+                            " AND kind <> 'course' AND period = ''"
                             % _SCHEDULE_SELECT, (refine_id,)).fetchone()
                         if old_row is not None:
                             old = self._schedule_row(old_row)
