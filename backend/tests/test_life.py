@@ -464,6 +464,16 @@ class LifeStoreTest(unittest.TestCase):
         rows = self.store.list_schedule(10)
         self.assertEqual([x["title"] for x in rows], ["高等数学"])
 
+    def test_delete_schedule_source_matches_combined_source(self):
+        """v4.5.4：旧行的 source 是「a.jpg,b.jpg」合并串，也要按文件名一并清掉。"""
+        self.store.upsert_schedule([{
+            "start_ts": T0 + 60.0, "when_text": "2026-10-27 08:00",
+            "title": "旧合并来源日程", "source": "课表.jpg,聊天.jpg",
+        }], source="课表.jpg,聊天.jpg", now=T0)
+        removed = self.store.delete_schedule_source(["课表.jpg", "聊天.jpg"])
+        self.assertEqual(removed, 1)
+        self.assertEqual(self.store.list_schedule(10), [])
+
     def test_old_schedule_table_is_migrated(self):
         """v4.0.0 之前的旧库只有 7 列：启动时补列，旧行照常可读、新字段走默认值。"""
         d = tempfile.TemporaryDirectory()

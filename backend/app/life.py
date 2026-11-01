@@ -751,8 +751,9 @@ class LifeStore:
     def delete_schedule_source(self, sources):
         """删掉某次扫描来源下的旧日程（重扫同一批资料时用新结构替换旧文本行）。
 
-        只按 ``source`` 精确匹配；``sources`` 可以是单个字符串或字符串列表。
-        返回删除行数；库不可用 / 空列表返回 0。
+        v4.5.4：旧库里的 ``source`` 可能是「a.jpg,b.jpg」这种**合并来源**，只按精确匹配
+        会漏掉它们、重扫后留下重复的旧活动。这里改为「来源字符串包含任一扫描文件名」
+        （文件名是带哈希的唯一名，不会误删别的资料）。
         """
         if isinstance(sources, str):
             sources = [sources]
@@ -761,9 +762,10 @@ class LifeStore:
             return 0
         try:
             with self._lock:
-                q = ",".join("?" * len(names))
+                where = " OR ".join(["source LIKE ?"] * len(names))
                 cur = self._db.execute(
-                    "DELETE FROM schedule_items WHERE source IN (%s)" % q, names)
+                    "DELETE FROM schedule_items WHERE (%s)" % where,
+                    ["%%%s%%" % n for n in names])
                 self._db.commit()
                 return int(cur.rowcount or 0)
         except Exception as e:              # noqa: BLE001

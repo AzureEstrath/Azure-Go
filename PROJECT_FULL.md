@@ -1,4 +1,4 @@
-# Azure · 全量项目文档（v4.5.4）
+# Azure · 全量项目文档（v4.5.5）
 
 > 本文件是**完整项目地图**：系统架构、人格化 / 日程 / 记忆三条主通路、代码量审计结果、
 > 每个第一方文件的作用、配置与测试入口、维护约定。
@@ -302,9 +302,17 @@ FastAPI 后端（backend/app，端口 8000）
   混进课程名的教师姓氏（「体育足球（男孙)」+ 孙峰 → 「体育足球（男）」）；
   `_merge_courses` 合并同日期 + 同节次 + 同名的重复课程块并补齐缺失字段。
 
+### 4.13 资料重扫补漏（v4.5.5）
+
+- **合并来源清理**：`delete_schedule_source` 从「source 精确匹配」改为「source 包含任一
+  扫描文件名」；旧图留下的 `a.jpg,b.jpg` 合并来源行不会在重扫后残留、和新的结构化结果重复。
+- **源文件过期兜底**：`drop_past_source_items` 先用规则抽取出每个文件的公告日期与标题；
+  若源公告已过期，而 LLM 把「本周六」算成下周，就按「条目最匹配的文件 + 标题二元组重叠 ≥2」
+  挡掉该条；同一群里另一条未来考试不会因为共享「77期党校初级班」被误伤。
+
 ---
 
-## 5. 代码量与结构审计（v4.5.4）
+## 5. 代码量与结构审计（v4.5.5）
 
 ### 5.1 体量最大的文件
 
@@ -329,6 +337,8 @@ FastAPI 后端（backend/app，端口 8000）
 - v4.5.0 提速走「同一条链路少等一次」：点评语音延后到后台合成、落子宣告走 `no_think`
   快速档、前端只有揭示棋子与保序才等语音——三句分工、去重窗口、`message → speech`
   顺序一条没动。
+- v4.5.5 只改重扫清理与过期兜底：`delete_schedule_source` 改「source 包含文件名」匹配，
+  `drop_past_source_items` 按源公告标题 / 日期挡过期条；不新增表、不新增 LLM 调用。
 - v4.5.4 资料扫描只改「读图 → 提取 → 入库」之间的清洗：OCR 足够时不调 VLM、
   公告按去换行整段重建、日期对回源文件、分组时间折叠、过期条目过滤；
   不新增表、不新增常驻 LLM 调用，课程表仍按 OCR 坐标直接入库。
@@ -469,7 +479,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_full_review.py` / `test_full_review_api.py` | 全盘复盘与 API |
 | `test_game_store.py` / `test_games_api.py` / `test_sgf.py` | 棋谱库、API、SGF |
 | `test_joseki*.py` | 定式识别 / 提取 / 门控 / 族计数 |
-| `test_life.py` | 生命时间线与日程持久化、`refine_id` 原地细化、测试清理基线 |
+| `test_life.py` | 生命时间线与日程持久化、`refine_id` 原地细化、合并来源重扫清理、测试清理基线 |
 | `test_lanes.py` | 任务车道统计 / 未知车道安全 / 重置 |
 | `test_llm.py` / `test_llm_chain.py` | LLM 客户端、思考档、流式、降级 |
 | `test_main.py` | FastAPI 端点 / 生命周期 / 运行期配置 / 记忆 API / 测试清理 |
@@ -479,7 +489,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_personal_facts.py` | 玩家私人事实守卫：截图晚饭场景、原话证据、反向线索、问句、兜底句 |
 | `test_prompt_chains.py` / `test_prompts.py` / `test_prompts_long_term.py` | 提示链、黄金提示词、注入段 |
 | `test_recall_chain.py` | 回忆链开始 / 延续 / 终止 |
-| `test_schedule*.py` | 日程抽取（无日期占位 / 细化候选 / 细化 id 校验 / 短补充放行）、公告多行重建 / 日期对齐 / 分组折叠 / 过期过滤、消息合并去重、归一化、聊天排程、取消、API（含原地细化）、学习 |
+| `test_schedule*.py` | 日程抽取（无日期占位 / 细化候选 / 细化 id 校验 / 短补充放行）、公告多行重建 / 日期对齐 / 分组折叠 / 过期过滤 / 源文件过期兜底、消息合并去重、归一化、聊天排程、取消、API（含原地细化）、学习 |
 | `test_speech_text.py` | 语气标记 |
 | `test_state.py` | 对局状态 |
 | `test_time_ctx.py` | 时间事实 |
@@ -607,7 +617,7 @@ LangChain / LangGraph、长期记忆、TTS、聊天队列、定式 / 画像 / �
 ## 8. 测试与运行
 
 ```powershell
-# 后端全量（当前 1225 tests OK）
+# 后端全量（当前 1227 tests OK）
 cd backend
 python -m unittest discover -s tests -q
 

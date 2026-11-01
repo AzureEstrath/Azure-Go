@@ -398,19 +398,19 @@ def _event_notes(lines, title, location):
     return _clip(" | ".join(out), NOTES_MAX)
 
 
-def _event_from_text(text, ref):
+def _event_from_text(text, ref, allow_past=False):
     """从聊天公告 / OCR 文本里规则抽一条明确活动；抽不出返回 None。
 
     v4.5.4 数据清洗：先按「去换行后的整段」重建日期、时间、标题与地点——截图 OCR 常把
     「将于 / 举行 / 地点」拆到两行；标题优先取【公告标题】，其次日期与时间之间的短句，
-    最后日期前最后一句。已经过去的公告不再新建条目。
+    最后日期前最后一句。默认跳过已经过去的公告；``allow_past=True`` 仅供源文件过期判定。
     """
     lines = _event_lines(text)
     if not lines:
         return None
     flat = "".join(lines)
     date = _event_date(flat, ref)
-    if date is None or date < ref.date():
+    if date is None or (not allow_past and date < ref.date()):
         return None
     dm = _DATE_MD_RE.search(flat)
     date_start = dm.start() if dm else 0
@@ -706,6 +706,55 @@ def collapse_group_items(items):
         if not main.get("location") and loc:
             main["location"] = loc
     return keep
+
+
+def drop_past_source_items(items, scan, now=None):
+    """源文件层面的过期兜底（v4.5.4）：即使 LLM 把「10月31日（本周六）」算成 11-07，
+    只要源公告本身是过期活动，就把标题片段对得上的条目一并挡掉。
+
+    只看**各文件的规则抽取值**（不依赖 LLM 日期），按标题内容二元组重叠 ≥2 才命中；
+    并且要求条目与该文件最匹配——否则同一群里「77期党校初级班」的考试会被另一条过期
+    活动误伤。
+    """
+    try:
+        ref = datetime.datetime.fromtimestamp(time.time() if now is None else float(now))
+    except (TypeError, ValueError, OverflowError):
+        ref = datetime.datetime.now()
+    files = _scan_file_texts(scan)
+    past_by_file = {}
+    for _name, text in files:
+        got = _event_from_text(text, ref, allow_past=True)
+        if not got or not got.get("date"):
+            continue
+        try:
+            d = datetime.date.fromisoformat(str(got["date"])[:10])
+        except ValueError:
+            continue
+        if d < ref.date():
+            past_by_file[text] = _item_title_tokens(got.get("title", ""))
+    if not past_by_file:
+        return list(items or [])
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("kind", "")) == "course":
+            out.append(it)
+            continue
+        tokens = _item_title_tokens(it.get("title", ""))
+        if not tokens:
+            out.append(it)
+            continue
+        best_text, best_score = "", 0
+        for _name, text in files:
+            score = sum(1 for t in tokens if t in text)
+            if score > best_score:
+                best_text, best_score = text, score
+        past_tokens = past_by_file.get(best_text, set())
+        if best_score >= 2 and past_tokens and len(tokens & past_tokens) >= 2:
+            continue
+        out.append(it)
+    return out
 
 
 def _int_cn(v):

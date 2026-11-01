@@ -1036,7 +1036,12 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             # 顺序：几何还原的课程在前，LLM 的普通日程在后——同一格冲突时保留更可靠的课程表条目。
             items = schedule_mod.normalize_items(table_items + raw, source=source, now=time.time())
             # v4.5.4：过期公告（旧截图里昨天的活动）不再新建；课程表条目照常保留。
+            before_drop = len(items)
             items = schedule_mod.drop_past_events(items, now=time.time())
+            if len(items) != before_drop:
+                print("[Schedule] 过期 / 只有日期的旧公告已过滤 %d 条" % (before_drop - len(items)))
+            # 源文件层面的过期兜底：LLM 把「本周六」算成下周时，按源公告标题片段再挡一次。
+            items = schedule_mod.drop_past_source_items(items, scan, now=time.time())
             life_store = getattr(app.state, "life", None)
             if life_store is not None and items:
                 # 重扫同一批资料：先清掉这份来源的旧行（旧版本只存了文本日程），

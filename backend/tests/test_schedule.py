@@ -273,6 +273,28 @@ class ScheduleExtractTest(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["title"], "长征主题展览参观报名")
 
+    def test_drop_past_source_items_uses_announcement_date(self):
+        """LLM 把「10月31日（本周六）」算成 11-07 时，源公告的过期日期仍要挡住它；
+        同一群的另一条未来考试不能被误伤。"""
+        scan = {"files": [
+            {"name": "practice.jpg", "kind": "image", "table": [],
+             "ocr": "77期党校初级班实践活动第 | 一次审核将于10月31日（本周 | "
+                    "六）晚18：00在森工楼316举 | 行。"},
+            {"name": "exam.jpg", "kind": "image", "table": [],
+             "ocr": "第77期党校初级班全体成员群(158） | 【结业考试通知】 | "
+                    "77期党校初级班结业考试安排如 | 下: | 【考试时间】：11月8日（周 | "
+                    "日）晚19：00-20：30。 | 【考试地点】：二教101-105"},
+        ]}
+        now = datetime.datetime(2026, 11, 1, 10, 0).timestamp()
+        items = [
+            {"title": "77期党校初级班实践活动第一次审核", "date": "2026-11-07",
+             "time": "18:00", "kind": "task"},
+            {"title": "77期党校初级班结业考试", "date": "2026-11-08",
+             "time": "19:00", "kind": "task"},
+        ]
+        kept = schedule.drop_past_source_items(items, scan, now=now)
+        self.assertEqual([x["title"] for x in kept], ["77期党校初级班结业考试"])
+
     def test_fallback_ignores_plain_chat(self):
         scan = {"files": [{
             "name": "chat.jpg", "kind": "image", "table": [],
