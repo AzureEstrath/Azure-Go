@@ -276,6 +276,32 @@ func _test_view() -> void:
 	_check("日程清单按天分组、不再重复年份",
 		_agenda_has_label(agenda_wrap, "10-28 周三")
 		and not _agenda_has_label(agenda_wrap, "2026-10-28"))
+	# v4.7.0：Azure 自己排的复习：标「规划」、有完成 + 取消规划，取消发整组 id。
+	var cancelled_groups: Array[String] = []
+	v.schedule_plan_cancel_requested.connect(func(g: String): cancelled_groups.append(g))
+	_check("Azure 规划取消信号已定义", v.has_signal("schedule_plan_cancel_requested"))
+	v.set_schedule_items([{
+		"when_text": "2026-10-29 18:00-18:50（Azure 规划）",
+		"title": "复习：英语考试 · 第1/4次", "notes": "Azure 规划",
+		"owner": "azure", "plan_group": "exam:9", "status": "planned",
+	}])
+	var plan_agenda = v._schedule_agenda
+	var plan_row = _agenda_row_with(plan_agenda, "复习：英语考试")
+	_check("Azure 规划行带 [规划] 标签",
+		plan_row != null and str(plan_row.get_child(1).text).contains("[规划]"))
+	_check("Azure 规划行有完成 / 取消按钮",
+		plan_row != null and _agenda_button_count(plan_row) == 2)
+	var cancel_btn: Button = null
+	if plan_row != null:
+		for ch in plan_row.get_children():
+			if ch is Button and str(ch.text) == "取消":
+				cancel_btn = ch
+	_check("Azure 规划行能找到取消按钮", cancel_btn != null)
+	if cancel_btn != null:
+		cancel_btn.pressed.emit()
+	_check("取消规划发出整组 id",
+		cancelled_groups.size() == 1 and cancelled_groups[0] == "exam:9")
+	v.show_month()
 	v._shift_month(1)
 	_check("月历能翻到下个月", v._calendar_title != null
 		and v._calendar_title.text.contains("11"))
@@ -692,6 +718,10 @@ func _test_chat_schedule_note(shell) -> void:
 	shell._on_message("ai_schedule", "好，日程记好了：「组会」（10月30日 周五 15:00）。")
 	_check("聊天排程不再插入生硬播报", shell.view._chat_log.get_child_count() == before)
 	_check("聊天排程补充不抢聊天 busy", shell._chat_busy)
+	# v4.7.0：复习规划说明是无语音 ai_notice；聊天面板开着也要看得到。
+	var before_notice: int = shell.view._chat_log.get_child_count()
+	shell._on_message("ai_notice", "我按空闲时间给「英语考试」排了 4 次复习。")
+	_check("规划说明在聊天面板可见", shell.view._chat_log.get_child_count() == before_notice + 1)
 	shell._chat_busy = false
 	shell.view.close_chat()
 

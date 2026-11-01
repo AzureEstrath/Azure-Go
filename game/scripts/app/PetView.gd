@@ -22,6 +22,7 @@ signal files_archive_requested
 signal files_cleanup_requested
 signal files_review_requested
 signal schedule_feedback_requested(id: int, outcome: String, actual_min: int)
+signal schedule_plan_cancel_requested(group: String)
 signal go_requested
 signal size_selected(height: int)
 signal prebuilt_tts_toggled(on: bool)
@@ -786,6 +787,8 @@ func _show_hover_card(anchor: Control, d: Dictionary) -> void:
 	var grade := _grade_text(d)
 	if grade != "":
 		lines.append("分级：%s" % grade)
+	if str(d.get("owner", "")) == "azure" and str(d.get("plan_group", "")) != "":
+		lines.append("这是 Azure 自己排的复习；整组可以随时取消，不影响你的课程与约定。")
 	var reason := _reason_text(d)
 	if reason != "":
 		lines.append("排班理由：%s" % reason)
@@ -1671,6 +1674,8 @@ func _period_time_map(courses: Array) -> Dictionary:
 func _add_timetable_block(grid: Control, col_w: float, d: Dictionary,
 		wd: int, p0: int, p1: int, is_event: bool, compact := false) -> void:
 	var title := str(d.get("title", "")).strip_edges()
+	if str(d.get("owner", "")) == "azure":
+		title = "规划·" + title
 	var teacher := str(d.get("teacher", "")).strip_edges()
 	var location := str(d.get("location", "")).strip_edges()
 	var tint: Color = EVENT_TINT if is_event else COURSE_TINTS[absi(hash(title)) % COURSE_TINTS.size()]
@@ -1978,7 +1983,9 @@ func _agenda_title_text(d: Dictionary) -> String:
 	var grade := str(d.get("grade", "")).strip_edges()
 	var title := str(d.get("title", "")).strip_edges()
 	var prefix := ""
-	if status == "planned" and grade != "closed":
+	if str(d.get("owner", "")) == "azure" and str(d.get("plan_group", "")) != "":
+		prefix = "[规划] "
+	elif status == "planned" and grade != "closed":
 		var tag := _grade_tag(d)
 		if tag != "":
 			prefix = "[%s] " % tag
@@ -2027,10 +2034,17 @@ func _agenda_row(d: Dictionary) -> HBoxContainer:
 		bd.pressed.connect(func(): schedule_feedback_requested.emit(
 			int(d.get("id", 0)), "done", 0))
 		row.add_child(bd)
-		var bp := _compact_button("推迟")
-		bp.pressed.connect(func(): schedule_feedback_requested.emit(
-			int(d.get("id", 0)), "deferred", 0))
-		row.add_child(bp)
+		var group := str(d.get("plan_group", ""))
+		if str(d.get("owner", "")) == "azure" and group != "":
+			var bc := _compact_button("取消")
+			bc.tooltip_text = "取消这一组 Azure 复习（不影响你自己的日程）"
+			bc.pressed.connect(func(): schedule_plan_cancel_requested.emit(group))
+			row.add_child(bc)
+		else:
+			var bp := _compact_button("推迟")
+			bp.pressed.connect(func(): schedule_feedback_requested.emit(
+				int(d.get("id", 0)), "deferred", 0))
+			row.add_child(bp)
 	return row
 
 func _grade_tag(d: Dictionary) -> String:

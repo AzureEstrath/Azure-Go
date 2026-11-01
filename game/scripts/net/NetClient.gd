@@ -492,6 +492,11 @@ func feedback_schedule(item_id: int, outcome: String, actual_min: int,
 		{"id": item_id, "outcome": outcome, "actual_min": maxi(0, actual_min)},
 		callback, 30.0)
 
+## 取消一组 Azure 复习规划（整组置 cancelled，不影响用户自己的日程）。
+func cancel_schedule_plan(group: String, callback: Callable) -> void:
+	_fetch_json("/api/schedule/plan/cancel", HTTPClient.METHOD_POST,
+		{"group": group}, callback, 30.0)
+
 ## 每周复盘：按类别返回计划 / 实际耗时偏差与完成、推迟计数。
 func fetch_schedule_review(callback: Callable, days := 7) -> void:
 	_fetch_json("/api/schedule/review?days=%d" % clampi(days, 1, 365),

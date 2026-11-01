@@ -84,6 +84,12 @@ class AzureConfig:
         self.schedule_reminder_enabled = True
         self.schedule_archive_days = 7
         self.schedule_retention_days = 30
+        # —— 考试复习规划（v4.7.0）：Azure 自己排的复习条目（owner="azure"），可整组取消 ——
+        # 范围不明确时先按整体排，调用方只问一次；用户不答就算了，不反复追问。
+        self.exam_plan_enabled = True
+        self.exam_plan_weeks = 3           # 规划窗口（周）；实际不晚于考试前一天
+        self.exam_plan_max_sessions = 6    # 每场考试最多几次复习
+        self.exam_plan_duration_min = 50   # 单次复习时长（分钟）
         # —— 知识查证（v4.6.0）：遇到不懂的知识，用网页版 DeepSeek 查一次并写成结构化记忆 ——
         # 默认 provider 走网页版；没有 token / cookie 时服务不可用，不会产生任何网络请求。
         # token / cookie 建议用环境变量 DEEPSEEK_WEB_TOKEN / DEEPSEEK_WEB_COOKIE，避免写进仓库。
@@ -278,6 +284,17 @@ class AzureConfig:
         self.schedule_chat_enabled = v if isinstance(v, bool) else self.schedule_chat_enabled
         v = d.get("schedule_reminder_enabled")
         self.schedule_reminder_enabled = v if isinstance(v, bool) else self.schedule_reminder_enabled
+        v = d.get("exam_plan_enabled")
+        self.exam_plan_enabled = v if isinstance(v, bool) else self.exam_plan_enabled
+        try:
+            self.exam_plan_weeks = max(1, min(8, int(d.get(
+                "exam_plan_weeks", self.exam_plan_weeks))))
+            self.exam_plan_max_sessions = max(2, min(12, int(d.get(
+                "exam_plan_max_sessions", self.exam_plan_max_sessions))))
+            self.exam_plan_duration_min = max(30, min(120, int(d.get(
+                "exam_plan_duration_min", self.exam_plan_duration_min))))
+        except (TypeError, ValueError):
+            pass
         try:
             self.schedule_archive_days = max(1, min(365, int(
                 d.get("schedule_archive_days", self.schedule_archive_days))))

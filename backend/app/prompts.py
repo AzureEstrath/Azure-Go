@@ -359,6 +359,20 @@ def knowledge_note(text):
         + "别念出处、别说「我查过资料」，也别整段背出来；与眼前事实冲突或拿不准时按不确定处理。") % t
 
 
+def association_note(text):
+    """常一起出现的记忆元素（v4.7.0）：只是常见搭配，不是事实。
+
+    ``text`` 为空 ⇒ 空串；有内容时也明确要求不要把它当成对方这次的选择，
+    防止「苹果 + 米饭 + 辣椒」被固化成一成不变的印象。
+    """
+    t = str(text or "").strip()
+    if t == "":
+        return ""
+    return ("\n\n【常一起提到的东西 · 只是常见搭配，不是事实】\n%s\n"
+        + "这些只是过去聊天里常一起出现的元素：只在相关时轻轻带一句，"
+        + "别当成对方这次的选择，也别拿它替对方做决定；与眼前说法冲突时以眼前为准。") % t
+
+
 def recall_note(text, continued=False):
     """主动回忆链的单条提示（v4.3.0，D）：只是心里浮起的旧事，可以提，也可以不提。
 
@@ -1014,7 +1028,8 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
 
 
 def life_context_block(chat_history, long_term="", time_facts=None, profile=None, schedule_text="",
-                       recall_text="", recall_continued=False, knowledge_text=""):
+                       recall_text="", recall_continued=False, knowledge_text="",
+                       association_text=""):
     """聊天专用上下文（v4.2.7）：只给对话 / 长期记忆 / 时间 / 画像 / 近期真实日程，不塞棋面与棋评铁律。
 
     桌宠聊天、以及围棋窗口里「与棋无关」的闲聊都走这里——模型看不到当前盘面与 KataGo
@@ -1025,6 +1040,7 @@ def life_context_block(chat_history, long_term="", time_facts=None, profile=None
     防止「明天不用赶早八」这类与日程冲突的判断。
     ``recall_text``（v4.3.0）是回忆链挑中的一条旧事：只作可选提示，不强制提；空串不留痕。
     ``knowledge_text``（v4.6.0）是她查证过的结构化笔记：空串不留痕。
+    ``association_text``（v4.7.0）是常一起提到的元素：只作软提示，空串不留痕。
     各空段与 ``context_block`` 同口径：没有内容时不留痕；纯函数，不读全局状态。
     """
     sched = str(schedule_text or "").strip()
@@ -1036,10 +1052,11 @@ def life_context_block(chat_history, long_term="", time_facts=None, profile=None
     # 出话后还有 personal_facts 的逻辑核对兜底。
     scope = ("\n\n【信息边界】\n你只知道玩家亲口说过、或日程 / 画像里写明的事；"
              "没提到的私人经历不要替他编造，不确定就自然问一句。")
-    return _t("【最近的对话】\n%s%s%s%s%s%s%s%s" % (
+    return _t("【最近的对话】\n%s%s%s%s%s%s%s%s%s" % (
         chat_brief(chat_history),
         long_term_note(long_term),
         knowledge_note(knowledge_text),
+        association_note(association_text),
         recall_note(recall_text, recall_continued),
         time_note(time_facts),
         profile_note(profile, 0),

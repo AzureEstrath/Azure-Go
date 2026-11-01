@@ -23,6 +23,7 @@ from collections import OrderedDict
 from langchain_openai import OpenAIEmbeddings
 
 from . import lanes
+from . import association as assoc_mod
 from .memory import MemoryStore, inject_text
 
 # 默认库路径：<backend>/data/memory.db（backend/data/ 已 gitignore，属运行产物）
@@ -429,6 +430,55 @@ class MemoryService:
         except Exception as e:              # noqa: BLE001
             print("[Memory] 知识记忆失效失败（已忽略）：%s" % e)
             return 0
+
+    # —— 关联记忆（v4.7.0）：常一起出现的词元素，只是软提示 ——
+
+    def observe_associations(self, text: str) -> int:
+        """把一轮聊天里可共现的元素写进关联事务；不足两个 / 关闭 / 失败返回 0。"""
+        if self.store is None or not self.available:
+            return 0
+        try:
+            tokens = assoc_mod.tokens_from_text(text)
+            if len(tokens) < 2:
+                return 0
+            return int(self.store.observe_association_turn(tokens) or 0)
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 关联事务写入失败（已忽略）：%s" % e)
+            return 0
+
+    def association_patterns(self, limit: int = 12) -> list:
+        """已保存的关联（只读；关闭 / 失败返回 ``[]``）。"""
+        if self.store is None:
+            return []
+        try:
+            return list(self.store.association_patterns(int(limit or 12)) or [])
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 关联结果读取失败（已忽略）：%s" % e)
+            return []
+
+    def association_note(self, query: str, limit: int = 2) -> str:
+        """当前话里提到的元素 → 「常一起提到」的软提示；没有命中返回空串。
+
+        只匹配**当前话里真的出现过的元素**，不会主动把所有关联倒出来；不写
+        支持度 / 置信度数字，避免被当成统计报告或刻板印象。
+        """
+        q = str(query or "")
+        if q.strip() == "":
+            return ""
+        tokens = set(assoc_mod.tokens_from_text(q))
+        if not tokens:
+            return ""
+        rows = [p for p in self.association_patterns(20)
+                if isinstance(p, dict) and tokens & set(p.get("items") or [])]
+        if not rows:
+            return ""
+        lines = []
+        for row in rows[:max(1, int(limit or 2))]:
+            items = [str(x) for x in row.get("items") or [] if str(x).strip()]
+            if len(items) < 2:
+                continue
+            lines.append("常一起提到：" + "、".join(items))
+        return "\n".join(lines)
 
     # —— 桌宠 / 围棋共用的事件记忆（MaiBot 式「episode + 可召回摘要」的轻量实现） ——
 

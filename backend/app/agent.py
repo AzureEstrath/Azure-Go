@@ -1254,6 +1254,20 @@ class AzureAgent:
             print("[Agent] 知识记忆注入异常（已忽略）：%s" % e)
             return ""
 
+    def association_note(self, query) -> str:
+        """常一起提到的元素（v4.7.0）：只作软提示；关闭 / 无命中 / 故障返回空串。
+
+        本方法是同步的：调用点必须 ``await asyncio.to_thread(...)``（读 SQLite）。
+        """
+        mem = getattr(self, "memory", None)
+        if mem is None or not bool(getattr(mem, "available", False)):
+            return ""
+        try:
+            return str(mem.association_note(str(query or "")) or "")
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 关联记忆注入异常（已忽略）：%s" % e)
+            return ""
+
     # —— 主动回忆：不是每句都提，按情绪/无聊/亲密与随机门决定 ——
 
     def idle_recall_chance(self) -> float:

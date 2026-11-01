@@ -858,13 +858,22 @@ async def _prepare_chat(agent, data):
                 except Exception as e:      # noqa: BLE001 —— 知识注入失败不影响聊天
                     print("[Chat] 知识笔记读取失败（已忽略）：%s" % e)
                     known = ""
+            # v4.7.0：常一起提到的元素（只作软提示；读库走线程）
+            assoc = ""
+            assoc_fn = getattr(agent, "association_note", None)
+            if callable(assoc_fn):
+                try:
+                    assoc = str(await asyncio.to_thread(assoc_fn, text) or "")
+                except Exception as e:      # noqa: BLE001 —— 关联注入失败不影响聊天
+                    print("[Chat] 关联记忆读取失败（已忽略）：%s" % e)
+                    assoc = ""
             ctx = prompts.life_context_block(
                 hist_now[:-1] if hist_now else hist_now, long_term=lt,
                 time_facts=time_facts, profile=profile,
                 schedule_text=str(facts.get("text") or ""),
                 recall_text=str(hint.get("text") or ""),
                 recall_continued=bool(chain.get("continued")),
-                knowledge_text=known)
+                knowledge_text=known, association_text=assoc)
             data["recall_hint"] = hint
             data["personal_evidence"] = await _personal_evidence_for(agent, hist_now, text)
         else:
@@ -1960,6 +1969,13 @@ async def _finalize_chat(agent, data):
                 print("[Chat] 审美学习失败（已忽略）：%s" % e)
         await asyncio.to_thread(agent._remember_chat_turn, str(data.get("text") or ""), stored,
                                 str(data.get("mode") or "game"))
+        # v4.7.0：把这一轮的可共现元素写进关联事务（不足两个元素自动跳过）。
+        mem = getattr(agent, "memory", None)
+        if mem is not None and bool(getattr(mem, "available", False)):
+            try:
+                await asyncio.to_thread(mem.observe_associations, str(data.get("text") or ""))
+            except Exception as e:              # noqa: BLE001 —— 关联学习失败不影响出话
+                print("[Chat] 关联记忆更新失败（已忽略）：%s" % e)
     # 桌宠聊天默认只用预制音（v4.2.5）：跳过 CosyVoice 合成，只发文字；
     # 前端收到后播一句预制情绪音。CosyVoice 服务照常启动，这里只是聊天链路不调用它。
     pet_prebuilt = (str(data.get("mode") or "game") == "pet"

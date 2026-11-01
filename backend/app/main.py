@@ -63,9 +63,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
 from . import actions
+from . import association as association_mod
 from . import auto_plan
 from . import config as config_mod
 from . import coords, events, lanes, persona, prompts, sgf
+from . import exam_plan
 from . import file_service
 from . import full_review
 from . import knowledge as knowledge_mod
@@ -153,6 +155,12 @@ async def _run_auto_plan(store, cfg, days=None, work_start=None, work_end=None):
     history = await asyncio.to_thread(store.list_schedule, 200, True, True)
     loader = getattr(store, "load_schedule_stats", None)
     category_stats = await asyncio.to_thread(loader) if callable(loader) else {}
+    assoc_bonus = {}
+    try:
+        patterns = await asyncio.to_thread(store.maybe_refresh_schedule_associations)
+        assoc_bonus = association_mod.category_bonus(patterns, gain=1.2)
+    except Exception as e:                  # noqa: BLE001 —— 关联只是弱偏好，失败就不加
+        print("[Schedule] 关联偏好读取失败（已忽略）：%s" % e)
     res = auto_plan.plan(
         items, now=time.time(),
         days=params["days"] if days is None else days,
@@ -161,10 +169,103 @@ async def _run_auto_plan(store, cfg, days=None, work_start=None, work_end=None):
         history=history, category_stats=category_stats,
         risk_z=params["risk_z"], buffer_min=params["buffer_min"],
         lock_sec=params["lock_sec"], transition_min=params["transition_min"],
-        align_min=params["align_min"])
+        align_min=params["align_min"], assoc_bonus=assoc_bonus)
     if res.get("assignments"):
         await asyncio.to_thread(store.update_schedule_plan, res["assignments"])
     return res
+
+
+def _exam_plan_notice(info):
+    """规划创建后的简短说明（AI_NOTICE，无语音）：不抢聊天，不重复生成。"""
+    groups = (info or {}).get("groups") or []
+    if not groups:
+        return ""
+    lines = []
+    for g in groups[:2]:
+        if not isinstance(g, dict):
+            continue
+        title = str(g.get("title") or "考试")
+        count = int(g.get("count") or 0)
+        lines.append("给「%s」排了 %d 次复习" % (title, count))
+    if not lines:
+        return ""
+    text = "我按空闲时间" + "、".join(lines) + "，在日程表上标成「规划」。"
+    if info.get("asked_scope"):
+        text += "范围还不清楚，我先按整体复习；你要是告诉我范围，我再调整。"
+    return text
+
+
+async def _run_exam_plans(app, store, cfg, items, now=None):
+    """给新出现的考试条目补 Azure 复习计划；失败只打日志。
+
+    `items` 可能是「本次聊天 / 本次扫描」的新条目；实际排复习时必须用**完整日程**，
+    否则只看见新考试、看不见课程 / 约定 / 已有任务，规划会和它们撞车。
+    """
+    try:
+        loader = getattr(store, "list_schedule_plan", None)
+        if callable(loader):
+            full = list(await asyncio.to_thread(loader, 300) or [])
+            if full:
+                items = full
+    except Exception as e:                  # noqa: BLE001 —— 读不到就用调用方给的条目
+        print("[Plan] 完整日程读取失败（按本次条目规划）：%s" % e)
+    try:
+        info = await asyncio.to_thread(exam_plan.ensure, store, items, cfg, now)
+    except Exception as e:                  # noqa: BLE001
+        print("[Plan] 复习计划生成失败（已忽略）：%s" % e)
+        return {"groups": [], "items": [], "asked_scope": False}
+    groups = (info or {}).get("groups") or []
+    if groups:
+        # 只留最近一个待补充范围的规划；下一轮聊天问一次，之后自动清掉。
+        pending = getattr(app.state, "exam_plan_pending", None)
+        if not isinstance(pending, dict):
+            pending = {}
+        for g in groups:
+            if isinstance(g, dict) and g.get("group") and not g.get("scope_known"):
+                pending[str(g["group"])] = {
+                    "title": str(g.get("title") or "考试"),
+                    "ts": time.time(),
+                }
+        app.state.exam_plan_pending = pending
+        try:
+            agent = getattr(app.state, "agent", None)
+            line = _exam_plan_notice(info)
+            if agent is not None and line:
+                agent._emit(events.message(events.AI_NOTICE, line))
+        except Exception as e:              # noqa: BLE001
+            print("[Plan] 规划说明发送失败（已忽略）：%s" % e)
+    return info
+
+
+async def _capture_plan_scope(app, text):
+    """用户回答了「考试范围」：补进规划备注；只处理一次，不回答就算了。"""
+    pending = getattr(app.state, "exam_plan_pending", None)
+    if not isinstance(pending, dict) or not pending:
+        return
+    store = getattr(app.state, "life", None)
+    app.state.exam_plan_pending = {}        # 一次性：无论是否识别到范围都清掉
+    raw = str(text or "").strip()
+    if store is None or len(raw) < 4:
+        return
+    scope_words = ("范围", "考的是", "包括", "Unit", "unit", "章", "单元",
+                   "单词", "语法", "阅读", "听力", "写作", "考点")
+    if not any(w in raw for w in scope_words):
+        return
+    scope = raw[:180]
+    changed = 0
+    for group, meta in pending.items():
+        try:
+            changed += int(await asyncio.to_thread(store.update_plan_notes, group, scope))
+        except Exception as e:              # noqa: BLE001
+            print("[Plan] 规划范围更新失败（已忽略）：%s" % e)
+    if changed:
+        try:
+            agent = getattr(app.state, "agent", None)
+            if agent is not None:
+                agent._emit(events.message(
+                    events.AI_NOTICE, "范围记下了；复习重点按这个调整。"))
+        except Exception as e:              # noqa: BLE001
+            print("[Plan] 范围确认发送失败（已忽略）：%s" % e)
 
 
 def _plan_sig(gate):
@@ -280,6 +381,8 @@ async def _capture_chat_schedule(app, cfg, agent, text):
     llm = getattr(agent, "llm", None)
     if life is None or llm is None:
         return
+    # v4.7.0：上一轮问过的「考试范围」只在本轮处理一次；不答就算了。
+    await _capture_plan_scope(app, text)
     # v4.4.1：日程判断是用户能看见的结果，优先于后台情绪精修。后者若已占住本地单槽
     # LLM，排程判断会直接超时（实测「这次没计入日程」）。
     try:
@@ -380,6 +483,8 @@ async def _capture_chat_schedule(app, cfg, agent, text):
                 agent._emit(events.message(events.AI_SCHEDULE, line))
             except Exception as e:          # noqa: BLE001
                 print("[Schedule] 聊天排程补充发送失败（已忽略）：%s" % e)
+        # v4.7.0：新考试条目 → Azure 自己排一组复习（owner=azure，可整组取消）。
+        await _run_exam_plans(app, life, cfg, rows, now=now)
 
 
 def _harden_stdout() -> None:
@@ -1180,11 +1285,16 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
                                  "stats": pr.get("stats", {})}
                 except Exception as e:      # noqa: BLE001
                     print("[Schedule] 扫描后自动排班失败（已忽略）：%s" % e)
+            # v4.7.0：扫描出的考试条目 → 复习规划（Azure 属性，可整组取消）。
+            exam_info = {"groups": [], "items": [], "asked_scope": False}
+            if life_store is not None and saved:
+                exam_info = await _run_exam_plans(app, life_store, cfg, saved, now=time.time())
             return {"ok": True, "folder": scan.get("folder", ""),
                     "files": _public_file_list(scan),
                     "items": auto_plan.decorate_items(
                         saved, time.time(), _schedule_cfg(cfg)["lock_sec"]),
                     "memory_written": mem_written, "auto_plan": plan_info,
+                    "exam_plan": exam_info,
                     "schedule": _schedule_payload()}
 
     def _public_file_list(scan):
@@ -1256,6 +1366,43 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         return {"ok": True, "planned": res["assignments"],
                 "unscheduled": res["unscheduled"], "stats": res["stats"],
                 "items": _schedule_payload()}
+
+    @app.post("/api/schedule/plan")
+    async def schedule_plan(body: dict | None = None):
+        """手动触发一次考试复习规划（没有新考试时是空操作）。"""
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": False, "error": "生命时间线未装配"}
+        items = await asyncio.to_thread(store.list_schedule_plan, 200)
+        info = await _run_exam_plans(app, store, cfg, items, now=time.time())
+        return {"ok": True, "groups": info.get("groups", []),
+                "items": _schedule_payload(), "asked_scope": info.get("asked_scope", False)}
+
+    @app.post("/api/schedule/plan/cancel")
+    async def schedule_plan_cancel(body: dict):
+        """取消一组 Azure 规划（整组置 cancelled，保留审计）。"""
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": False, "error": "生命时间线未装配"}
+        group = str((body or {}).get("group") or "").strip()
+        if group == "":
+            return {"ok": False, "error": "缺少 group"}
+        count = await asyncio.to_thread(store.cancel_plan, group, time.time())
+        return {"ok": True, "cancelled": count, "items": _schedule_payload()}
+
+    @app.get("/api/schedule/associations")
+    async def schedule_associations(limit: int = 12):
+        """日程类别共现（只读）：support / confidence / lift；没有数据返回空列表。"""
+        store = getattr(app.state, "life", None)
+        if store is None:
+            return {"ok": True, "items": []}
+        try:
+            items = await asyncio.to_thread(
+                store.load_schedule_associations, max(1, min(int(limit), 50)))
+        except Exception as e:              # noqa: BLE001
+            print("[Schedule] 关联读取失败（已忽略）：%s" % e)
+            items = []
+        return {"ok": True, "items": items}
 
     @app.post("/api/schedule/archive")
     async def schedule_archive(body: dict | None = None):

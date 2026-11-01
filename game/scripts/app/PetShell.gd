@@ -122,6 +122,7 @@ func _build_ui() -> void:
 	view.files_cleanup_requested.connect(_cleanup_files)
 	view.files_review_requested.connect(_review_schedule)
 	view.schedule_feedback_requested.connect(_feedback_schedule)
+	view.schedule_plan_cancel_requested.connect(_cancel_schedule_plan)
 	view.go_requested.connect(_launch_game)
 	view.size_selected.connect(_on_size_selected)
 	view.prebuilt_tts_toggled.connect(_on_prebuilt_tts_toggled)
@@ -364,7 +365,13 @@ func _on_message(kind: String, text: String) -> void:
 	if kind == "ai_idle" or kind == "ai_notice":
 		if kind != "ai_notice":
 			_queue_speech("idle")
-		if _idle_muted or view.is_chat_open():
+		if _idle_muted:
+			return
+		if view.is_chat_open():
+			# 无语音的系统通知（含 v4.7.0 的复习规划说明）在聊天面板开着时也要看得到；
+			# 旧行为直接 return，会把「我按空闲时间排了复习」悄悄吞掉。
+			view.append_chat("assistant", body)
+			_bump_activity()
 			return
 		view.show_bubble(body)
 		if kind != "ai_notice":
@@ -594,6 +601,22 @@ func _feedback_schedule(id: int, outcome: String, actual_min: int) -> void:
 			if mean > 0:
 				line = "已记录完成，实际 %d 分钟；该类别均值更新为 %d 分钟。" % [actual, mean]
 		view.set_files_status(line)
+		_bump_activity())
+
+func _cancel_schedule_plan(group: String) -> void:
+	if view == null or group.strip_edges() == "":
+		return
+	if agent == null or not _online:
+		view.set_files_status("后端还没连上，稍后再试。")
+		return
+	view.set_files_status("正在取消这组复习…")
+	agent.cancel_schedule_plan(group, func(ok: bool, _c: int, d: Dictionary):
+		if not ok or not bool(d.get("ok", false)):
+			view.set_files_status(str(d.get("error", "取消失败，稍后再试。")))
+			return
+		view.set_schedule_items(d.get("items", []))
+		var n := int(d.get("cancelled", 0))
+		view.set_files_status("已取消 %d 条 Azure 复习。" % n if n > 0 else "这组复习已经结束或取消过了。")
 		_bump_activity())
 
 func _review_schedule() -> void:

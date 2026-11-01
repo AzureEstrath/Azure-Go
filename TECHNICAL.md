@@ -84,6 +84,8 @@
 > **v4.6.1：Azure 有基础审美（意境 / 笔触 / 骨气 / 温柔 / 安静，轻热闹与跟风），自己明确的
 > 好恶按小学习率沉淀到 persona 表；偏好题先给标准再举例，只报热门名 / 没判断会重答一次；
 > 玩家已说过偏好时删掉句尾「你呢」这类空洞反问。**
+> **v4.7.0：考试复习规划（owner=azure + plan_group，避开已有日程、范围未知只问一次、整组可取消）
+> 与 FP-Growth 关联挖掘（日程类别弱偏好 + 记忆常见搭配软提示，支持度 / 置信度 / 提升度门槛）。**
 > 最后更新：2026-11-01。
 
 ---
@@ -364,6 +366,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | 记忆/画像 | `memory_enabled`、`memory_*`、`profile_enabled`、`time_aware_enabled` |
 | 知识查证 | `knowledge_enabled`、`knowledge_provider`、`knowledge_llm_fallback`、`deepseek_web_url/create_url/token/cookie/session_id/timeout_sec`、`knowledge_lookup_cooldown_sec`、`knowledge_confidence_min`、`knowledge_max_chars`（token / cookie 优先读环境变量 `DEEPSEEK_WEB_TOKEN` / `DEEPSEEK_WEB_COOKIE`） |
 | 审美 | `aesthetic_enabled`（与 `persona_enabled` 一起生效；任一关闭 ⇒ 不加审美段、不学习、不清理反问） |
+| 考试规划 | `exam_plan_enabled`、`exam_plan_weeks`、`exam_plan_max_sessions`、`exam_plan_duration_min` |
 | 语音 | `tts_enabled`、`tts_mode`、`tts_local_*`、`tts_aliyun_*`、`tts_speed/pitch/volume`、`tts_sync_speak/batch_speak/long_chunk` |
 | 视觉 | `ui_theme`、`vrm_path`、`ownership_enabled` |
 | 音效 | `sfx_enabled`、`sfx_volume` |
@@ -466,6 +469,9 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | GET | `/api/knowledge/recent` | 最近的结构化知识记忆 |
 | GET | `/api/schedule` | 共享日程列表 |
 | POST | `/api/schedule/auto_plan` | 自动排班（分层收缩 + 机会约束 + 每日缓冲 + best-fit） |
+| POST | `/api/schedule/plan` | 手动触发一次考试复习规划 |
+| POST | `/api/schedule/plan/cancel` | 取消一组 Azure 复习规划 |
+| GET | `/api/schedule/associations` | 日程类别共现关联（只读） |
 | POST | `/api/schedule/feedback` | 完成 / 推迟 / 跳过反馈 → EWMA 学习；推迟后立即重排 |
 | GET | `/api/schedule/review` | 按类别复盘计划 / 实际耗时偏差 |
 | POST | `/api/schedule/archive` | 归档过期 / 指定日程 |
@@ -906,6 +912,24 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
       变化时才写（普通聊天不会因为扫历史而每轮写库）。任何故障只打日志，聊天照常。
     - 关闭：`aesthetic_enabled=false` 或 `persona_enabled=false` ⇒ 提示词不加段、不学习、
       不清理反问；既有 prompt golden 不受影响（审美段只在聊天系统消息里，且为空时逐字符不变）。
+30. **考试复习规划与关联挖掘（v4.7.0）**：
+    - `app/exam_plan.py`：`is_exam` 只认标题 / 备注里的考试词（课程表不算）；`scope_text` /
+      `scope_parts` 从备注读范围；`build_plan` 用 `auto_plan.free_slots`（与自动排班同一套
+      日内窗口 / 缓冲 / 训练留白）选未来空闲段，避开已有条目，按可用日期均匀取点、
+      近考试更密，单次默认 50 分钟、最多 12 次（配置默认 6）；长空档优先 18:00 后。
+    - 属性：规划条目 `owner="azure"` + `plan_group="exam:<id>"`；`auto_plan.classify_item`
+      对这类条目返回 `locked`（后续重排不移动）；`LifeStore.has_plan_group` 防止重复生成，
+      取消后不自动重建；`cancel_plan` 整组置 cancelled（保留审计）。
+    - 范围：`main._run_exam_plans` 生成后把未读到的规划放进 `app.state.exam_plan_pending`；
+      `_capture_plan_scope` 在下一轮聊天只处理一次，识别「范围 / 考点 / 单元 / Unit / 语法…」
+      就 `update_plan_notes`，不识别也清掉，不反复追问。
+    - `app/association.py`：纯标准库 FP-Growth（`mine` / `patterns`），每轮聊天用
+      `tokens_from_text` 抽日常元素（词表 + ASCII 词），写入 `memory.db.memory_assoc_turns`；
+      每 6 轮重挖一次（最近 200 轮），结果存 `memory_assoc_patterns`，支持度 ≥3、
+      置信度 ≥0.65、提升度 ≥1.05、上限 12；`MemoryService.association_note` 只匹配当前话里
+      出现过的元素，提示词明确「只是常见搭配，不是事实」。日程侧按「同一天出现的类别」
+      挖到 `life.db.schedule_assoc`，`auto_plan.plan(assoc_bonus=…)` 只加很小的排序分；
+      原始 / 结果表都有限量，失败只打日志。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 
@@ -939,11 +963,11 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
 
 | 文件 | 位置 | 内容 | 写入时机 |
 | --- | --- | --- | --- |
-| `memory.db` | `backend/data/` | 长期记忆与可选向量（`vectors.model` / `vectors.dim` 指纹）；v4.6.0 起含 `kind="knowledge"` 的结构化知识条目 | 记忆写入/局末/知识查证 |
+| `memory.db` | `backend/data/` | 长期记忆与可选向量（`vectors.model` / `vectors.dim` 指纹）；v4.6.0 起含 `kind="knowledge"` 的结构化知识条目；v4.7.0 起含 `memory_assoc_turns`（最近聊天元素事务）与 `memory_assoc_patterns`（FP-Growth 结果） | 记忆写入/局末/知识查证/每轮聊天 |
 | `profile.db` | `backend/data/` | 玩家棋风画像、每局记录、人格化状态（关系 / 情绪余温 / 互动数）与审美状态（`persona.aesthetic`：轴线 / 自己与对方的作品偏好） | `summarize()`；画像总开关关着时不写画像，人格化仍按 `persona_enabled` 写 persona 表；审美在聊天里判断变化时低频写 |
 | `games.db` | `backend/data/` | 棋谱库、逐手、总结、注记 | 局末归档 / 导入 |
 | `joseki_progress.db` | `backend/data/` | 定式族出现计数 | 定式命中时 |
-| `life.db` | `backend/data/` | 生命时间线、慢变量、共享日程（`schedule_items`）与类别耗时统计（`schedule_stats`） | 互动 / 日程写入 / 执行反馈 |
+| `life.db` | `backend/data/` | 生命时间线、慢变量、共享日程（`schedule_items`，含 `owner` / `plan_group`）与类别耗时统计（`schedule_stats`）；v4.7.0 起含日程类别关联 `schedule_assoc` | 互动 / 日程写入 / 执行反馈 / 规划生成 |
 | `thinking_lines.json` | `game/data/` | 思考短句解析工具的数据（当前运行路径不轮播） | 只读 |
 | `assets/voice` | `game/assets/` | 27 条预制语音 | 只读 |
 | `backend/logs` | `backend/logs/` | 服务日志、PID 文件、TTS 探针 | 运行时 |

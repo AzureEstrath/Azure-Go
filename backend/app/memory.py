@@ -28,6 +28,7 @@ import threading
 import time
 
 from . import memory_semantics as emo_sem
+from . import association as association_mod
 
 MEMORY_MAX_ROWS = 2000          # 库内记忆行数上限（超出按时间淘汰最旧）
 CHAT_MAX_ROWS = 1000            # 聊天原文流水上限（超出按时间淘汰最旧；与 memories 解耦）
@@ -46,6 +47,8 @@ MAX_TEXT_LEN = 200              # 单条记忆写入时的字数上限
 MAX_CHAT_USER_LEN = 240          # 聊天流水：玩家单句上限
 MAX_CHAT_REPLY_LEN = 360         # 聊天流水：Azure 单句上限
 MAX_INJECT_ITEM_CHARS = 120     # 注入提示词时单条记忆的字数上限
+ASSOC_MAX_TURNS = 300           # 关联挖掘只保留最近 N 轮聊天事务（再往前只留结果，不无限增长）
+ASSOC_REFRESH_EVERY = 6         # 每 N 轮重挖一次；单轮只追加事务，不做全量扫描
 
 # 关键词检索的切分：ASCII 按词、CJK 按二元组（中文没空格，整串匹配对不上自然问句）
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
@@ -106,6 +109,20 @@ _SCHEMA = (
         summary TEXT NOT NULL DEFAULT '',
         mood TEXT NOT NULL DEFAULT '{}',
         meta TEXT NOT NULL DEFAULT '{}'
+    )""",
+    # v4.7.0：关联挖掘的原始事务（每轮聊天的词元素）与结果（常一起出现的元素）。
+    # 原始事务只保留最近 ASSOC_MAX_TURNS 轮；结果按 support / confidence / lift 门槛保存。
+    """CREATE TABLE IF NOT EXISTS memory_assoc_turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL DEFAULT 0,
+        tokens TEXT NOT NULL DEFAULT '[]'
+    )""",
+    """CREATE TABLE IF NOT EXISTS memory_assoc_patterns (
+        items TEXT PRIMARY KEY,
+        support INTEGER NOT NULL DEFAULT 0,
+        confidence REAL NOT NULL DEFAULT 0,
+        lift REAL NOT NULL DEFAULT 0,
+        updated_ts REAL NOT NULL DEFAULT 0
     )""",
 )
 
@@ -533,6 +550,114 @@ class MemoryStore:
         for row in rows:
             row["meta"] = _loads_meta(row.get("meta"))
         return rows
+
+    # —— 关联挖掘（v4.7.0）：每轮追加词元素事务，定期用 FP-Growth 重挖结果 ——
+
+    def observe_association_turn(self, tokens, now=None) -> int:
+        """追加一轮聊天事务；到刷新点时重挖关联，返回本次写入的关联条数。
+
+        不足两个元素不写（没有共现）；库不可用 / 失败返回 0，绝不影响聊天。
+        """
+        items = []
+        for token in tokens or []:
+            s = str(token or "").strip().lower()
+            if s and s not in items:
+                items.append(s)
+        if self._conn is None or len(items) < 2:
+            return 0
+        t = float(now if now is not None else time.time())
+        count = 0
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO memory_assoc_turns(ts, tokens) VALUES(?,?)",
+                    (t, json.dumps(items, ensure_ascii=False)))
+                self._conn.commit()
+                row = self._conn.execute(
+                    "SELECT COUNT(*), MAX(id) FROM memory_assoc_turns").fetchone()
+                count = int(row[0] or 0)
+                max_id = int(row[1] or 0)
+                if max_id > ASSOC_MAX_TURNS:
+                    self._conn.execute(
+                        "DELETE FROM memory_assoc_turns WHERE id <= ?",
+                        (max_id - ASSOC_MAX_TURNS,))
+                    self._conn.commit()
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 关联事务写入失败（已忽略）：%s" % e)
+            return 0
+        if count <= 2 or count % ASSOC_REFRESH_EVERY == 0:
+            return self.refresh_associations()
+        return 0
+
+    def refresh_associations(self, min_support=3, min_confidence=0.65,
+                             limit=12) -> int:
+        """用最近的事务重挖关联，结果 upsert 进 ``memory_assoc_patterns``；返回条数。"""
+        if self._conn is None:
+            return 0
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT tokens FROM memory_assoc_turns ORDER BY id DESC LIMIT 200"
+                ).fetchall()
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 关联事务读取失败（已忽略）：%s" % e)
+            return 0
+        transactions = []
+        for row in rows:
+            try:
+                items = json.loads(str(row[0] or "[]"))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(items, list):
+                transactions.append([str(x) for x in items if str(x).strip()])
+        try:
+            got = association_mod.patterns(
+                transactions, min_support=max(2, int(min_support)),
+                min_confidence=max(0.0, min(1.0, float(min_confidence))),
+                min_lift=1.05, max_len=3, limit=max(1, int(limit or 12)))
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 关联挖掘失败（已忽略）：%s" % e)
+            return 0
+        try:
+            with self._lock:
+                self._conn.execute("DELETE FROM memory_assoc_patterns")
+                for row in got:
+                    items = ",".join(str(x) for x in row.get("items") or [])
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO memory_assoc_patterns"
+                        "(items, support, confidence, lift, updated_ts) VALUES(?,?,?,?,?)",
+                        (items, int(row.get("support", 0)),
+                         float(row.get("confidence", 0.0)),
+                         float(row.get("lift", 0.0)), time.time()))
+                self._conn.commit()
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 关联结果写入失败（已忽略）：%s" % e)
+            return 0
+        return len(got)
+
+    def association_patterns(self, limit=12) -> list:
+        """已保存的关联（按支持度 / 置信度），库不可用返回 ``[]``。"""
+        if self._conn is None:
+            return []
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT items, support, confidence, lift, updated_ts "
+                    "FROM memory_assoc_patterns ORDER BY support DESC, confidence DESC LIMIT ?",
+                    (max(1, min(int(limit or 12), 50)),)).fetchall()
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 关联结果读取失败（已忽略）：%s" % e)
+            return []
+        out = []
+        for row in rows:
+            out.append({
+                "items": [x for x in str(row[0] or "").split(",") if x],
+                "support": int(row[1] or 0),
+                "confidence": float(row[2] or 0.0),
+                "lift": float(row[3] or 0.0),
+                "updated_ts": float(row[4] or 0.0),
+            })
+        return out
 
     def recall(self, query: str, k: int = 3, mood=None, min_score: float = 0.0) -> list:
         """召回最相关的 ``k`` 条记忆，按 score 降序；任何故障返回 ``[]``。

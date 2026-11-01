@@ -136,6 +136,10 @@ def classify_item(item, now=None, lock_sec=0.0):
     status = str(item.get("status", "planned") or "planned").strip().lower()
     if status in ("done", "cancelled", "canceled"):
         return GRADE_CLOSED
+    # v4.7.0：Azure 自己排的复习计划已经按空闲时段定好位；自动排班不得再移动，
+    # 用户可以在日程面板整组取消（取消后不再是 planned，这条也就不再生效）。
+    if str(item.get("owner") or "") == "azure" and str(item.get("plan_group") or "").strip() != "":
+        return GRADE_LOCKED
     kind = str(item.get("kind", "task") or "task").strip().lower()
     period = str(item.get("period", "") or "").strip()
     weekday = _int(item.get("weekday", -1), -1)
@@ -328,6 +332,53 @@ def _fmt_range(start_ts, duration_min):
     return "%s %s-%s（自动安排）" % (a.date().isoformat(), a.strftime("%H:%M"), b.strftime("%H:%M"))
 
 
+def free_slots(items, now=None, days=14, work_start=DEFAULT_WORK_START,
+               work_end=DEFAULT_WORK_END, buffer_min=0, transition_min=0):
+    """给「额外计划」找未来空闲段：返回 ``[(day_index, start_ts, end_ts)]``。
+
+    与自动排班共用同一套日内窗口 / 缓冲 / 切换留白；已有日程按开始时间 + 时长占位，
+    课程 / 约定 / 已完成都算占用。纯函数、不改任何条目。
+    """
+    ref = _num(now, time.time()) or time.time()
+    try:
+        horizon = max(1, min(60, int(days)))
+    except (TypeError, ValueError):
+        horizon = 14
+    ws = _time_minutes(work_start, 8 * 60)
+    we = _time_minutes(work_end, 22 * 60)
+    if we <= ws + MIN_SLOT_MIN:
+        ws, we = 8 * 60, 22 * 60
+    try:
+        buffer = max(0, min(240, int(buffer_min)))
+    except (TypeError, ValueError):
+        buffer = 0
+    try:
+        transition = max(0, min(60, int(transition_min)))
+    except (TypeError, ValueError):
+        transition = 0
+    busy_by_day = {}
+    for it in items or []:
+        if not isinstance(it, dict) or str(it.get("status") or "") in ("cancelled", "canceled"):
+            continue
+        start = _num(it.get("start_ts"), 0.0)
+        if start <= 0.0:
+            continue
+        dur = _clamp(_int(it.get("duration_min"), DEFAULT_DURATION), 5, 24 * 60)
+        pad = transition * 60.0
+        day = datetime.datetime.fromtimestamp(start).date()
+        busy_by_day.setdefault(day, []).append((start - pad, start + dur * 60.0 + pad))
+    out = []
+    for i in range(horizon):
+        bounds = _day_bounds(i, ref, ws, we, buffer)
+        if bounds is None:
+            continue
+        day = datetime.datetime.fromtimestamp(bounds[0]).date()
+        busy = busy_by_day.get(day, [])
+        for a, b in _free_slots(bounds[0], bounds[1], busy):
+            out.append((i, a, b))
+    return out
+
+
 def _category_target(item, global_mean, global_var, targets):
     """某任务的收缩目标：类别均值（可信度加权）+ 类别先验 / 全局均值兜底。"""
     cat = str(item.get("task_type") or schedule_learning.infer_task_type(
@@ -413,7 +464,8 @@ def _plan_reason(row, kept=False, late=False):
 def plan(items, now=None, days=7, work_start=DEFAULT_WORK_START,
          work_end=DEFAULT_WORK_END, history=None, category_stats=None,
          risk_z=DEFAULT_RISK_Z, buffer_min=0, lock_sec=0,
-         transition_min=DEFAULT_TRANSITION_MIN, align_min=DEFAULT_ALIGN_MIN):
+         transition_min=DEFAULT_TRANSITION_MIN, align_min=DEFAULT_ALIGN_MIN,
+         assoc_bonus=None):
     """给未定时间 / 之前自动排过的任务分配时间；返回 assignments / unscheduled / stats。"""
     ref = _num(now, time.time()) or time.time()
     try:
@@ -480,8 +532,13 @@ def plan(items, now=None, days=7, work_start=DEFAULT_WORK_START,
     targets = schedule_learning.plan_targets(category_stats or {})
 
     enriched = []
+    assoc = assoc_bonus if isinstance(assoc_bonus, dict) else {}
     for it in flexible:
         cat, t_mean, t_var, bonus, n = _category_target(it, d_mean, d_var, targets)
+        try:
+            bonus += max(0.0, min(2.0, float(assoc.get(cat, 0.0) or 0.0)))
+        except (TypeError, ValueError):
+            pass
         raw_d = _clamp(_int(it.get("duration_min"), DEFAULT_DURATION), 5, 24 * 60)
         raw_p = _clamp(_int(it.get("priority"), DEFAULT_PRIORITY), 0, 100)
         enriched.append({

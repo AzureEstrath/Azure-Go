@@ -22,6 +22,8 @@ import threading
 import time
 
 from .emotion import EmotionModel
+from . import association as association_mod
+from . import schedule_learning
 
 # 默认库路径：<backend>/data/life.db（backend/data/ 已 gitignore，属运行产物）
 DEFAULT_DB_PATH = os.path.join(
@@ -90,7 +92,9 @@ _SCHEMA = (
         actual_min REAL NOT NULL DEFAULT 0,
         defer_count INTEGER NOT NULL DEFAULT 0,
         completed_ts REAL NOT NULL DEFAULT 0,
-        outcome TEXT NOT NULL DEFAULT ''
+        outcome TEXT NOT NULL DEFAULT '',
+        owner TEXT NOT NULL DEFAULT 'user',
+        plan_group TEXT NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS idx_life_events_ts ON life_events(ts)",
     "CREATE INDEX IF NOT EXISTS idx_schedule_start ON schedule_items(start_ts)",
@@ -107,6 +111,14 @@ _SCHEMA = (
         change_point_ts REAL NOT NULL DEFAULT 0,
         updated_ts REAL NOT NULL DEFAULT 0
     )""",
+    # v4.7.0：日程类别共现关联（FP-Growth 结果，只作很弱的排序偏好）。
+    """CREATE TABLE IF NOT EXISTS schedule_assoc (
+        items TEXT PRIMARY KEY,
+        support INTEGER NOT NULL DEFAULT 0,
+        confidence REAL NOT NULL DEFAULT 0,
+        lift REAL NOT NULL DEFAULT 0,
+        updated_ts REAL NOT NULL DEFAULT 0
+    )""",
 )
 
 # 日程表的**完整列**（顺序固定：`_schedule_row` 按这个下标读）。新增字段用于周课表 UI：
@@ -117,7 +129,7 @@ SCHEDULE_COLS = ("id", "start_ts", "when_text", "title", "notes", "source", "sta
                  "kind", "priority", "duration_min", "deadline_ts",
                  "auto_planned", "reminded_ts", "archived", "archived_ts",
                  "task_type", "actual_min", "defer_count", "completed_ts", "outcome",
-                 "updated_ts")
+                 "updated_ts", "owner", "plan_group")
 _SCHEDULE_SELECT = ", ".join(SCHEDULE_COLS)
 # 旧库升级：v4.0.0 之前的 schedule_items 没有这些列，启动时按需 ALTER TABLE 补上。
 _SCHEDULE_EXTRA_COLS = {
@@ -143,6 +155,8 @@ _SCHEDULE_EXTRA_COLS = {
     "defer_count": "INTEGER NOT NULL DEFAULT 0",
     "completed_ts": "REAL NOT NULL DEFAULT 0",
     "outcome": "TEXT NOT NULL DEFAULT ''",
+    "owner": "TEXT NOT NULL DEFAULT 'user'",
+    "plan_group": "TEXT NOT NULL DEFAULT ''",
 }
 
 # 事件类型 → 需要更新的时间戳字段。所有事件都能写进时间线；
@@ -552,6 +566,8 @@ class LifeStore:
             "completed_ts": float(r[27] or 0.0) if len(r) > 27 else 0.0,
             "outcome": _text(28),
             "updated_ts": float(r[29] or 0.0) if len(r) > 29 else 0.0,
+            "owner": _text(30) or "user",
+            "plan_group": _text(31),
         }
 
     def upsert_schedule(self, items, source="", now=None):
@@ -604,6 +620,10 @@ class LifeStore:
                     if not math.isfinite(deadline) or deadline < 0.0:
                         deadline = 0.0
                     auto_planned = 1 if bool(it.get("auto_planned", False)) else 0
+                    owner = str(it.get("owner", "user") or "user").strip().lower()
+                    if owner not in ("user", "azure"):
+                        owner = "user"
+                    plan_group = _clip(it.get("plan_group", ""), 48)
                     task_type = _clip(it.get("task_type", ""), 24) or (
                         "course" if kind == "course" else "general")
                     # —— 原地细化（v4.5.0）：聊天里「活动是参加心理课」这类补充只改那一条 ——
@@ -615,7 +635,7 @@ class LifeStore:
                         # 也不能改写它（查不到就退回普通插入，宁可多一条也不动课表）。
                         old_row = self._db.execute(
                             "SELECT %s FROM schedule_items WHERE id = ? AND archived = 0"
-                            " AND kind <> 'course' AND period = ''"
+                            " AND kind <> 'course' AND period = '' AND owner = 'user'"
                             % _SCHEDULE_SELECT, (refine_id,)).fetchone()
                         if old_row is not None:
                             old = self._schedule_row(old_row)
@@ -690,19 +710,22 @@ class LifeStore:
                     if kind == "course" and (date_text != "" or weekday >= 0):
                         if date_text != "":
                             row = self._db.execute(
-                                "SELECT id, source, notes, teacher, location FROM schedule_items "
+                                "SELECT id, source, notes, teacher, location, owner, plan_group "
+                                "FROM schedule_items "
                                 "WHERE archived = 0 AND date_text = ? AND period = ? "
                                 "AND title = ? ORDER BY id ASC LIMIT 1",
                                 (date_text, period, title)).fetchone()
                         else:
                             row = self._db.execute(
-                                "SELECT id, source, notes, teacher, location FROM schedule_items "
+                                "SELECT id, source, notes, teacher, location, owner, plan_group "
+                                "FROM schedule_items "
                                 "WHERE archived = 0 AND date_text = '' AND weekday = ? "
                                 "AND period = ? AND title = ? ORDER BY id ASC LIMIT 1",
                                 (weekday, period, title)).fetchone()
                     if row is None:
                         row = self._db.execute(
-                            "SELECT id, source, notes, teacher, location FROM schedule_items "
+                            "SELECT id, source, notes, teacher, location, owner, plan_group "
+                            "FROM schedule_items "
                             "WHERE archived = 0 AND start_ts = ? AND title = ? "
                             "ORDER BY id ASC LIMIT 1",
                             (start, title)).fetchone()
@@ -711,11 +734,11 @@ class LifeStore:
                             "INSERT INTO schedule_items(start_ts, when_text, title, notes, source, "
                             "status, created_ts, updated_ts, date_text, weekday, period, period_start, "
                             "period_end, start_time, end_time, teacher, location, kind, priority, "
-                            "duration_min, deadline_ts, auto_planned, task_type) "
-                            "VALUES(?,?,?,?,?,'planned',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "duration_min, deadline_ts, auto_planned, task_type, owner, plan_group) "
+                            "VALUES(?,?,?,?,?,'planned',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (start, when_text, title, notes, src, t, t, date_text, weekday, period,
                              p_start, p_end, start_time, end_time, teacher, location, kind, priority,
-                             duration, deadline, auto_planned, task_type))
+                             duration, deadline, auto_planned, task_type, owner, plan_group))
                         sid = int(cur.lastrowid)
                     else:
                         sid = int(row[0])
@@ -724,15 +747,22 @@ class LifeStore:
                         notes = notes or str(row[2] or "")
                         teacher = teacher or str(row[3] or "")
                         location = location or str(row[4] or "")
+                        # 用户来源的普通条目永远不会把 Azure 规划改成自己的；规划组也保留。
+                        old_owner = str(row[5] or "user") if len(row) > 5 else "user"
+                        old_group = str(row[6] or "") if len(row) > 6 else ""
+                        if old_owner == "azure" and owner == "user":
+                            owner = "azure"
+                        plan_group = plan_group or old_group
                         self._db.execute(
                             "UPDATE schedule_items SET start_ts = ?, when_text = ?, notes = ?, "
                             "source = ?, date_text = ?, weekday = ?, period = ?, period_start = ?, "
                             "period_end = ?, start_time = ?, end_time = ?, teacher = ?, location = ?, "
                             "kind = ?, priority = ?, duration_min = ?, deadline_ts = ?, "
-                            "auto_planned = ?, task_type = ?, updated_ts = ? WHERE id = ?",
+                            "auto_planned = ?, task_type = ?, owner = ?, plan_group = ?, "
+                            "updated_ts = ? WHERE id = ?",
                             (start, when_text, notes, src, date_text, weekday, period, p_start, p_end,
                              start_time, end_time, teacher, location, kind, priority, duration,
-                             deadline, auto_planned, task_type, t, sid))
+                             deadline, auto_planned, task_type, owner, plan_group, t, sid))
                     got = self._db.execute(
                         "SELECT %s FROM schedule_items WHERE id = ?" % _SCHEDULE_SELECT,
                         (sid,)).fetchone()
@@ -843,6 +873,177 @@ class LifeStore:
         except Exception as e:              # noqa: BLE001
             print("[Life] 日程历史读取失败（已忽略）：%s" % e)
             return []
+
+    # —— Azure 规划（v4.7.0）：owner=azure + plan_group；随时可整组取消 ——
+
+    def has_active_plan(self, plan_group) -> bool:
+        """同一规划组是否还有未完成 / 未取消的条目（防止重复生成复习计划）。"""
+        group = str(plan_group or "").strip()
+        if self._db is None or group == "":
+            return False
+        try:
+            with self._lock:
+                row = self._db.execute(
+                    "SELECT COUNT(*) FROM schedule_items WHERE plan_group = ? AND archived = 0 "
+                    "AND status = 'planned'", (group,)).fetchone()
+            return int(row[0] or 0) > 0 if row is not None else False
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 规划组读取失败（已忽略）：%s" % e)
+            return False
+
+    def has_plan_group(self, plan_group) -> bool:
+        """该规划组是否已经存在过（含完成 / 取消）：避免取消后又自动生成一遍。"""
+        group = str(plan_group or "").strip()
+        if self._db is None or group == "":
+            return False
+        try:
+            with self._lock:
+                row = self._db.execute(
+                    "SELECT COUNT(*) FROM schedule_items WHERE plan_group = ? AND archived = 0",
+                    (group,)).fetchone()
+            return int(row[0] or 0) > 0 if row is not None else False
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 规划组读取失败（已忽略）：%s" % e)
+            return False
+
+    def cancel_plan(self, plan_group, now=None) -> int:
+        """取消 Azure 规划：整组未完成条目置 cancelled（保留审计，不删除）。"""
+        group = str(plan_group or "").strip()
+        if self._db is None or group == "":
+            return 0
+        t = _as_ts(now) or time.time()
+        try:
+            with self._lock:
+                cur = self._db.execute(
+                    "UPDATE schedule_items SET status = 'cancelled', outcome = 'azure_plan_cancelled', "
+                    "updated_ts = ? WHERE plan_group = ? AND archived = 0 AND status = 'planned'",
+                    (t, group))
+                self._db.commit()
+                return int(cur.rowcount or 0)
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 取消规划失败（已忽略）：%s" % e)
+            return 0
+
+    def update_plan_notes(self, plan_group, extra, now=None) -> int:
+        """给规划组补一段范围 / 说明（用户回答「范围是…」时用；不重建时间）。"""
+        group = str(plan_group or "").strip()
+        text = _clip(str(extra or "").strip(), 180)
+        if self._db is None or group == "" or text == "":
+            return 0
+        t = _as_ts(now) or time.time()
+        try:
+            with self._lock:
+                cur = self._db.execute(
+                    "UPDATE schedule_items SET notes = substr("
+                    "CASE WHEN notes = '' THEN ? ELSE notes || '；' || ? END, 1, 300), "
+                    "updated_ts = ? WHERE plan_group = ? AND archived = 0 AND status = 'planned'",
+                    (text, text, t, group))
+                self._db.commit()
+                return int(cur.rowcount or 0)
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 规划备注更新失败（已忽略）：%s" % e)
+            return 0
+
+    # —— 日程类别共现（v4.7.0）：FP-Growth 结果，只作很弱的排序偏好 ——
+
+    def refresh_schedule_associations(self, limit=300, min_support=3,
+                                      min_confidence=0.65, max_patterns=12,
+                                      now=None) -> int:
+        """按「同一天出现的类别」挖共现，写入 ``schedule_assoc``；返回条数。"""
+        if self._db is None:
+            return 0
+        history = self.list_schedule_history(limit)
+        groups = {}
+        for it in history:
+            if not isinstance(it, dict):
+                continue
+            if str(it.get("kind") or "") == "course" or str(it.get("period") or "") != "":
+                continue
+            status = str(it.get("status") or "planned")
+            if status in ("cancelled", "canceled"):
+                continue
+            day = str(it.get("date") or "")[:10]
+            if day == "":
+                ts = float(it.get("start_ts") or it.get("completed_ts") or 0.0)
+                if ts <= 0.0:
+                    continue
+                try:
+                    day = datetime.date.fromtimestamp(ts).isoformat()
+                except (OverflowError, OSError, ValueError):
+                    continue
+            cat = str(it.get("task_type") or "").strip().lower()
+            if cat == "" or cat == "course":
+                cat = schedule_learning.infer_task_type(
+                    it.get("title", ""), "task", it.get("notes", ""))
+            if cat == "":
+                continue
+            groups.setdefault(day, set()).add(cat)
+        transactions = [vals for vals in groups.values() if len(vals) >= 2]
+        try:
+            got = association_mod.patterns(
+                transactions, min_support=max(2, int(min_support)),
+                min_confidence=max(0.0, min(1.0, float(min_confidence))),
+                min_lift=1.05, max_len=2, limit=max(1, int(max_patterns or 12)))
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 日程关联挖掘失败（已忽略）：%s" % e)
+            return 0
+        t = _as_ts(now) or time.time()
+        try:
+            with self._lock:
+                self._db.execute("DELETE FROM schedule_assoc")
+                for row in got:
+                    items = ",".join(str(x) for x in row.get("items") or [])
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO schedule_assoc"
+                        "(items, support, confidence, lift, updated_ts) VALUES(?,?,?,?,?)",
+                        (items, int(row.get("support", 0)),
+                         float(row.get("confidence", 0.0)),
+                         float(row.get("lift", 0.0)), t))
+                self._db.commit()
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 日程关联写入失败（已忽略）：%s" % e)
+            return 0
+        return len(got)
+
+    def maybe_refresh_schedule_associations(self, max_age_sec=6 * 3600,
+                                            now=None) -> list:
+        """按需刷新（默认 6 小时一次）；返回当前关联列表。"""
+        if self._db is None:
+            return []
+        t = _as_ts(now) or time.time()
+        try:
+            with self._lock:
+                row = self._db.execute(
+                    "SELECT MAX(updated_ts), COUNT(*) FROM schedule_assoc").fetchone()
+            latest = float(row[0] or 0.0) if row is not None else 0.0
+            count = int(row[1] or 0) if row is not None else 0
+        except Exception:                   # noqa: BLE001
+            latest, count = 0.0, 0
+        if count <= 0 or t - latest >= max(60.0, float(max_age_sec or 0)):
+            self.refresh_schedule_associations(now=t)
+        return self.load_schedule_associations()
+
+    def load_schedule_associations(self, limit=12) -> list:
+        """读已保存的日程类别关联（按支持度 / 置信度；库不可用返回 ``[]``）。"""
+        if self._db is None:
+            return []
+        try:
+            with self._lock:
+                rows = self._db.execute(
+                    "SELECT items, support, confidence, lift, updated_ts FROM schedule_assoc "
+                    "ORDER BY support DESC, confidence DESC LIMIT ?",
+                    (max(1, min(int(limit or 12), 50)),)).fetchall()
+        except Exception as e:              # noqa: BLE001
+            print("[Life] 日程关联读取失败（已忽略）：%s" % e)
+            return []
+        out = []
+        for row in rows:
+            out.append({"items": [x for x in str(row[0] or "").split(",") if x],
+                        "support": int(row[1] or 0),
+                        "confidence": float(row[2] or 0.0),
+                        "lift": float(row[3] or 0.0),
+                        "updated_ts": float(row[4] or 0.0)})
+        return out
 
     def record_feedback(self, item_id, outcome="done", actual_min=0, now=None):
         """记录一次执行结果：done / deferred / skipped；返回更新后的条目或 ``{}``。

@@ -3,7 +3,7 @@
 > **桌宠是主程序，围棋是它打开的独立窗口。**
 > 同一套 Azure 人格、情绪、时间线与记忆，在桌宠、围棋窗口和重启后的下一次见面之间保持连续。
 
-**版本：v4.6.1（Release）**
+**版本：v4.7.0（Release）**
 
 > 完整项目地图与每个文件的作用：[PROJECT_FULL.md](PROJECT_FULL.md)。
 
@@ -61,6 +61,15 @@ Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你�
   标准判断再举例；没接触过的作品会直说没玩过，不假装体验。她自己明确表达的好恶会以很小的
   学习率慢慢沉淀，跨重启保留；玩家说过的偏好单独记住，不会反过来改她的口味。
   你上文说过「最喜欢星月夜」，下一句就不会再被反问「你呢」——句尾的空洞反问会被删掉。
+- **考试复习规划（v4.7.0）**：聊天或资料扫描新增「英语考试 / 期末 / 结业 / 补考」这类条目后，
+  Azure 会按未来几周的空闲时段排一组复习，标成 `owner="azure"` 的**规划**（与你的日程属性不同，
+  但在月历 / 周表 / 清单里同样显示）。规划避开课程、约定和已有任务，近考试更密；
+  范围能从备注里读到就按范围分重点，读不到就先按整体复习并只问一次——你不答就算了。
+  每条规划都能点「完成」，整组随时可以「取消」，不会影响你自己的日程。
+- **关联挖掘（v4.7.0）**：`association.py` 用 FP-Growth 从同一天出现的日程类别里找「常一起做」
+  的组合，只给自动排班一个很小的排序加分；从聊天里找常一起出现的日常元素（如苹果 / 米饭 /
+  辣椒），存进记忆库，相关话题只作「常见搭配」软提示。两者都有支持度 / 置信度 / 提升度门槛，
+  单次出现不成立，也不会把常见搭配写成「你今天一定吃了什么」。
 - **资料扫描更稳（v4.5.4）**：OCR 已读出足够正文时不再等慢速 VLM；标题 / 日期 / 地点从去掉
   换行后的整段公告里重建，分组到场时间合并成一条主活动，过期公告不写；课程名会清掉截图
   省略号、半角括号与混进名字里的教师姓氏，同一格重复课程自动合并。
@@ -193,6 +202,12 @@ Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你�
   不改变她的口味。偏好题先给标准再举例，没接触过就直说不假装；只报热门名字 / 没有审美判断
   的回答会重答一次，仍不合格就用「只讲标准、不硬选作品」的兜底。玩家已经说过偏好时，
   句尾「你呢 / 你最喜欢哪个」这类空洞反问会被删掉，不再重复提问。
+  **v4.7.0**：考试复习规划——新增「英语考试 / 期末 / 结业 / 补考」后自动按未来几周空闲时段
+  排一组 `owner="azure"` 的复习（避开课程 / 约定 / 已有任务、近考试更密）；范围能从备注读到
+  就分重点，读不到先按整体复习并只问一次。规划在月历 / 周表 / 清单里都显示「规划」标签，
+  每条能完成，整组随时取消且不会自动重建。关联挖掘：FP-Growth 从同一天出现的日程类别里
+  找常一起做的组合（只给自动排班很小加分），从聊天里找常一起出现的日常元素并存进记忆库；
+  支持度 / 置信度 / 提升度三重门槛 + 提示词「只是常见搭配，不是事实」，避免刻板印象与过拟合。
 - **资料箱 → 周课表**：图片 / PDF / 文档经 OCR + VLM 读取（OCR 正文足够时自动跳过 VLM）；
   课程表按 OCR 坐标还原成 7 天 × 12 节的周课表（星期、节次、教师、地点、日期），不再压成一串文字。
 - **重扫不再重复 / 事件不再误判（v4.1.7）**：课程按「日期 + 节次 + 标题」去重，
@@ -459,6 +474,10 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `ui_theme` | `mist` | 客户端主题 |
 | `prompt_user_name` | `朋友` | 对玩家的称呼 |
 | `aesthetic_enabled` | `true` | 审美基线 + 长期偏好培养；关闭后聊天提示词不加审美段、不学习新偏好 |
+| `exam_plan_enabled` | `true` | 新增考试后自动排 Azure 复习计划（可整组取消） |
+| `exam_plan_weeks` | `3` | 复习规划窗口（周）；实际不晚于考试前一天 |
+| `exam_plan_max_sessions` | `6` | 每场考试最多安排几次复习 |
+| `exam_plan_duration_min` | `50` | 单次复习时长（分钟） |
 
 完整字段与后端读取方见 `TECHNICAL.md`。部分设置可在围棋窗口设置面板中即时修改并写回配置；服务地址类配置通常需要重启后端。
 
@@ -510,6 +529,9 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 - `memories`：可召回长期记忆；每条带**二维情绪矩阵**（愉悦度 × 唤醒度、0~1）与九格中文标签
   （低落 / 不安 / 焦躁 / 淡然 / 平静 / 振奋 / 惬意 / 开心 / 兴奋），写入时取当时的情绪；
 - `vectors`：记忆向量（JSON）+ `model` 指纹 + `dim` 维度；换 embedding 模型后旧向量自动隔离；
+- `memory_assoc_turns` / `memory_assoc_patterns`（v4.7.0）：最近聊天的可共现元素事务，以及
+  FP-Growth 挖出的「常一起提到」搭配（支持度 ≥3、置信度 ≥0.65、提升度 ≥1.05，上限 12）；
+  只在当前话里提到相关元素时作软提示，不主动倒库、不写成事实。
 - `games`：对局归档。
 
 记忆是本地 SQLite，不上传云端。v4.3.1 起默认启用本地 **qwen3-Embedding.gguf**（llama.cpp，
@@ -560,6 +582,9 @@ CPU 编码，单条约 0.1–0.4 秒）：向量带 `model` 指纹与维度，�
 | `POST /api/files/scan` | OCR / VLM / 文档读取 → LLM 提取日程 → 写共享日程与记忆 |
 | `GET /api/schedule` | 共享日程列表（含 `grade` / `grade_label` 自动分级；`include_archived=1` 看留档） |
 | `POST /api/schedule/auto_plan` | 自动排班（分层收缩 + 机会约束 + 每日缓冲 + best-fit） |
+| `POST /api/schedule/plan` | 手动触发一次考试复习规划（没有新考试时是空操作） |
+| `POST /api/schedule/plan/cancel` | 取消一组 Azure 复习规划（整组置 cancelled，不影响用户日程） |
+| `GET /api/schedule/associations` | 日程类别共现关联（support / confidence / lift，只读） |
 | `POST /api/schedule/feedback` | 记录完成 / 推迟 / 跳过；更新 EWMA，推迟后立即重排 |
 | `GET /api/schedule/review?days=7` | 按类别复盘计划 / 实际耗时偏差与完成、推迟计数 |
 | `POST /api/schedule/archive` | 归档过期 / 指定日程（不删除） |
@@ -597,8 +622,9 @@ cd backend
 python -m unittest discover -s tests -q
 ```
 
-当前全量：**1284 tests OK**（含 `test_knowledge.py` 的 35 项、`test_aesthetics.py` 的 22 项：
-审美基线 / 玩家偏好提取 / 自己好恶的学习与落盘 / 偏好题重答 / 重复反问清理）。
+当前全量：**1302 tests OK**（含 `test_knowledge.py` 的 35 项、`test_aesthetics.py` 的 22 项、
+`test_association.py` 的 10 项 FP-Growth / 记忆关联 / 日程共现、`test_exam_plan.py` 的 8 项
+复习规划）。
 
 ### 前端门卫
 
@@ -617,7 +643,7 @@ Get-ChildItem game\tests\test_*.gd | ForEach-Object {
 }
 ```
 
-当前 21 个前端脚本全部通过；`test_pet_shell.gd` 160 项断言（含月历 / 周视图 / 表上方紧凑清单 / 完成保留 / 聊天排程与历史清洗 / 圆形遮罩 / 四档思考 / 极窄聊天适配 / 测试清理按钮 / 多屏选屏），`test_mode_transition.gd` 10 项断言（纸张转场曲线 / 端点 / 时长 / busy），`test_config.gd` 221 项断言。
+当前 21 个前端脚本全部通过；`test_pet_shell.gd` 166 项断言（含月历 / 周视图 / 表上方紧凑清单 / 完成保留 / 聊天排程与历史清洗 / 圆形遮罩 / 四档思考 / 极窄聊天适配 / 测试清理按钮 / 多屏选屏 / Azure 规划标签、整组取消与规划说明可见），`test_mode_transition.gd` 10 项断言（纸张转场曲线 / 端点 / 时长 / busy），`test_config.gd` 221 项断言。
 
 ### 启动自检
 
@@ -677,6 +703,9 @@ godot --headless --path game --export-release "Windows Desktop" "build\Azure.exe
 │  ├─ app\agent.py                回合编排 / 情绪 / 事件
 │  ├─ app\agent_graph.py          LangGraph 阶段
 │  ├─ app\knowledge.py            网页版知识查证 / 结构化记忆（v4.6.0）
+│  ├─ app\aesthetics.py           审美基线 / 长期偏好（v4.6.1）
+│  ├─ app\exam_plan.py            考试复习规划 / 空闲段 / 范围（v4.7.0）
+│  ├─ app\association.py          FP-Growth 关联挖掘（v4.7.0）
 │  ├─ app\emotion.py              PAD / 双速 / 粘性
 │  ├─ app\life.py                 生命时间线 / 慢变量 / 共享日程
 │  ├─ app\memory.py               共享记忆 / episode
