@@ -11,6 +11,7 @@ extends Node
 const NetClientScript := preload("res://scripts/net/NetClient.gd")
 const TTSClientScript := preload("res://scripts/services/TTSClient.gd")
 const PetViewScript := preload("res://scripts/app/PetView.gd")
+const ModeTransitionScript := preload("res://scripts/ui/ModeTransition.gd")
 
 const IDLE_FIRST_SEC := 15.0              # 助手存在感：先开口，但不抢话
 const PEEK_FIRST_SEC := 150.0
@@ -41,6 +42,7 @@ var _dominance := 0.50
 var _services_started := false
 var _game_running := false
 var _game_pid := -1
+var _transition = null
 
 var _last_activity := 0
 var _next_idle := 0
@@ -105,6 +107,8 @@ func _build_ui() -> void:
 	view.pet_height = clampi(int(cfg.pet_height), 96, 360)
 	view.theme = GufengTheme.build_theme(GufengTheme.font())
 	add_child(view)
+	_transition = ModeTransitionScript.new()
+	add_child(_transition)
 	view.interacted.connect(_on_interact)
 	view.chat_submitted.connect(_on_chat_submitted)
 	view.chat_opened.connect(_on_chat_opened)
@@ -1051,12 +1055,13 @@ func _launch_game() -> void:
 	view.close_files()
 	view.close_menu()
 	view.save_position()
+	var pet_pos := Vector2i(-1, -1)
+	if DisplayServer.get_name() != "headless":
+		pet_pos = DisplayServer.window_get_position()
 	if tts != null:
 		tts.stop()
 	_game_running = true
 	_game_pid = -1
-	if DisplayServer.get_name() != "headless":
-		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_MINIMIZED)
 	var exe := OS.get_executable_path()
 	if exe.ends_with("_console.exe"):
 		var alt := exe.substr(0, exe.length() - "_console.exe".length()) + ".exe"
@@ -1069,6 +1074,9 @@ func _launch_game() -> void:
 	args.append("--")
 	args.append("--game")
 	args.append("--from-pet")
+	if pet_pos.x >= 0 and pet_pos.y >= 0:
+		args.append("--pet-x=%d" % pet_pos.x)
+		args.append("--pet-y=%d" % pet_pos.y)
 	if _services_started:
 		OS.set_environment("AZURE_SERVICES_MANAGED", "1")
 	var pid := OS.create_process(exe, args)
@@ -1077,6 +1085,16 @@ func _launch_game() -> void:
 		view.show_bubble("围棋窗口没有打开，稍后再试。", 5.0)
 		return
 	_game_pid = pid
+	# 先启动新进程，让它的启动与这张纸的淡入重叠；纸盖满后再最小化桌宠。
+	if _transition != null and DisplayServer.get_name() != "headless":
+		await _transition.cover()
+		# 纸已经盖满：再给子进程一点时间创建自己的窗口，桌面不会先空出一块。
+		await get_tree().create_timer(0.35).timeout
+	# 启动失败 / 对弈窗口极快退出时，_restore_after_game 可能已经跑过：此时再最小化就会把
+	# 刚恢复的桌宠藏起来。只在「这一局还在跑」时才最小化。
+	if DisplayServer.get_name() != "headless" and _game_running and _game_pid == pid \
+			and OS.is_process_running(pid):
+		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_MINIMIZED)
 
 func _tick_game(now: int) -> void:
 	if _game_pid <= 0 or OS.is_process_running(_game_pid):
@@ -1098,6 +1116,9 @@ func _restore_after_game(now := 0) -> void:
 	_last_activity = now if now > 0 else Time.get_ticks_msec()
 	_unanswered_proactive = 0
 	_next_idle = _last_activity + _first_idle_delay_ms()
+	# 对弈窗口关掉：桌宠以「纸 → 小桌宠」淡入，不再瞬间弹回来。
+	if _transition != null and DisplayServer.get_name() != "headless":
+		await _transition.reveal()
 	_next_peek = _last_activity + int(PEEK_FIRST_SEC * 1000.0)
 	view.show_bubble("棋局先放着，我回来了。", 6.0)
 	_play_tone("happy")

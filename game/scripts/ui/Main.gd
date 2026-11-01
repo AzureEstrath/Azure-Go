@@ -7,6 +7,7 @@ const BOARD_CELLS := 4                      # 棋盘切成 4×4 个格子矩形�
 const BOARD_LAST := 18                      # 19 路棋盘的最大下标
 const CARD_FOLLOW_SEC := 0.25                # 「卡片跟随取景」的节流间隔（秒）
 const MOVE_PENDING_SEC := 12.0               # 「点下就锁」的兜底解锁：回包/事件全丢也不许把棋盘锁死
+const ModeTransitionScript := preload("res://scripts/ui/ModeTransition.gd")
 
 ## 启动设置面板确认（_ready 里 await 它，之后才按新配置起各服务）
 signal setup_confirmed
@@ -57,6 +58,7 @@ var _restart_retry_ms := 0                 # reset 请求没发出去时的重�
 var _setup_done := false                   # 本次运行已在主界面里点过「设置」：开局时不再弹第二遍
 var _setup_showing := false                # 设置面板正在显示（防重入）
 var _transition := false                   # 主界面 ⇄ 对局的运镜正在跑（期间不吃 Esc / 不叠加动画）
+var _mode_transition = null                  # 桌宠 ⇄ 对弈的纸张转场（v4.6.0）
 var _cover_only := false                   # --title：只画封面（截图调试）——不叠问候 / 设置面板
 var _shot_requested := false               # 命令行带 --shot= / --demo：截图模式
 ## —— 启动预热（和经典版一样：主界面 / 设置面板期间先把 CosyVoice 起起来）——
@@ -298,6 +300,8 @@ func _ready() -> void:
 	# `--from-pet` 表示这个窗口是桌宠拉起的独立进程，关窗即退出，由桌宠恢复自己。
 	_pet_feature_on = false
 	get_tree().auto_accept_quit = true
+	if _from_pet and _mode_transition != null:
+		_mode_transition.cover_now()          # 新窗口第一帧就铺纸，避免白闪 / 桌面空洞
 	await _boot_game()
 
 ## 启动时的公共初始化：配置、主题、字体、语音配对 / 音效。3D 世界与正式 UI 留到 `_boot_game()`。
@@ -311,6 +315,8 @@ func _boot_common() -> void:
 	_from_pet = _has_cli_arg("--from-pet")
 	_keep_game = _from_pet or _has_cli_arg("--keep-game")
 	GufengTheme.apply_preset(cfg.ui_theme)     # 建任何 UI 之前先落主题（默认雾蓝）
+	_mode_transition = ModeTransitionScript.new()
+	add_child(_mode_transition)
 	_build_pairing()                           # 语音配对状态机：只做决策，副作用回调回本文件
 	_build_sfx()                               # 对局音效：预加载 6 个音频、4 个播放器轮转
 	_font = _make_cjk_font()
@@ -338,6 +344,10 @@ func _boot_game() -> void:
 	_build_title_screen()                      # 主界面：纸幕封面（棋盘与化身在纸幕后）
 	_prewarm_local_services()                  # 封面 / 设置面板期间先把本地语音（按记住的音色）起起来
 	await _maybe_show_title()                  # 首次启动：等「开始对局」
+	if _from_pet and _mode_transition != null:
+		# 棋盘 / 侧栏已经建好就淡开纸，不再等语音服务预热：否则桌宠拉起的窗口会长时间
+		# 停在空白纸上，连「要不要等 CosyVoice」的对话框都被纸挡在下面。
+		_mode_transition.reveal()
 	if _cover_only and _shot_requested:
 		_handle_cli()                          # 只拍封面：不起服务 / 不叠问候，避免聊天面板透在纸幕后
 		return
@@ -439,8 +449,11 @@ func _enter_game_window() -> void:
 		get_viewport().transparent_bg = false
 		DisplayServer.window_set_title("Azure · 围棋陪练")
 		DisplayServer.window_set_size(Vector2i(1280, 800))
-		var scr := DisplayServer.screen_get_usable_rect(DisplayServer.window_get_current_screen())
-		DisplayServer.window_set_position(scr.position + (scr.size - Vector2i(1280, 800)) / 2)
+		if not _from_pet:
+			# 桌宠拉起的窗口：屏幕与位置已由 Launcher 按桌宠所在显示器选好，
+			# 这里再按「当前屏幕」居中会把它抢回主屏（多屏时窗口跳到另一块屏）。
+			var scr := DisplayServer.screen_get_usable_rect(DisplayServer.window_get_current_screen())
+			DisplayServer.window_set_position(scr.position + (scr.size - Vector2i(1280, 800)) / 2)
 	if _pet_layer != null:
 		_pet_layer.visible = false
 	if _pet_ui != null:
@@ -3283,6 +3296,8 @@ func _maybe_show_title() -> void:
 	_shot_requested = shot
 	if shot and not force:
 		return
+	if _from_pet and not force:
+		return                                   # 桌宠拉开：直接进棋局，不再多按一次「开始对局」
 	_open_title_screen(false)                    # 首帧直接摆到「远看棋盘 + 封面」，无动画
 	if shot:
 		return                                   # 截图模式：画出来即可，不能卡在等确认上

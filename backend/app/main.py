@@ -68,6 +68,7 @@ from . import config as config_mod
 from . import coords, events, lanes, persona, prompts, sgf
 from . import file_service
 from . import full_review
+from . import knowledge as knowledge_mod
 from . import schedule as schedule_mod
 from . import schedule_chat
 from . import schedule_learning
@@ -199,6 +200,59 @@ def _start_chat_schedule(app, cfg, agent, text):
         app.state.chat_capture_tasks = tasks
     tasks.add(task)
     task.add_done_callback(tasks.discard)
+
+
+def _last_reply_text(agent):
+    """最近一条**助手**台词（判断「她上一句是不是露怯」用；没有返回空串）。"""
+    try:
+        hist = list(getattr(getattr(agent, "st", None), "chat_history", []) or [])
+    except Exception:                       # noqa: BLE001
+        return ""
+    for m in reversed(hist):
+        if isinstance(m, dict) and str(m.get("role", "")) == "assistant":
+            return str(m.get("content", "") or "")
+    return ""
+
+
+def _start_chat_knowledge(app, agent, text):
+    """聊天结束后按需在后台查一次知识（v4.6.0）。
+
+    只在明确的知识问句、或她上一句露怯时触发（``knowledge.need`` 是纯规则）；
+    没有 token / cookie 时 ``available`` 为假，这里直接返回，**不发任何网络请求**。
+    查证不占 ``busy``、不拖慢 HTTP 回包；任务与聊天排程共用同一个退出取消集合。
+    """
+    ks = getattr(app.state, "knowledge", None)
+    if ks is None or not bool(getattr(ks, "available", False)):
+        return
+    if not str(text or "").strip():
+        return
+    try:
+        if not knowledge_mod.need(text, _last_reply_text(agent)):
+            return
+    except Exception as e:                  # noqa: BLE001 —— 判断失败就当不需要查
+        print("[Knowledge] 触发判断失败（已忽略）：%s" % e)
+        return
+    try:
+        task = asyncio.create_task(_capture_chat_knowledge(ks, text))
+    except Exception as e:                  # noqa: BLE001 —— 建任务失败不影响聊天
+        print("[Knowledge] 查证任务创建失败（已忽略）：%s" % e)
+        return
+    tasks = getattr(app.state, "chat_capture_tasks", None)
+    if tasks is None:
+        tasks = set()
+        app.state.chat_capture_tasks = tasks
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _capture_chat_knowledge(ks, text):
+    """后台查证 + 写结构化记忆；任何失败只打日志，绝不影响聊天。"""
+    try:
+        await ks.lookup_and_remember_async(text)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:                  # noqa: BLE001
+        print("[Knowledge] 后台查证失败（已忽略）：%s" % e)
 
 
 def _recent_chat_text(agent, limit=8):
@@ -440,7 +494,7 @@ PROFILE_SOURCE_GAMES = 20
 
 
 def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=True, memory=None,
-               game_store=None, life=None):
+               game_store=None, life=None, knowledge=None):
     """构造应用；测试可注入 stub 引擎/LLM/agent/memory/tts/game_store（autostart=False 跳过引擎启动）。
 
     ``memory`` 显式传入时优先于 lifespan 构造的 ``MemoryService``（测试 seam）：
@@ -548,6 +602,15 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             if callable(_adaptive):                     # v3.11.5：注入 agent 也按配置接通
                 _adaptive(cfg.adaptive_difficulty, cfg.adaptive_difficulty_base,
                           cfg.adaptive_difficulty_spread)
+        # 知识查证（v4.6.0）：显式注入优先；没有 token / cookie 时 available=False，
+        # 后台查证与注入都不发生（零网络请求、提示词逐字符不变）。
+        ks = knowledge if knowledge is not None else knowledge_mod.KnowledgeService(
+            cfg, memory=mem, llm=getattr(app.state.agent, "llm", None))
+        app.state.knowledge = ks
+        try:
+            app.state.agent.knowledge = ks
+        except Exception as e:                  # noqa: BLE001 —— 假 agent 不能挂属性就算了
+            print("[Knowledge] 挂到 agent 失败（已忽略）：%s" % e)
         # 人格化：生产装配读一次跨局状态（关系 / 情绪余温 / 互动数）。
         # 测试装配（autostart=False）刻意不读真实 profile.db，保持门卫与提示词逐字符不变。
         if autostart:
@@ -623,6 +686,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
     @app.get("/api/health")
     async def health():
         s = a()
+        ks = getattr(app.state, "knowledge", None)
         return {
             "ok": True,
             "katago_dead": s.katago.is_dead(),
@@ -632,6 +696,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             "katago_url": cfg.katago_url,
             "llm_url": s.llm.base_url,
             "memory_rows": memory_rows(),
+            # v4.6.0：知识查证是否真的可用（没配 token / cookie 时为 false，零请求）
+            "knowledge_available": bool(getattr(ks, "available", False)),
         }
 
     @app.get("/api/lanes")
@@ -731,6 +797,8 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         await s.chat(text, str(body.get("mode", "game")))
         # 聊天回复已经通过 WS 送达；排程判断在后台继续，不拖慢这条 HTTP 回包。
         _start_chat_schedule(app, cfg, s, text)
+        # v4.6.0：明确的知识问句同样在后台查证，不占 busy、不拖慢回包。
+        _start_chat_knowledge(app, s, text)
         return ok()
 
     @app.get("/api/chat/history")
@@ -753,6 +821,41 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
         for it in items:
             if isinstance(it, dict):
                 it["reply_text"] = actions.naturalize(it.get("reply_text", ""))
+        return {"ok": True, "items": items}
+
+    @app.post("/api/knowledge/search")
+    async def knowledge_search(body: dict = None):
+        """手动查一次知识并写成结构化记忆（v4.6.0）。
+
+        关闭 / 没配 token / 网页不可用时返回 ``{"ok": false, "error": …}``，不 500。
+        查证结果写入 ``kind=knowledge`` 记忆，同一话题旧条目自动失效。
+        """
+        ks = getattr(app.state, "knowledge", None)
+        query = str((body or {}).get("query", "") or "").strip()
+        if ks is None or not bool(getattr(ks, "available", False)):
+            return {"ok": False, "error": "知识查证未启用或未配置"}
+        if query == "":
+            return {"ok": False, "error": "缺少 query"}
+        try:
+            item = await ks.lookup_and_remember_async(query)
+        except Exception as e:              # noqa: BLE001
+            print("[Knowledge] 手动查证失败（已忽略）：%s" % e)
+            item = None
+        if item is None:
+            return {"ok": False, "error": "没有查到可靠结果"}
+        return {"ok": True, "item": item}
+
+    @app.get("/api/knowledge/recent")
+    async def knowledge_recent(limit: int = 20):
+        """最近的结构化知识记忆（只读；关闭 / 无库时返回空列表）。"""
+        ks = getattr(app.state, "knowledge", None)
+        if ks is None:
+            return {"ok": True, "items": []}
+        try:
+            items = list(await asyncio.to_thread(ks.recent_rows, max(1, min(int(limit), 100))))
+        except Exception as e:              # noqa: BLE001
+            print("[Knowledge] 知识记忆读取失败（已忽略）：%s" % e)
+            items = []
         return {"ok": True, "items": items}
 
     @app.post("/api/summarize")

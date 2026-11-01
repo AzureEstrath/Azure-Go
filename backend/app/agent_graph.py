@@ -840,12 +840,22 @@ async def _prepare_chat(agent, data):
                     hint = {}
             hint = hint if isinstance(hint, dict) else {}
             chain = hint.get("chain") if isinstance(hint.get("chain"), dict) else {}
+            # v4.6.0：她查证过的知识笔记（只给非棋闲聊；读库走线程，失败只是少一段参考）
+            known = ""
+            known_fn = getattr(agent, "knowledge_note", None)
+            if callable(known_fn):
+                try:
+                    known = str(await asyncio.to_thread(known_fn, text) or "")
+                except Exception as e:      # noqa: BLE001 —— 知识注入失败不影响聊天
+                    print("[Chat] 知识笔记读取失败（已忽略）：%s" % e)
+                    known = ""
             ctx = prompts.life_context_block(
                 hist_now[:-1] if hist_now else hist_now, long_term=lt,
                 time_facts=time_facts, profile=profile,
                 schedule_text=str(facts.get("text") or ""),
                 recall_text=str(hint.get("text") or ""),
-                recall_continued=bool(chain.get("continued")))
+                recall_continued=bool(chain.get("continued")),
+                knowledge_text=known)
             data["recall_hint"] = hint
             data["personal_evidence"] = await _personal_evidence_for(agent, hist_now, text)
         else:

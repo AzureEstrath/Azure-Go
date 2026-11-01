@@ -3,7 +3,7 @@
 > **桌宠是主程序，围棋是它打开的独立窗口。**
 > 同一套 Azure 人格、情绪、时间线与记忆，在桌宠、围棋窗口和重启后的下一次见面之间保持连续。
 
-**版本：v4.5.5（Release）**
+**版本：v4.6.0（Release）**
 
 > 完整项目地图与每个文件的作用：[PROJECT_FULL.md](PROJECT_FULL.md)。
 
@@ -75,6 +75,10 @@ Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你�
 - `chat_history`：桌宠与围棋共用的最近聊天原文流水。
 - `episodes`：按 **6 轮 / 620 字 / 15 分钟空档 / 情绪效价跳变 0.30** 自动收束的聊天片段。
 - `memories`：可召回的长期记忆（聊天摘要、事件、对局总结、手动写入）。
+- **知识记忆（v4.6.0）**：遇到自己不懂的知识问句时，Azure 会用网页版 DeepSeek 查一次，
+  把结果整理成 `topic / summary / facts / confidence` 的 `kind="knowledge"` 记忆；下一轮
+  相关话题只把这份**她自己的笔记**当软提示，不念出处、不背全文。查证是后台任务，不占
+  `busy`、不拖慢聊天；没有配置 token / cookie 时零网络请求，失败也不会影响出话。
 - `LifeTimeline`：只追加的生命事件与相对时间事实；桌宠启动时能知道“上一回见到你是什么时候”。
 - 共享后端：桌宠、围棋窗口、重启后的 Azure 看到的是同一份情绪与记忆。
 
@@ -173,6 +177,12 @@ Azure 是一个本地优先的桌面 AI 助手：她可以待在桌面上陪你�
   **v4.5.5**：资料重扫补漏——旧图「a.jpg,b.jpg」合并来源的行按文件名一并清掉；
   LLM 把「10月31日（本周六）」算成下周时，按源公告标题与日期再挡一次；
   同一群里另一条未来考试不会被过期活动的标题片段误伤。
+  **v4.6.0**：知识查证 + 结构化人格化记忆——明确的知识问句（或她上一句露怯）触发一次后台
+  网页版 DeepSeek 查证，结果写成 `kind="knowledge"` 记忆（同话题刷新会让旧条目失效），
+  相关话题再注入「她查过的资料」软提示；网页失败 / 低置信 / 没配置都只当没查到。
+  桌宠 ⇄ 对弈窗口新增纸张转场：桌宠先盖纸 → 新窗口第一帧铺纸 → 棋盘建好就淡开，
+  多屏时沿用桌宠所在屏幕；窗口被极快关闭时不会把桌宠留在最小化状态。
+  管理面新增 `POST /api/knowledge/search` 与 `GET /api/knowledge/recent`。
 - **资料箱 → 周课表**：图片 / PDF / 文档经 OCR + VLM 读取（OCR 正文足够时自动跳过 VLM）；
   课程表按 OCR 坐标还原成 7 天 × 12 节的周课表（星期、节次、教师、地点、日期），不再压成一串文字。
 - **重扫不再重复 / 事件不再误判（v4.1.7）**：课程按「日期 + 节次 + 标题」去重，
@@ -420,6 +430,14 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `schedule_ewma_alpha` | `0.35` | 真实耗时 EWMA 的更新速度 |
 | `schedule_align_min` | `30` | 普通任务开始时间的对齐粒度（分钟） |
 | `schedule_transition_min` | `10` | 课程 / 约定前后的通勤与切换留白（分钟） |
+| `knowledge_enabled` | `true` | 知识查证总开关；关闭后不查、不注入 |
+| `knowledge_provider` | `deepseek_web` | `deepseek_web` / `llm` / `off` |
+| `knowledge_llm_fallback` | `false` | 网页失败时是否允许本地 LLM 兜底（会占生成槽） |
+| `deepseek_web_token` / `deepseek_web_cookie` | 空 | 网页版会话凭据；推荐用环境变量 `DEEPSEEK_WEB_TOKEN` / `DEEPSEEK_WEB_COOKIE` |
+| `deepseek_web_session_id` | 空 | 可选：复用已有网页会话；留空自动创建 |
+| `knowledge_lookup_cooldown_sec` | `600` | 同一问题成功查证后的冷却（秒）；失败只用 60 秒短冷却 |
+| `knowledge_confidence_min` | `0.55` | 低于此置信度的结果不写记忆 |
+| `knowledge_max_chars` | `420` | 存储摘要的最大字数 |
 | `vlm_enabled` | `true` | 自动窥屏 / 资料图片读取；缺环境时退化 |
 | `tts_enabled` | `true` | 语音总开关 |
 | `tts_mode` | `local` | `system` / `local` / `openai` / `aliyun` |
@@ -432,6 +450,10 @@ Godot_v4.6.3-stable_win64.exe --path game -- --game
 | `prompt_user_name` | `朋友` | 对玩家的称呼 |
 
 完整字段与后端读取方见 `TECHNICAL.md`。部分设置可在围棋窗口设置面板中即时修改并写回配置；服务地址类配置通常需要重启后端。
+
+知识查证使用**网页版 DeepSeek 的非公开会话协议**，需要你自己的浏览器会话 token / cookie：
+设置在环境变量里即可（不写进仓库、也不进日志），配置文件留空时环境变量仍然生效。
+站点改版 / 过期凭据只会让这一次查证失败，聊天与棋局照常；`knowledge_provider=off` 可整体关闭。
 
 ---
 
@@ -533,8 +555,10 @@ CPU 编码，单条约 0.1–0.4 秒）：向量带 `model` 指纹与维度，�
 | `POST /api/schedule/cleanup` | 清理超过保留期的归档 |
 | `POST /api/schedule/remind` | 手动触发一次事务提醒（LLM 文本 / 模板） |
 | `GET /api/chat/history` | 最近聊天流水 |
+| `POST /api/knowledge/search` | 手动查一次知识并写成结构化记忆（未配置 / 低置信返回 `ok=false`） |
+| `GET /api/knowledge/recent` | 最近的结构化知识记忆（`topic / summary / facts / confidence`） |
 | `GET /api/state` | 围棋棋盘权威快照 |
-| `GET /api/health` | 引擎 / LLM / 记忆状态 |
+| `GET /api/health` | 引擎 / LLM / 记忆 / 知识查证状态 |
 | `GET /api/lanes` | 任务车道统计（`foreground` / `persona` / `background`，只读） |
 | `POST /api/testing/reset` | 测试清理：清空聊天 / 长期记忆 / episode / 对话类生命事件，情绪与慢变量回基线（不动日程、棋谱） |
 
@@ -562,7 +586,8 @@ cd backend
 python -m unittest discover -s tests -q
 ```
 
-当前全量：**1227 tests OK**。
+当前全量：**1262 tests OK**（含 `test_knowledge.py` 的 35 项：触发规则 / 结构化解析 /
+SSE / 记忆写入与同话题失效 / 冷却 / API）。
 
 ### 前端门卫
 
@@ -581,7 +606,7 @@ Get-ChildItem game\tests\test_*.gd | ForEach-Object {
 }
 ```
 
-当前 20 个前端脚本全部通过；`test_pet_shell.gd` 156 项断言（含月历 / 周视图 / 表上方紧凑清单 / 完成保留 / 聊天排程与历史清洗 / 圆形遮罩 / 四档思考 / 极窄聊天适配 / 测试清理按钮），`test_config.gd` 221 项断言。
+当前 21 个前端脚本全部通过；`test_pet_shell.gd` 160 项断言（含月历 / 周视图 / 表上方紧凑清单 / 完成保留 / 聊天排程与历史清洗 / 圆形遮罩 / 四档思考 / 极窄聊天适配 / 测试清理按钮 / 多屏选屏），`test_mode_transition.gd` 10 项断言（纸张转场曲线 / 端点 / 时长 / busy），`test_config.gd` 221 项断言。
 
 ### 启动自检
 
@@ -611,7 +636,7 @@ godot --headless --path game --export-release "Windows Desktop" "build\Azure.exe
 
 发布前建议检查：
 
-1. 后端全量与前端 20 个脚本全部通过；
+1. 后端全量与前端 21 个脚本全部通过；
 2. `godot --headless --path game --quit` 退出码 0；
 3. 桌宠透明、置顶、拖动与右键菜单在目标机器上正常；
 4. `assets/azure_pet.png`、`assets/voice/`、`Azure.vrm` 在导出包中可用；
@@ -630,7 +655,7 @@ godot --headless --path game --export-release "Windows Desktop" "build\Azure.exe
 │  ├─ scenes\Launcher.tscn        主场景：桌宠 / 围棋选择
 │  ├─ scenes\Main.tscn            独立围棋窗口
 │  ├─ scripts\app\                Launcher / PetShell / PetView
-│  ├─ scripts\ui\                 Main / Board3D / AzureAvatar / TitleScreen...
+│  ├─ scripts\ui\                 Main / Board3D / AzureAvatar / TitleScreen / ModeTransition...
 │  ├─ scripts\net\NetClient.gd     REST + WebSocket 客户端
 │  ├─ scripts\services\           TTSClient / SpeechPairing
 │  ├─ assets\azure_pet.png        桌宠完整半身图
@@ -640,6 +665,7 @@ godot --headless --path game --export-release "Windows Desktop" "build\Azure.exe
 ├─ backend\                       FastAPI 后端
 │  ├─ app\agent.py                回合编排 / 情绪 / 事件
 │  ├─ app\agent_graph.py          LangGraph 阶段
+│  ├─ app\knowledge.py            网页版知识查证 / 结构化记忆（v4.6.0）
 │  ├─ app\emotion.py              PAD / 双速 / 粘性
 │  ├─ app\life.py                 生命时间线 / 慢变量 / 共享日程
 │  ├─ app\memory.py               共享记忆 / episode
@@ -672,6 +698,8 @@ godot --headless --path game --export-release "Windows Desktop" "build\Azure.exe
 - 桌宠是客户端主程序，但情绪 / 记忆 / LLM / TTS / 棋局编排仍依赖本机后端；后端不可达时只能显示离线气泡与本地反应。
 - 窥屏依赖本机 Python、OCR 与 VLM；缺环境时自动退化为普通走神，不影响聊天与围棋。
 - 资料箱扫描依赖 `peek/.venv` 的 OCR / VLM 环境；文本与 DOCX 可独立处理，PDF / 图片在缺少依赖时只会记录错误，不影响其他文件。
+- 知识查证走网页版 DeepSeek 的**非公开协议**：站点改版、凭据过期或网络不可用时只会查不到，
+  不会影响聊天与棋局；它依赖用户自己的 token / cookie，不随包分发。
 - 事件分割目前先落“时间 / 轮数 / 字数 / 情绪效价跳变”四类边界；话题 embedding 级分割、双时态记忆、记忆衰减/重新巩固仍在后续优化清单中。
 - 发布包不内置大模型与引擎权重，首次部署仍需按第 4 节准备本机服务。
 

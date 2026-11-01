@@ -79,6 +79,8 @@
 > 半角括号 / 教师姓氏残片并合并同格重复课程。**
 > **v4.5.5：重扫清理按「source 包含文件名」匹配旧合并来源；新增 `drop_past_source_items`
 > 按源公告标题 / 日期挡掉 LLM 误算成下周的过期活动，且不会误伤同群里的未来考试。**
+> **v4.6.0：新增网页版 DeepSeek 知识查证 + 结构化 `kind="knowledge"` 记忆；后台任务不占
+> busy，网页失败 / 低置信 / 未配置都只当没查到；桌宠 ⇄ 对弈新增 `ModeTransition` 纸张转场。**
 > 最后更新：2026-11-01。
 
 ---
@@ -357,6 +359,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | 教学 | `joseki_teach`、`joseki_rate`、`adaptive_difficulty` 系列 |
 | 情绪 | `emotion_drift`、`drift_base`、`drift_max` |
 | 记忆/画像 | `memory_enabled`、`memory_*`、`profile_enabled`、`time_aware_enabled` |
+| 知识查证 | `knowledge_enabled`、`knowledge_provider`、`knowledge_llm_fallback`、`deepseek_web_url/create_url/token/cookie/session_id/timeout_sec`、`knowledge_lookup_cooldown_sec`、`knowledge_confidence_min`、`knowledge_max_chars`（token / cookie 优先读环境变量 `DEEPSEEK_WEB_TOKEN` / `DEEPSEEK_WEB_COOKIE`） |
 | 语音 | `tts_enabled`、`tts_mode`、`tts_local_*`、`tts_aliyun_*`、`tts_speed/pitch/volume`、`tts_sync_speak/batch_speak/long_chunk` |
 | 视觉 | `ui_theme`、`vrm_path`、`ownership_enabled` |
 | 音效 | `sfx_enabled`、`sfx_volume` |
@@ -455,6 +458,8 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | POST | `/api/memory/write` | 手动写入记忆 |
 | GET | `/api/memory/stats` | 记忆库体量 |
 | POST | `/api/memory/forget` | 删除记忆 |
+| POST | `/api/knowledge/search` | 手动查一次知识并写结构化记忆（未配置 / 低置信返回 `ok=false`） |
+| GET | `/api/knowledge/recent` | 最近的结构化知识记忆 |
 | GET | `/api/schedule` | 共享日程列表 |
 | POST | `/api/schedule/auto_plan` | 自动排班（分层收缩 + 机会约束 + 每日缓冲 + best-fit） |
 | POST | `/api/schedule/feedback` | 完成 / 推迟 / 跳过反馈 → EWMA 学习；推迟后立即重排 |
@@ -863,6 +868,22 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
     - `schedule.drop_past_source_items`：规则抽取每个文件的公告标题与日期；
       源公告已过期时，按「条目最匹配的文件 + 标题二元组重叠 ≥2」挡掉 LLM 误算成下周的条目；
       文件匹配用 token 得分，避免同群另一条未来考试被「77期党校初级班」这类公共片段误伤。
+28. **知识查证 + 窗口转场（v4.6.0）**：
+    - `app/knowledge.py`：`need` / `query_of` / `parse_structured` / `render_note` 是纯函数；
+      `DeepSeekWebClient` 先建 session 再 completion，`_extract_web_text` 兼容 SSE 增量 /
+      累积全文与普通 JSON；`KnowledgeService.lookup_async` 把网页请求放线程、LLM 兜底留在
+      当前事件循环（生成锁绑在循环上，不能在新线程里 `asyncio.run`）。
+    - 写入：`MemoryService.remember_knowledge` → `memories(kind="knowledge", tag=topic_tag,
+      meta=结构化条目)`；`supersede_knowledge` 让同话题旧条目失效（保留审计）。
+    - 触发 / 注入：`main._start_chat_knowledge` 在 `/api/chat` 回包后起后台任务（与聊天排程
+      共用 `chat_capture_tasks`，退出时一并取消）；`agent_graph._prepare_chat` 用
+      `asyncio.to_thread(agent.knowledge_note, text)` 取注入正文，空串时 `life_context_block`
+      输出逐字符不变。失败冷却 60 秒、成功冷却 `knowledge_lookup_cooldown_sec`。
+    - 转场：`game/scripts/ui/ModeTransition.gd` 是 `CanvasLayer` 纸面覆盖层；
+      `PetShell._launch_game` 先 `cover()`、等 0.35 秒再最小化，并在最小化前复核
+      「这一局还在跑」，避免快速退出把桌宠留在最小化；`Main` 在 `_from_pet` 时第一帧
+      `cover_now()`，棋盘 / 侧栏建好就 `reveal()`；`Launcher` 用 `--pet-x/y` 选屏，
+      `Main._enter_game_window` 对 `--from-pet` 不再按当前屏幕重新居中。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 
@@ -896,7 +917,7 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
 
 | 文件 | 位置 | 内容 | 写入时机 |
 | --- | --- | --- | --- |
-| `memory.db` | `backend/data/` | 长期记忆与可选向量（`vectors.model` / `vectors.dim` 指纹） | 记忆写入/局末 |
+| `memory.db` | `backend/data/` | 长期记忆与可选向量（`vectors.model` / `vectors.dim` 指纹）；v4.6.0 起含 `kind="knowledge"` 的结构化知识条目 | 记忆写入/局末/知识查证 |
 | `profile.db` | `backend/data/` | 玩家棋风画像、每局记录、人格化状态（关系 / 情绪余温 / 互动数） | `summarize()`；画像总开关关着时不写画像，人格化仍按 `persona_enabled` 写 persona 表 |
 | `games.db` | `backend/data/` | 棋谱库、逐手、总结、注记 | 局末归档 / 导入 |
 | `joseki_progress.db` | `backend/data/` | 定式族出现计数 | 定式命中时 |

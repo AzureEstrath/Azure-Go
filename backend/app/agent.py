@@ -1234,6 +1234,23 @@ class AzureAgent:
             print("[Agent] 长期记忆召回异常（已忽略）：%s" % e)
             return ""
 
+    # —— 知识查证（v4.6.0）：查过的资料写成结构化记忆，下一轮相关话题再注入 ——
+
+    def knowledge_note(self, query) -> str:
+        """她查过的知识笔记（注入聊天上下文用）；未接线 / 关闭 / 任何故障返回空串。
+
+        本方法是**同步**的：调用点必须 ``await asyncio.to_thread(self.knowledge_note, …)``——
+        读 SQLite 不得冻住事件循环。注不进去只是少一段参考，绝不影响出话。
+        """
+        k = getattr(self, "knowledge", None)
+        if k is None:
+            return ""
+        try:
+            return str(k.note_for(str(query or "")) or "")
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 知识记忆注入异常（已忽略）：%s" % e)
+            return ""
+
     # —— 主动回忆：不是每句都提，按情绪/无聊/亲密与随机门决定 ——
 
     def idle_recall_chance(self) -> float:

@@ -767,3 +767,14 @@ func _test_launcher() -> void:
 	_check("--shot 走围棋（截图调试）",
 		_launcher_script.pick_mode(PackedStringArray(["--shot=x.png"]), false, true))
 	_check("无头模式走围棋", _launcher_script.pick_mode(PackedStringArray([]), true, true))
+	_check("桌宠位置参数解析",
+		_launcher_script.pet_position(PackedStringArray(["--pet-x=120", "--pet-y=80"]))
+			== Vector2i(120, 80))
+	_check("缺一维不猜桌宠位置",
+		_launcher_script.pet_position(PackedStringArray(["--pet-x=120"])) == Vector2i(-1, -1))
+	_check("多屏按桌宠位置选屏",
+		_launcher_script.screen_for_point(Vector2i(2100, 100),
+			[Rect2i(0, 0, 1920, 1080), Rect2i(1920, 0, 1920, 1080)]) == 1)
+	_check("落不到任何屏时回主屏",
+		_launcher_script.screen_for_point(Vector2i(-50, -50),
+			[Rect2i(0, 0, 1920, 1080)]) == 0)

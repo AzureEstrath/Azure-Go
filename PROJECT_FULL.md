@@ -1,4 +1,4 @@
-# Azure · 全量项目文档（v4.5.5）
+# Azure · 全量项目文档（v4.6.0）
 
 > 本文件是**完整项目地图**：系统架构、人格化 / 日程 / 记忆三条主通路、代码量审计结果、
 > 每个第一方文件的作用、配置与测试入口、维护约定。
@@ -310,9 +310,30 @@ FastAPI 后端（backend/app，端口 8000）
   若源公告已过期，而 LLM 把「本周六」算成下周，就按「条目最匹配的文件 + 标题二元组重叠 ≥2」
   挡掉该条；同一群里另一条未来考试不会因为共享「77期党校初级班」被误伤。
 
+### 4.14 知识查证与窗口转场（v4.6.0）
+
+- **触发规则**：`knowledge.need(text, reply)` 是纯函数——排除日程 / 棋局 / 私人话题；明确知识
+  问句（什么是 / 为什么 / 怎么 / 原理 / 区别…）或她上一句露怯（「我不确定」）时触发。
+  查证是后台任务，不占 `busy`、不拖慢 HTTP 回包。
+- **网页查证**：`DeepSeekWebClient` 用用户自己的 token / cookie 走网页版会话：先
+  `chat_session/create`，再 `chat/completion`；兼容 SSE 增量 / 累积全文与普通 JSON。
+  超时、协议变化、空结果一律返回空串，只打日志。
+- **结构化**：`parse_structured` 只接受 `topic / summary / facts / confidence`；没有按 JSON
+  回答的正文只当 0.5 低置信（默认阈值 0.55 下不写）；置信度不足不写记忆。
+- **记忆**：写入 `memories(kind="knowledge")`，`meta` 保留完整结构；同一 `topic_tag` 刷新时
+  旧条目 supersede（保留审计、不删除）；`render_note` 按 query 二元组重叠选最多 2 条注入。
+- **注入**：只插在聊天 `life_context_block` 的长期记忆段之后；空串时输出逐字符不变；
+  标题是「她查过的资料」，要求不念出处、不背全文。`knowledge_enabled=false` 时不读不写。
+- **窗口转场**：`ModeTransition` 纸张覆盖层（0.22s 盖 / 0.28s 揭，smoothstep 纯函数）；
+  桌宠先盖纸、等 0.35s 给子进程建窗后再最小化；新窗口第一帧 `cover_now`，棋盘 / 侧栏建好
+  就 reveal，不把「等 CosyVoice」的对话框挡在纸下面。`Launcher` 按 `--pet-x/y` 选屏并居中，
+  `Main._enter_game_window` 对 `--from-pet` 不再抢回主屏；快速退出不会把桌宠留在最小化。
+- **API**：`POST /api/knowledge/search`、`GET /api/knowledge/recent`；`/api/health` 增
+  `knowledge_available`，不返回 token / cookie。
+
 ---
 
-## 5. 代码量与结构审计（v4.5.5）
+## 5. 代码量与结构审计（v4.6.0）
 
 ### 5.1 体量最大的文件
 
@@ -323,10 +344,12 @@ FastAPI 后端（backend/app，端口 8000）
 | ~3136 | `backend/tests/test_agent.py` | Agent 全链路回归 |
 | ~2681 | `game/scripts/app/PetView.gd` | 桌宠视图、聊天面板、月历 / 周表、紧凑日程清单 |
 | ~2006 | `backend/app/agent_graph.py` | LangGraph 六节点编排与全部提示词装配（含延后语音 / `no_think`） |
-| ~1756 | `backend/app/main.py` | FastAPI 生命周期 / REST / WS / 日程后台任务 |
+| ~1756 | `backend/app/main.py` | FastAPI 生命周期 / REST / WS / 日程后台任务 / 知识查证接线 |
 | ~1409 | `backend/app/life.py` | 生命时间线 / 慢变量 / 日程持久化（含原地细化） |
-| ~1159 | `game/scripts/app/PetShell.gd` | 桌宠外壳、服务拉起、聊天 / 窥屏 / 情绪同步 |
+| ~1159 | `game/scripts/app/PetShell.gd` | 桌宠外壳、服务拉起、聊天 / 窥屏 / 情绪同步、窗口转场 |
+| ~534 | `backend/app/knowledge.py` | 网页版知识查证 / 结构化解析 / 知识记忆注入（v4.6.0） |
 | ~300 | `backend/app/personal_facts.py` | 玩家私人事实守卫（纯逻辑） |
+| ~93 | `game/scripts/ui/ModeTransition.gd` | 桌宠 ⇄ 对弈纸张转场（v4.6.0） |
 | ~70 | `backend/app/lanes.py` | 任务车道统计（纯标准库） |
 
 ### 5.2 已做的收敛
@@ -339,6 +362,10 @@ FastAPI 后端（backend/app，端口 8000）
   顺序一条没动。
 - v4.5.5 只改重扫清理与过期兜底：`delete_schedule_source` 改「source 包含文件名」匹配，
   `drop_past_source_items` 按源公告标题 / 日期挡过期条；不新增表、不新增 LLM 调用。
+- v4.6.0 知识查证走**后台任务**，不占 `busy`、不新增回合内 LLM 调用；网页失败 / 低置信 /
+  未配置都只当没查到。知识记忆复用既有 `memories` 表（`kind="knowledge"` + `meta`），
+  **不新增表**；同话题用 supersede 收敛。转场只是 `CanvasLayer` 覆盖层 + 纯时间函数，
+  不改窗口生命周期、不碰服务与 `busy`。
 - v4.5.4 资料扫描只改「读图 → 提取 → 入库」之间的清洗：OCR 足够时不调 VLM、
   公告按去换行整段重建、日期对回源文件、分组时间折叠、过期条目过滤；
   不新增表、不新增常驻 LLM 调用，课程表仍按 OCR 坐标直接入库。
@@ -422,6 +449,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `joseki.py` | 定式识别、分支、族命名与讲解素材 |
 | `joseki_gate.py` | 定式提示门控：技能 / 情绪 / 冷却 / 概率 |
 | `joseki_progress.py` | 定式族出现计数与复习优先级 |
+| `knowledge.py` | 知识查证（v4.6.0）：网页版 DeepSeek 客户端、结构化解析、知识记忆写入 / 注入、冷却 |
 | `lanes.py` | 任务车道统计：`foreground` / `persona` / `background` 计数与耗时，只观测 |
 | `life.py` | 生命时间线：慢变量、情绪快照、事件、日程（含 `refine_id` 原地细化）、类别耗时、统计、测试清理基线 |
 | `llm.py` | `LLMClient`：LangChain 链、按调用思考档 / `no_think`、超时、失败映射 |
@@ -494,6 +522,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_state.py` | 对局状态 |
 | `test_time_ctx.py` | 时间事实 |
 | `test_timetable.py` | 课表几何还原、课程名清洗（括号 / 省略号 / 教师姓氏残片） |
+| `test_knowledge.py` | 知识查证：触发规则 / 结构化解析 / SSE / 记忆写入与同话题失效 / 冷却 / API（v4.6.0） |
 | `test_tools.py` | 发言侧工具 |
 | `test_tts*.py` | TTS 文本 / 缓存 / 阿里云 / 链路 |
 | `test_agent_graph.py` / `test_agent.py` 中的 v4.4.x / v4.5.0 用例 | 回忆链、日程事实、动态情绪权重、embedding、私人事实重答、聊天 UI 适配、情绪方向、隐式日程、延后语音顺序、`no_think` 三阶段、主动提问记账 |
@@ -522,6 +551,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `ui/JosekiCard.gd` | 定式教学卡片 |
 | `ui/Main.gd` | 围棋主窗口：对局、聊天、设置、资料、日程、服务状态 |
 | `ui/MiniBoard.gd` | 小棋盘预览 / 复盘缩略 |
+| `ui/ModeTransition.gd` | 桌宠 ⇄ 对弈纸张转场（覆盖 / 揭开曲线，纯时间函数） |
 | `ui/PetMode.gd` | 桌宠模式切换与独立窗口 |
 | `ui/TitleScreen.gd` | 标题页 |
 | `addons/azure_dev/plugin.gd` | 开发期 Godot 编辑器插件（一键自检 / 开发辅助） |

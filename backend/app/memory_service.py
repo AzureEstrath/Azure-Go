@@ -392,6 +392,44 @@ class MemoryService:
             print("[Memory] 取消记忆写入失败（已忽略）：%s" % e)
             return None
 
+    def remember_knowledge(self, text: str, tag: str, meta: dict | None = None) -> int | None:
+        """写一条 ``kind=knowledge`` 的结构化知识记忆（v4.6.0）。"""
+        if self.store is None:
+            return None
+        m = dict(meta) if isinstance(meta, dict) else {}
+        try:
+            return self.store.write(str(text or ""), kind="knowledge",
+                                    tag=str(tag or ""), meta=m)
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 知识记忆写入失败（已忽略）：%s" % e)
+            return None
+
+    def knowledge_rows(self, limit: int = 20) -> list:
+        """最近的结构化知识记忆（含 meta）；关闭 / 失败返回 ``[]``。"""
+        if self.store is None:
+            return []
+        try:
+            return list(self.store.recent_by_kind("knowledge", int(limit or 20)) or [])
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 知识记忆读取失败（已忽略）：%s" % e)
+            return []
+
+    def supersede_knowledge(self, tag: str, keep_id: int = 0) -> int:
+        """同一知识话题刷新时让旧条目失效；返回失效条数。"""
+        if self.store is None or str(tag or "") == "":
+            return 0
+        try:
+            rows = self.store.recent_by_kind("knowledge", 40)
+            ids = [int(r["id"]) for r in rows
+                   if str(r.get("tag", "")) == str(tag) and int(r.get("id", 0)) != int(keep_id)]
+            if not ids:
+                return 0
+            return int(self.store.supersede(ids, by_id=int(keep_id or 0),
+                                            reason="knowledge_refresh") or 0)
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 知识记忆失效失败（已忽略）：%s" % e)
+            return 0
+
     # —— 桌宠 / 围棋共用的事件记忆（MaiBot 式「episode + 可召回摘要」的轻量实现） ——
 
     def recent_chats(self, limit: int = 50) -> list:

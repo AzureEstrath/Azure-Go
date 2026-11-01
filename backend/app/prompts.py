@@ -345,6 +345,20 @@ def long_term_note(text):
         + "只在与眼前盘面不冲突时自然参考，拿不准就按眼前这盘棋来。") % t
 
 
+def knowledge_note(text):
+    """她查证过、整理成结构化记忆的资料（v4.6.0）：是她自己的笔记，不是网页原文。
+
+    ``text`` 为空串时返回空串——没有知识记忆时聊天上下文逐字符不变。
+    措辞只写「怎么用」，不写具体话术（提示词里不放可被照抄的例句）。
+    """
+    t = str(text or "").strip()
+    if t == "":
+        return ""
+    return ("\n\n【她查过的资料 · 她自己的笔记，不是网页原文】\n%s\n"
+        + "这些是她以前不懂时自己查过、记下来的要点：只在与玩家这句话相关时自然用上，"
+        + "别念出处、别说「我查过资料」，也别整段背出来；与眼前事实冲突或拿不准时按不确定处理。") % t
+
+
 def recall_note(text, continued=False):
     """主动回忆链的单条提示（v4.3.0，D）：只是心里浮起的旧事，可以提，也可以不提。
 
@@ -1000,7 +1014,7 @@ def context_block(moves, memory_log, chat_history, phase, skip_last_chat=False, 
 
 
 def life_context_block(chat_history, long_term="", time_facts=None, profile=None, schedule_text="",
-                       recall_text="", recall_continued=False):
+                       recall_text="", recall_continued=False, knowledge_text=""):
     """聊天专用上下文（v4.2.7）：只给对话 / 长期记忆 / 时间 / 画像 / 近期真实日程，不塞棋面与棋评铁律。
 
     桌宠聊天、以及围棋窗口里「与棋无关」的闲聊都走这里——模型看不到当前盘面与 KataGo
@@ -1010,6 +1024,7 @@ def life_context_block(chat_history, long_term="", time_facts=None, profile=None
     ``schedule_text``（v4.2.9）是未来 48 小时的真实日程摘要；非空时插在时间/画像块之后，
     防止「明天不用赶早八」这类与日程冲突的判断。
     ``recall_text``（v4.3.0）是回忆链挑中的一条旧事：只作可选提示，不强制提；空串不留痕。
+    ``knowledge_text``（v4.6.0）是她查证过的结构化笔记：空串不留痕。
     各空段与 ``context_block`` 同口径：没有内容时不留痕；纯函数，不读全局状态。
     """
     sched = str(schedule_text or "").strip()
@@ -1021,9 +1036,10 @@ def life_context_block(chat_history, long_term="", time_facts=None, profile=None
     # 出话后还有 personal_facts 的逻辑核对兜底。
     scope = ("\n\n【信息边界】\n你只知道玩家亲口说过、或日程 / 画像里写明的事；"
              "没提到的私人经历不要替他编造，不确定就自然问一句。")
-    return _t("【最近的对话】\n%s%s%s%s%s%s%s" % (
+    return _t("【最近的对话】\n%s%s%s%s%s%s%s%s" % (
         chat_brief(chat_history),
         long_term_note(long_term),
+        knowledge_note(knowledge_text),
         recall_note(recall_text, recall_continued),
         time_note(time_facts),
         profile_note(profile, 0),

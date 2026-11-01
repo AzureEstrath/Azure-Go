@@ -36,7 +36,8 @@ class RestTest(unittest.TestCase):
             self.assertEqual(r.status_code, 200)
             self.assertTrue(r.json()["ok"])
             self.assertEqual(set(r.json()),
-                             {"ok", "katago_dead", "katago_error", "katago_url", "llm_url", "memory_rows"})
+                             {"ok", "katago_dead", "katago_error", "katago_url", "llm_url",
+                              "memory_rows", "knowledge_available"})
 
             lanes = client.get("/api/lanes").json()
             self.assertTrue(lanes["ok"])

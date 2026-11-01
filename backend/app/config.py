@@ -81,6 +81,21 @@ class AzureConfig:
         self.schedule_reminder_enabled = True
         self.schedule_archive_days = 7
         self.schedule_retention_days = 30
+        # —— 知识查证（v4.6.0）：遇到不懂的知识，用网页版 DeepSeek 查一次并写成结构化记忆 ——
+        # 默认 provider 走网页版；没有 token / cookie 时服务不可用，不会产生任何网络请求。
+        # token / cookie 建议用环境变量 DEEPSEEK_WEB_TOKEN / DEEPSEEK_WEB_COOKIE，避免写进仓库。
+        self.knowledge_enabled = True
+        self.knowledge_provider = "deepseek_web"     # deepseek_web / llm / off
+        self.knowledge_llm_fallback = False          # 网页版失败时是否允许本地 LLM 兜底（会占生成槽）
+        self.deepseek_web_url = "https://chat.deepseek.com/api/v0/chat/completion"
+        self.deepseek_web_create_url = "https://chat.deepseek.com/api/v0/chat_session/create"
+        self.deepseek_web_token = ""
+        self.deepseek_web_cookie = ""
+        self.deepseek_web_session_id = ""
+        self.deepseek_web_timeout_sec = 30.0
+        self.knowledge_lookup_cooldown_sec = 600
+        self.knowledge_max_chars = 420
+        self.knowledge_confidence_min = 0.55
         # v4.1.1 动态排程：每日集中缓冲 / 已承诺窗口 / 机会约束 / EWMA 学习速度。
         self.schedule_buffer_min = 45       # 每天工作窗口末尾预留的弹性时间（分钟）
         self.schedule_lock_hours = 12       # 自动安排在未来多少小时内不再移动
@@ -275,6 +290,35 @@ class AzureConfig:
                 d.get("schedule_transition_min", self.schedule_transition_min))))
             self.schedule_align_min = max(1, min(60, int(
                 d.get("schedule_align_min", self.schedule_align_min))))
+        except (TypeError, ValueError):
+            pass
+        v = d.get("knowledge_enabled")
+        self.knowledge_enabled = v if isinstance(v, bool) else self.knowledge_enabled
+        prov = str(d.get("knowledge_provider", self.knowledge_provider) or "").strip().lower()
+        self.knowledge_provider = prov if prov in ("deepseek_web", "llm", "off") else "deepseek_web"
+        v = d.get("knowledge_llm_fallback")
+        self.knowledge_llm_fallback = v if isinstance(v, bool) else self.knowledge_llm_fallback
+        self.deepseek_web_url = str(d.get("deepseek_web_url", self.deepseek_web_url))
+        self.deepseek_web_create_url = str(d.get(
+            "deepseek_web_create_url", self.deepseek_web_create_url))
+        # token / cookie 优先读环境变量（配置文件里留空时也不会把环境变量顶掉）。
+        self.deepseek_web_token = str(
+            os.environ.get("DEEPSEEK_WEB_TOKEN", "")
+            or d.get("deepseek_web_token", self.deepseek_web_token) or "")
+        self.deepseek_web_cookie = str(
+            os.environ.get("DEEPSEEK_WEB_COOKIE", "")
+            or d.get("deepseek_web_cookie", self.deepseek_web_cookie) or "")
+        self.deepseek_web_session_id = str(d.get(
+            "deepseek_web_session_id", self.deepseek_web_session_id))
+        try:
+            self.deepseek_web_timeout_sec = max(5.0, min(120.0, float(d.get(
+                "deepseek_web_timeout_sec", self.deepseek_web_timeout_sec))))
+            self.knowledge_lookup_cooldown_sec = max(60, min(86400, int(d.get(
+                "knowledge_lookup_cooldown_sec", self.knowledge_lookup_cooldown_sec))))
+            self.knowledge_max_chars = max(120, min(1200, int(d.get(
+                "knowledge_max_chars", self.knowledge_max_chars))))
+            self.knowledge_confidence_min = max(0.0, min(1.0, float(d.get(
+                "knowledge_confidence_min", self.knowledge_confidence_min))))
         except (TypeError, ValueError):
             pass
         v = d.get("adaptive_difficulty")        # 只认 JSON true / false（与 profile_enabled 同口径）

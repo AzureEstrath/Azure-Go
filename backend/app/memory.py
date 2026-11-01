@@ -511,6 +511,29 @@ class MemoryStore:
                     pass
                 return None
 
+    def recent_by_kind(self, kind: str, limit: int = 20) -> list:
+        """按 kind 取最近的有效记忆（含 meta）；知识查证 / 管理面使用。
+
+        与 recall 不同，这里不做向量排序，只按时间倒序；返回字段含 ``meta``，
+        供「她查过的资料」结构化注入。库不可用 / 脏 kind 返回 ``[]``。
+        """
+        k = max(1, min(int(limit or 20), 200))
+        kd = str(kind or "").strip()
+        if kd == "" or self._conn is None:
+            return []
+        try:
+            with self._lock:
+                rows = [dict(r) for r in self._conn.execute(
+                    "SELECT id, ts, kind, tag, text, meta, emo_v, emo_a, emo_tag "
+                    "FROM memories WHERE status = 'active' AND kind = ? "
+                    "ORDER BY ts DESC, id DESC LIMIT ?", (kd, k))]
+        except Exception as e:              # noqa: BLE001
+            print("[Memory] 按 kind 读取失败（已忽略）：%s" % e)
+            return []
+        for row in rows:
+            row["meta"] = _loads_meta(row.get("meta"))
+        return rows
+
     def recall(self, query: str, k: int = 3, mood=None, min_score: float = 0.0) -> list:
         """召回最相关的 ``k`` 条记忆，按 score 降序；任何故障返回 ``[]``。
 
