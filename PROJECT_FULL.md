@@ -1,4 +1,4 @@
-# Azure · 全量项目文档（v4.6.0）
+# Azure · 全量项目文档（v4.6.1）
 
 > 本文件是**完整项目地图**：系统架构、人格化 / 日程 / 记忆三条主通路、代码量审计结果、
 > 每个第一方文件的作用、配置与测试入口、维护约定。
@@ -331,9 +331,26 @@ FastAPI 后端（backend/app，端口 8000）
 - **API**：`POST /api/knowledge/search`、`GET /api/knowledge/recent`；`/api/health` 增
   `knowledge_available`，不返回 token / cookie。
 
+### 4.15 审美基线与发展（v4.6.1）
+
+- **基础眼光**：`app/aesthetics.py` 的 `BASELINE` 定义八个维度（情绪与余韵 / 笔触与手作感 /
+  骨气与结构 / 温柔与含蓄 / 叙事与留白 / 安静与日常感 / 新奇与实验 / 热闹与明快），
+  初始值重前六项、轻热闹；不是按热度投票，也不是写死的作品答案。
+- **玩家偏好**：`merge_user_evidence` 从最近对话识别「我 / 自己 + 喜欢 / 选 …」、已知作品的
+  短答与正负情感，写成 `owner="user"` 的条目；**不改 Azure 的轴线**，只用来接住对方说过的话。
+- **自己的发展**：`learn_from_reply` 只学 Azure 自己的明确好恶；新判断才按 `LEARN_RATE`
+  微调轴线（同一判断重复出现不重复学习）；作品去重、上限 40 条，状态写进
+  `profile.db` 的 `persona` 表 `aesthetic` 键，跨重启恢复。
+- **聊天接线**：`agent.aesthetic_note()` 生成「你的审美」段，只在非棋闲聊里追加到系统消息；
+  `_guard_aesthetic_reply` 在偏好题上检查回答是否带自己的判断（只报热门名 / 空短答会重答一次，
+  仍不合格就用「只讲标准、不硬选作品」的 `taste_fallback`），并在玩家已说过偏好时删掉句尾
+  「你呢 / 你最喜欢哪个」这类空洞反问。
+- **关闭**：`aesthetic_enabled=false` 或 `persona_enabled=false` 时提示词不加审美段、不学习、
+  不清理反问（与没有这个功能时逐字符同构）。
+
 ---
 
-## 5. 代码量与结构审计（v4.6.0）
+## 5. 代码量与结构审计（v4.6.1）
 
 ### 5.1 体量最大的文件
 
@@ -348,6 +365,7 @@ FastAPI 后端（backend/app，端口 8000）
 | ~1409 | `backend/app/life.py` | 生命时间线 / 慢变量 / 日程持久化（含原地细化） |
 | ~1159 | `game/scripts/app/PetShell.gd` | 桌宠外壳、服务拉起、聊天 / 窥屏 / 情绪同步、窗口转场 |
 | ~534 | `backend/app/knowledge.py` | 网页版知识查证 / 结构化解析 / 知识记忆注入（v4.6.0） |
+| ~600 | `backend/app/aesthetics.py` | 审美基线 / 玩家偏好提取 / 自己好恶的长期学习（v4.6.1） |
 | ~300 | `backend/app/personal_facts.py` | 玩家私人事实守卫（纯逻辑） |
 | ~93 | `game/scripts/ui/ModeTransition.gd` | 桌宠 ⇄ 对弈纸张转场（v4.6.0） |
 | ~70 | `backend/app/lanes.py` | 任务车道统计（纯标准库） |
@@ -366,6 +384,10 @@ FastAPI 后端（backend/app，端口 8000）
   未配置都只当没查到。知识记忆复用既有 `memories` 表（`kind="knowledge"` + `meta`），
   **不新增表**；同话题用 supersede 收敛。转场只是 `CanvasLayer` 覆盖层 + 纯时间函数，
   不改窗口生命周期、不碰服务与 `busy`。
+- v4.6.1 审美是**纯规则 + 低频写库**：基线 / 偏好提取 / 回答检查都不调 LLM；只有偏好题
+  缺少自己的判断时多一次短重答（超时 10 秒），失败就用确定性兜底。自己好恶只在
+  判断真的变化时写 `persona`，同一句重复不会反复写库；玩家偏好单独记 `owner="user"`，
+  不参与轴线更新。
 - v4.5.4 资料扫描只改「读图 → 提取 → 入库」之间的清洗：OCR 足够时不调 VLM、
   公告按去换行整段重建、日期对回源文件、分组时间折叠、过期条目过滤；
   不新增表、不新增常驻 LLM 调用，课程表仍按 OCR 坐标直接入库。
@@ -450,6 +472,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `joseki_gate.py` | 定式提示门控：技能 / 情绪 / 冷却 / 概率 |
 | `joseki_progress.py` | 定式族出现计数与复习优先级 |
 | `knowledge.py` | 知识查证（v4.6.0）：网页版 DeepSeek 客户端、结构化解析、知识记忆写入 / 注入、冷却 |
+| `aesthetics.py` | 审美（v4.6.1）：基础眼光、作品标签、玩家偏好提取、自己好恶学习、偏好题检查 / 重复反问清理 |
 | `lanes.py` | 任务车道统计：`foreground` / `persona` / `background` 计数与耗时，只观测 |
 | `life.py` | 生命时间线：慢变量、情绪快照、事件、日程（含 `refine_id` 原地细化）、类别耗时、统计、测试清理基线 |
 | `llm.py` | `LLMClient`：LangChain 链、按调用思考档 / `no_think`、超时、失败映射 |
@@ -523,6 +546,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_time_ctx.py` | 时间事实 |
 | `test_timetable.py` | 课表几何还原、课程名清洗（括号 / 省略号 / 教师姓氏残片） |
 | `test_knowledge.py` | 知识查证：触发规则 / 结构化解析 / SSE / 记忆写入与同话题失效 / 冷却 / API（v4.6.0） |
+| `test_aesthetics.py` | 审美：基线 / 玩家偏好 / 自己好恶学习与落盘 / 偏好题重答 / 重复反问清理（v4.6.1） |
 | `test_tools.py` | 发言侧工具 |
 | `test_tts*.py` | TTS 文本 / 缓存 / 阿里云 / 链路 |
 | `test_agent_graph.py` / `test_agent.py` 中的 v4.4.x / v4.5.0 用例 | 回忆链、日程事实、动态情绪权重、embedding、私人事实重答、聊天 UI 适配、情绪方向、隐式日程、延后语音顺序、`no_think` 三阶段、主动提问记账 |

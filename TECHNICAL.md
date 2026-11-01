@@ -81,6 +81,9 @@
 > 按源公告标题 / 日期挡掉 LLM 误算成下周的过期活动，且不会误伤同群里的未来考试。**
 > **v4.6.0：新增网页版 DeepSeek 知识查证 + 结构化 `kind="knowledge"` 记忆；后台任务不占
 > busy，网页失败 / 低置信 / 未配置都只当没查到；桌宠 ⇄ 对弈新增 `ModeTransition` 纸张转场。**
+> **v4.6.1：Azure 有基础审美（意境 / 笔触 / 骨气 / 温柔 / 安静，轻热闹与跟风），自己明确的
+> 好恶按小学习率沉淀到 persona 表；偏好题先给标准再举例，只报热门名 / 没判断会重答一次；
+> 玩家已说过偏好时删掉句尾「你呢」这类空洞反问。**
 > 最后更新：2026-11-01。
 
 ---
@@ -360,6 +363,7 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 | 情绪 | `emotion_drift`、`drift_base`、`drift_max` |
 | 记忆/画像 | `memory_enabled`、`memory_*`、`profile_enabled`、`time_aware_enabled` |
 | 知识查证 | `knowledge_enabled`、`knowledge_provider`、`knowledge_llm_fallback`、`deepseek_web_url/create_url/token/cookie/session_id/timeout_sec`、`knowledge_lookup_cooldown_sec`、`knowledge_confidence_min`、`knowledge_max_chars`（token / cookie 优先读环境变量 `DEEPSEEK_WEB_TOKEN` / `DEEPSEEK_WEB_COOKIE`） |
+| 审美 | `aesthetic_enabled`（与 `persona_enabled` 一起生效；任一关闭 ⇒ 不加审美段、不学习、不清理反问） |
 | 语音 | `tts_enabled`、`tts_mode`、`tts_local_*`、`tts_aliyun_*`、`tts_speed/pitch/volume`、`tts_sync_speak/batch_speak/long_chunk` |
 | 视觉 | `ui_theme`、`vrm_path`、`ownership_enabled` |
 | 音效 | `sfx_enabled`、`sfx_volume` |
@@ -884,6 +888,24 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
       「这一局还在跑」，避免快速退出把桌宠留在最小化；`Main` 在 `_from_pet` 时第一帧
       `cover_now()`，棋盘 / 侧栏建好就 `reveal()`；`Launcher` 用 `--pet-x/y` 选屏，
       `Main._enter_game_window` 对 `--from-pet` 不再按当前屏幕重新居中。
+29. **基础审美与长期偏好（v4.6.1）**：
+    - `app/aesthetics.py`：`BASELINE` 八维（情绪 / 笔触 / 结构 / 温柔 / 叙事 / 安静 /
+      新奇 / 热闹），`KNOWN_TAGS` 只用于认作品、不用于写死答案；`merge_user_evidence`
+      把玩家明确喜欢 / 不喜欢 / 提过的作品记成 `owner="user"`，**不改 Azure 轴线**；
+      `learn_from_reply` 只从 Azure 自己的明确好恶学习，按 `LEARN_RATE` 微调并写
+      `owner="azure"` 条目；同一判断重复出现不重复学习 / 不写库。
+    - 提示词：`agent.aesthetic_note()` 生成「你的审美」段，仅在非棋闲聊时追加到系统消息；
+      偏好题额外要求「先说标准、再举例，不用热度 / 销量作理由，没接触过就直说，网页资料也要
+      先过自己的审美」，并把玩家已说过的偏好列出来、要求接着说不反问。
+    - 回答检查：`agent_graph._guard_aesthetic_reply` 对偏好题调用
+      `aesthetics.needs_taste_retry`；只报热门名 / 作品名或没有审美词的极短回答，给模型一次
+      10 秒短重答；仍不合格用 `taste_fallback`（只讲标准、不硬选作品）。玩家已说过偏好时，
+      `strip_echo_question` 删掉句尾「你呢 / 你最喜欢哪个」这类空洞反问，真正的新问题不动。
+    - 落盘：`Agent._learn_and_save_aesthetics` 在聊天 finalize 里 `await asyncio.to_thread`
+      写 `profile.db` 的 `persona` 表 `aesthetic` 键；`load_persona` 启动恢复；只有当判断真的
+      变化时才写（普通聊天不会因为扫历史而每轮写库）。任何故障只打日志，聊天照常。
+    - 关闭：`aesthetic_enabled=false` 或 `persona_enabled=false` ⇒ 提示词不加段、不学习、
+      不清理反问；既有 prompt golden 不受影响（审美段只在聊天系统消息里，且为空时逐字符不变）。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 
@@ -918,7 +940,7 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
 | 文件 | 位置 | 内容 | 写入时机 |
 | --- | --- | --- | --- |
 | `memory.db` | `backend/data/` | 长期记忆与可选向量（`vectors.model` / `vectors.dim` 指纹）；v4.6.0 起含 `kind="knowledge"` 的结构化知识条目 | 记忆写入/局末/知识查证 |
-| `profile.db` | `backend/data/` | 玩家棋风画像、每局记录、人格化状态（关系 / 情绪余温 / 互动数） | `summarize()`；画像总开关关着时不写画像，人格化仍按 `persona_enabled` 写 persona 表 |
+| `profile.db` | `backend/data/` | 玩家棋风画像、每局记录、人格化状态（关系 / 情绪余温 / 互动数）与审美状态（`persona.aesthetic`：轴线 / 自己与对方的作品偏好） | `summarize()`；画像总开关关着时不写画像，人格化仍按 `persona_enabled` 写 persona 表；审美在聊天里判断变化时低频写 |
 | `games.db` | `backend/data/` | 棋谱库、逐手、总结、注记 | 局末归档 / 导入 |
 | `joseki_progress.db` | `backend/data/` | 定式族出现计数 | 定式命中时 |
 | `life.db` | `backend/data/` | 生命时间线、慢变量、共享日程（`schedule_items`）与类别耗时统计（`schedule_stats`） | 互动 / 日程写入 / 执行反馈 |

@@ -58,7 +58,7 @@ from typing import TypedDict
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 
-from . import (actions, coords, decay, estimate, events, persona, personal_facts,
+from . import (actions, aesthetics, coords, decay, estimate, events, persona, personal_facts,
                prompts, recall_chain, schedule_facts, speech_text)
 from .llm_chain import ThinkStream, content_of, content_text_of
 from .tools import TOOLS
@@ -823,9 +823,10 @@ async def _prepare_chat(agent, data):
             data["chat_budget"] = int(agent.chat_budget())
         except Exception:                   # noqa: BLE001 —— 预算算不出来就按旧值
             data["chat_budget"] = 400
+        # 当前这句会单独作为最后一条 user 消息发送，上下文里不重复它。
+        hist_now = list(getattr(agent.st, "chat_history", []) or [])
+        aesthetic = ""
         if mode == "pet" or not _chat_about_go(text):
-            # 当前这句会单独作为最后一条 user 消息发送，上下文里不重复它。
-            hist_now = list(getattr(agent.st, "chat_history", []) or [])
             facts = await _schedule_facts_for(agent, text=text)
             data["schedule_rows"] = list(facts.get("rows") or [])
             data["schedule_ref"] = facts.get("ref")
@@ -840,6 +841,14 @@ async def _prepare_chat(agent, data):
                     hint = {}
             hint = hint if isinstance(hint, dict) else {}
             chain = hint.get("chain") if isinstance(hint.get("chain"), dict) else {}
+            # v4.6.1：审美只给非棋闲聊；空串时系统消息逐字符不变。
+            aes_fn = getattr(agent, "aesthetic_note", None)
+            if callable(aes_fn):
+                try:
+                    aesthetic = str(aes_fn(text, hist_now) or "").strip()
+                except Exception as e:      # noqa: BLE001 —— 审美提示坏了照常出话
+                    print("[Chat] 审美提示生成失败（已忽略）：%s" % e)
+                    aesthetic = ""
             # v4.6.0：她查证过的知识笔记（只给非棋闲聊；读库走线程，失败只是少一段参考）
             known = ""
             known_fn = getattr(agent, "knowledge_note", None)
@@ -875,9 +884,10 @@ async def _prepare_chat(agent, data):
             except Exception as e:          # noqa: BLE001 —— 方向提示坏了照常出话
                 print("[Chat] 回复方向提示失败（已忽略）：%s" % e)
                 direction = ""
-        if direction:
+        extra = "\n\n".join(x for x in (aesthetic, direction) if x)
+        if extra:
             msgs[0] = {"role": "system",
-                       "content": str(msgs[0].get("content") or "") + "\n\n" + direction}
+                       "content": str(msgs[0].get("content") or "") + "\n\n" + extra}
         hist = agent.st.chat_history
         upto = len(hist) - 1            # 最后一条是刚追加的这句，下面单独发，避免重复
         for sp in prompts.chat_windows(hist[:upto]):
@@ -1453,6 +1463,54 @@ async def _fix_personal_claim(agent, data, msgs, raw):
     return fallback or raw
 
 
+async def _guard_aesthetic_reply(agent, data, msgs, raw):
+    """审美偏好题的回答检查（v4.6.1）。
+
+    只做两件事：
+    - **没有用自己的眼光**（只报热门名 / 作品名，或没有审美词极短回答）⇒ 给模型一次按
+      审美标准重答的机会；重答失败保留原话。
+    - 玩家已经说过偏好 ⇒ 删掉句尾「你呢 / 你最喜欢哪个」这类空洞反问，避免重复提问。
+    关闭人格化 / 审美时原样返回；任何异常都不影响出话。
+    """
+    if not raw:
+        return raw
+    if not bool(getattr(agent, "aesthetic_enabled", False)) \
+            or not bool(getattr(agent, "persona_enabled", False)):
+        return raw
+    text = str(data.get("text") or "")
+    state = {}
+    try:
+        fn = getattr(agent, "aesthetic_state_for", None)
+        if callable(fn):
+            state = fn(text, list(getattr(agent.st, "chat_history", []) or []))
+    except Exception as e:                  # noqa: BLE001 —— 状态读不到就只做原样返回
+        print("[Chat] 审美状态读取失败（已忽略）：%s" % e)
+        state = {}
+    if aesthetics.needs_taste_retry(raw, text):
+        fix_msgs = list(msgs) + [{"role": "user", "content": aesthetics.retry_prompt()}]
+        raw2 = ""
+        try:
+            raw2 = await asyncio.wait_for(
+                _say(agent, fix_msgs, 260, think_mode=0, no_think=True, naturalize=False),
+                timeout=CHAT_RETRY_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            print("[Chat] 审美重答超时，保留原话")
+        if (raw2 and not actions.looks_structured(raw2)
+                and not aesthetics.needs_taste_retry(raw2, text)):
+            raw = raw2
+        else:
+            fallback = aesthetics.taste_fallback(state)
+            if fallback:
+                raw = fallback
+            print("[Chat] 审美重答仍未带上自己的判断，改用审美兜底")
+    try:
+        if aesthetics.has_user_preference(state):
+            raw = aesthetics.strip_echo_question(raw, True)
+    except Exception as e:                  # noqa: BLE001
+        print("[Chat] 重复反问清理失败（已忽略）：%s" % e)
+    return raw
+
+
 async def _speak_chat(agent, data, msgs):
     """聊天台词（消息构造失败时按空回复处理，由 finalize 的兜底顶上）。
 
@@ -1524,6 +1582,8 @@ async def _speak_chat(agent, data, msgs):
     # v4.3.3：玩家私人事实核对（吃没吃饭 / 下没下班 / 睡没睡好）。放在日程核对之后，
     # 因为日程冲突重答可能已经产生一句新的、需要再核对的台词。
     raw = await _fix_personal_claim(agent, data, msgs, raw)
+    # v4.6.1：偏好题必须带自己的审美判断；玩家已说过偏好时删掉句尾空洞反问。
+    raw = await _guard_aesthetic_reply(agent, data, msgs, raw)
     data["reply"] = actions.naturalize(str(raw or ""))
 
 
@@ -1891,6 +1951,13 @@ async def _finalize_chat(agent, data):
                 note_fn(str(data.get("text") or ""), stored)
             except Exception as e:              # noqa: BLE001 —— 状态机坏了不影响出话
                 print("[Chat] 未答问题状态更新失败（已忽略）：%s" % e)
+        # v4.6.1：从她自己的回复里学习审美（低频写库、失败开放；玩家偏好只作证据）。
+        learn_aes = getattr(agent, "_learn_and_save_aesthetics", None)
+        if callable(learn_aes):
+            try:
+                await asyncio.to_thread(learn_aes, str(data.get("text") or ""), stored)
+            except Exception as e:              # noqa: BLE001 —— 审美学习失败不影响出话
+                print("[Chat] 审美学习失败（已忽略）：%s" % e)
         await asyncio.to_thread(agent._remember_chat_turn, str(data.get("text") or ""), stored,
                                 str(data.get("mode") or "game"))
     # 桌宠聊天默认只用预制音（v4.2.5）：跳过 CosyVoice 合成，只发文字；

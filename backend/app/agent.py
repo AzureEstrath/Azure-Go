@@ -16,7 +16,7 @@ import uuid
 
 from langchain_core.messages import ToolMessage
 
-from . import actions, adaptive, coords, events, joseki_gate, lanes, persona, profile, prompt_chains, prompts, pv_lines, recall_chain, speech_text, time_ctx
+from . import actions, adaptive, aesthetics, coords, events, joseki_gate, lanes, persona, profile, prompt_chains, prompts, pv_lines, recall_chain, speech_text, time_ctx
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
     PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, PHASE_PEER, build_graph, is_joseki_mistake,
@@ -385,7 +385,7 @@ class AzureAgent:
                  persona_relationship_enabled=False, persona_address_name="",
                  adaptive_enabled=False, adaptive_base=adaptive.BASE_DEFAULT,
                  adaptive_spread=adaptive.SPREAD_DEFAULT, adaptive_rng=None,
-                 life=None, recall_rng=None):
+                 life=None, recall_rng=None, aesthetic_enabled=True):
         self.st = GameState()
         self.katago = engine
         self.llm = llm
@@ -540,6 +540,9 @@ class AzureAgent:
         #    与画像开关**解耦**：画像记棋风，人格化记「你们一起下过多少盘、她心里还留着什么」。
         #    ``load_persona()`` 在 lifespan 里读一次 profile.db 的 persona 表（测试不调用 ⇒ 零变化）。
         self.persona_enabled = bool(persona_enabled)
+        # 审美（v4.6.1）：与人格化一起开关；关闭时聊天提示词逐字符不变。
+        self.aesthetic_enabled = bool(aesthetic_enabled)
+        self._aesthetic = aesthetics.default_state()
         self.persona_rng = persona_rng if persona_rng is not None else random.Random()
         # 关系阶段 / 称呼变化：**默认关**，称呼保持 `prompts.user_name`（默认玩家）不变。
         # 开启后才按局数推进称呼；`persona_address_name` 为空 ⇒ 即便开启也仍用原名。
@@ -2253,6 +2256,11 @@ class AzureAgent:
             data = {}
         self._persona = data if isinstance(data, dict) else {}
         try:
+            self._aesthetic = aesthetics.sanitize(self._persona.get("aesthetic"))
+        except Exception as e:                      # noqa: BLE001 —— 脏审美状态按基线降级
+            print("[Agent] 审美状态读取异常（按基线降级）：%s" % e)
+            self._aesthetic = aesthetics.default_state()
+        try:
             self._interactions = int(self._persona.get("interactions_total") or 0)
         except (TypeError, ValueError):
             self._interactions = 0
@@ -2265,6 +2273,57 @@ class AzureAgent:
         """系统提示词附加段：人格化 + 生命状态 + 情绪语言节奏；都空 ⇒ 空串（提示词逐字符不变）。"""
         parts = [self.persona_note(), self.life_note(), self.emotion_language_note()]
         return "\n\n".join(p for p in parts if p)
+
+    # ================= 审美（v4.6.1）：基础眼光 + 可发展的偏好 =================
+
+    def aesthetic_state_for(self, player_text="", history=None) -> dict:
+        """当前审美状态 + 玩家近期偏好（只读；关闭时返回基线，不扫历史）。
+
+        纯内存、零 IO；不会因为聊天频繁而写库。真正落盘在 ``_learn_and_save_aesthetics``。
+        """
+        if not self.persona_enabled or not self.aesthetic_enabled:
+            return aesthetics.default_state()
+        try:
+            base = aesthetics.sanitize(self._aesthetic)
+            return aesthetics.merge_user_evidence(
+                base, history if history is not None else getattr(self.st, "chat_history", []),
+                player_text)
+        except Exception as e:                  # noqa: BLE001 —— 审美状态坏了不该影响出话
+            print("[Agent] 审美状态合并失败（已忽略）：%s" % e)
+            return aesthetics.sanitize(self._aesthetic)
+
+    def aesthetic_note(self, player_text="", history=None) -> str:
+        """聊天用的「你的审美」段；关闭 / 空内容返回空串（系统消息逐字符不变）。"""
+        if not self.persona_enabled or not self.aesthetic_enabled:
+            return ""
+        try:
+            return aesthetics.taste_note(self.aesthetic_state_for(player_text, history),
+                                         player_text)
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 审美提示生成失败（已忽略）：%s" % e)
+            return ""
+
+    def _learn_and_save_aesthetics(self, player_text, reply_text) -> None:
+        """一轮聊天后学习她自己的审美表达，并写回 ``profile.db`` 的 persona 表。
+
+        只学 Azure 自己的明确好恶；玩家偏好只作为「对方说过」的证据，不改她的轴线。
+        写库是**低频**的（只有真的出现作品 / 明确好恶时才写），任何失败只打日志。
+        本方法是同步的：调用点必须 ``await asyncio.to_thread(...)``。
+        """
+        if not self.persona_enabled or not self.aesthetic_enabled:
+            return
+        try:
+            original = aesthetics.sanitize(self._aesthetic)
+            hist = list(getattr(self.st, "chat_history", []) or [])
+            state = aesthetics.merge_user_evidence(original, hist, player_text)
+            state, _learned = aesthetics.learn_from_reply(state, reply_text, player_text)
+            if state == original:
+                return
+            self._aesthetic = state
+            if self.profile_store is not None:
+                self.profile_store.set_persona({"aesthetic": state})
+        except Exception as e:                  # noqa: BLE001 —— 审美学习失败绝不影响聊天
+            print("[Agent] 审美学习写入失败（已忽略）：%s" % e)
 
     def emotion_language_note(self) -> str:
         """情绪 → 语言节奏（v4.3.0，C）：只把明显偏离基线的情绪翻译成句长 / 问句 / 快慢。
@@ -2404,6 +2463,7 @@ class AzureAgent:
             "streak": streak,
             "mood": mood,
             "interactions_total": int(self._interactions),
+            "aesthetic": aesthetics.sanitize(self._aesthetic),
         }
         try:
             await asyncio.to_thread(self.profile_store.set_persona, items)

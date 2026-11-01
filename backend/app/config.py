@@ -59,6 +59,9 @@ class AzureConfig:
         # 人格化（关系阶段 / 情绪余温 / 小目标 / 夜間语气）：默认开；关掉＝提示词逐字符不变。
         # 与 `profile_enabled` 解耦：画像记棋风，人格化记「你们一起下过多少盘、她心里还留着什么」。
         self.persona_enabled = True
+        # 审美（v4.6.1）：Azure 的基础眼光 + 从聊天里慢慢发展的偏好；默认开。
+        # 与 persona_enabled 一起生效；任一关闭 ⇒ 聊天提示词不加审美段、不学新偏好。
+        self.aesthetic_enabled = True
         # 关系阶段与称呼变化：**默认关**（称呼保持 prompt_user_name，默认玩家不变）。
         # 开启后才按局数推进称呼；`persona_address_name` 为空 ⇒ 即便开启也仍用原名。
         self.persona_relationship_enabled = False
@@ -254,6 +257,8 @@ class AzureConfig:
         self.time_aware_enabled = v if isinstance(v, bool) else self.time_aware_enabled
         v = d.get("persona_enabled")
         self.persona_enabled = v if isinstance(v, bool) else self.persona_enabled
+        v = d.get("aesthetic_enabled")
+        self.aesthetic_enabled = v if isinstance(v, bool) else self.aesthetic_enabled
         v = d.get("persona_relationship_enabled")
         self.persona_relationship_enabled = v if isinstance(v, bool) else self.persona_relationship_enabled
         v = d.get("persona_address_name")

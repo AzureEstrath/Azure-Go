@@ -570,6 +570,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             app.state.agent.player_name = cfg.prompt_user_name
             app.state.agent.pet_chat_tts_prebuilt = bool(cfg.pet_chat_tts_prebuilt)
             app.state.agent.pet_chat_think_level = int(cfg.pet_chat_think_level)
+            app.state.agent.aesthetic_enabled = bool(cfg.aesthetic_enabled)
             _adaptive = getattr(app.state.agent, "configure_adaptive", None)
             if callable(_adaptive):                     # v3.11.5：默认关；关着＝落点与现状一致
                 _adaptive(cfg.adaptive_difficulty, cfg.adaptive_difficulty_base,
@@ -590,6 +591,7 @@ def create_app(cfg=None, engine=None, llm=None, agent=None, tts=None, autostart=
             # 人格化：测试装配（autostart=False）不读真实 profile.db，也不改提示词；
             # 生产在下面统一 load_persona() 读一次跨局状态。
             app.state.agent.persona_enabled = bool(cfg.persona_enabled and autostart)
+            app.state.agent.aesthetic_enabled = bool(cfg.aesthetic_enabled and autostart)
             app.state.agent.persona_relationship_enabled = bool(cfg.persona_relationship_enabled)
             app.state.agent.persona_address_name = str(cfg.persona_address_name or "").strip()[:16]
             app.state.agent.player_name = cfg.prompt_user_name
