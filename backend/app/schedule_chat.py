@@ -47,6 +47,11 @@ _TASK_CUE = re.compile(
     r"卖|出售|摆摊|进货|出货|转卖|remind|appointment)",
     re.I)
 
+# 细化线索（v4.5.3）：待定占位正在被补充时，玩家可能只回「心理课 / 参加心理课 / 就是那个」——
+# 这种短句没有时间 / 事项动词，但既然有候选条目，就值得让模型看一眼能不能填 refine_id。
+_REFINE_CUE = re.compile(
+    r"(就是|叫|名叫|改成|改到|换成|补充|其实|参加|课|班|活动|演出|聚会)", re.I)
+
 
 def _clip(text, limit=TITLE_MAX):
     s = " ".join(str(text or "").split())
@@ -55,12 +60,18 @@ def _clip(text, limit=TITLE_MAX):
     return s if len(s) <= limit else s[:limit - 1] + "…"
 
 
-def looks_schedulable(text):
-    """规则闸门：这句话**值不值得**让模型判断（False ⇒ 一次 LLM 都不发）。"""
+def looks_schedulable(text, has_candidates=False):
+    """规则闸门：这句话**值不值得**让模型判断（False ⇒ 一次 LLM 都不发）。
+
+    ``has_candidates``：本轮有可细化的待定条目。此时很短的补充（「心理课」「参加心理课」）
+    也会放行——它多半是在回答她刚才的追问，不能因为「没有事项动词」就漏掉。
+    """
     s = str(text or "").strip()
     if s == "":
         return False
-    return bool(_TIME_CUE.search(s) or _TASK_CUE.search(s))
+    if _TIME_CUE.search(s) or _TASK_CUE.search(s):
+        return True
+    return bool(has_candidates) and len(s) <= 24 and bool(_REFINE_CUE.search(s))
 
 
 def _json_object(text):
@@ -149,7 +160,7 @@ async def extract(llm, text, now=None, context_text="", candidates=None):
     **绝不把错误文本当成日程**，也不向调用方抛异常。
     """
     raw_text = _clip(text, MAX_TEXT)
-    if llm is None or raw_text == "" or not looks_schedulable(raw_text):
+    if llm is None or raw_text == "" or not looks_schedulable(raw_text, bool(candidates)):
         return []
     ref = datetime.datetime.fromtimestamp(time.time() if now is None else float(now))
     cand_rows = []

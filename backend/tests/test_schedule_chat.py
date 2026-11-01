@@ -24,6 +24,13 @@ class GateTest(unittest.IsolatedAsyncioTestCase):
                      "下周三答辩", "晚上八点半健身"):
             self.assertTrue(schedule_chat.looks_schedulable(text), text)
 
+    def test_short_supplement_needs_candidates(self):
+        """v4.5.3：待定条目正在细化时，「心理课」这种短补充也要放行；没有候选时不放行。"""
+        self.assertFalse(schedule_chat.looks_schedulable("心理课"))
+        self.assertTrue(schedule_chat.looks_schedulable("心理课", True))
+        self.assertTrue(schedule_chat.looks_schedulable("参加心理课", True))
+        self.assertFalse(schedule_chat.looks_schedulable("好累", True))
+
     async def test_extract_skips_gate_without_calling_llm(self):
         llm = StubLLM(text='{"schedule": true, "items": [{"title": "随便"}]}')
         self.assertEqual(await schedule_chat.extract(llm, "有点累", now=NOW), [])
@@ -139,6 +146,18 @@ class ExtractTest(unittest.IsolatedAsyncioTestCase):
         items2 = await schedule_chat.extract(
             llm2, "活动是参加心理课", now=NOW, candidates=[])
         self.assertEqual(items2[0]["refine_id"], 0)
+
+    async def test_short_supplement_reaches_llm_with_candidates(self):
+        """v4.5.3：只回「心理课」时，有候选也要让模型看一眼并填回 refine_id。"""
+        llm = StubLLM(text='{"schedule": true, "items": ['
+                           '{"title": "参加心理课", "refine_id": 7}]}')
+        items = await schedule_chat.extract(
+            llm, "心理课", now=NOW,
+            candidates=[{"id": 7, "title": "有个活动", "when_text": "待定"}])
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["refine_id"], 7)
+        self.assertEqual(items[0]["title"], "参加心理课")
 
     def test_refine_candidates_skip_courses_and_closed(self):
         rows = [

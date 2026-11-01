@@ -1902,6 +1902,14 @@ async def _finalize_idle(agent, data):
     stored = speech_text.extract_tone(reply)[1] or reply
     if _alive(agent, data):                     # 看门狗守卫：旧一代不再写聊天历史
         agent.st.chat_history.append({"role": "assistant", "content": stored})
+        # 主动开口问过的问题也进「未答问题」状态机（v4.5.3）：下次聊天可以自然接上，
+        # 而不是把「你在忙什么呀」当成没发生过。压力仍按好奇度起步、逐轮衰减。
+        note_fn = getattr(agent, "_update_open_questions", None)
+        if callable(note_fn):
+            try:
+                note_fn("", stored)
+            except Exception as e:              # noqa: BLE001 —— 状态机坏了不影响开口
+                print("[Idle] 未答问题状态更新失败（已忽略）：%s" % e)
         await asyncio.to_thread(agent._remember_pet_line, "idle", stored,
                                 str(data.get("mode") or "game"))
     await _emit_deduped(agent, events.AI_IDLE, reply, epoch=data.get("epoch"))
@@ -1915,6 +1923,13 @@ async def _finalize_peer(agent, data):
     stored = speech_text.extract_tone(reply)[1] or reply
     if _alive(agent, data):
         agent.st.chat_history.append({"role": "assistant", "content": stored})
+        # 与闲置搭话同一口径：窥屏时问过的问题也记进未答问题状态机。
+        note_fn = getattr(agent, "_update_open_questions", None)
+        if callable(note_fn):
+            try:
+                note_fn("", stored)
+            except Exception as e:              # noqa: BLE001
+                print("[Peer] 未答问题状态更新失败（已忽略）：%s" % e)
         await asyncio.to_thread(agent._remember_pet_line, "peer", stored,
                                 str(data.get("mode") or "game"))
     await _emit_deduped(agent, events.AI_IDLE, reply, epoch=data.get("epoch"))

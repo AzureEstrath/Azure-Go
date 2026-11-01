@@ -282,6 +282,12 @@ class ReplyDirectionTest(unittest.TestCase):
         self.assertTrue(persona.answers_question("不想说。", "可以告诉Azure卖的是什么"))
         self.assertTrue(persona.answers_question("嗯。", "部署者大人有活动吗"))
         self.assertFalse(persona.answers_question("今天好累。", "部署者大人有活动吗"))
+        # v4.5.3：问「什么 / 哪」的问句，一句短名词回答也算答过；反问不算。
+        self.assertTrue(persona.answers_question("手作。", "可以告诉Azure卖的是什么"))
+        self.assertTrue(persona.answers_question("红色。", "你最喜欢什么颜色"))
+        self.assertTrue(persona.answers_question("心理课。", "周末有什么安排吗"))
+        self.assertFalse(persona.answers_question("真的吗？", "可以告诉Azure卖的是什么"))
+        self.assertFalse(persona.answers_question("为什么呀？", "周末有什么安排吗"))
 
     def test_unanswered_question_decays_and_stops(self):
         reply = "有活动吗？还有，你还没告诉我要卖什么呢？"

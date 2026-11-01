@@ -210,6 +210,8 @@ _Q_WORD_RE = re.compile(
 
 # 是非问句 + 很短的肯定 / 否定回答 ⇒ 算回答过（不再要求提到同一个话题词）。
 _YES_NO_RE = re.compile(r"(吗|么|是不是|有没有|要不要|会不会|行不行|好不好)")
+# 问「什么 / 哪 / 怎么」的问句：一句短名词回答（「手作」「心理课」）也算答过。
+_WH_WORD_RE = re.compile(r"(什么|啥|哪|怎么|为什么|为何|多少|如何)")
 _SHORT_ANSWER_RE = re.compile(
     r"^(嗯|恩|嗯嗯|是|是的|对|对啊|好|好呀|行|可以|有|有的|有啊|没有|没|不是|不|不用)$")
 
@@ -268,6 +270,14 @@ def answers_question(player_text, question_text) -> bool:
         return True
     if _YES_NO_RE.search(q) and len(ans) <= 6 and _SHORT_ANSWER_RE.match(
             re.sub(r"[。！？!?，,、\s]+", "", ans)):
+        return True
+    # 问「什么 / 哪 / 怎么」的问句收到一句很短的实质回答（「手作」「心理课」「红色」）
+    # 也算答过——不然同一件事会被换个说法再问一遍，正好违背「问过就收」。
+    # 纯是非问句仍只认明确的「嗯 / 是 / 没有」；反问 / 追问（「真的吗」「为什么」）不算回答。
+    brief = re.sub(r"[。！？!?，,、\s]+", "", ans)
+    # 只认「有实际内容词」的短回答：「嗯 / 还是不答」这类虚词不能算答过（否则会把还在等的问题吃掉）。
+    if (_WH_WORD_RE.search(q) and 0 < len(brief) <= 6 and _content_grams(brief)
+            and not _question_like(ans)):
         return True
     return False
 
@@ -704,6 +714,18 @@ def _focus_chars(text) -> set:
         if re.match(r"^[\u4e00-\u9fff]$", ch) and ch not in _Q_STOP_CHARS:
             out.add(ch)
     return out
+
+
+def _question_like(text) -> bool:
+    """这句话本身是不是在追问 / 反问（「真的吗」「为什么」）：不能当成对上一个问题的回答。"""
+    t = str(text or "").strip()
+    if t == "":
+        return False
+    if "？" in t or "?" in t:
+        return True
+    if t.endswith(("吗", "么", "嘛", "呢")):
+        return True
+    return bool(re.match(r"(为什么|怎么|什么|哪|咋|几|是不是|有没有|要不要)", t))
 
 
 def _as_int(v) -> int:

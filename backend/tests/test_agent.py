@@ -263,6 +263,24 @@ class FlowTest(unittest.TestCase):
         self.assertGreaterEqual(agent.mood.v, before[0] - 1e-9,
                                 "桌宠 idle_near 不应把愉悦度往下拉")
 
+    def test_idle_question_enters_open_questions_and_chat_answer_clears_it(self):
+        """v4.5.3：主动开口问过的事会被记住；玩家下一句聊天回答后就收掉。"""
+        async def run():
+            agent, _eng, _llm, _bus = _mk()
+            agent.mood.v, agent.mood.c, agent.mood.a = 0.70, 0.80, 0.50
+            agent.llm = StubLLM("你在忙什么呀？")
+            await agent.idle_remark("pet")
+            first = agent.open_questions()
+            agent.llm = StubLLM("哦，写作业呀。")
+            await agent.chat("写作业", "pet")
+            return first, agent.open_questions()
+
+        first, after = asyncio.run(run())
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["q"], "你在忙什么呀")
+        self.assertGreater(first[0]["pressure"], 0.0)
+        self.assertEqual(after, [])
+
     def test_idle_recall_chance_uses_mood_and_slow_state(self):
         agent, _eng, _llm, _bus = _mk()
         agent.memory = _RecallMemory()

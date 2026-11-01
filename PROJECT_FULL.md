@@ -1,4 +1,4 @@
-# Azure · 全量项目文档（v4.5.2）
+# Azure · 全量项目文档（v4.5.3）
 
 > 本文件是**完整项目地图**：系统架构、人格化 / 日程 / 记忆三条主通路、代码量审计结果、
 > 每个第一方文件的作用、配置与测试入口、维护约定。
@@ -275,9 +275,20 @@ FastAPI 后端（backend/app，端口 8000）
 - **为什么**：原先的清单把「完整日期 + 分级 + 优先级 + 两个按钮」都塞进一行，长标题还会
   折成两三行，十几条就成了一堵字墙、把周表挤到面板下方；紧凑后同一批条目少占一半高度。
 
+### 4.11 短回答 / 主动提问 / 短补充（v4.5.3）
+
+- **短回答算答过**：`persona.answers_question` 对问「什么 / 哪 / 怎么」的问句，接受 ≤6 字、
+  含实际内容词、非反问的短回答（「手作」「心理课」「红色」）；纯是非问句仍只认明确的
+  嗯 / 是 / 没有。已答的问题不会再被换个说法重问。
+- **主动提问也记账**：`_finalize_idle` / `_finalize_peer` 把主动开口 / 窥屏时问过的问题交给
+  `_update_open_questions`；下一轮聊天能自然接上，答了就收，没答按压力衰减。
+- **短补充放行**：`schedule_chat.looks_schedulable(text, has_candidates)` 在有可细化候选时，
+  允许 ≤24 字的短补充（「心理课 / 参加心理课」）进入抽取；没有候选时保持原闸门，
+  避免为普通闲聊多发 LLM 调用。
+
 ---
 
-## 5. 代码量与结构审计（v4.5.2）
+## 5. 代码量与结构审计（v4.5.3）
 
 ### 5.1 体量最大的文件
 
@@ -285,11 +296,11 @@ FastAPI 后端（backend/app，端口 8000）
 | --- | --- | --- |
 | ~6291 | `game/scripts/ui/Main.gd` | 围棋窗口 UI / 设置 / 服务状态 / 窥屏 / TTS 播放 |
 | ~3496 | `backend/app/agent.py` | 公开动作、情绪、记忆、工具、看板、TTS 桥接、未答问题压力 |
-| ~3118 | `backend/tests/test_agent.py` | Agent 全链路回归 |
-| ~2680 | `game/scripts/app/PetView.gd` | 桌宠视图、聊天面板、月历 / 周表、紧凑日程清单 |
-| ~1991 | `backend/app/agent_graph.py` | LangGraph 六节点编排与全部提示词装配（含延后语音 / `no_think`） |
+| ~3136 | `backend/tests/test_agent.py` | Agent 全链路回归 |
+| ~2681 | `game/scripts/app/PetView.gd` | 桌宠视图、聊天面板、月历 / 周表、紧凑日程清单 |
+| ~2006 | `backend/app/agent_graph.py` | LangGraph 六节点编排与全部提示词装配（含延后语音 / `no_think`） |
 | ~1756 | `backend/app/main.py` | FastAPI 生命周期 / REST / WS / 日程后台任务 |
-| ~1406 | `backend/app/life.py` | 生命时间线 / 慢变量 / 日程持久化（含原地细化） |
+| ~1409 | `backend/app/life.py` | 生命时间线 / 慢变量 / 日程持久化（含原地细化） |
 | ~1159 | `game/scripts/app/PetShell.gd` | 桌宠外壳、服务拉起、聊天 / 窥屏 / 情绪同步 |
 | ~300 | `backend/app/personal_facts.py` | 玩家私人事实守卫（纯逻辑） |
 | ~70 | `backend/app/lanes.py` | 任务车道统计（纯标准库） |
@@ -302,6 +313,8 @@ FastAPI 后端（backend/app，端口 8000）
 - v4.5.0 提速走「同一条链路少等一次」：点评语音延后到后台合成、落子宣告走 `no_think`
   快速档、前端只有揭示棋子与保序才等语音——三句分工、去重窗口、`message → speech`
   顺序一条没动。
+- v4.5.3 只改规则层：未答问题判定、主动开口记账、日程闸门，不新增表、不新增常驻 LLM 调用；
+  只有「存在待定条目 + 短补充」时才多一次后台抽取。
 - v4.5.2 周表恢复原分节网格（撤销真实时间轴与分栏），只重排表上方的清单：
   按天分组、单行省略、去掉优先级标签与已结束条目的按钮位；数据来源与 `/api/schedule`
   契约不变，测试改为按标题定位清单行。
@@ -443,18 +456,18 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_main.py` | FastAPI 端点 / 生命周期 / 运行期配置 / 记忆 API / 测试清理 |
 | `test_memory.py` / `test_memory_semantics.py` | 记忆存储、向量指纹、回填、阈值、情绪矩阵、supersede、巩固分、somatic_charge |
 | `test_mood_delta.py` | 情绪小调用解析与限频 |
-| `test_persona.py` / `test_profile*.py` | 人格化、情绪方向压力 / 问句预算、未答问题衰减、画像、画像库 |
+| `test_persona.py` / `test_profile*.py` | 人格化、情绪方向压力 / 问句预算、未答问题衰减、短回答判定、画像、画像库 |
 | `test_personal_facts.py` | 玩家私人事实守卫：截图晚饭场景、原话证据、反向线索、问句、兜底句 |
 | `test_prompt_chains.py` / `test_prompts.py` / `test_prompts_long_term.py` | 提示链、黄金提示词、注入段 |
 | `test_recall_chain.py` | 回忆链开始 / 延续 / 终止 |
-| `test_schedule*.py` | 日程抽取（无日期占位 / 细化候选 / 细化 id 校验）、归一化、聊天排程、取消、API（含原地细化）、学习 |
+| `test_schedule*.py` | 日程抽取（无日期占位 / 细化候选 / 细化 id 校验 / 短补充放行）、归一化、聊天排程、取消、API（含原地细化）、学习 |
 | `test_speech_text.py` | 语气标记 |
 | `test_state.py` | 对局状态 |
 | `test_time_ctx.py` | 时间事实 |
 | `test_timetable.py` | 课表几何还原 |
 | `test_tools.py` | 发言侧工具 |
 | `test_tts*.py` | TTS 文本 / 缓存 / 阿里云 / 链路 |
-| `test_agent_graph.py` / `test_agent.py` 中的 v4.4.x / v4.5.0 用例 | 回忆链、日程事实、动态情绪权重、embedding、私人事实重答、聊天 UI 适配、情绪方向、隐式日程、延后语音顺序、`no_think` 三阶段 |
+| `test_agent_graph.py` / `test_agent.py` 中的 v4.4.x / v4.5.0 用例 | 回忆链、日程事实、动态情绪权重、embedding、私人事实重答、聊天 UI 适配、情绪方向、隐式日程、延后语音顺序、`no_think` 三阶段、主动提问记账 |
 
 ### 6.4 `game/scripts/`
 
@@ -575,7 +588,7 @@ LangChain / LangGraph、长期记忆、TTS、聊天队列、定式 / 画像 / �
 ## 8. 测试与运行
 
 ```powershell
-# 后端全量（当前 1212 tests OK）
+# 后端全量（当前 1215 tests OK）
 cd backend
 python -m unittest discover -s tests -q
 
