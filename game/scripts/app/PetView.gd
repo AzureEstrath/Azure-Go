@@ -36,19 +36,13 @@ const BUBBLE_TOP := 8.0
 const MENU_W := 210.0
 const CHAT_W := 230.0
 const FILES_W := 480.0
-# 周表按**真实时间**排版（v4.5.0）：不再把一天切成 12 个不均节次，改成半小时一格的连续时间轴。
-# 默认 08:00–22:00；有更早 / 更晚的条目时自动按整点外扩。课程块与约定块各自按起止分钟定位、
-# 重叠时自动分栏，块里只放标题（教师 / 地点 / 分级留给悬停卡）。
+# 周课表网格：左侧节次列 + 7 个星期列 × 12 节。单元格外框与参考图一致，课程块跨行显示。
 const TABLE_HEAD_H := 32.0
+const TABLE_ROW_H := 26.0
 const TABLE_TIME_W := 44.0
 const TABLE_PERIODS := 12
-# 标准节次开始时间（分钟）：课程没带 start_time 时的兜底（第5节是午间空档）。
+# 标准节次开始时间（分钟）：第5节是午间空档，12:00-13:00 的约定会落在这一行。
 const PERIOD_START_MIN := [480, 530, 590, 640, 700, 810, 860, 920, 970, 1110, 1160, 1210]
-const TABLE_DAY_START := 480.0      # 08:00
-const TABLE_DAY_END := 1320.0       # 22:00
-const TABLE_HALF_H := 14.0          # 半小时的高度（整点 28px，一刻钟虚线更细）
-const TABLE_MIN_BLOCK_H := 16.0
-const TABLE_PERIOD_MIN := 45        # 没带 end_time 的课程：一节按 45 分钟估
 const EVENT_TINT := Color(0.96, 0.83, 0.56, 0.55)
 const COURSE_TINTS := [
 	Color(0.58, 0.84, 0.74, 0.40), Color(0.58, 0.80, 0.93, 0.40),
@@ -1526,8 +1520,7 @@ func _render_week(courses: Array, plain: Array) -> void:
 	var this_btn := _compact_button("本周")
 	this_btn.pressed.connect(_open_current_week)
 	bar.add_child(this_btn)
-	_schedule_rows.add_child(_files_hint(
-		"课程只显示所属周；定时约定只显示这一周。重叠的块自动分栏，悬停看详情。"))
+	_schedule_rows.add_child(_files_hint("课程只显示所属周；定时约定只显示这一周。"))
 
 	var timed: Array = []
 	var week_plain: Array = []
@@ -1621,36 +1614,12 @@ func _item_start_minutes(d: Dictionary) -> int:
 		return -1
 	return _clock_minutes(when)
 
-func _item_minutes_range(d: Dictionary) -> Vector2i:
-	"""条目的真实起止分钟（周表时间轴用）。返回 ``(-1, -1)`` = 这一条排不进时间轴。
-
-	优先 ``start_time`` / ``end_time``；课程没带时刻时按标准节次（``PERIOD_START_MIN``）兜底，
-	时长按 ``duration_min`` → 节数 × 45 分钟 → 60 分钟逐级回退。结束必定 ≥ 开始 + 5 分钟。
-	"""
-	var start := _item_start_minutes(d)
-	var p0 := int(d.get("period_start", 0))
-	if start < 0 and p0 >= 1 and p0 <= PERIOD_START_MIN.size():
-		start = int(PERIOD_START_MIN[p0 - 1])
-	if start < 0:
-		return Vector2i(-1, -1)
-	var end := _clock_minutes(str(d.get("end_time", "")))
-	if end <= start:
-		var dur := int(d.get("duration_min", 0))
-		if dur <= 0:
-			if p0 >= 1:
-				var p1 := maxi(p0, int(d.get("period_end", p0)))
-				dur = TABLE_PERIOD_MIN * (p1 - p0 + 1)
-			else:
-				dur = 60
-		end = start + maxi(5, dur)
-	return Vector2i(start, maxi(start + 5, end))
-
-func _time_y(minutes: int, axis_start: int) -> float:
-	"""一天内某一分钟落在表里的纵坐标（表头之下、按半小时高度线性换算）。"""
-	return TABLE_HEAD_H + float(int(minutes) - int(axis_start)) * (TABLE_HALF_H / 30.0)
-
-func _clock_text(minutes: int) -> String:
-	return "%02d:%02d" % [int(minutes) / 60, int(minutes) % 60]
+func _period_index(minutes: int) -> int:
+	var idx := 1
+	for i in range(PERIOD_START_MIN.size()):
+		if minutes >= PERIOD_START_MIN[i]:
+			idx = i + 1
+	return clampi(idx, 1, TABLE_PERIODS)
 
 func _event_block(d: Dictionary) -> Dictionary:
 	"""有明确时刻的约定 / 自动安排 → 周表块（避免被只画课程的网格漏掉）。
@@ -1663,13 +1632,16 @@ func _event_block(d: Dictionary) -> Dictionary:
 	if status != "planned" and status != "done":
 		return {}
 	var wd := _weekday_from_item(d)
-	var span := _item_minutes_range(d)
-	if wd < 0 or span.x < 0:
+	var start := _item_start_minutes(d)
+	if wd < 0 or start < 0:
 		return {}
+	var dur := maxi(5, int(d.get("duration_min", 60)))
+	var p0 := _period_index(start)
+	var p1 := _period_index(start + dur - 1)
 	var ev := d.duplicate()
 	ev["_event_wd"] = wd
-	ev["_event_start"] = span.x
-	ev["_event_end"] = span.y
+	ev["_event_p0"] = p0
+	ev["_event_p1"] = maxi(p0, p1)
 	return ev
 
 func _dedupe_events(items: Array) -> Array:
@@ -1677,7 +1649,7 @@ func _dedupe_events(items: Array) -> Array:
 	for it in items:
 		var d: Dictionary = it
 		var key := "%d|%d|%s" % [int(d.get("_event_wd", -1)),
-			int(d.get("_event_start", -1)), str(d.get("title", ""))]
+			int(d.get("_event_p0", 0)), str(d.get("title", ""))]
 		if not map.has(key):
 			map[key] = d
 	var out: Array = []
@@ -1685,139 +1657,86 @@ func _dedupe_events(items: Array) -> Array:
 		out.append(map[k])
 	return out
 
-func _week_blocks(courses: Array, timed: Array) -> Array:
-	"""课程 + 定时约定 → 周表块（统一按真实起止分钟，后续再按星期分组、分栏）。"""
-	var out: Array = []
+func _period_time_map(courses: Array) -> Dictionary:
+	"""节次 → 开始时间（只收每门课的起始节；结束节不冒充下一节的开始时间）。"""
+	var out := {}
 	for it in courses:
 		var d: Dictionary = it
-		var span := _item_minutes_range(d)
-		if span.x < 0:
-			continue
-		out.append({
-			"item": d, "is_event": false,
-			"wd": clampi(int(d.get("weekday", 0)), 0, 6),
-			"start": span.x, "end": span.y,
-		})
-	for it in timed:
-		var ev: Dictionary = it
-		out.append({
-			"item": ev, "is_event": true,
-			"wd": clampi(int(ev.get("_event_wd", 0)), 0, 6),
-			"start": int(ev.get("_event_start", 0)), "end": int(ev.get("_event_end", 0)),
-		})
+		var p := int(d.get("period_start", 0))
+		var t0 := str(d.get("start_time", "")).strip_edges()
+		if p >= 1 and t0 != "" and not out.has(p):
+			out[p] = t0
 	return out
 
-func _week_time_bounds(blocks: Array) -> Vector2i:
-	"""时间轴范围：至少 08:00–22:00；有更早 / 更晚的条目时按整点外扩（夹在 00:00–24:00）。"""
-	var lo := int(TABLE_DAY_START)
-	var hi := int(TABLE_DAY_END)
-	for b in blocks:
-		lo = mini(lo, floori(int(b.get("start", 0)) / 60.0) * 60)
-		hi = maxi(hi, ceili(int(b.get("end", 0)) / 60.0) * 60)
-	return Vector2i(clampi(lo, 0, 1440), clampi(hi, 60, 1440))
-
-func _assign_lanes(entries: Array) -> void:
-	"""同一天的块：按开始时间排序，重叠的并到一簇；簇内贪心分栏（块宽 = 列宽 / 簇内栏数）。
-
-	不合并任何块——「N 项约定」那种块会把标题藏起来；分栏后每块仍有自己的标题与悬停卡。
-	"""
-	entries.sort_custom(func(a, b):
-		if int(a.get("start", 0)) != int(b.get("start", 0)):
-			return int(a.get("start", 0)) < int(b.get("start", 0))
-		return int(a.get("end", 0)) < int(b.get("end", 0)))
-	var cluster: Array = []
-	var cluster_end := -1
-	for e in entries:
-		var s := int(e.get("start", 0))
-		if cluster.is_empty() or s < cluster_end:
-			cluster.append(e)
-			cluster_end = maxi(cluster_end, int(e.get("end", 0)))
-		else:
-			_lanes_of_cluster(cluster)
-			cluster = [e]
-			cluster_end = int(e.get("end", 0))
-	if not cluster.is_empty():
-		_lanes_of_cluster(cluster)
-
-func _lanes_of_cluster(cluster: Array) -> void:
-	var lane_ends: Array[int] = []
-	for e in cluster:
-		var s := int(e.get("start", 0))
-		var lane := -1
-		for i in lane_ends.size():
-			if s >= lane_ends[i]:
-				lane = i
-				break
-		if lane < 0:
-			lane = lane_ends.size()
-			lane_ends.append(0)
-		e["lane"] = lane
-		lane_ends[lane] = int(e.get("end", 0))
-	for e in cluster:
-		e["lanes"] = lane_ends.size()
-
 func _add_timetable_block(grid: Control, col_w: float, d: Dictionary,
-		wd: int, start_min: int, end_min: int, is_event: bool,
-		lane: int, lanes: int, axis_start: int) -> void:
-	"""一个时间块：按真实起止分钟定位；同一天重叠时按 ``lane/lanes`` 横向分栏。"""
+		wd: int, p0: int, p1: int, is_event: bool, compact := false) -> void:
 	var title := str(d.get("title", "")).strip_edges()
+	var teacher := str(d.get("teacher", "")).strip_edges()
+	var location := str(d.get("location", "")).strip_edges()
 	var tint: Color = EVENT_TINT if is_event else COURSE_TINTS[absi(hash(title)) % COURSE_TINTS.size()]
-	var lane_w := maxf(8.0, (col_w - 4.0) / float(maxi(1, lanes)))
-	var y := _time_y(start_min, axis_start) + 1.0
-	var h := maxf(TABLE_MIN_BLOCK_H, _time_y(end_min, axis_start) - y - 1.0)
+	var block_h := float(p1 - p0 + 1) * TABLE_ROW_H - 3
+	# 与课程同格的事件（v4.2.6）：不整块盖住课程，改成贴在格子底部的一条窄条；
+	# 仍可悬停展开完整信息，既看得见又不会把课程标题遮没。
+	var panel_h := minf(block_h, maxf(14.0, TABLE_ROW_H - 5.0)) if compact else block_h
+	var panel_y := TABLE_HEAD_H + float(p0 - 1) * TABLE_ROW_H + 1
+	if compact:
+		panel_y += block_h - panel_h
 	# 用 Panel（不是 PanelContainer）：块要精确控制文字位置，容器会把 Label 压回最小高度。
 	var panel := Panel.new()
-	panel.position = Vector2(TABLE_TIME_W + float(wd) * col_w + 2.0 + float(lane) * lane_w, y)
-	panel.size = Vector2(maxf(8.0, lane_w - 2.0), h)
+	panel.position = Vector2(TABLE_TIME_W + float(wd) * col_w + 2, panel_y)
+	panel.size = Vector2(col_w - 4, panel_h)
 	panel.mouse_filter = Control.MOUSE_FILTER_PASS
-	var closed := str(d.get("status", "")) == "done" or str(d.get("grade", "")) == "closed"
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(tint.r, tint.g, tint.b, 0.22) if closed else tint
+	sb.bg_color = tint
 	sb.border_color = Color(GufengTheme.ACCENT, 0.8) if is_event else Color(tint.r, tint.g, tint.b, 0.85)
 	sb.set_border_width_all(1)
 	if is_event:
-		sb.border_width_left = 3                  # 约定块左侧一道重线：与课程块一眼区分
+		sb.border_width_left = 2 if compact else 3
 	sb.set_corner_radius_all(4)
 	panel.add_theme_stylebox_override("panel", sb)
 	var lbl := Label.new()
 	lbl.position = Vector2(3, 1)
-	lbl.size = Vector2(panel.size.x - 6.0, h - 2.0)
-	lbl.text = title
+	lbl.size = Vector2(col_w - 10, maxf(8.0, panel_h - 4))
+	var text := title
+	if compact:
+		text = "· " + title          # 窄条只放标题，分级信息留给悬停卡
+	elif is_event:
+		# 约定块：窄列优先保留标题；宽列再带一行分级。
+		if col_w >= 52.0:
+			var grade := _grade_text(d)
+			if grade != "":
+				text += "\n" + grade
+	elif col_w >= 52.0:
+		# 窄列不塞教师 / 地点，给课程名留出可读空间；悬停卡仍显示完整信息。
+		var sub: Array[String] = []
+		if teacher != "":
+			sub.append(teacher)
+		if location != "":
+			sub.append(location)
+		if not sub.is_empty():
+			text += "\n" + " ".join(sub)
+	lbl.text = text
 	lbl.autowrap_mode = TextServer.AUTOWRAP_ARBITRARY
 	lbl.clip_text = true
-	lbl.max_lines_visible = 2 if h >= TABLE_HALF_H * 2.0 else 1
-	lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER if h < TABLE_HALF_H * 2.0 else VERTICAL_ALIGNMENT_TOP
-	lbl.add_theme_font_size_override("font_size", 8 if lane_w >= 24.0 else 7)
-	lbl.add_theme_color_override("font_color",
-		GufengTheme.INK_SOFT if closed else GufengTheme.INK)
+	lbl.max_lines_visible = 1 if compact else 4
+	lbl.add_theme_font_size_override("font_size", 7 if (is_event and col_w < 44.0) or compact else 8)
+	lbl.add_theme_color_override("font_color", GufengTheme.INK)
 	# 悬停只保留一个自绘浮层：**不再设置 tooltip_text**，避免 Godot 默认黑底白字提示
 	# 和这张卡同时出现。
 	panel.set_meta("sched_item", d)
 	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	panel.add_child(lbl)
-	# 鼠标停留 → 浮层展开完整信息（教师 / 地点 / 分级 / 备注）。
+	# 鼠标停留 → 浮层展开完整信息（格子放不下的长标题 / 教师 / 地点 / 备注）。
 	panel.mouse_entered.connect(func(): _show_hover_card(panel, d))
 	panel.mouse_exited.connect(_hide_hover_card)
 	grid.add_child(panel)
 
 func _build_timetable(courses: Array, timed: Array = []) -> void:
-	var blocks := _week_blocks(courses, timed)
-	var bounds := _week_time_bounds(blocks)
-	var start_min := bounds.x
-	var end_min := bounds.y
 	# 表格宽度跟着视口走：7 天优先全部可见；预留外层纵向滚动条约 14px，
 	# 否则 360px 宽窗口会多出 12px 横向滚动条、右侧星期列被裁掉。
 	var table_w := clampf(size.x - MARGIN * 2.0 - 36.0, 280.0, FILES_W - 44.0)
 	var col_w := (table_w - TABLE_TIME_W) / 7.0
-	var table_h := _time_y(end_min, start_min)
-	# 同一天的重叠块分栏：课程与约定一视同仁（不再有「窄条盖住课程」的特例）。
-	var by_day := {}
-	for wd in range(7):
-		by_day[wd] = []
-	for b in blocks:
-		by_day[clampi(int(b.get("wd", 0)), 0, 6)].append(b)
-	for wd in range(7):
-		_assign_lanes(by_day[wd])
+	var table_h := TABLE_HEAD_H + TABLE_ROW_H * TABLE_PERIODS
 	# —— 周标题：以选中的周一为起点（课程按周重复，不再从扫描日期推） ——
 	var ws := _week_start_key()
 	var ws_unix := _date_unix(ws)
@@ -1826,8 +1745,7 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 	if ws_unix > 0:
 		var ed := Time.get_datetime_dict_from_unix_time(ws_unix + 6 * 86400)
 		end_txt = "%02d-%02d" % [int(ed.get("month", 0)), int(ed.get("day", 0))]
-	note.text = "本周时间表 · %s ~ %s · %s–%s" % [ws.substr(5), end_txt,
-		_clock_text(start_min), _clock_text(end_min)]
+	note.text = "本周课表 · %s ~ %s" % [ws.substr(5), end_txt]
 	var today_col := -1
 	var today_unix := _date_unix(_today_key())
 	if ws_unix > 0 and today_unix >= ws_unix and today_unix < ws_unix + 7 * 86400:
@@ -1853,11 +1771,7 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 	hscroll.custom_minimum_size = Vector2(0, table_h + 14.0)
 	hscroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	hscroll.add_child(holder)
-	var hour_count := int((end_min - start_min) / 60)
-	_timetable = {
-		"col_w": col_w, "width": table_w, "height": table_h, "today_col": today_col,
-		"start_min": start_min, "end_min": end_min, "hour_count": hour_count,
-	}
+	_timetable = {"col_w": col_w, "width": table_w, "height": table_h, "today_col": today_col}
 	_schedule_table = grid
 	_schedule_rows.add_child(hscroll)
 	# —— 表头：星期 + 选中周的日期 ——
@@ -1881,82 +1795,243 @@ func _build_timetable(courses: Array, timed: Array = []) -> void:
 			GufengTheme.ACCENT if wd == today_col else GufengTheme.INK_SOFT)
 		head.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		grid.add_child(head)
-	# —— 左侧时间刻度：整点带标签、半点只有虚线（连续时间轴，不再按「第几节」跳） ——
-	for m in range(start_min, end_min, 60):
+	# —— 左侧节次 / 时间 ——
+	var times := _period_time_map(courses)
+	for p in range(1, TABLE_PERIODS + 1):
 		var lbl := Label.new()
-		lbl.text = _clock_text(m)
-		lbl.position = Vector2(0, _time_y(m, start_min) + 1.0)
-		lbl.size = Vector2(TABLE_TIME_W - 3.0, TABLE_HALF_H)
-		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+		var t := str(times.get(p, ""))
+		lbl.text = str(p) + ("\n" + t if t != "" else "")
+		lbl.position = Vector2(0, TABLE_HEAD_H + float(p - 1) * TABLE_ROW_H)
+		lbl.size = Vector2(TABLE_TIME_W - 2, TABLE_ROW_H)
+		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 		lbl.add_theme_font_size_override("font_size", 7)
 		lbl.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.9))
 		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		grid.add_child(lbl)
-	# —— 块：按真实分钟定位、重叠分栏；块里只放标题，教师 / 地点 / 分级留给悬停卡 ——
-	for b in blocks:
-		_add_timetable_block(grid, col_w, b.get("item", {}),
-			int(b.get("wd", 0)), int(b.get("start", start_min)), int(b.get("end", start_min)),
-			bool(b.get("is_event", false)), int(b.get("lane", 0)), int(b.get("lanes", 1)),
-			start_min)
+	# —— 课程块（跨节）——
+	var occupied := {}
+	for it in courses:
+		var d: Dictionary = it
+		var wd := clampi(int(d.get("weekday", 0)), 0, 6)
+		var p0 := clampi(int(d.get("period_start", 1)), 1, TABLE_PERIODS)
+		var p1 := clampi(int(d.get("period_end", p0)), p0, TABLE_PERIODS)
+		for p in range(p0, p1 + 1):
+			occupied["%d|%d" % [wd, p]] = true
+		_add_timetable_block(grid, col_w, d, wd, p0, p1, false)
+	# —— 约定 / 定时事件：按开始时刻落到对应节次行，不再只出现在列表里 ——
+	# 同一格有多个约定时合并成一个「N 项约定」块（悬停卡列出全部）。
+	# v4.2.6：与课程同格时不再整块跳过，改为在格子底部画一条窄条（见 `_add_timetable_block`）。
+	var groups := {}
+	var group_order := []
+	var group_compact := {}
+	for it in timed:
+		var ev: Dictionary = it
+		var wd := clampi(int(ev.get("_event_wd", 0)), 0, 6)
+		var p0 := clampi(int(ev.get("_event_p0", 1)), 1, TABLE_PERIODS)
+		var p1 := clampi(int(ev.get("_event_p1", p0)), p0, TABLE_PERIODS)
+		var blocked := false
+		for p in range(p0, p1 + 1):
+			if occupied.has("%d|%d" % [wd, p]):
+				blocked = true
+				break
+		var key := "%d|%d" % [wd, p0]
+		if not groups.has(key):
+			groups[key] = []
+			group_order.append(key)
+		if blocked:
+			group_compact[key] = true
+		groups[key].append(ev)
+	for key in group_order:
+		var group: Array = groups[key]
+		var base: Dictionary = group[0]
+		var wd := clampi(int(base.get("_event_wd", 0)), 0, 6)
+		var p0 := clampi(int(base.get("_event_p0", 1)), 1, TABLE_PERIODS)
+		var p1 := clampi(int(base.get("_event_p1", p0)), p0, TABLE_PERIODS)
+		for ev in group:
+			p1 = maxi(p1, clampi(int(ev.get("_event_p1", p0)), p0, TABLE_PERIODS))
+		var compact := bool(group_compact.get(key, false))
+		if group.size() == 1:
+			_add_timetable_block(grid, col_w, base, wd, p0, p1, true, compact)
+			continue
+		var merged: Dictionary = base.duplicate()
+		merged["title"] = "%d 项约定" % group.size()
+		var any_open := false
+		for ev in group:
+			if str(ev.get("grade", "")) != "closed":
+				any_open = true
+				break
+		merged["grade"] = "committed" if any_open else "closed"
+		merged["grade_label"] = "已约定" if any_open else "已结束"
+		var whens: Array[String] = []
+		var seen_when := {}
+		var lines: Array[String] = []
+		for ev in group:
+			var title := str(ev.get("title", "")).strip_edges()
+			var when := str(ev.get("when_text", "")).strip_edges()
+			var loc := str(ev.get("location", "")).strip_edges()
+			if when != "" and not seen_when.has(when):
+				seen_when[when] = true
+				whens.append(when)
+			var line := title
+			if when != "":
+				line += "（%s）" % when
+			if loc != "":
+				line += " " + loc
+			lines.append(line)
+		merged["when_text"] = "；".join(whens)
+		merged["notes"] = "\n".join(lines)
+		_add_timetable_block(grid, col_w, merged, wd, p0, p1, true, compact)
 
 func _build_agenda(items: Array, heading := "日程 / 约定") -> void:
+	"""表上方的清单：**按天分组、每条只占一行**。
+
+	旧版把完整日期 + 分级 + 优先级 + 两个按钮都塞进一行，长标题还会折成两三行，
+	十几条就成了一堵字墙。这里时间只留「时:分」（周视图不再重复年份），标题单行省略，
+	分级只留一个小标签；优先级 / 地点 / 排班理由留给悬停卡。
+	"""
 	var wrap := VBoxContainer.new()
-	wrap.add_theme_constant_override("separation", 2)
+	wrap.add_theme_constant_override("separation", 1)
 	wrap.custom_minimum_size = Vector2(0, 0)
 	wrap.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	if _schedule_agenda == null:
 		_schedule_agenda = wrap
 	_schedule_rows.add_child(wrap)
-	wrap.add_child(_files_hint(heading))
+	wrap.add_child(_files_hint("%s · %d 项" % [heading, items.size()]))
+	var last_day := ""
 	for it in items:
+		if not (it is Dictionary):
+			continue
 		var d: Dictionary = it
-		var when := str(d.get("when_text", "")).strip_edges()
-		var title := str(d.get("title", "")).strip_edges()
-		var status := str(d.get("status", "planned")).strip_edges()
-		var tag := _priority_tag(d)
-		var grade_tag := _grade_tag(d)
-		var row := HBoxContainer.new()
-		row.add_theme_constant_override("separation", 3)
-		var lbl := Label.new()
-		lbl.text = "· %s  " % when
-		if status == "planned" and grade_tag != "":
-			lbl.text += "[%s] " % grade_tag
-		lbl.text += "%s%s" % [tag, title]
-		if status == "done":
-			lbl.text += "（已完成）"
-		elif status == "cancelled":
-			lbl.text += "（已取消）"
-		lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		lbl.custom_minimum_size = Vector2(96, 0)
-		lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		lbl.add_theme_font_size_override("font_size", 10)
-		lbl.add_theme_color_override("font_color",
-			GufengTheme.INK_SOFT if status != "planned" else GufengTheme.INK)
-		# 悬停只显示一张自绘卡；不再用 Godot 默认的黑底 tooltip（会和卡片重复）。
-		lbl.set_meta("sched_item", d)
-		lbl.mouse_entered.connect(func(): _show_hover_card(lbl, d))
-		lbl.mouse_exited.connect(_hide_hover_card)
-		row.add_child(lbl)
-		if status == "planned":
-			# 执行反馈：完成 → 后端按「现在 - 开始时间」估实际耗时；推迟 → 明天优先再排。
-			var bd := _compact_button("完成")
-			bd.pressed.connect(func(): schedule_feedback_requested.emit(
-				int(d.get("id", 0)), "done", 0))
-			row.add_child(bd)
-			var bp := _compact_button("推迟")
-			bp.pressed.connect(func(): schedule_feedback_requested.emit(
-				int(d.get("id", 0)), "deferred", 0))
-			row.add_child(bp)
-		wrap.add_child(row)
+		var day := _agenda_day_key(d)
+		if day != last_day:
+			last_day = day
+			if not (day == "" and heading == "待安排"):
+				wrap.add_child(_agenda_day_label(_agenda_day_text(d)))
+		wrap.add_child(_agenda_row(d))
 
-func _priority_tag(d: Dictionary) -> String:
-	var pri := int(d.get("priority", 50))
-	if pri >= 85:
-		return "[紧急] "
-	if pri >= 70:
-		return "[高] "
+func _agenda_day_key(d: Dictionary) -> String:
+	"""清单分组用的日期：库里 date → when_text 里的日期 → start_ts；都没有 ⇒ 空串（待定）。"""
+	var date := str(d.get("date", "")).strip_edges()
+	if date.length() >= 10:
+		return date.substr(0, 10)
+	var from_text := _date_in_text(str(d.get("when_text", "")))
+	if from_text != "":
+		return from_text
+	var ts := float(d.get("start_ts", 0.0))
+	if ts > 0.0:
+		return Time.get_date_string_from_unix_time(int(ts))
 	return ""
+
+func _date_in_text(text: String) -> String:
+	var re := RegEx.new()
+	re.compile("(\\d{4})[-/](\\d{1,2})[-/](\\d{1,2})")
+	var m := re.search(str(text))
+	if m == null:
+		return ""
+	return "%s-%02d-%02d" % [m.get_string(1), int(m.get_string(2)), int(m.get_string(3))]
+
+func _agenda_day_text(d: Dictionary) -> String:
+	var date := _agenda_day_key(d)
+	if date == "":
+		return "待定"
+	var unix := _date_unix(date)
+	if unix <= 0:
+		return date.substr(5)
+	var dd := Time.get_datetime_dict_from_unix_time(unix)
+	return "%02d-%02d 周%s" % [int(dd.get("month", 0)), int(dd.get("day", 0)),
+		["一", "二", "三", "四", "五", "六", "日"][clampi(_weekday_index(unix), 0, 6)]]
+
+func _agenda_day_label(text: String) -> Label:
+	var lbl := Label.new()
+	lbl.text = text
+	lbl.custom_minimum_size = Vector2(0, 13)
+	lbl.add_theme_font_size_override("font_size", 8)
+	lbl.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.65))
+	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return lbl
+
+func _agenda_time_text(d: Dictionary) -> String:
+	var start := str(d.get("start_time", "")).strip_edges()
+	var end := str(d.get("end_time", "")).strip_edges()
+	if start != "":
+		return start if end == "" else "%s-%s" % [start, end]
+	var when := str(d.get("when_text", ""))
+	if "全天" in when:
+		return "全天"
+	var re := RegEx.new()
+	re.compile("(\\d{1,2})\\s*[:：]\\s*(\\d{2})")
+	var found := re.search_all(when)
+	if found.is_empty():
+		# 有日期但没时刻 ⇒「全天」；连日期都没有（或写着待定）⇒「待定」。
+		return "全天" if _agenda_day_key(d) != "" else "待定"
+	var first = found[0]
+	var text := "%02d:%s" % [int(first.get_string(1)), first.get_string(2)]
+	if found.size() >= 2:
+		var second = found[1]
+		text += "-%02d:%s" % [int(second.get_string(1)), second.get_string(2)]
+	return text
+
+func _agenda_title_text(d: Dictionary) -> String:
+	"""清单里的标题：只留一个分级短标签；结束 / 完成 / 取消用后缀，优先级进悬停卡。"""
+	var status := str(d.get("status", "planned")).strip_edges()
+	var grade := str(d.get("grade", "")).strip_edges()
+	var title := str(d.get("title", "")).strip_edges()
+	var prefix := ""
+	if status == "planned" and grade != "closed":
+		var tag := _grade_tag(d)
+		if tag != "":
+			prefix = "[%s] " % tag
+	var suffix := ""
+	if status == "done":
+		suffix = "（已完成）"
+	elif status == "cancelled":
+		suffix = "（已取消）"
+	elif grade == "closed":
+		suffix = "（已结束）"
+	return prefix + title + suffix
+
+func _agenda_row(d: Dictionary) -> HBoxContainer:
+	var status := str(d.get("status", "planned")).strip_edges()
+	var grade := str(d.get("grade", "")).strip_edges()
+	# 「已结束」只是历史记录：不再给完成 / 推迟按钮（周表里仍能看到它）。
+	var active := status == "planned" and grade != "closed"
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 2)
+	var when := Label.new()
+	when.text = _agenda_time_text(d)
+	when.custom_minimum_size = Vector2(60, 0)
+	when.add_theme_font_size_override("font_size", 8)
+	when.add_theme_color_override("font_color", Color(GufengTheme.INK_SOFT, 0.75))
+	when.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	when.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	row.add_child(when)
+	var lbl := Label.new()
+	lbl.text = _agenda_title_text(d)
+	lbl.custom_minimum_size = Vector2(96, 0)
+	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lbl.clip_text = true
+	lbl.max_lines_visible = 1
+	lbl.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	lbl.add_theme_font_size_override("font_size", 9)
+	lbl.add_theme_color_override("font_color",
+		GufengTheme.INK if active else GufengTheme.INK_SOFT)
+	# 悬停只显示一张自绘卡；不再用 Godot 默认的黑底 tooltip（会和卡片重复）。
+	lbl.set_meta("sched_item", d)
+	lbl.mouse_entered.connect(func(): _show_hover_card(lbl, d))
+	lbl.mouse_exited.connect(_hide_hover_card)
+	row.add_child(lbl)
+	if active:
+		# 执行反馈：完成 → 后端按「现在 - 开始时间」估实际耗时；推迟 → 明天优先再排。
+		var bd := _compact_button("完成")
+		bd.pressed.connect(func(): schedule_feedback_requested.emit(
+			int(d.get("id", 0)), "done", 0))
+		row.add_child(bd)
+		var bp := _compact_button("推迟")
+		bp.pressed.connect(func(): schedule_feedback_requested.emit(
+			int(d.get("id", 0)), "deferred", 0))
+		row.add_child(bp)
+	return row
 
 func _grade_tag(d: Dictionary) -> String:
 	"""日程分级短标签（后端已分级；离线 / 测试数据时按字段兜底推断）。"""
@@ -2054,9 +2129,7 @@ func draw_schedule_table(c: Control, s: Vector2) -> void:
 	var col_w := float(_timetable.get("col_w", 0.0))
 	if col_w <= 0.0:
 		return
-	var start_min := int(_timetable.get("start_min", int(TABLE_DAY_START)))
-	var end_min := int(_timetable.get("end_min", int(TABLE_DAY_END)))
-	# 表头浅色底 + 当天列高亮（块画在它上面，不遮表头）。
+	# 表头浅色底 + 网格线（细、低对比，课程块在它上面跨行）。
 	c.draw_rect(Rect2(Vector2.ZERO, Vector2(s.x, TABLE_HEAD_H)), Color(GufengTheme.ACCENT, 0.10))
 	var today_col := int(_timetable.get("today_col", -1))
 	if today_col >= 0 and today_col < 7:
@@ -2064,17 +2137,9 @@ func draw_schedule_table(c: Control, s: Vector2) -> void:
 		c.draw_rect(Rect2(tx, 0, col_w, TABLE_HEAD_H), Color(GufengTheme.ACCENT, 0.20))
 		c.draw_rect(Rect2(tx, TABLE_HEAD_H, col_w, s.y - TABLE_HEAD_H), Color(GufengTheme.ACCENT, 0.035))
 	var line := Color(GufengTheme.INK, 0.10)
-	var half := Color(GufengTheme.INK, 0.055)
-	# 整点实线 / 半点虚线：连续时间轴，半小时也看得出刻度。
-	var m := start_min
-	while m <= end_min:
-		var y := _time_y(m, start_min)
-		if y > TABLE_HEAD_H + 0.5 and y < s.y - 0.5:
-			if m % 60 == 0:
-				c.draw_line(Vector2(0, y), Vector2(s.x, y), line, 1.0)
-			else:
-				c.draw_dashed_line(Vector2(TABLE_TIME_W, y), Vector2(s.x, y), half, 1.0, 3.0)
-		m += 30
+	for i in range(TABLE_PERIODS + 1):
+		var y := TABLE_HEAD_H + float(i) * TABLE_ROW_H
+		c.draw_line(Vector2(0, y), Vector2(s.x, y), line, 1.0)
 	for i in range(9):
 		var x := 0.0 if i == 0 else TABLE_TIME_W + float(i - 1) * col_w
 		if i == 8:
@@ -2082,15 +2147,6 @@ func draw_schedule_table(c: Control, s: Vector2) -> void:
 		c.draw_line(Vector2(x, 0), Vector2(x, s.y), line, 1.0)
 	c.draw_line(Vector2(TABLE_TIME_W, TABLE_HEAD_H), Vector2(TABLE_TIME_W, s.y),
 		Color(GufengTheme.INK, 0.16), 1.0)
-	# 今天这一列的「现在」线：一眼看出当前时间落在哪个块上。
-	if today_col >= 0 and today_col < 7:
-		var now := Time.get_time_dict_from_system()
-		var mins := int(now.get("hour", 0)) * 60 + int(now.get("minute", 0))
-		if mins >= start_min and mins <= end_min:
-			var ny := _time_y(mins, start_min)
-			var nx := TABLE_TIME_W + float(today_col) * col_w
-			c.draw_line(Vector2(nx, ny), Vector2(nx + col_w, ny),
-				Color(GufengTheme.CINNABAR, 0.78), 1.5)
 
 func set_files_status(text: String) -> void:
 	if _files_status != null:

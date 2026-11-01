@@ -60,6 +60,35 @@ func _check(name: String, ok: bool) -> void:
 		_fail += 1
 		print("  FAIL  ", name)
 
+func _agenda_row_with(wrap, needle: String):
+	"""清单行：按标题找（行首是时间列，不再把整行文字拼成一条 Label）。"""
+	if wrap == null:
+		return null
+	for c in wrap.get_children():
+		if c is HBoxContainer:
+			for ch in c.get_children():
+				if ch is Label and str(ch.text).contains(needle):
+					return c
+	return null
+
+func _agenda_has_label(wrap, needle: String) -> bool:
+	"""清单里的独立文字（日期分组标题 / 汇总标题）。"""
+	if wrap == null:
+		return false
+	for c in wrap.get_children():
+		if c is Label and str(c.text).contains(needle):
+			return true
+	return false
+
+func _agenda_button_count(row) -> int:
+	var n := 0
+	if row == null:
+		return 0
+	for c in row.get_children():
+		if c is Button:
+			n += 1
+	return n
+
 func _run() -> void:
 	print("[petshell] 桌宠外壳自检（尺寸 / 菜单 / 聊天 / 拖动 / 启动判断）")
 	await _test_view()
@@ -236,11 +265,17 @@ func _test_view() -> void:
 	_check("执行反馈 / 复盘信号已定义",
 		v.has_signal("schedule_feedback_requested") and v.has_signal("files_review_requested"))
 	var agenda_wrap = v._schedule_agenda
-	var task_row = agenda_wrap.get_child(1) if agenda_wrap.get_child_count() > 1 else null
+	var task_row = _agenda_row_with(agenda_wrap, "评审")
 	_check("普通日程行带完成 / 推迟按钮",
-		task_row != null and task_row.get_child_count() == 3)
+		task_row != null and _agenda_button_count(task_row) >= 2)
 	_check("普通日程行显示自动分级",
-		task_row != null and task_row.get_child(0).text.contains("[待排]"))
+		task_row != null and str(task_row.get_child(1).text).contains("[待排]"))
+	_check("普通日程行只占一行文字（标题省略）",
+		task_row != null and int(task_row.get_child(1).max_lines_visible) == 1
+		and bool(task_row.get_child(1).clip_text))
+	_check("日程清单按天分组、不再重复年份",
+		_agenda_has_label(agenda_wrap, "10-28 周三")
+		and not _agenda_has_label(agenda_wrap, "2026-10-28"))
 	v._shift_month(1)
 	_check("月历能翻到下个月", v._calendar_title != null
 		and v._calendar_title.text.contains("11"))
@@ -275,8 +310,7 @@ func _test_view() -> void:
 	_check("点日期能打开对应周", v._week_start == "2026-10-26"
 		and v._week_title != null and v._week_title.text.contains("10月"))
 	_check("周课表网格生成", v._schedule_table != null)
-	_check("课程块按真实时间落在网格里", v._schedule_table.get_child_count()
-		== 7 + int(v._timetable.get("hour_count", 0)) + 2)
+	_check("课程块跨节落在网格里", v._schedule_table.get_child_count() > 7 + 12)
 	_check("表格宽度按面板铺开（窄窗口也保留 7 天）", v._schedule_table.custom_minimum_size.x >= 280.0
 		and v._schedule_table.custom_minimum_size.x <= 480.0)
 	v.set_schedule_items([
@@ -287,12 +321,10 @@ func _test_view() -> void:
 		 "date": "2026-11-04", "weekday": 2, "period": "1-2", "period_start": 1,
 		 "period_end": 2, "start_time": "08:00", "end_time": "09:35"},
 	])
-	_check("同一门课跨周扫描只留一格", v._schedule_table.get_child_count()
-		== 7 + int(v._timetable.get("hour_count", 0)) + 1)
+	_check("同一门课跨周扫描只留一格", v._schedule_table.get_child_count() == 7 + 12 + 1)
 	v.show_week_for_date("2026-11-04")
 	_check("下一周只显示它自己的课表", v._schedule_table != null
-		and v._schedule_table.get_child_count()
-			== 7 + int(v._timetable.get("hour_count", 0)) + 1)
+		and v._schedule_table.get_child_count() == 7 + 12 + 1)
 	v._calendar_month = "2026-11"
 	v.show_month()
 	await process_frame
@@ -356,32 +388,30 @@ func _test_view() -> void:
 	])
 	await process_frame
 	var event_wrap = v._schedule_agenda
-	var event_row = event_wrap.get_child(1) if event_wrap != null and event_wrap.get_child_count() > 1 else null
+	var event_row = _agenda_row_with(event_wrap, "篮球赛")
 	_check("聊天公告提取的活动按普通日程显示并标为约定",
-		event_row != null and event_row.get_child(0).text.contains("篮球赛")
-		and event_row.get_child(0).text.contains("[约定]"))
+		event_row != null and str(event_row.get_child(1).text).contains("篮球赛")
+		and str(event_row.get_child(1).text).contains("[约定]"))
 	_check("360 宽也能完整显示 7 天", v._schedule_table != null
 		and v._timetable.has("col_w")
 		and float(v._timetable.get("col_w", 0.0)) * 7.0 + 44.0
 			<= float(v._timetable.get("width", 0.0)) + 0.5)
 	var event_block = null
-	var football_block = null
 	if v._schedule_table != null:
 		for c in v._schedule_table.get_children():
 			if c is Panel and c.has_meta("sched_item"):
 				var meta: Dictionary = c.get_meta("sched_item")
-				if str(meta.get("title", "")).contains("篮球赛"):
+				if str(meta.get("title", "")).contains("篮球赛") \
+						or str(meta.get("notes", "")).contains("篮球赛"):
 					event_block = c
-				elif str(meta.get("title", "")).contains("足球赛"):
-					football_block = c
-	_check("重叠的两个约定各自成块（不再合并成「2 项约定」）",
-		event_block != null and football_block != null)
-	_check("重叠的约定自动分栏、块与块不相交", event_block != null and football_block != null
-		and event_block.position.x != football_block.position.x
-		and not event_block.get_rect().intersects(football_block.get_rect()))
+					break
+	_check("同一格多个约定合并成一个块", event_block != null
+		and str(event_block.get_meta("sched_item").get("title", "")) == "2 项约定")
+	_check("合并块在悬停卡里列出两场比赛", event_block != null
+		and str(event_block.get_meta("sched_item").get("notes", "")).contains("足球赛"))
 	_check("定时约定块也不使用原生黑底 tooltip", event_block != null
 		and event_block.tooltip_text == "")
-	var event_lbl = event_row.get_child(0) if event_row != null else null
+	var event_lbl = event_row.get_child(1) if event_row != null else null
 	_check("日程行不再使用原生黑底 tooltip", event_lbl != null
 		and event_lbl.tooltip_text == "")
 	if event_lbl != null:
@@ -415,11 +445,11 @@ func _test_view() -> void:
 					course_block = c
 				elif str(meta.get("title", "")) == "电脑线上会议":
 					overlap_block = c
-	_check("与课程重叠的约定仍然画进周表", overlap_block != null)
-	_check("课程与约定重叠时自动分栏、互不遮挡",
+	_check("与课程同格的约定仍然画进周表", overlap_block != null)
+	_check("同格约定改为底部窄条、不遮住课程",
 		overlap_block != null and course_block != null
-		and overlap_block.position.x != course_block.position.x
-		and not overlap_block.get_rect().intersects(course_block.get_rect()))
+		and overlap_block.size.y <= float(v.TABLE_ROW_H)
+		and overlap_block.position.y >= course_block.position.y + course_block.size.y - 20.0)
 	v._calendar_month = "2026-10"
 	v.show_month()
 	await process_frame
@@ -447,22 +477,21 @@ func _test_view() -> void:
 		 "priority": 50, "duration_min": 60},
 	])
 	v.show_week_for_date("2026-10-29")
-	var closed_basket = null
-	var closed_football = null
+	var closed_block = null
 	if v._schedule_table != null:
 		for c in v._schedule_table.get_children():
-			if c is Panel and c.has_meta("sched_item"):
-				var meta: Dictionary = c.get_meta("sched_item")
-				if str(meta.get("title", "")) == "班级篮球赛":
-					closed_basket = c
-				elif str(meta.get("title", "")) == "班级足球赛":
-					closed_football = c
-	_check("已结束的两条约定仍各自留在本周周表",
-		closed_basket != null and closed_football != null)
-	_check("已结束的约定块逐个标为已结束",
-		closed_basket != null and closed_football != null
-		and str(closed_basket.get_meta("sched_item").get("grade", "")) == "closed"
-		and str(closed_football.get_meta("sched_item").get("grade", "")) == "closed")
+			if c is Panel and c.has_meta("sched_item") \
+					and str(c.get_meta("sched_item").get("title", "")) == "2 项约定":
+				closed_block = c
+				break
+	_check("已结束的两条约定仍留在本周周表", closed_block != null)
+	_check("已结束的合并块标为已结束", closed_block != null
+		and str(closed_block.get_meta("sched_item").get("grade", "")) == "closed")
+	var closed_row = _agenda_row_with(v._schedule_agenda, "班级篮球赛")
+	_check("已结束的清单行不再给完成 / 推迟按钮",
+		closed_row != null and _agenda_button_count(closed_row) == 0)
+	_check("已结束的清单行标为已结束",
+		closed_row != null and str(closed_row.get_child(1).text).contains("（已结束）"))
 	# 完成的任务也不能从周表消失（后端 include_done + 前端允许 done）。
 	v.set_schedule_items([{
 		"id": 6, "title": "交实验报告",
