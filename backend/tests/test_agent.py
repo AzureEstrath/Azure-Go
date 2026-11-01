@@ -783,6 +783,51 @@ class PetChatTest(unittest.TestCase):
         self.assertEqual(bright_llm.calls[0][1], 460)
         self.assertIn("轻快", str(bright_llm.calls[0][0][0].get("content", "")))
 
+    def test_chat_direction_note_is_algorithm_driven(self):
+        """v4.5.0：方向提示由情绪分布算出——高好奇才出现「了解对方」，基线逐字符不变。"""
+        curious = StubLLM()
+        self._run(curious, text="我待会儿有点事", mood={"v": 0.70, "c": 0.80, "a": 0.50})
+        sys_text = str(curious.calls[0][0][0].get("content", ""))
+        self.assertIn("这句往哪儿说", sys_text)
+        self.assertIn("了解对方", sys_text)
+        base = StubLLM()
+        self._run(base, text="我待会儿有点事")
+        self.assertNotIn("这句往哪儿说", str(base.calls[0][0][0].get("content", "")))
+
+    def test_unanswered_questions_follow_emotion_and_lapse(self):
+        """v4.5.0：问过的问题进状态机；答过的自动消掉，没答的最多再带回来一次。"""
+        async def run():
+            agent, _eng, _llm, _bus = _mk()
+            agent.tts = _FakeTTS()
+            curious = (0.70, 0.80, 0.50)
+            turns = [
+                ("我有点事想跟你说", "欸？部署者大人有活动吗？那要卖的东西是什么呢？"),
+                ("活动是参加心理课", "哦~原来是心理课呀，那要卖的东西是什么呢？"),
+                ("嗯", "嗯，那我不问了。"),
+            ]
+            seen = []
+            for text, reply in turns:
+                agent.mood.v, agent.mood.c, agent.mood.a = curious
+                agent.llm = StubLLM(reply)
+                await agent.chat(text, "pet")
+                seen.append((agent.open_questions(),
+                             str(agent.llm.calls[0][0][0].get("content", ""))))
+            return seen
+
+        (first, first_sys), (second, second_sys), (third, _third_sys) = asyncio.run(run())
+        # 第一轮两句都算问句（「欸？」太短不算）→ 两条待答，压力 = 好奇算出的 ask。
+        self.assertEqual(len(first), 2)
+        self.assertTrue(all(p["pressure"] > 0.0 for p in first))
+        self.assertNotIn("上一句问过", first_sys)
+        # 第二轮：玩家答了「活动」→ 方向里只把「卖东西」那件事换说法带回来一次。
+        self.assertIn("上一句问过", second_sys)
+        self.assertIn("卖", second_sys)
+        self.assertNotIn("部署者大人有活动吗", second_sys)
+        # 换说法又问了一次 ⇒ 压力按饱和规则落底，不会再三遍四遍地追问。
+        self.assertEqual(second, [])
+        self.assertEqual(third, [])
+
+
     def test_chat_recall_cue_and_chain_continuation(self):
         """v4.3.0（D）：明确提旧事才回忆；链未断时可接着补一条，并带“延续”提示。"""
         memory = _RecallMemory([
@@ -1306,11 +1351,21 @@ class StreamGuardTest(unittest.TestCase):
                 yield piece
 
     class TurnLLM(StubLLM):
-        """每次调用换一句：`player_move` 三个阶段各自出话，便于核对 `turn_id` 是不是同一个。"""
+        """每次调用换一句：`player_move` 三个阶段各自出话，便于核对 `turn_id` 是不是同一个。
+
+        v4.5.0：落子宣告走 ``no_think`` 快速档（有意不走流式），所以编号必须在 ``chat`` 与
+        ``astream`` **两个入口**上共用，否则「第几句」会和真实阶段错位。
+        """
 
         def __init__(self):
             super().__init__()
             self.n = 0
+
+        async def chat(self, messages, max_tokens=300, no_think=False, think_mode=None):
+            self.calls.append((list(messages), max_tokens, no_think))
+            self.think_modes.append(think_mode)
+            self.n += 1
+            return "第%d句。" % self.n
 
         async def astream(self, messages, max_tokens=300):
             self.n += 1
@@ -1377,7 +1432,11 @@ class StreamGuardTest(unittest.TestCase):
         self.assertTrue(toks, "三个阶段都该有流式增量")
         self.assertTrue(agent.turn_id)
         self.assertEqual({str(e["turn_id"]) for e in toks}, {agent.turn_id})   # 三阶段同一个
-        self.assertEqual("".join(e["delta"] for e in toks), "第1句。第2句。第3句。")
+        # v4.5.0：落子宣告走 no_think 快速档，有意不走流式（省掉一轮等待）——
+        # token 只来自「点评」与「全局感想」两阶段，第二句仍是完整 message。
+        self.assertEqual("".join(e["delta"] for e in toks), "第1句。第3句。")
+        self.assertTrue(agent.llm.calls[1][2], "落子宣告应走 no_think 快速档")
+        self.assertEqual([str(m["text"]) for m in bus.messages(events.AI_MOVE)], ["第2句。"])
         for m in bus.messages():                 # 既有 message 事件的形状一个字都没动
             self.assertNotIn("turn_id", m)
 

@@ -212,6 +212,48 @@ class LifeStoreTest(unittest.TestCase):
         self.assertEqual(self.store.next_schedule(now=T0), {})
 
 
+    def test_schedule_refine_updates_in_place(self):
+        """v4.5.0：聊天里的补充只改那一条——保时间、并备注、不回退状态。"""
+        created = self.store.upsert_schedule([
+            {"start_ts": T0 + 5 * 3600.0, "when_text": "2026-10-27 周三 21:00",
+             "title": "有个活动", "notes": "玩家提过一嘴", "source": "chat",
+             "date": "2026-10-27", "start_time": "21:00", "duration_min": 90,
+             "priority": 70},
+        ], source="chat", now=T0)
+        self.assertEqual(len(created), 1)
+        sid = created[0]["id"]
+        refined = self.store.upsert_schedule([
+            {"refine_id": sid, "start_ts": 0.0, "when_text": "待定",
+             "title": "参加心理课", "notes": "周三晚上", "source": "chat"},
+        ], source="chat", now=T0 + 60)
+        self.assertEqual(len(refined), 1, "细化不应新增条目")
+        self.assertEqual(len(self.store.list_schedule(10)), 1)
+        row = refined[0]
+        self.assertEqual(row["id"], sid)
+        self.assertEqual(row["title"], "参加心理课")
+        self.assertEqual(row["start_ts"], T0 + 5 * 3600.0)
+        self.assertEqual(row["when_text"], "2026-10-27 周三 21:00")
+        self.assertEqual(row["start_time"], "21:00")
+        self.assertEqual(row["duration_min"], 90)
+        self.assertEqual(row["priority"], 70)
+        self.assertEqual(row["status"], "planned")
+        self.assertIn("玩家提过一嘴", row["notes"])
+        self.assertIn("周三晚上", row["notes"])
+        # 已完成的条目照常可以补细节，但不会被这次补充打回 planned。
+        self.assertTrue(self.store.set_schedule_status(sid, "done"))
+        done = self.store.upsert_schedule([
+            {"refine_id": sid, "start_ts": 0.0, "when_text": "待定",
+             "title": "参加心理课", "source": "chat"},
+        ], source="chat", now=T0 + 120)
+        self.assertEqual(done[0]["status"], "done")
+        # 指向不存在的 id 时退回普通插入，不吞掉这句话。
+        ghost = self.store.upsert_schedule([
+            {"refine_id": 9999, "start_ts": 0.0, "when_text": "待定",
+             "title": "另外一件事", "source": "chat"},
+        ], source="chat", now=T0 + 180)
+        self.assertEqual(len(ghost), 1)
+        self.assertEqual(ghost[0]["title"], "另外一件事")
+
     def test_schedule_course_fields_and_dedupe(self):
         """课程条目带星期 / 节次 / 教师 / 地点；同一门课重复扫描按日期+节次+标题更新而不是新增。"""
         saved = self.store.upsert_schedule([{

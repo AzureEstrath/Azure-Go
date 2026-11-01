@@ -4,9 +4,11 @@
 ``AzureAgent`` / ``agent_graph`` 负责。所有函数都是纯函数：时间、随机源、状态由调用方注入，
 方便单测，也保证关掉人格化时整条链路逐字符不变。
 
-四块内容：
+五块内容：
 - 关系阶段：按一起下过的局数（+ 少量互动）分档，给出一句**语气指令**，不直接念给玩家听；
 - 情绪余温：上一局结束时的三维情绪按时间向基线回落，新局带一点回来（有逻辑、不硬编）；
+- 情绪 → 语言节奏 / 回复方向：`v/c/a` 既决定「怎么说」，也决定「这句往哪儿说」，
+  并维护「问过但没被回答的问题」——可以再问一次，绝不反复追问；
 - 小目标：每局开始小概率选一个「今天的小心思」，只影响语气与话题，不承诺做不到的事；
 - 回忆文案：棋谱库某局的短回忆、复盘开场白、难度放轻时的半句提示。
 """
@@ -160,6 +162,274 @@ def emotion_language_note(mood) -> str:
     return ("【此刻说话的节奏 · 只影响语气与长短，不要逐条念出来】\n"
             + "\n".join("· " + p for p in parts[:3])
             + "\n（你仍是平时的 Azure：克制、有分寸，不卖萌也不端着；别把情绪名或数值说出口。）")
+
+
+# ================= 情绪 → 回复方向 + 未答问题（v4.5.0，E） =================
+#
+# 不写「好奇高就说某句」这类硬分流：把 v / c / a 相对基线的偏离标准化后，作为**对话动作**
+# 的对数几率（好奇→问、愉悦→分享、低落→接住、活跃→推进、安静→收），softmax 成分布；
+# 只有概率高于「不特意做什么」的中性动作，才算这句的**方向**。未答问题也用压力值
+# （pressure，按情绪分布给初值、每轮指数衰减、再问一次就减半）决定「能不能带回来」，
+# 而不是写死「最多问两次」——压力落到下限以下就自然收住。基线且无积压 ⇒ 空串（提示词不变）。
+
+# 情绪尺度的调参（不是判定阈值）：三轴「一个标准差」的感受幅度；增益控制分布的峰度。
+_POLICY_SIGMA = {"v": 0.20, "c": 0.18, "a": 0.22}
+_POLICY_GAIN = 1.0
+# 方向的门槛来自分布本身：动作概率要比「不特意做什么」高出这么多归一化概率质量才算方向，
+# 基线附近（情绪还没形成倾向）就什么都不写。
+_POLICY_MARGIN = 0.08
+# 问句预算上限：一次最多两件事（一件新问题 + 一件没答过的旧问题）。
+_ASK_MAX = 2
+# 追问压力：问过一次后每轮按「基础衰减 + 好奇加成」衰减；再问一次只留一半压力。
+_REASK_DECAY_BASE = 0.45
+_REASK_DECAY_GAIN = 0.35
+_REASK_SATIATION = 0.5
+_REASK_FLOOR = 0.18
+
+# 话题片段（中文二元组）里不能当「主题」用的虚词 / 疑问词 / 对话动词：
+# 只含这些字的二元组一律丢掉，否则「关于什么的呢」会被误当成一个新话题
+# （它其实是在追问上一句，属于同一条未答问题）。
+_Q_STOP_CHARS = set(
+    "什么哪咋怎吗呢吧嘛呀哦啊嗯诶欸这那哪个些多少于关和与对把被让给从向在"
+    "是有会能可要想说告诉还就都也才又很太更最没不别我你他她们问答应聊")
+
+# 「卖什么 / 卖的是什么 / 去哪」这类疑问词前的内容字就是话题焦点
+# （中间允许夹「的 / 是 / 了」这类虚词；单字也足以判断答没答）。
+_FOCUS_RE = re.compile(r"(.)(?:的|是|了|着|过){0,2}\s*(?:什么|啥|哪些|哪个|哪样|怎么样|如何)")
+
+# 明确的回避 / 不想说：算「已经回应过」，之后不再追问（也别道歉或解释）。
+_REFUSE_RE = re.compile(
+    r"(不想说|不想讲|不告诉你|不说了|别问|保密|关你.*事|没什么|不关你事|"
+    r"以后再说|改天再说|再说吧|算了|不方便说|不想聊)")
+
+# 「呢」既可以是疑问语气，也可以是「这个可是要好好上呢」这种陈述收尾：
+# 只有句中出现疑问词时才把「…呢」当问句（问号仍然无条件算问句）。
+_Q_WORD_RE = re.compile(
+    r"(什么|啥|哪|怎么|为什么|为何|多少|几时|几点|是不是|有没有|要不要|会不会|"
+    r"能不能|好不好|行不行|对吗|对吧)")
+
+# 是非问句 + 很短的肯定 / 否定回答 ⇒ 算回答过（不再要求提到同一个话题词）。
+_YES_NO_RE = re.compile(r"(吗|么|是不是|有没有|要不要|会不会|行不行|好不好)")
+_SHORT_ANSWER_RE = re.compile(
+    r"^(嗯|恩|嗯嗯|是|是的|对|对啊|好|好呀|行|可以|有|有的|有啊|没有|没|不是|不|不用)$")
+
+
+def question_fragments(text, limit=2) -> list:
+    """从一段话里取出**带具体话题**的问句（去掉「欸？」这类纯感叹）。
+
+    只保留能当「未答问题」追踪的句子：有问号，或以「吗 / 么 / 嘛 / 呢」收尾且句中带
+    疑问词（「这个可是要好好上呢」是陈述、不是问句）。像「关于什么的呢」「后来呢」
+    这种没有新话题的追问会被跳过——它们本来就是上一句的续问，单独追踪只会重复追问。
+    """
+    raw = str(text or "")
+    if raw.strip() == "":
+        return []
+    out = []
+    for frag in re.findall(r"[^。！？!?\n]+[。！？!?]?", raw):
+        f = frag.strip()
+        if f == "":
+            continue
+        body = re.sub(r"[。！？!?；;，,、\s]+$", "", f).strip()
+        if body == "":
+            continue
+        has_mark = ("？" in f) or ("?" in f)
+        tail_q = (body.endswith(("吗", "么", "嘛"))
+                  or (body.endswith("呢") and bool(_Q_WORD_RE.search(body))))
+        if not has_mark and not tail_q:
+            continue
+        if not (_content_grams(body) or _focus_chars(body)):
+            continue
+        if len(body) < 3:
+            continue
+        if any(same_question(body, q) for q in out):
+            continue
+        out.append(body)
+        if len(out) >= max(1, _as_int(limit) or 1):
+            break
+    return out
+
+
+def answers_question(player_text, question_text) -> bool:
+    """玩家这句话**是否算回答了**那个问题（纯规则，不调模型）。
+
+    命中任一条即算答过：① 提到问题里的话题片段 / 疑问焦点；② 明确回避
+    （「不想说」）；③ 是非问句收到很短的肯定 / 否定回答。
+    """
+    ans = str(player_text or "").strip()
+    q = str(question_text or "").strip()
+    if ans == "" or q == "":
+        return False
+    if _REFUSE_RE.search(ans):
+        return True
+    hay = ans.lower()
+    if any(g in hay for g in _content_grams(q)):
+        return True
+    if any(ch in hay for ch in _focus_chars(q)):
+        return True
+    if _YES_NO_RE.search(q) and len(ans) <= 6 and _SHORT_ANSWER_RE.match(
+            re.sub(r"[。！？!?，,、\s]+", "", ans)):
+        return True
+    return False
+
+
+def same_question(a, b) -> bool:
+    """两句话是不是**同一个问题**（用来合并重复追问，而不是又记一条）。"""
+    ga, gb = _content_grams(a), _content_grams(b)
+    if ga and gb:
+        overlap = ga & gb
+        if len(overlap) >= 2:
+            return True
+        if len(overlap) >= 1 and min(len(ga), len(gb)) <= 2:
+            return True
+    if _focus_chars(a) & _focus_chars(b):
+        return True
+    return False
+
+
+def emotion_policy(mood) -> dict:
+    """情绪三维 → 对话动作分布（纯算法，不是 if-else 硬分流）。
+
+    v / c / a 相对基线 ``MOOD_BASELINE`` 的偏离先按各自的感受尺度标准化，作为五个动作的
+    对数几率：``ask``（好奇）＝ +z_c、``share``（愉悦）＝ +z_v、``hold``（低落）＝ -z_v、
+    ``push``（活跃）＝ +z_a、``quiet``（安静）＝ -z_a，另有一个 ``neutral``（不特意做什么）
+    恒为 0。softmax 之后，只有概率**高于 neutral** 的动作才算这句的方向；两者之差归一化成
+    ``excess``，同时决定问句预算（越好奇越多，最多两件）。数据脏 / 缺维 ⇒ ``{}``。
+    """
+    src = mood if isinstance(mood, dict) else {}
+    try:
+        v, c, a = float(src.get("v")), float(src.get("c")), float(src.get("a"))
+    except (TypeError, ValueError):
+        return {}
+    if not all(math.isfinite(x) for x in (v, c, a)):
+        return {}
+    try:
+        v0, c0, a0 = (float(x) for x in MOOD_BASELINE[:3])
+    except (TypeError, ValueError):
+        return {}
+
+    def _z(x, zero, key):
+        return (x - zero) / _POLICY_SIGMA[key]
+
+    logits = {
+        "ask": _z(c, c0, "c"),
+        "share": _z(v, v0, "v"),
+        "hold": -_z(v, v0, "v"),
+        "push": _z(a, a0, "a"),
+        "quiet": -_z(a, a0, "a"),
+        "neutral": 0.0,
+    }
+    try:
+        raw = {k: math.exp(_POLICY_GAIN * x) for k, x in logits.items()}
+    except OverflowError:                   # 极端脏值（理论上到不了）也不抛
+        raw = {k: (float("inf") if x > 0 else 0.0) for k, x in logits.items()}
+    total = sum(raw.values())
+    if not (total > 0.0) or not math.isfinite(total):
+        return {}
+    probs = {k: x / total for k, x in raw.items()}
+    neutral = probs["neutral"]
+    scale = max(1e-6, 1.0 - neutral)
+    excess = {k: max(0.0, (p - neutral) / scale) for k, p in probs.items() if k != "neutral"}
+    acts = sorted((k for k in excess if excess[k] >= _POLICY_MARGIN), key=lambda k: -excess[k])
+    if "hold" in acts:
+        # 情绪低落时先接住对方：再好奇也不在这句开新问题（同一个分布内部的冲突消解）。
+        acts = [k for k in acts if k != "ask"]
+    if "ask" in acts:
+        ask_budget = min(_ASK_MAX, int(math.ceil(_ASK_MAX * excess["ask"])))
+    else:
+        ask_budget = 0
+    return {"probs": probs, "excess": excess, "acts": acts[:2],
+            "ask": float(excess.get("ask", 0.0)), "ask_budget": ask_budget}
+
+
+def update_open_questions(pending, player_text, reply_text, mood=None) -> list:
+    """推进「未答问题」状态机：答过 / 回避的移出，压力衰减到下限以下就收住。
+
+    - 玩家回答了（或明确说不想说）⇒ 直接移出；
+    - 没答 ⇒ ``pressure *= 0.45 + 0.35 * ask``（越好奇衰减越慢），低于 ``_REASK_FLOOR`` 移出；
+    - 这次回复里换了说法又问同一个问题 ⇒ 在**已衰减**的压力上再减半（问过就满足了一部分），
+      不重复记一条、也不会因为「又问了一次」把压力刷新回满；
+    - 新问题 ⇒ 压力 = 当前好奇质量（不刻意问时压力本来就很低，下一轮自然消失）；
+    - 最多留两条，旧的在前：先解决旧问题，下一轮自然轮到「卖东西」这类旧话题。
+    """
+    policy = emotion_policy(mood)
+    ask = float(policy.get("ask", 0.0)) if policy else 0.0
+    decay = _REASK_DECAY_BASE + _REASK_DECAY_GAIN * ask
+    player = str(player_text or "")
+    rows = []
+    for p in pending or []:
+        if not isinstance(p, dict):
+            continue
+        q = str(p.get("q") or "").strip()
+        if q == "" or answers_question(player, q):
+            continue
+        try:
+            pressure = _clamp01(p.get("pressure", 0.0))
+        except (TypeError, ValueError):
+            pressure = 0.0
+        rows.append({"q": q, "pressure": pressure * decay})
+    for q in question_fragments(reply_text, limit=2):
+        merged = None
+        for row in rows:
+            if same_question(q, row["q"]):
+                merged = row
+                break
+        if merged is not None:
+            merged["q"] = q                 # 用最新说法，下次更容易自然带回来
+            merged["pressure"] = min(merged["pressure"], ask) * _REASK_SATIATION
+            continue
+        if ask >= _REASK_FLOOR:            # 没有好奇驱动时，问过的问题不进状态机
+            rows.append({"q": q, "pressure": ask})
+    return [r for r in rows if r["pressure"] >= _REASK_FLOOR][-2:]
+
+
+def reply_direction_note(mood, pending=None) -> str:
+    """情绪分布 + 未答问题的压力 → 一段**内容方向**提示；没有方向 ⇒ ``""``。
+
+    与 ``emotion_language_note``（语气节奏）分开：这里只说「这句往哪儿聊」，
+    所有措辞都由 ``emotion_policy`` / 压力值算出来的档位决定，不写任何示例台词，
+    也绝不把情绪名或数值念出来。
+    """
+    policy = emotion_policy(mood)
+    if not policy:
+        return ""
+    acts = list(policy.get("acts") or [])
+    parts = []
+
+    rows = [p for p in (pending or []) if isinstance(p, dict) and str(p.get("q") or "").strip()]
+    reask = None
+    for p in rows:
+        try:
+            pressure = _clamp01(p.get("pressure", 0.0))
+        except (TypeError, ValueError):
+            pressure = 0.0
+        if pressure >= _REASK_FLOOR:
+            reask = (str(p.get("q") or "").strip(), pressure)
+            break
+    budget = int(policy.get("ask_budget", 0) or 0)
+    if reask is not None and budget > 0:
+        budget -= 1                         # 带回来的旧问题占掉一个问句额度
+
+    if "ask" in acts and budget > 0:
+        parts.append("好奇心把这句话的重心推向「了解对方」：最多问 %d 件对方刚提到的事"
+                     "（细节 / 后来 / 具体是哪一件），不猜自己的答案。" % budget)
+    if reask is not None and "ask" in acts:
+        parts.append("上一句问过「%s」，对方还没回答：可以换个说法自然带回来一次，"
+                     "问的是同一件事；对方再不接就收住，不重复第二遍。" % reask[0])
+    if "share" in acts:
+        parts.append("心情把这句话推向「说一点自己」：可以带半句自己的感受或近况，"
+                     "再顺着对方的话接一句，别只顾着问。")
+    if "hold" in acts:
+        parts.append("低落把这句话推向「先接住对方」：只回应这一句，不开新话题、不加问句。")
+    if "push" in acts:
+        parts.append("活跃把这句话推向「往前推」：给一个具体的下一步或小提议，别停在附和。")
+    if "quiet" in acts:
+        parts.append("安静把这句话收短：不主动推进话题，回应到位就停。")
+
+    if not parts:
+        return ""
+    return ("【这句往哪儿说 · 按此刻情绪算出的方向，不要逐条念出来】\n"
+            + "\n".join("· " + p for p in parts[:3])
+            + "\n（仍用 Azure 平时干脆、有分寸的口吻；问句件数按上面的数，对方不接就收住。）")
 
 
 def chat_budget(mood, life_fields=None) -> int:
@@ -408,6 +678,32 @@ def is_private_text(*parts) -> bool:
 
 
 # ================= 内部 =================
+
+
+def _content_grams(text) -> set:
+    """可当话题用的片段：中文二元组（滤掉虚词 / 疑问词）+ 3 字母以上的英文词。"""
+    t = str(text or "").strip().lower()
+    grams = set()
+    if t == "":
+        return grams
+    for i in range(len(t) - 1):
+        g = t[i:i + 2]
+        if g.strip() == "" or any(ch in _Q_STOP_CHARS for ch in g):
+            continue
+        if re.match(r"^[\u4e00-\u9fff]{2}$", g):
+            grams.add(g)
+    for word in re.findall(r"[a-z]{3,}", t):
+        grams.add(word)
+    return grams
+
+
+def _focus_chars(text) -> set:
+    """疑问词前的那个内容字（「卖什么」→ 卖）：单字也足以判断答没答。"""
+    out = set()
+    for ch in _FOCUS_RE.findall(str(text or "")):
+        if re.match(r"^[\u4e00-\u9fff]$", ch) and ch not in _Q_STOP_CHARS:
+            out.add(ch)
+    return out
 
 
 def _as_int(v) -> int:

@@ -669,7 +669,16 @@ def _parse_item(raw, ref, source):
     elif date is not None:
         when_text = "%s（全天）" % date_text
 
+    # 细化已有条目（v4.5.0）：只认正整数的 refine_id，脏值 / bool / 负数一律当「新建」。
+    try:
+        refine_id = int(raw.get("refine_id", raw.get("update_id", raw.get("target_id", 0)) or 0))
+    except (TypeError, ValueError, OverflowError):
+        refine_id = 0
+    if refine_id <= 0:
+        refine_id = 0
+
     return {
+        "refine_id": refine_id,
         "start_ts": start_ts,
         "when_text": when_text,
         "title": title,
@@ -713,6 +722,9 @@ def normalize_items(raw_items, source="", now=None):
                 key = ("slot", it["date"], it["weekday"], it["period_start"])
             else:
                 key = ("course", it["date"], it["period"], _norm_title(it["title"]))
+        elif it.get("refine_id"):
+            # 细化条目按 id 去重：同一次回复里对同一条的两次补充只保留最后一次。
+            key = ("refine", it["refine_id"], _norm_title(it["title"]))
         else:
             key = ("item", round(float(it["start_ts"]), 1), _norm_title(it["title"]))
         if key in seen:

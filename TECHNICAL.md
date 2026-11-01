@@ -63,7 +63,12 @@
 > 情绪小调用，后台日程判断上限放宽到 20 秒，避免本地单槽模型忙时“思路断了 / 漏记日程”。**
 > **v4.4.2：右键菜单加入测试数据清理（二次确认），清空聊天 / 记忆 / episode / 对话类生命事件
 > 并让情绪与慢变量回基线；去掉菜单黑色压暗层，tooltip 改为雾纸卡片。**
-> 最后更新：2026-10-31。
+> **v4.5.0：三维情绪用 softmax 相对压力驱动回复方向（追问 / 分享 / 收住 / 推进 / 安静，
+> 基线时注段为空、提示词逐字符不变），未答问题逐轮衰减、最多按人设追一两次；
+> 围棋链路提速（点评语音延后合成 + 落子宣告 `no_think`，前端只对揭示棋子与保序等语音）；
+> 聊天里没说时间的安排先留「待定」占位，补充信息按 `refine_id` 原地细化；
+> 周表改为连续真实时间轴、重叠块分栏与悬停卡。**
+> 最后更新：2026-11-01。
 
 ---
 
@@ -377,11 +382,14 @@ KataGo 服务只依赖 `fastapi`、`uvicorn`（`httpx` 仅测试用）。
 - `ai_notice` 明确声明「这条没有语音」，不登记配对，避免挤掉后续真语音；
 - 语音缺失/超时不会锁死棋盘，配对状态机有超时兜底；
 - 预制开场欢迎语；情绪语气词只在「Azure 思考中…」占位出现的**思考节点**插入，候选音优先匹配上一句的 `[[tone]]` / `{行为}`，频率由当前情绪强度决定（语义匹配约 8%~50%，纯情绪约 2%~22%，另有 2 节点 + 6 秒连播闸）；思考、逐句 tone、落子打断都不插；摸头保留一声 `pat` 反应；
-- `tts_sync_speak` 控制文字是否等语音；`tts_batch_speak` 控制多条消息是否合并朗读。
+- `tts_sync_speak` 只决定「要不要等语音」：开启时**落子宣告（`reveal`）**严格等语音开口，
+  前面还有没显示的台词时按到达顺序等；点评 / 聊天 / 闲置搭话文字先到、语音随后播
+  （`turn_active` 不再扣住文字）。关闭时所有文字立即显示。`tts_batch_speak` 控制多条消息
+  是否合并朗读。
 
 ### 5.9 前端测试
 
-`game/tests/` 下 18 个 headless 脚本，覆盖：配置读写、标题屏、新局、视角与悬停、定式卡片与档位、聊天队列、语音配对、TTS、口语化目差、复盘、战报、棋谱回放、点目、形象路径、音效、思考短句解析工具。运行方式见第 10 节。
+`game/tests/` 下 20 个 headless 脚本，覆盖：配置读写、标题屏、新局、视角与悬停、定式卡片与档位、聊天队列、语音配对、TTS、口语化目差、复盘、战报、棋谱回放、点目、形象路径、音效、思考短句解析工具、桌宠外壳与周表。运行方式见第 10 节。
 
 ---
 
@@ -778,6 +786,25 @@ KataGo 服务测试 36 个，用假引擎，不依赖真实 KataGo。
       `TooltipPanel/TooltipLabel` 主题改为雾纸卡片，替代 Godot 默认黑底 tooltip。
     - “清理测试 / 退出桌宠”同一行，按钮第一次点击变为「再点一次确认」，4 秒内第二次点击
       才发请求；`PetView.clear_chat()` 强制清空面板（后端空历史本身不会清屏）。
+22. **情绪方向 / 提速 / 隐式日程 / 周表（v4.5.0）**：
+    - `persona.emotion_policy`：`(v, c, a)` 相对基线 `(0.58, 0.55, 0.30)` 的标准化偏离做
+      softmax，得到 `ask / share / hold / push / quiet / neutral` 的相对压力；只有超过
+      `_POLICY_MARGIN = 0.08` 的显著项才产出 `reply_direction_note`，问句预算
+      `ceil(_ASK_MAX * excess.ask)`（最多 2）。基线时注段为空，提示词逐字符不变。
+    - `agent._open_questions`：未答问题每轮按 `0.45 + 0.35 * ask` 衰减；换说法再问乘
+      `_REASK_SATIATION = 0.5`；低于 `_REASK_FLOOR = 0.18` 自动移出，已答的当回合过滤。
+    - 提速：点评语音用 `defer_speech=True` 丢后台合成，与 own_turn 的引擎分析 / 出话重叠；
+      下一处 `_emit_line` 在发 `message` 之前 `_flush_pending_speech`，`player_move` 的
+      `finally` 再 flush 一次；落子宣告改走 `no_think=True`（短宣告不需要推理预算，也不走流式）。
+    - 前端 `SpeechPairing.should_wait_voice(sync, env, reveal)` 只在 `reveal` 或
+      `has_pending()` 时为真；`turn_active` 仅用于 `release_stale`。
+    - 日程：`schedule_chat.extract(..., context_text, candidates)` 带最近对话与
+      `refine_candidates`；`schedule._parse_item` 输出 `refine_id`，无日期写
+      `when_text="待定"`、`start_ts=0`；`life.upsert_schedule` 按 `refine_id` 原地细化，
+      保留旧时间 / 状态 / `auto_planned`。
+    - 周表：`PetView._build_timetable` 改为连续真实时间轴（默认 08:00–22:00，半小时 14px），
+      `_assign_lanes` 对同一天重叠的块贪心分栏；块内只显示标题，教师 / 地点 / 分级 / 排班理由
+      进悬停卡；整点实线 + 半点虚线 + 今日当前时间线。
 
 未采用（缺少数据源或收益不足）：数字孪生 / Pareto 预演、手机行为信号触发、夜间消息 / 邮件事实抽取。
 

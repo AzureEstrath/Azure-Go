@@ -240,12 +240,13 @@ async def _capture_chat_schedule(app, cfg, agent, text):
         app.state.chat_capture_lock = lock
     async with lock:
         now = time.time()
+        context = _recent_chat_text(agent)
         # v4.2.7：先看「这句话是不是在取消已有的日程」——规则匹配现有标题，
         # 拿不准才让 LLM 结合最近对话判断；课程等固定项不在这里取消。
         try:
             candidates = await asyncio.to_thread(life.list_schedule, 200)
             cancel_ids = await schedule_chat.extract_cancellations(
-                llm, text, _recent_chat_text(agent), candidates, now=now)
+                llm, text, context, candidates, now=now)
         except Exception as e:              # noqa: BLE001 —— 取消判断失败不影响新增
             print("[Schedule] 聊天取消判断异常（已忽略）：%s" % e)
             candidates, cancel_ids = [], []
@@ -278,7 +279,11 @@ async def _capture_chat_schedule(app, cfg, agent, text):
                         print("[Schedule] 取消日程刷新事件发送失败（已忽略）：%s" % e)
                 return
         try:
-            items = await schedule_chat.extract(llm, text, now=now)
+            # v4.5.0：带上最近几轮（理解「这个 / 那个」）和现有待细化的条目，
+            # 让「活动是参加心理课」写回同一条占位日程，而不是另建一条。
+            items = await schedule_chat.extract(
+                llm, text, now=now, context_text=context,
+                candidates=schedule_chat.refine_candidates(candidates, now=now))
         except Exception as e:              # noqa: BLE001 —— 判断失败只打日志
             print("[Schedule] 聊天日程判断异常（已忽略）：%s" % e)
             return

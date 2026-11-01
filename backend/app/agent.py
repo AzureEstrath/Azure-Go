@@ -19,7 +19,8 @@ from langchain_core.messages import ToolMessage
 from . import actions, adaptive, coords, events, joseki_gate, lanes, persona, profile, prompt_chains, prompts, pv_lines, recall_chain, speech_text, time_ctx
 from .agent_graph import (
     PHASE_AFTER_PLAYER, PHASE_ANALYZE, PHASE_CHAT, PHASE_IDLE, PHASE_JUST_MOVED,
-    PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, PHASE_PEER, build_graph, is_joseki_mistake, _emit_line,
+    PHASE_OBSERVE, PHASE_OWN_TURN, PHASE_SUMMARY, PHASE_PEER, build_graph, is_joseki_mistake,
+    _emit_line, _flush_pending_speech,
 )
 from .board import GoBoard, SIZE as BOARD_SIZE
 from .config import DRIFT_MAX_LIMIT
@@ -459,6 +460,9 @@ class AzureAgent:
         self._recall_chain: dict = {}
         self._recall_chain_end_ts: float = 0.0
         self._chat_seq: int = 0             # 玩家聊天序号：回忆链只在“链开始后确实又聊过”时检查换题
+        # 未答问题（v4.5.0）：她在聊天里问过、玩家还没回答的问题。最多两条（旧的先让位），
+        # 每次由 ``persona.reply_direction_note`` 决定「能不能再问一次」；纯内存、不落盘。
+        self._open_questions: list = []
 
         # —— 跨局的定式族计数（T5）：默认不接线（None）⇒ 一律当作「第 1 次」、每次都上卡片；
         #    由 main.py 的 lifespan 无条件注入 JosekiProgress（没有开关，设计 §8.4）——
@@ -2264,6 +2268,47 @@ class AzureAgent:
         except Exception:                       # noqa: BLE001
             return 400
 
+    def open_questions(self) -> list:
+        """当前未答问题（只读快照；脏数据直接丢掉）。"""
+        rows = []
+        for p in getattr(self, "_open_questions", []) or []:
+            if not isinstance(p, dict):
+                continue
+            q = str(p.get("q") or "").strip()
+            if q == "":
+                continue
+            try:
+                pressure = max(0.0, min(1.0, float(p.get("pressure", 0.0))))
+            except (TypeError, ValueError):
+                pressure = 0.0
+            rows.append({"q": q, "pressure": pressure})
+        return rows
+
+    def chat_direction_note(self, player_text="") -> str:
+        """情绪三维 + 未答问题 → 聊天内容方向（空串 ⇒ 系统消息逐字符不变）。
+
+        ``player_text`` 是**这一句**：状态机在回合结束才推进，这里先把「玩家刚答过的」
+        问题临时摘掉，避免她对着刚得到的答案又追问一遍。
+        """
+        try:
+            rows = self.open_questions()
+            text = str(player_text or "")
+            if text:
+                rows = [p for p in rows if not persona.answers_question(text, p["q"])]
+            return persona.reply_direction_note(self._mood_axis(), rows)
+        except Exception as e:                  # noqa: BLE001 —— 方向提示坏了不该影响出话
+            print("[Agent] 回复方向提示生成失败（已忽略）：%s" % e)
+            return ""
+
+    def _update_open_questions(self, player_text, reply_text) -> None:
+        """一轮聊天结束后推进未答问题状态（纯内存；任何异常只打日志）。"""
+        try:
+            self._open_questions = persona.update_open_questions(
+                self.open_questions(), str(player_text or ""), str(reply_text or ""),
+                self._mood_axis())
+        except Exception as e:                  # noqa: BLE001
+            print("[Agent] 未答问题状态更新失败（已忽略）：%s" % e)
+
     def persona_note(self) -> str:
         """人格化提示词附加段（关系 / 最近胜负 / 夜間语气 / 小目标 / 难度半句）。
 
@@ -2692,6 +2737,12 @@ class AzureAgent:
             print("[Agent] 落子编排异常：%s" % e)
         finally:
             self._clear_busy(owner)                 # 只清自己那份：别解开后来新回合的锁
+            # v4.5.0：点评语音是延后合成的（与她下一步重叠），回合收口前把它的 `speech`
+            # 补发完——绝不留一条后台合成拖到下一轮、把配对序号错配给新台词。
+            try:
+                await _flush_pending_speech(self)
+            except Exception:                       # noqa: BLE001 —— 收尾失败不影响 busy 已归位
+                pass
 
     async def _player_move_turns(self, x, y, token):
         """``player_move`` 的三个阶段（同一个 epoch，交给 ``_turn_guard`` 整体兜底）。

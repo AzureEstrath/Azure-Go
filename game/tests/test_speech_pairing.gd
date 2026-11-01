@@ -408,8 +408,8 @@ func _run() -> void:
 		p11.display(r11)
 	_check("⑪ 文字当场显示、不留待显示残留（不会挂在「思考中」占位里）",
 			_shown == ["聊天回复"] and not p11.has_pending())
-	_check("⑪ 回合还没结束时照样等语音（对局中的同步说话不变）",
-			p11.should_wait_voice(true, _env(true, true, false), false))
+	_check("⑪ 回合还没结束也不再等语音（文字先到、语音随后播）",
+			not p11.should_wait_voice(true, _env(true, true, false), false))
 	_check("⑪ 「同步说话」关掉时一律不等", not p11.should_wait_voice(false, _env(true, false, false), false))
 	_check("⑪ 落子宣告（reveal）任何情况下都等：音画同步的硬规则不许被绕过",
 			p11.should_wait_voice(true, _env(false, true, false), true))

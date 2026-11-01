@@ -1,4 +1,4 @@
-# Azure · 全量项目文档（v4.4.2）
+# Azure · 全量项目文档（v4.5.0）
 
 > 本文件是**完整项目地图**：系统架构、人格化 / 日程 / 记忆三条主通路、代码量审计结果、
 > 每个第一方文件的作用、配置与测试入口、维护约定。
@@ -74,6 +74,10 @@ FastAPI 后端（backend/app，端口 8000）
      情绪语言节奏（`persona.emotion_language_note`）/ 慢变量语气（`agent.life_note`）。
    - **基线附近情绪语言节奏为空**，提示词逐字符不变；明显偏离时只给句长、问句、
      快慢的软约束，并保留「仍是 Azure、克制不卖萌」的人设边界。
+   - **v4.5.0 · 情绪也决定方向**：`persona.emotion_policy` 把三维相对基线的标准化偏离经
+     softmax 得到「追问 / 分享 / 收住 / 推进 / 安静」的相对压力；只有明显偏离才产出
+     `reply_direction_note` 与问句预算（`ceil` 好奇压力，最多 2），基线时注段为空。
+     未答问题按轮衰减、换说法再问打对折，降到地板自动移出，不会反复追问。
 5. **语言参数**
    - `agent.chat_budget()` → 340 / 400 / 440 / 460 tokens；由 `agent_graph._prepare_chat`
      放进 `data["chat_budget"]`，`_speak_chat` 使用。
@@ -94,6 +98,8 @@ FastAPI 后端（backend/app，端口 8000）
    - `message` 事件带文本；`speech` 事件带 `pitch`（当前情绪区域音高）；
    - 前端 `Main.gd` / `PetShell.gd` 播放 TTS 或预制语气音，`PetView.gd` 显示聊天气泡；
    - 头像 morphs / burst 由客户端按 `mood` 事件渲染。
+   - **v4.5.0 同步语义**：只有落子宣告（`reveal`）严格等语音开口；点评 / 聊天 /
+     闲置搭话文字先到、语音随后播，积压时按到达顺序等（不抢位）。
 
 ---
 
@@ -120,8 +126,12 @@ FastAPI 后端（backend/app，端口 8000）
 3. 取消：`LifeStore.set_schedule_status(..., "cancelled")`；
    `MemoryService.supersede_schedule_item` 让旧日程记忆失效，
    并写一条 `schedule:cancelled` 审计记忆；
-4. 新增：`schedule_chat.extract` → `schedule.normalize_items` → `LifeStore.upsert_schedule`
+4. 新增：`schedule_chat.extract`（v4.5.0 起带最近对话与 `refine_candidates`）→
+   `schedule.normalize_items`（可带 `refine_id`）→ `LifeStore.upsert_schedule`
    → 按需 `auto_plan` → 写 memory → `ai_schedule` 只作面板刷新信号，不单独播报；
+   - **隐式记录 / 原地细化**：玩家提到「有活动 / 要卖东西」但没给时间时，先写一条
+     `when_text="待定"`、`start_ts=0` 的占位，不编造时刻；之后补充「活动是心理课」，
+     模型用 `refine_id` 指回同一条，`upsert_schedule` 只补标题 / 备注 / 时间，不新建重复条目。
 5. 同一标题 + 同一天的新日程会让旧记忆 `supersede`（不删除，保留审计）。
 
 ### 3.3 聊天时的日程事实
@@ -222,27 +232,59 @@ FastAPI 后端（backend/app，端口 8000）
   重置到默认；`agent.mood.reset()` 后强推一次 `mood` 事件。
 - 不删除日程、课程、棋谱与画像；菜单黑色压暗层与 Godot 默认黑底 tooltip 一并移除。
 
+### 4.8 情绪方向 / 提速 / 周表（v4.5.0）
+
+- **情绪 → 回复方向（算法，不写死台词）**：`persona.emotion_policy` 用
+  `(v, c, a)` 相对基线 `(0.58, 0.55, 0.30)` 的标准化偏离做 softmax，
+  得到 `ask / share / hold / push / quiet / neutral` 的相对压力；只有超过
+  `_POLICY_MARGIN=0.08` 的显著项才产出注段，问句预算 `ceil(_ASK_MAX * excess.ask)`（最多 2）。
+  注段追加在系统消息末尾，**为空时提示词逐字符不变**（golden 提示词仍锁定）。
+- **未答问题压力**：`agent._open_questions` 逐轮按 `0.45 + 0.35*ask` 衰减；
+  换说法再问乘 `_REASK_SATIATION=0.5`；低于 `_REASK_FLOOR=0.18` 自动移出。
+  已答的问题临时过滤，不会在同一回合被重复带回。
+- **语音提速**：`agent_graph._finalize_after_player` 的点评语音用 `defer_speech=True`
+  丢到后台合成，与 own_turn 的引擎分析 / 模型出话重叠；下一处 `_emit_line` 在发
+  `message` 之前 `_flush_pending_speech`，保证 `message → speech` 顺序与 `seq` 不错位；
+  `player_move` 的 `finally` 收口时再 flush 一次，绝不留到下一回合。
+  `_speak_own_turn` 的落子宣告改走 `no_think=True`（短宣告不需要推理预算，也不走流式）。
+- **前端等待语义**：`SpeechPairing.should_wait_voice` 只在「要揭示棋子（reveal）」或
+  「前面还有未显示台词（保序）」时等；点评 / 聊天 / 闲置 / 非法手提示文字立即显示，
+  `turn_active` 不再扣住文字。「同步说话」开关的提示文案同步更新。
+- **周表重排**：`PetView._build_timetable` 改为连续真实时间轴（默认 08:00–22:00，
+  有更早 / 更晚条目按整点外扩；半小时 14px、整点实线 + 半点虚线）；课程与约定统一按
+  `_item_minutes_range` 的真实起止分钟定位；同一天重叠的块由 `_assign_lanes` 贪心分栏
+  （`lane / lanes`，块宽 = 列宽 / 簇内栏数），不再合并成「N 项约定」；块内只显示标题，
+  教师 / 地点 / 分级 / 排班理由放进悬停卡；今日列高亮并画当前时间线。
+
 ---
 
-## 5. 代码量与结构审计（v4.4.2）
+## 5. 代码量与结构审计（v4.5.0）
 
 ### 5.1 体量最大的文件
 
 | 行数 | 文件 | 说明 |
 | --- | --- | --- |
 | ~6291 | `game/scripts/ui/Main.gd` | 围棋窗口 UI / 设置 / 服务状态 / 窥屏 / TTS 播放 |
-| ~3442 | `backend/app/agent.py` | 公开动作、情绪、记忆、工具、看板、TTS 桥接 |
-| ~3056 | `backend/tests/test_agent.py` | Agent 全链路回归 |
-| ~2520 | `game/scripts/app/PetView.gd` | 桌宠视图、聊天面板、月历 / 周表 |
-| ~1918 | `backend/app/agent_graph.py` | LangGraph 六节点编排与全部提示词装配 |
-| ~1668 | `backend/app/main.py` | FastAPI 生命周期 / REST / WS / 日程后台任务 |
-| ~1297 | `backend/app/life.py` | 生命时间线 / 慢变量 / 日程持久化 |
-| ~1133 | `game/scripts/app/PetShell.gd` | 桌宠外壳、服务拉起、聊天 / 窥屏 / 情绪同步 |
+| ~3496 | `backend/app/agent.py` | 公开动作、情绪、记忆、工具、看板、TTS 桥接、未答问题压力 |
+| ~3118 | `backend/tests/test_agent.py` | Agent 全链路回归 |
+| ~2625 | `game/scripts/app/PetView.gd` | 桌宠视图、聊天面板、月历 / 周表（真实时间轴） |
+| ~1991 | `backend/app/agent_graph.py` | LangGraph 六节点编排与全部提示词装配（含延后语音 / `no_think`） |
+| ~1756 | `backend/app/main.py` | FastAPI 生命周期 / REST / WS / 日程后台任务 |
+| ~1406 | `backend/app/life.py` | 生命时间线 / 慢变量 / 日程持久化（含原地细化） |
+| ~1159 | `game/scripts/app/PetShell.gd` | 桌宠外壳、服务拉起、聊天 / 窥屏 / 情绪同步 |
 | ~300 | `backend/app/personal_facts.py` | 玩家私人事实守卫（纯逻辑） |
 | ~70 | `backend/app/lanes.py` | 任务车道统计（纯标准库） |
 
 ### 5.2 已做的收敛
 
+- v4.5.0 情绪方向只是**一条可选的系统消息尾注**（`persona.emotion_policy` 纯函数 +
+  softmax），基线附近为空、提示词逐字符不变；未答问题压力留在 `agent._open_questions`
+  内存里，不新增表、不新增 LLM 调用。
+- v4.5.0 提速走「同一条链路少等一次」：点评语音延后到后台合成、落子宣告走 `no_think`
+  快速档、前端只有揭示棋子与保序才等语音——三句分工、去重窗口、`message → speech`
+  顺序一条没动。
+- v4.5.0 周表只在 `PetView` 内部换几何（真实时间轴 + 分栏 + 悬停卡），数据来源与
+  `/api/schedule` 契约不变；重叠块不再合并，测试改为逐块断言。
 - v4.4.2 测试清理只做「删对话 / 回基线」，日程、课程、棋谱与画像保持不动；菜单按钮
   二次确认，避免误触。
 - v4.4.1 强思考只换请求超时，不换模型 / 预算 / 提示词；排程优先只取消后台情绪任务，
@@ -301,7 +343,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `actions.py` | 模型输出自然化：从 JSON / 日程结构转回人话 |
 | `adaptive.py` | 1~5 档自适应难度、局内冷却与基线约束 |
 | `agent.py` | `AzureAgent`：公开动作、情绪结算、记忆、工具、TTS 桥、看门狗、消息窗口 |
-| `agent_graph.py` | LangGraph 六节点编排：prepare → decide → tools → decide → speak → finalize |
+| `agent_graph.py` | LangGraph 六节点编排：prepare → decide → tools → decide → speak → finalize；点评语音延后合成、落子宣告 `no_think` 快速档 |
 | `auto_plan.py` | 自动排班：优先级、James-Stein、EWMA、机会约束、缓冲、锁定窗、最小扰动 |
 | `board.py` | 围棋棋盘、落子 / 提子 / 气 / 复制 / 文本棋盘 |
 | `config.py` | 后端配置读取与夹取（LLM、embedding、记忆、日程、TTS、提示词） |
@@ -319,14 +361,14 @@ FastAPI 后端（backend/app，端口 8000）
 | `joseki_gate.py` | 定式提示门控：技能 / 情绪 / 冷却 / 概率 |
 | `joseki_progress.py` | 定式族出现计数与复习优先级 |
 | `lanes.py` | 任务车道统计：`foreground` / `persona` / `background` 计数与耗时，只观测 |
-| `life.py` | 生命时间线：慢变量、情绪快照、事件、日程、类别耗时、统计、测试清理基线 |
+| `life.py` | 生命时间线：慢变量、情绪快照、事件、日程（含 `refine_id` 原地细化）、类别耗时、统计、测试清理基线 |
 | `llm.py` | `LLMClient`：LangChain 链、按调用思考档 / `no_think`、超时、失败映射 |
 | `llm_chain.py` | ChatOpenAI 装配、`extra_body` 合并、流式、content / think 剥离 |
-| `main.py` | FastAPI：生命周期、REST、WebSocket、聊天排程、提醒循环、记忆 API |
+| `main.py` | FastAPI：生命周期、REST、WebSocket、聊天排程（带最近对话与细化候选）、提醒循环、记忆 API |
 | `memory.py` | 长期记忆存储：聊天流水 / episode / 记忆 / 向量 / supersede / 回填 |
 | `memory_semantics.py` | 记忆二维情绪矩阵、九格标签、情绪相似度、动态权重、变更线索 |
 | `memory_service.py` | 记忆门面：`MemoryStore` + `EmbedProvider`（本地 GGUF / HTTP）+ 回填 |
-| `persona.py` | 人格化纯逻辑：关系阶段、情绪余温、小目标、旧局回忆、情绪语言节奏、聊天预算 |
+| `persona.py` | 人格化纯逻辑：关系阶段、情绪余温、小目标、旧局回忆、情绪语言节奏、聊天预算、情绪方向压力（`emotion_policy` softmax + 问句预算 / 未答问题衰减） |
 | `personal_facts.py` | 玩家私人事实守卫：只认玩家原话，核对吃饭 / 下班 / 睡眠 / 身体，出话后重答或兜底 |
 | `profile.py` | 棋风画像计算与文本化（布局 / 战斗 / 官子 / 薄弱方位） |
 | `profile_store.py` | 画像库与 persona 表持久化 |
@@ -334,8 +376,8 @@ FastAPI 后端（backend/app，端口 8000）
 | `prompts.py` | 全部提示词：人设、上下文、长期记忆、回忆、日程、画像、时间、定式 |
 | `pv_lines.py` | 预测线 A / B / C 提取与胜率差 |
 | `recall_chain.py` | 主动回忆链：开始 / 延续 / 终止条件、话题与情绪门 |
-| `schedule.py` | 日程 / 课表抽取、确定性日期归一化、去重、任务分类、记忆文本 / meta |
-| `schedule_chat.py` | 聊天日程判断、取消规则 + LLM fallback、JSON 解析 |
+| `schedule.py` | 日程 / 课表抽取、确定性日期归一化、无日期占位（`when_text="待定"`）、`refine_id` 细化、去重、任务分类、记忆文本 / meta |
+| `schedule_chat.py` | 聊天日程判断（带最近对话与 `refine_candidates`）、取消规则 + LLM fallback、JSON 解析 |
 | `schedule_facts.py` | 日程事实：时间指代、窗口选条、格式化、出话冲突核对 |
 | `schedule_learning.py` | 类别 EWMA 时长、变更点、偏好、反馈与复盘 |
 | `sgf.py` | SGF 导入 / 导出 |
@@ -364,7 +406,7 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_actions.py` | 输出自然化 |
 | `test_adaptive.py` | 自适应难度 |
 | `test_agent.py` | Agent 全链路：聊天 / 情绪 / 记忆 / 提醒 / 工具 / 去重 / 日程冲突 |
-| `test_agent_graph.py` | LangGraph 阶段、工具轮、看门狗、流式、去重 |
+| `test_agent_graph.py` | LangGraph 阶段、工具轮、看门狗、流式、去重、延后语音顺序 |
 | `test_auto_plan.py` | 排班算法与触发闸门 |
 | `test_board.py` / `test_coords.py` | 棋盘与坐标 |
 | `test_config.py` | 配置默认值 / 夹取 / embedding 字段 |
@@ -375,24 +417,24 @@ FastAPI 后端（backend/app，端口 8000）
 | `test_full_review.py` / `test_full_review_api.py` | 全盘复盘与 API |
 | `test_game_store.py` / `test_games_api.py` / `test_sgf.py` | 棋谱库、API、SGF |
 | `test_joseki*.py` | 定式识别 / 提取 / 门控 / 族计数 |
-| `test_life.py` | 生命时间线与日程持久化、测试清理基线 |
+| `test_life.py` | 生命时间线与日程持久化、`refine_id` 原地细化、测试清理基线 |
 | `test_lanes.py` | 任务车道统计 / 未知车道安全 / 重置 |
 | `test_llm.py` / `test_llm_chain.py` | LLM 客户端、思考档、流式、降级 |
 | `test_main.py` | FastAPI 端点 / 生命周期 / 运行期配置 / 记忆 API / 测试清理 |
 | `test_memory.py` / `test_memory_semantics.py` | 记忆存储、向量指纹、回填、阈值、情绪矩阵、supersede、巩固分、somatic_charge |
 | `test_mood_delta.py` | 情绪小调用解析与限频 |
-| `test_persona.py` / `test_profile*.py` | 人格化、画像、画像库 |
+| `test_persona.py` / `test_profile*.py` | 人格化、情绪方向压力 / 问句预算、未答问题衰减、画像、画像库 |
 | `test_personal_facts.py` | 玩家私人事实守卫：截图晚饭场景、原话证据、反向线索、问句、兜底句 |
 | `test_prompt_chains.py` / `test_prompts.py` / `test_prompts_long_term.py` | 提示链、黄金提示词、注入段 |
 | `test_recall_chain.py` | 回忆链开始 / 延续 / 终止 |
-| `test_schedule*.py` | 日程抽取、归一化、聊天排程、取消、API、学习 |
+| `test_schedule*.py` | 日程抽取（无日期占位 / 细化候选）、归一化、聊天排程、取消、API、学习 |
 | `test_speech_text.py` | 语气标记 |
 | `test_state.py` | 对局状态 |
 | `test_time_ctx.py` | 时间事实 |
 | `test_timetable.py` | 课表几何还原 |
 | `test_tools.py` | 发言侧工具 |
 | `test_tts*.py` | TTS 文本 / 缓存 / 阿里云 / 链路 |
-| `test_agent_graph.py` / `test_agent.py` 中的 v4.4.x 用例 | 回忆链、日程事实、动态情绪权重、embedding、私人事实重答、聊天 UI 适配 |
+| `test_agent_graph.py` / `test_agent.py` 中的 v4.4.x / v4.5.0 用例 | 回忆链、日程事实、动态情绪权重、embedding、私人事实重答、聊天 UI 适配、情绪方向、隐式日程、延后语音顺序、`no_think` 三阶段 |
 
 ### 6.4 `game/scripts/`
 
@@ -400,14 +442,14 @@ FastAPI 后端（backend/app，端口 8000）
 | --- | --- |
 | `app/Launcher.gd` | 启动分流：桌宠 / 围棋 / 命令行覆盖 |
 | `app/PetShell.gd` | 桌宠外壳：服务拉起、窗口拖动、聊天 / 窥屏 / 情绪 / TTS 状态 |
-| `app/PetView.gd` | 桌宠视图：圆形头像、聊天气泡 / 时间 / 分段思考、资料 / 月历 / 周表 |
+| `app/PetView.gd` | 桌宠视图：圆形头像、聊天气泡 / 时间 / 分段思考、资料 / 月历 / 周表（真实时间轴 + 重叠分栏 + 悬停卡） |
 | `core/AzureConfig.gd` | 前端配置读写（保留未知后端键，`_raw` 原样写回） |
 | `core/Coords.gd` | 前端坐标换算 |
 | `core/GameReplay.gd` | 棋谱重放 |
 | `net/ChatQueue.gd` | busy 时聊天排队 |
 | `net/NetClient.gd` | REST / WS 客户端、设置推送、聊天 / 记忆 / 日程接口、测试清理请求 |
 | `services/SfxPlayer.gd` | 落子 / 提子 / 终局音效 |
-| `services/SpeechPairing.gd` | `turn_id + seq` 语音与气泡配对 |
+| `services/SpeechPairing.gd` | `turn_id + seq` 语音与气泡配对；只有揭示棋子与保序才等语音 |
 | `services/TTSClient.gd` | 前端 TTS 播放（系统 / 后端音频） |
 | `ui/Ambience.gd` | 背景氛围 |
 | `ui/AzureAvatar.gd` | VRM 头像、表情 morph、burst |
@@ -439,7 +481,8 @@ FastAPI 后端（backend/app，端口 8000）
 `test_report.gd`、`test_review_mode.gd`、`test_score_phrase.gd`、`test_sfx.gd`、
 `test_speech_pairing.gd`、`test_thinking_lines.gd`、`test_title_screen.gd`、
 `test_tts.gd`、`test_view_helpers.gd`。
-`test_pet_shell.gd` 也覆盖圆形遮罩、四档思考、气泡去重、月历 / 周表。
+`test_pet_shell.gd` 也覆盖圆形遮罩、四档思考、气泡去重、月历 / 周表（真实时间轴、
+整点 / 半点刻度、重叠块分栏不遮挡）。
 
 ### 6.6 `katago_service/`
 
@@ -512,7 +555,7 @@ LangChain / LangGraph、长期记忆、TTS、聊天队列、定式 / 画像 / �
 ## 8. 测试与运行
 
 ```powershell
-# 后端全量（当前 1192 tests OK）
+# 后端全量（当前 1208 tests OK）
 cd backend
 python -m unittest discover -s tests -q
 
@@ -528,10 +571,11 @@ run_test_env.bat tests
 
 前端门卫重点：
 
-- `test_pet_shell.gd`：圆形遮罩、四档思考、气泡去重、迟到回复、预制音、月历 / 周表。
+- `test_pet_shell.gd`：圆形遮罩、四档思考、气泡去重、迟到回复、预制音、月历 / 周表
+  （重叠约定各自成块、分栏不相交、已结束块逐个保留）。
 - `test_config.gd`：配置默认值 / 夹取 / 保存 / 设置推送。
 - `test_net_chat.gd` / `test_chat_queue.gd`：WS 聊天、busy 排队。
-- `test_speech_pairing.gd`：`turn_id + seq` 语音配对。
+- `test_speech_pairing.gd`：`turn_id + seq` 语音配对；只有 `reveal` 与保序才等语音。
 - `test_pet_mode.gd` / `test_avatar_path.gd`：桌宠切换与头像。
 
 ---

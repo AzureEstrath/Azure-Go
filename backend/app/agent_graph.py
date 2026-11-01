@@ -855,6 +855,19 @@ async def _prepare_chat(agent, data):
                 long_term=lt, events=agent.event_log.all(),
                 profile=profile, time_facts=time_facts)
         msgs = [agent._sys_msg(), agent._user_msg(ctx)]
+        # 情绪 → 回复方向（v4.5.0）：只在非空时追加到系统消息末尾（与 ``len_note`` 同位置口径），
+        # 基线且无未答问题 ⇒ 一个字都不加，提示词逐字符不变（golden 不受影响）。
+        direction = ""
+        dir_fn = getattr(agent, "chat_direction_note", None)
+        if callable(dir_fn):
+            try:
+                direction = str(dir_fn(text) or "").strip()
+            except Exception as e:          # noqa: BLE001 —— 方向提示坏了照常出话
+                print("[Chat] 回复方向提示失败（已忽略）：%s" % e)
+                direction = ""
+        if direction:
+            msgs[0] = {"role": "system",
+                       "content": str(msgs[0].get("content") or "") + "\n\n" + direction}
         hist = agent.st.chat_history
         upto = len(hist) - 1            # 最后一条是刚追加的这句，下面单独发，避免重复
         for sp in prompts.chat_windows(hist[:upto]):
@@ -1311,7 +1324,9 @@ async def _speak_own_turn(agent, data, msgs):
         if agent.tools_enabled:
             think_msg = await agent._tool_loop(msgs, 80, "own_turn")
         else:
-            think_msg = await _say(agent, msgs, 80)
+            # v4.5.0：落子宣告只是一句「我下这儿、为什么」，不需要推理预算——把思考留给
+            # 点评与全局感想（这两处仍是全局档位）。质量不受影响，等待时间明显变短。
+            think_msg = await _say(agent, msgs, 80, no_think=True)
     if agent._llm_failed(think_msg):            # 云端失败：落子宣告退化为兜底台词（坐标照常揭示）
         think_msg = agent._fallback_line("game")
     data["think_msg"] = think_msg
@@ -1686,19 +1701,64 @@ async def _emit_speech(agent, text):
     ))
 
 
-async def _emit_line(agent, kind, text, move=None, epoch=None, with_speech=True):
+async def _emit_line(agent, kind, text, move=None, epoch=None, with_speech=True,
+                     defer_speech=False):
     """发一条对外台词：先 ``message``，**紧随其后**补 ``speech``（音画同步：前端按 turn_id+seq 配对）。
 
     ``epoch``（v3.7.0）：看门狗守卫——带了它且已经不属于当前这一代时，这条台词（连同它的
     ``speech``）一条都不发。调用点从本轮 ``data`` 里传；不传（公开方法的非法手提示、空盘提示，
     以及既有单测的直接调用）时行为与以前逐字一致——那些是**新的用户动作**，不是被作废的旧一代。
     ``with_speech=False``：只发文字（桌宠聊天预制音模式，v4.2.5），不合成、不等待 TTS。
+    ``defer_speech=True``（v4.5.0 提速）：这条台词**不等合成**——先把合成丢到后台，让她下一步的
+    引擎分析 / 模型出话与它重叠；下一处 ``_emit_line`` 在发 ``message`` 之前会先把它补发完，
+    所以 ``message → speech`` 的到达顺序与「严格串行合成」时**逐字一致**（配对不受影响）。
+    只给 ``after_player`` 的点评用：下一阶段（``own_turn``）的落子宣告要等它的 ``speech``，
+    必须走这条收口；需要音画同步的 ``ai_move`` 永远不延后。
     """
     if epoch is not None and not agent.epoch_ok(epoch):
         return
+    await _flush_pending_speech(agent)
     agent._emit(events.message(kind, text, move))
     if with_speech:
-        await _emit_speech(agent, text)
+        if defer_speech:
+            _defer_speech(agent, text)
+        else:
+            await _emit_speech(agent, text)
+
+
+def _defer_speech(agent, text):
+    """把一条台词的合成丢到后台（``_emit_line`` 的 ``defer_speech`` 分支）。
+
+    ``speech`` 事件**此刻还不发**：由下一处 ``_flush_pending_speech`` 在发下一条 ``message``
+    之前收口。后台任务自己失败只丢语音（``_emit_speech`` 内部已兜一层，这里再兜一层）。
+    """
+    async def run():
+        try:
+            await _emit_speech(agent, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                      # noqa: BLE001 —— 绝不影响这一回合
+            print("[TTS] 延后合成异常（本条不发语音事件）：%s" % e)
+    agent._pending_speech = asyncio.create_task(run())
+
+
+async def _flush_pending_speech(agent):
+    """把上一条**延后合成**的语音补发完（``message → speech`` 严格按序的结构性保证）。
+
+    前端按**到达顺序**配对 ``speech`` 与最早那条还没配上的 ``message``：延后合成的那条若拖到
+    下一条 ``message`` 之后才发 ``speech``，语音就会配错台词。所以每个发 ``message`` 的出口
+    （``_emit_line`` / ``_emit_deduped``，后者经由前者）都先过这里。没有积压时零开销。
+    """
+    task = getattr(agent, "_pending_speech", None)
+    if task is None:
+        return
+    agent._pending_speech = None
+    try:
+        await task
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:                          # noqa: BLE001 —— 延后合成失败只丢语音
+        print("[TTS] 延后合成异常（本条不发语音事件）：%s" % e)
 
 
 def _log_safe(text) -> str:
@@ -1717,7 +1777,7 @@ def _log_safe(text) -> str:
         return s.encode("ascii", "replace").decode("ascii")
 
 
-async def _emit_deduped(agent, kind, text, epoch=None, with_speech=True):
+async def _emit_deduped(agent, kind, text, epoch=None, with_speech=True, defer_speech=False):
     """发一条**非落子宣告**的 ``message`` 事件：窗口内一字不差的原话不再推给前端。
 
     只做「发事件」这一道闸门（S25/S26）：调用方的 ``memory_log`` / ``chat_history`` 写入**照常**发生；
@@ -1738,7 +1798,8 @@ async def _emit_deduped(agent, kind, text, epoch=None, with_speech=True):
         print("[Agent] 原话去重（最近 %d 条内一字不差）已抑制：%s"
               % (AI_DEDUP_WINDOW, _log_safe(text)))
     else:
-        await _emit_line(agent, kind, text, epoch=epoch, with_speech=with_speech)
+        await _emit_line(agent, kind, text, epoch=epoch, with_speech=with_speech,
+                         defer_speech=defer_speech)
     agent._note_line(text)
 
 
@@ -1749,7 +1810,8 @@ async def _finalize_after_player(agent, data):
         agent.st.log_memory("E", text, len(agent.st.moves))
         # 逐手存档（v3.7.0）：玩家那手的点评，存**未截断的原文**（log_memory 那条仍是滚动 18 条 / 截 80 字）
         agent.st.note_move(len(agent.st.moves), "review", "E", text)
-    await _emit_deduped(agent, events.AI_COMMENT, text, epoch=data.get("epoch"))
+    await _emit_deduped(agent, events.AI_COMMENT, text, epoch=data.get("epoch"),
+                        defer_speech=True)      # v4.5.0：合成与她下一步的分析 / 出话重叠
 
 
 async def _finalize_own_turn(agent, data):
@@ -1812,6 +1874,13 @@ async def _finalize_chat(agent, data):
     stored = speech_text.extract_tone(reply)[1] or reply
     if _alive(agent, data):                     # 看门狗守卫：旧一代不再写聊天历史
         agent.st.chat_history.append({"role": "assistant", "content": stored})
+        # 未答问题状态机（v4.5.0）：玩家这句答没答、这句又问了什么，只在这里推进一次。
+        note_fn = getattr(agent, "_update_open_questions", None)
+        if callable(note_fn):
+            try:
+                note_fn(str(data.get("text") or ""), stored)
+            except Exception as e:              # noqa: BLE001 —— 状态机坏了不影响出话
+                print("[Chat] 未答问题状态更新失败（已忽略）：%s" % e)
         await asyncio.to_thread(agent._remember_chat_turn, str(data.get("text") or ""), stored,
                                 str(data.get("mode") or "game"))
     # 桌宠聊天默认只用预制音（v4.2.5）：跳过 CosyVoice 合成，只发文字；

@@ -37,13 +37,14 @@ _TIME_CUE = re.compile(
     r"(半|一|两|三|四|五|六|七|八|九|十|几)\s*(个)?\s*(小时|钟头|分钟))",
     re.I)
 
-# 事项线索：明确的待办 / 约定 / 截止 / 提醒动词。
+# 事项线索：明确的待办 / 约定 / 截止 / 提醒动词。v4.5.0 起把「卖东西」这类
+# 还没给时间的经营 / 杂事也算进来——先记成占位条目，之后才有东西可细化。
 _TASK_CUE = re.compile(
     r"(提醒|记一下|记住|记下|安排|排一下|排进|别忘了|截止|要交|提交|"
     r"报告|作业|论文|复习|预习|考试|面试|开会|会议|讲座|活动|比赛|聚会|"
     r"约好|约了|约在|约会|见面|吃饭|去医院|看病|取快递|取件|寄|报名|签到|打卡|"
     r"上课|出差|赶车|赶飞机|健身|锻炼|打扫|做完|写完|deadline|meeting|tomorrow|"
-    r"remind|appointment)",
+    r"卖|出售|摆摊|进货|出货|转卖|remind|appointment)",
     re.I)
 
 
@@ -135,8 +136,13 @@ def _drop_past(items, now):
     return out
 
 
-async def extract(llm, text, now=None):
+async def extract(llm, text, now=None, context_text="", candidates=None):
     """判断并抽取聊天里的日程；返回 ``schedule.normalize_items`` 形状的列表。
+
+    - ``candidates``：现有可细化的日程（``refine_candidates`` 的输出）。给进提示词后，
+      玩家补充「活动是参加心理课」时模型能填 ``refine_id`` 而不是另建一条；
+    - ``context_text``：最近几轮对话（帮模型理解「这个 / 那个」指什么，可空）；
+    - 玩家只说了「有个活动 / 要卖个东西」、还没给时间 ⇒ 也排成占位条目（date/time 为 null）。
 
     失败（没有地址 / 超时 / 空输出 / 非 JSON / 判断为 false）一律返回 ``[]``，
     **绝不把错误文本当成日程**，也不向调用方抛异常。
@@ -145,6 +151,25 @@ async def extract(llm, text, now=None):
     if llm is None or raw_text == "" or not looks_schedulable(raw_text):
         return []
     ref = datetime.datetime.fromtimestamp(time.time() if now is None else float(now))
+    cand_rows = []
+    for it in candidates or []:
+        if not isinstance(it, dict):
+            continue
+        try:
+            sid = int(it.get("id", 0) or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        title = _clip(it.get("title", ""), TITLE_MAX)
+        if sid <= 0 or title == "":
+            continue
+        cand_rows.append("- id=%d | %s | %s" % (
+            sid, str(it.get("when_text", "") or "待定").strip(), title))
+    cand_block = ""
+    if cand_rows:
+        cand_block = ("下面是他现有、**还没有确定时间或可能要被细化**的日程。"
+                      "如果这句话是在补充其中一条，就填那条的 refine_id：\n"
+                      + "\n".join(cand_rows[:8]) + "\n")
+    ctx = _clip(context_text, 300)
     prompt = (
         "你是桌面助手 Azure 的日程判断器。判断玩家这句话里有没有**他自己要做的、"
         "值得记进日程的事**。\n"
@@ -153,8 +178,14 @@ async def extract(llm, text, now=None):
         "不要排：闲聊、感受、假设（“如果我明天…”）、玩笑、问 Azure 自己的事、"
         "已经过去的活动、别人的事、泛泛的愿望。"
         "玩家只说“明天好忙”这类情绪、没有具体事项时，也不要排。\n"
+        "① 玩家只说了有个活动 / 要卖个东西、还没说时间，也要排：title 按原话概括，"
+        "date / time 都写 null（先记下来，之后他会补充）。\n"
+        "② 如果这句话是在**补充 / 细化**下面的已有日程（把「卖东西」说得更具体、"
+        "给「活动」补上时间和名字），填 refine_id，不要另建重复条目；"
+        "没有对应条目时 refine_id 写 null。\n"
         "今天是 %s（%s）。相对日期（今天/明天/后天/下周X）请换算成真实日期；"
         "不要编造日期、地点、时长、人物。\n"
+        "%s"
         "只输出 JSON 对象，不要解释、不要代码围栏：\n"
         '{"schedule": false}\n'
         "或\n"
@@ -165,14 +196,17 @@ async def extract(llm, text, now=None):
         '"end_time": "HH:MM" 或 null, "title": "10-30 字的事项", '
         '"location": "可选", "priority": "0-100 的整数", '
         '"duration_min": "预计分钟数", "deadline": "YYYY-MM-DD HH:MM" 或 null, '
-        '"notes": "可选"}]}\n'
+        '"refine_id": "要细化的条目的整数 id 或 null", "notes": "可选"}]}\n'
         "日期和时间只按玩家原话写：有原话日期短语就填 relative_date，不要自己心算；"
         "只有日期没有时刻也可以；只说“提醒我记一下”但没给日期时间时，date/time 都写 null。\n"
         "同一句话里有多个不同的日期 / 时刻事项时，分别输出多个 item，不要只保留其中一个；"
         "“明天早上有 X 活动 / 课程 / 会议”这种带明确时间的固定安排，也算玩家的安排，"
         "与“我打算 / 我要去”的个人计划一起列出。\n\n"
-        "玩家刚说：「%s」"
-    ) % (ref.strftime("%Y-%m-%d"), "周" + "一二三四五六日"[ref.weekday()], raw_text)
+        "%s玩家的这一句：「%s」"
+    ) % (ref.strftime("%Y-%m-%d"), "周" + "一二三四五六日"[ref.weekday()],
+         cand_block,
+         ("最近对话（只作理解，不要重复排已经排过的）：\n%s\n" % ctx) if ctx else "",
+         raw_text)
     msgs = [{"role": "user", "content": prompt}]
     try:
         try:
@@ -242,6 +276,15 @@ def _cancel_candidates(items, now=None):
             continue
         out.append(it)
     return out
+
+
+def refine_candidates(items, now=None):
+    """现有可被「接着细化」的条目：还没结束的、非课程的约定 / 占位条目。
+
+    与取消候选同一套窗口（plans 且非课程、-6h..+14d 或待定），只是用途不同：
+    这里是把它们列给抽取模型，让「活动是参加心理课」能填回同一条 ``refine_id``。
+    """
+    return _cancel_candidates(items, now=now)
 
 
 def _topic_grams(title):

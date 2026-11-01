@@ -1089,6 +1089,27 @@ class _HangingTTS:
                 "tone": "", "pitch": 0.0}
 
 
+class _GateTTS:
+    """第一次合成挂住、由测试放行的假 TTS（v4.5.0 延后合成的门卫用）。"""
+
+    def __init__(self):
+        self.calls = 0
+        self.release = asyncio.Event()
+        self.released = False
+
+    @property
+    def enabled(self):
+        return True
+
+    async def speak(self, text):
+        self.calls += 1
+        if self.calls == 1:
+            await self.release.wait()
+            self.released = True
+        return {"id": "g%d" % self.calls, "mode": "openai", "text": "",
+                "tone": "", "pitch": 0.0}
+
+
 async def _wait_for(pred, timeout=5.0, step=0.01):
     """轮询等待（替代「睡够某个秒数」）：判别力来自**僵尸那一代真的跑到了某处**，不是等够时间。
 
@@ -1309,6 +1330,50 @@ class BusyWatchdogTest(unittest.TestCase):
         self.assertNotEqual(agent.st.last_katago, "旧形势")
         self.assertTrue(bus.of_type("mood"))
         self.assertFalse(agent.busy)
+
+
+class DeferredSpeechTest(unittest.TestCase):
+    """v4.5.0 提速：点评语音延后合成（与下一步重叠），但 ``message → speech`` 的顺序不许乱。"""
+
+    def test_comment_speech_overlaps_next_stage_and_keeps_pairing_order(self):
+        agent, _eng, _llm, bus = _mk()
+
+        class NumberedLLM(StubLLM):
+            """每次调用换一句：三阶段台词不重复（不会被后端 8 条去重闸门吃掉）。"""
+
+            def __init__(self):
+                super().__init__()
+                self.n = 0
+
+            async def chat(self, messages, max_tokens=300, no_think=False, think_mode=None):
+                self.calls.append((list(messages), max_tokens, no_think))
+                self.think_modes.append(think_mode)
+                self.n += 1
+                return "第%d句。" % self.n
+
+        turn = NumberedLLM()
+        agent.llm = turn
+
+        async def run():
+            tts = _GateTTS()
+            agent.tts = tts
+            task = asyncio.create_task(agent.player_move(3, 3))
+            # 第一句（点评）的合成挂住时，落子宣告（max_tokens=80）应当已经出话：
+            # 这就是「延后合成」要换来的重叠；旧的串行写法会在这里一直等到合成返回。
+            ok = await _wait_for(
+                lambda: any(int(c[1]) == 80 for c in turn.calls), timeout=3.0)
+            self.assertTrue(ok, "点评语音挂住时应已开始落子宣告（延后合成没有生效）")
+            self.assertEqual(len(bus.messages(events.AI_MOVE)), 0,
+                             "第一条 speech 还没发，落子宣告不许抢到它前面")
+            tts.release.set()
+            await task
+
+        asyncio.run(run())
+
+        seq = [str(e.get("type")) for e in bus.events
+               if e.get("type") in ("message", "speech")]
+        self.assertEqual(seq, ["message", "speech"] * 3,
+                         "每条 message 后面必须紧跟它自己的 speech（配对序号不能错）")
 
 
 # —— 以下为修复轮 R-1（v3.7.0）追加（既有断言一个字符都没改；追加在文件末尾，理由同上）——

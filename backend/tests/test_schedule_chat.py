@@ -90,6 +90,52 @@ class ExtractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["when_text"], "待定")
 
+    async def test_undeclared_time_still_creates_placeholder(self):
+        """v4.5.0：只说了「要卖个东西」、没给时间也要留下一条待定记录。"""
+        llm = StubLLM(text='{"schedule": true, "items": [{"title": "卖东西"}]}')
+        items = await schedule_chat.extract(llm, "我这周末要卖个东西", now=NOW)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "卖东西")
+        self.assertEqual(items[0]["when_text"], "待定")
+        self.assertEqual(items[0]["start_ts"], 0.0)
+        self.assertEqual(items[0]["refine_id"], 0)
+
+    async def test_candidates_and_context_reach_the_prompt(self):
+        """细化候选（id + 标题）与最近对话都要进提示词，模型才有依据填 refine_id。"""
+        llm = StubLLM(text='{"schedule": false}')
+        await schedule_chat.extract(
+            llm, "活动是参加心理课", now=NOW,
+            context_text="欸？部署者大人有活动吗？关于什么的呢？",
+            candidates=[{"id": 42, "title": "活动", "when_text": "待定",
+                         "status": "planned", "kind": "task", "period": "", "start_ts": 0.0}])
+        prompt = str(llm.calls[0][0][-1].get("content", ""))
+        self.assertIn("id=42", prompt)
+        self.assertIn("refine_id", prompt)
+        self.assertIn("最近对话", prompt)
+        self.assertIn("活动吗", prompt)
+
+    async def test_refine_id_is_kept_and_dirty_values_dropped(self):
+        llm = StubLLM(text=(
+            '{"schedule": true, "items": ['
+            '{"title": "心理课", "refine_id": 42},'
+            '{"title": "摆摊", "refine_id": -3}]}'))
+        items = await schedule_chat.extract(llm, "活动是参加心理课", now=NOW)
+        self.assertEqual([it["title"] for it in items], ["心理课", "摆摊"])
+        self.assertEqual(items[0]["refine_id"], 42)
+        self.assertEqual(items[1]["refine_id"], 0)
+
+    def test_refine_candidates_skip_courses_and_closed(self):
+        rows = [
+            {"id": 42, "title": "活动", "when_text": "待定", "status": "planned",
+             "kind": "task", "period": "", "start_ts": 0.0},
+            {"id": 43, "title": "有机化学", "status": "planned", "kind": "course",
+             "period": "1-2", "start_ts": NOW + 22 * 3600},
+            {"id": 44, "title": "旧约定", "status": "done", "kind": "task",
+             "period": "", "start_ts": NOW + 3600},
+        ]
+        ids = [it["id"] for it in schedule_chat.refine_candidates(rows, now=NOW)]
+        self.assertEqual(ids, [42])
+
 
 class CancelTest(unittest.IsolatedAsyncioTestCase):
     """v4.2.7：语言理解取消日程——规则先匹配现有标题，拿不准再让 LLM 结合上下文。"""

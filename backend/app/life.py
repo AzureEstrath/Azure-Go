@@ -13,6 +13,7 @@
 它只负责**时间**：事件序、最近互动、最近主动、最近聊天、最近对局。
 """
 
+import datetime
 import json
 import math
 import os
@@ -183,6 +184,19 @@ def _as_ts(v):
     if not math.isfinite(t) or t <= 0.0 or t > 253402300799.0:
         return None
     return t
+
+
+def _combine_ts(date_text, start_time, fallback=0.0):
+    """``2026-11-03`` + ``15:00`` → 本地时间戳；解析失败返回 ``fallback``。
+
+    只用于「细化已有条目」把旧时刻挪到新日期，脏值一律退回原时间。
+    """
+    try:
+        d = datetime.datetime.strptime(str(date_text or "").strip(), "%Y-%m-%d").date()
+        hh, mm = [int(x) for x in str(start_time or "").strip().split(":")[:2]]
+        return datetime.datetime.combine(d, datetime.time(hh, mm)).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return float(fallback or 0.0)
 
 
 def _clip(text, limit=MAX_SUMMARY_LEN):
@@ -592,6 +606,80 @@ class LifeStore:
                     auto_planned = 1 if bool(it.get("auto_planned", False)) else 0
                     task_type = _clip(it.get("task_type", ""), 24) or (
                         "course" if kind == "course" else "general")
+                    # —— 原地细化（v4.5.0）：聊天里「活动是参加心理课」这类补充只改那一条 ——
+                    # 新条目没给时间就保留旧时间，标题取更具体的一方，备注 / 来源合并；
+                    # status / created_ts / 完成记录一律不动（不把「已排好」打回「待定」）。
+                    refine_id = _safe_int(it.get("refine_id"), 0)
+                    if refine_id > 0:
+                        old_row = self._db.execute(
+                            "SELECT %s FROM schedule_items WHERE id = ? AND archived = 0"
+                            % _SCHEDULE_SELECT, (refine_id,)).fetchone()
+                        if old_row is not None:
+                            old = self._schedule_row(old_row)
+                            old_date = str(old.get("date") or "")
+                            has_clock = (start_time != "" or end_time != "" or period != "")
+                            kept_old_time = False
+                            if start <= 0.0:
+                                # 新条目连日期都没有：时间信息整条沿用旧值（占位条目本来就没有）
+                                start = float(old.get("start_ts", 0.0) or 0.0)
+                                kept_old_time = True
+                            if when_text == "" or when_text == "待定":
+                                when_text = str(old.get("when_text") or when_text)
+                            if date_text == "":
+                                date_text = old_date
+                            elif not has_clock and date_text != old_date and \
+                                    str(old.get("start_time") or ""):
+                                # 只补充了日期：把旧时刻挪到新日期，别把 15:00 的约定打回 09:00 全天
+                                start_time = str(old.get("start_time") or "")
+                                end_time = end_time or str(old.get("end_time") or "")
+                                start = _combine_ts(date_text, start_time, start)
+                            if weekday < 0:
+                                weekday = _safe_int(old.get("weekday"), -1)
+                            if period == "":
+                                period = str(old.get("period") or "")
+                                p_start = _safe_int(old.get("period_start"), 0)
+                                p_end = _safe_int(old.get("period_end"), 0)
+                            start_time = start_time or str(old.get("start_time") or "")
+                            end_time = end_time or str(old.get("end_time") or "")
+                            teacher = teacher or str(old.get("teacher") or "")
+                            location = location or str(old.get("location") or "")
+                            if not has_clock:
+                                duration = _safe_int(old.get("duration_min"), 60)
+                            if kept_old_time:
+                                # 时间不是这次新给的：保留「是不是自动排的」，别把待定项变成硬约定
+                                auto_planned = _safe_int(old.get("auto_planned"), 0)
+                            old_title = str(old.get("title") or "").strip()
+                            if old_title and len(old_title) > len(title) and title in old_title:
+                                title = old_title     # 新说法更泛（「课」）时保留旧的具体标题
+                            old_notes = str(old.get("notes") or "")
+                            if notes == "":
+                                notes = old_notes
+                            elif old_notes and old_notes != notes and old_notes not in notes:
+                                notes = _clip(old_notes + "；" + notes, 300)
+                            src = _merge_sources(old.get("source"), src)
+                            priority = max(priority, _safe_int(old.get("priority"), 50))
+                            if deadline <= 0.0:
+                                deadline = float(old.get("deadline_ts", 0.0) or 0.0)
+                            if task_type == "general":
+                                task_type = str(old.get("task_type") or task_type)
+                            if kind == "task":
+                                kind = str(old.get("kind") or kind)
+                            self._db.execute(
+                                "UPDATE schedule_items SET start_ts = ?, when_text = ?, title = ?, "
+                                "notes = ?, source = ?, date_text = ?, weekday = ?, period = ?, "
+                                "period_start = ?, period_end = ?, start_time = ?, end_time = ?, "
+                                "teacher = ?, location = ?, priority = ?, duration_min = ?, "
+                                "deadline_ts = ?, task_type = ?, kind = ?, "
+                                "auto_planned = ?, updated_ts = ? WHERE id = ?",
+                                (start, when_text, title, notes, src, date_text, weekday, period,
+                                 p_start, p_end, start_time, end_time, teacher, location, priority,
+                                 duration, deadline, task_type, kind, auto_planned, t, refine_id))
+                            got = self._db.execute(
+                                "SELECT %s FROM schedule_items WHERE id = ?" % _SCHEDULE_SELECT,
+                                (refine_id,)).fetchone()
+                            if got is not None:
+                                out.append(self._schedule_row(got))
+                            continue
                     # 去重键**不再包含 source**：同一课表换一张图 / 重扫一次时 source 会变，
                     # 旧逻辑会把整张表再插一遍。课程按「日期（或星期）+ 节次 + 标题」，
                     # 普通条目按「开始时间 + 标题」；命中后合并 source 与缺失字段。

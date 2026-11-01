@@ -1670,7 +1670,8 @@ func _build_right_panel(root: Control) -> void:
 	_drift_opt.item_selected.connect(_on_drift_level_selected)
 	drawer.add_child(_drift_opt)
 	_acc_check(drawer, "同步说话", cfg.tts_sync_speak, "sync",
-		"开启：Azure 的文字等语音就绪后一起显示（消除文字先出、声音晚到的割裂感）；关闭：文字立即显示")
+		"开启：落子宣告等语音开口再显示（棋子揭示与语音同步）；点评 / 聊天等文字先到、语音随后播。"
+		+ "关闭：所有文字立即显示")
 	_acc_check(drawer, "整段合成", cfg.tts_batch_speak, "batch",
 		"开启：Azure 连发的多条消息合并成一段、连续朗读；关闭：逐句合成，第一句播完等第二句合成（想边听边等选它）")
 	_acc_check(drawer, "长句合并", cfg.tts_long_chunk, "chunk",
@@ -2714,10 +2715,9 @@ func _deliver_msg(kind: String, text: String, tone: String, rec: Dictionary) -> 
 			get_tree().create_timer(BATCH_WINDOW).timeout.connect(func(): _flush_batch(token))
 		else:
 			# 逐句播报：语音由 speech 事件驱动（按到达顺序与这条配对）。
-			# 「同步说话」只在**她这一轮还没结束**（或这条要揭示棋子）时让文字等语音——
-			# 见 `should_wait_voice`：回合已经结束的台词（聊天 / 闲置搭话 / 非法手提示）当场显示，
-			# 她上一句的音频还在播时也不能扣着（否则回复会一直挂在「Azure 思考中……」里，
-			# 等到玩家再发一条才放出来）。
+			# 「同步说话」只在**这条要揭示棋子**或**前面还有没显示的台词**时让文字等语音——
+			# 见 `should_wait_voice`：点评 / 聊天 / 闲置搭话 / 非法手提示一律当场显示（后端先发
+			# `message` 再合成，等她这一轮还是上一轮结束都不该扣着文字）。
 			var wait_voice: bool = pairing.should_wait_voice(cfg.tts_sync_speak, _pair_facts(), reveal)
 			pairing.arm(rec, wait_voice)
 			if not wait_voice or pairing.played(rec):

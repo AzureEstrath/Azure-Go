@@ -233,5 +233,79 @@ class EmotionLanguageTest(unittest.TestCase):
         self.assertEqual(persona.chat_budget({"v": "x"}), 400)
 
 
+class ReplyDirectionTest(unittest.TestCase):
+    """v4.5.0（E）：情绪三维经 softmax 决定回复方向，未答问题按压力衰减收住。"""
+
+    BASE = {"v": 0.58, "c": 0.55, "a": 0.30}
+    CURIOUS = {"v": 0.70, "c": 0.80, "a": 0.50}
+
+    def test_baseline_has_no_direction(self):
+        self.assertEqual(persona.emotion_policy(self.BASE)["acts"], [])
+        self.assertEqual(persona.reply_direction_note(self.BASE), "")
+
+    def test_curiosity_drives_questions(self):
+        policy = persona.emotion_policy(self.CURIOUS)
+        self.assertIn("ask", policy["acts"])
+        self.assertGreater(policy["ask_budget"], 0)
+        note = persona.reply_direction_note(self.CURIOUS)
+        self.assertIn("了解对方", note)
+        self.assertNotIn("0.8", note)           # 不把情绪数值念出来
+
+    def test_low_valence_holds_first(self):
+        policy = persona.emotion_policy({"v": 0.30, "c": 0.80, "a": 0.30})
+        self.assertIn("hold", policy["acts"])
+        self.assertNotIn("ask", policy["acts"])
+        self.assertEqual(policy["ask_budget"], 0)
+        self.assertIn("先接住对方", persona.reply_direction_note({"v": 0.30, "c": 0.80, "a": 0.30}))
+
+    def test_bright_and_active(self):
+        note = persona.reply_direction_note({"v": 0.75, "c": 0.50, "a": 0.70})
+        self.assertIn("说一点自己", note)
+        self.assertIn("往前推", note)
+
+    def test_dirty_values(self):
+        self.assertEqual(persona.emotion_policy({"v": "x"}), {})
+        self.assertEqual(persona.reply_direction_note(None), "")
+
+    def test_question_fragments(self):
+        text = "欸？部署者大人有活动吗？关于什么的呢？不过也不要忘记卖东西，可以告诉Azure卖的是什么吗？"
+        got = persona.question_fragments(text)
+        self.assertEqual(len(got), 2)
+        self.assertIn("活动", got[0])
+        self.assertIn("卖", got[1])
+        self.assertEqual(persona.question_fragments("这个可是要好好上呢。"), [])
+        self.assertEqual(persona.question_fragments("关于什么的呢？"), [])
+
+    def test_answers_question(self):
+        self.assertTrue(persona.answers_question("活动是参加心理课。", "部署者大人有活动吗"))
+        self.assertTrue(persona.answers_question("我卖的是手作。", "可以告诉Azure卖的是什么"))
+        self.assertTrue(persona.answers_question("不想说。", "可以告诉Azure卖的是什么"))
+        self.assertTrue(persona.answers_question("嗯。", "部署者大人有活动吗"))
+        self.assertFalse(persona.answers_question("今天好累。", "部署者大人有活动吗"))
+
+    def test_unanswered_question_decays_and_stops(self):
+        reply = "有活动吗？还有，你还没告诉我要卖什么呢？"
+        pending = persona.update_open_questions([], "今天好累", reply, self.CURIOUS)
+        self.assertEqual(len(pending), 2)
+        # 玩家答了活动 ⇒ 只剩「卖」；下一句可以带回来一次
+        pending = persona.update_open_questions(pending, "活动是参加心理课。", "原来是心理课呀。",
+                                               self.CURIOUS)
+        self.assertEqual(len(pending), 1)
+        self.assertIn("卖", pending[0]["q"])
+        note = persona.reply_direction_note(self.CURIOUS, pending)
+        self.assertIn("上一句问过", note)
+        # 再问一次但玩家还是不答 ⇒ 压力减半落到下限以下，之后不再追问
+        pending = persona.update_open_questions(
+            pending, "还是不答", "那你要卖什么呀？", self.CURIOUS)
+        self.assertEqual(pending, [])
+        self.assertNotIn("上一句问过", persona.reply_direction_note(self.CURIOUS, []))
+
+    def test_baseline_never_nags(self):
+        reply = "你要卖什么呀？"
+        pending = persona.update_open_questions([], "嗯", reply, self.BASE)
+        self.assertEqual(pending, [])           # 基线附近的问题不进状态机
+        self.assertEqual(persona.reply_direction_note(self.BASE, [{"q": "x", "pressure": 0.1}]), "")
+
+
 if __name__ == "__main__":
     unittest.main()
