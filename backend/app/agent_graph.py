@@ -1499,7 +1499,7 @@ async def _guard_aesthetic_reply(agent, data, msgs, raw):
                 and not aesthetics.needs_taste_retry(raw2, text)):
             raw = raw2
         else:
-            fallback = aesthetics.taste_fallback(state)
+            fallback = aesthetics.taste_fallback(state, text)
             if fallback:
                 raw = fallback
             print("[Chat] 审美重答仍未带上自己的判断，改用审美兜底")

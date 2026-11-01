@@ -562,17 +562,22 @@ def retry_prompt():
             "不要反问对方已经答过的内容。）")
 
 
-def taste_fallback(state):
+def taste_fallback(state, player_text=""):
     """重答仍只报热门名字时的确定性兜底：只讲自己的标准，不硬选作品。
 
-    不是固定台词模板：高 / 低维度由当前 ``axes`` 算出来，随长期偏好变化。
+    不是固定台词模板：高 / 低维度由当前 ``axes`` 算出来，随长期偏好变化；
+    「接触不多」只在问游戏 / 二次元时用，问画 / 作品时改成不凭热度选。
     """
     st = sanitize(state)
     high, low = _axis_phrases(st)
     if not high:
         return ""
-    line = ("我对这个类型接触不多，没法装作很懂。按我自己的审美，我更看重"
-            + "、".join(high[:3]) + "；")
+    ask = str(player_text or "")
+    if any(w in ask for w in ("游戏", "手游", "二次元")):
+        line = "我对这个类型接触不多，没法装作很懂。"
+    else:
+        line = "我不想只凭热度给你一个名字。"
+    line += "按我自己的审美，我更看重" + "、".join(high[:3]) + "；"
     if low:
         line += "对" + "、".join(low[:2]) + "那一类不太来电。"
     else:

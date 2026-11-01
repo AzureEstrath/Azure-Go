@@ -172,11 +172,14 @@ class PureTest(unittest.TestCase):
         self.assertIsNone(aesthetics.fit_score(st, "不存在的作品"))
 
     def test_taste_fallback_lists_criteria_not_a_hot_title(self):
-        out = aesthetics.taste_fallback(aesthetics.default_state())
+        out = aesthetics.taste_fallback(aesthetics.default_state(), "你最喜欢哪个二次元手游")
         self.assertIn("按我自己的审美", out)
         self.assertIn("更看重", out)
         self.assertIn("不太来电", out)
         self.assertNotIn("原神", out)
+        art = aesthetics.taste_fallback(aesthetics.default_state(), "你最喜欢哪幅画")
+        self.assertNotIn("接触不多", art)
+        self.assertIn("只凭热度", art)
 
 
 class CountingStore:
